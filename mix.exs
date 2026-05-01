@@ -31,6 +31,8 @@ defmodule Shuttle.MixProject do
     [
       {:jason, "~> 1.4"},
       {:yaml_elixir, "~> 2.12"},
+      {:phoenix, "~> 1.7"},
+      {:bandit, "~> 1.0"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
   end

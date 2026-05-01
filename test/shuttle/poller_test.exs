@@ -139,8 +139,8 @@ defmodule Shuttle.PollerTest do
 
     # Check snapshot shows running worker
     snap = Poller.snapshot(poller)
-    assert length(snap.running) == 1
-    assert hd(snap.running).fiber_id == "tests/haiku"
+    assert length(snap.eligible) == 1
+    assert hd(snap.eligible).fiber_id == "tests/haiku"
   end
 
   test "poller skips closed fibers" do
@@ -275,7 +275,7 @@ defmodule Shuttle.PollerTest do
     Process.sleep(100)
 
     snap1 = Poller.snapshot(poller)
-    assert length(snap1.running) == 1
+    assert length(snap1.eligible) == 1
 
     # Simulate worker exit (tmux session dies)
     MockRunner.remove_tmux_session("shuttle-tests-haiku")
@@ -283,7 +283,7 @@ defmodule Shuttle.PollerTest do
     Process.sleep(50)
 
     snap2 = Poller.snapshot(poller)
-    assert length(snap2.running) == 0
+    assert length(snap2.eligible) == 0
     assert length(snap2.retrying) == 1
     assert hd(snap2.retrying).fiber_id == "tests/haiku"
   end
@@ -330,7 +330,7 @@ defmodule Shuttle.PollerTest do
     Process.sleep(100)
 
     snap = Poller.snapshot(poller)
-    assert length(snap.running) == 1
-    assert hd(snap.running).fiber_id == "tests/orphan"
+    assert length(snap.eligible) == 1
+    assert hd(snap.eligible).fiber_id == "tests/orphan"
   end
 end

@@ -18,6 +18,8 @@ defmodule Shuttle.Poller do
 
   alias Shuttle.{Dispatcher, WorkerWatcher}
 
+  @pubsub_topic "shuttle:snapshot"
+
   @default_poll_interval_ms 30_000
   @default_max_concurrent_workers 10
   @default_heartbeat_interval_ms 5_000
@@ -105,11 +107,13 @@ defmodule Shuttle.Poller do
   def handle_info(:run_poll_cycle, state) do
     state = maybe_dispatch(state)
     state = schedule_tick(state, state.poll_interval_ms)
+    broadcast_snapshot(state)
     {:noreply, state}
   end
 
   def handle_info({:worker_exited, fiber_id, reason, session_alive?}, state) do
     state = handle_worker_exit(state, fiber_id, reason, session_alive?)
+    broadcast_snapshot(state)
     {:noreply, state}
   end
 
@@ -132,15 +136,22 @@ defmodule Shuttle.Poller do
 
   @impl true
   def handle_call(:snapshot, _from, state) do
-    now = DateTime.utc_now()
-    now_ms = System.monotonic_time(:millisecond)
+    {:reply, build_snapshot(state), state}
+  end
 
-    running =
+  # ── Snapshot ──
+
+  @spec build_snapshot(State.t()) :: map()
+  defp build_snapshot(state) do
+    now = DateTime.utc_now()
+    now_ms = DateTime.to_unix(now, :millisecond)
+
+    eligible =
       Enum.map(state.running, fn {fiber_id, meta} ->
         %{
           fiber_id: fiber_id,
           tmux_session: meta.session,
-          agent_id: meta.agent_id,
+          agent: meta.agent_id,
           state: "running",
           started_at: meta.started_at,
           last_activity_at: meta.last_activity_at,
@@ -158,15 +169,22 @@ defmodule Shuttle.Poller do
         }
       end)
 
-    {:reply,
-     %{
-       poll_at: now_ms,
-       host: hostname(),
-       running: running,
-       retrying: retrying,
-       claimed_count: MapSet.size(state.claimed),
-       max_concurrent: state.max_concurrent_workers
-     }, state}
+    %{
+      poll_at: now_ms,
+      host: hostname(),
+      eligible: eligible,
+      blocked: [],
+      orphans: [],
+      retrying: retrying,
+      claimed_count: MapSet.size(state.claimed),
+      max_concurrent: state.max_concurrent_workers
+    }
+  end
+
+  defp broadcast_snapshot(state) do
+    snap = build_snapshot(state)
+    Phoenix.PubSub.broadcast(Shuttle.PubSub, @pubsub_topic, {:snapshot, snap})
+    snap
   end
 
   # ── Dispatch ──
@@ -296,11 +314,14 @@ defmodule Shuttle.Poller do
               last_activity_at: now
             })
 
-            %{
+            state = %{
               state
               | running: running,
                 claimed: MapSet.put(state.claimed, fiber_id)
             }
+
+            broadcast_snapshot(state)
+            state
 
           {:error, reason} ->
             Logger.error("Failed to start watcher for #{fiber_id}: #{inspect(reason)}")
@@ -506,7 +527,9 @@ defmodule Shuttle.Poller do
         delay_type: delay_type
       })
 
-    %{state | retry_queue: retry_queue, claimed: MapSet.put(state.claimed, fiber_id)}
+    state = %{state | retry_queue: retry_queue, claimed: MapSet.put(state.claimed, fiber_id)}
+    broadcast_snapshot(state)
+    state
   end
 
   defp pop_retry(%State{} = state, fiber_id, retry_token) when is_reference(retry_token) do

@@ -23,12 +23,20 @@ defmodule Shuttle.Application do
   @impl true
   def start(_type, _args) do
     children = [
+      {Phoenix.PubSub, name: Shuttle.PubSub},
       {DynamicSupervisor, strategy: :one_for_one, name: Shuttle.WatcherSupervisor}
     ]
 
     children =
       if Application.get_env(:shuttle, :start_poller, true) do
         children ++ [Shuttle.Poller]
+      else
+        children
+      end
+
+    children =
+      if Application.get_env(:shuttle, :start_endpoint, true) do
+        children ++ [ShuttleWeb.Endpoint]
       else
         children
       end
