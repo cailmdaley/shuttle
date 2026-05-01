@@ -122,14 +122,14 @@ defmodule Shuttle.DispatcherTest do
     assert prompt =~ "felt history append tests/haiku"
   end
 
-  test "session_name sanitizes slashes" do
-    assert Dispatcher.session_name("tests/haiku") == "shuttle-tests-haiku"
-    assert Dispatcher.session_name("a/b/c") == "shuttle-a-b-c"
+  test "session_name preserves slashes" do
+    assert Dispatcher.session_name("tests/haiku") == "shuttle-tests/haiku"
+    assert Dispatcher.session_name("a/b/c") == "shuttle-a/b/c"
   end
 
   test "dispatch creates tmux session for eligible fiber" do
     result = Dispatcher.dispatch("tests/haiku", runner: MockRunner)
-    assert {:ok, "shuttle-tests-haiku"} = result
+    assert {:ok, "shuttle-tests/haiku"} = result
 
     commands = MockRunner.commands()
     assert Enum.any?(commands, fn {cmd, args} ->
@@ -144,7 +144,7 @@ defmodule Shuttle.DispatcherTest do
 
   test "dispatch refuses already-running fiber" do
     # Pre-seed the tmux session
-    MockRunner.add_tmux_session("shuttle-tests-haiku")
+    MockRunner.add_tmux_session("shuttle-tests/haiku")
 
     result = Dispatcher.dispatch("tests/haiku", runner: MockRunner)
     assert {:error, :already_running} = result
@@ -152,7 +152,7 @@ defmodule Shuttle.DispatcherTest do
 
   test "dispatch resolves pi agent from bare tag" do
     result = Dispatcher.dispatch("tests/pi-tagged", runner: MockRunner)
-    assert {:ok, "shuttle-tests-pi-tagged"} = result
+    assert {:ok, "shuttle-tests/pi-tagged"} = result
 
     # Verify the tmux new-session command was issued
     commands = MockRunner.commands()

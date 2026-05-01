@@ -205,7 +205,7 @@ defmodule Shuttle.PollerTest do
 
     commands = MockRunner.commands()
     refute Enum.any?(commands, fn {cmd, args} ->
-      cmd == "tmux" and hd(args) == "new-session" and Enum.member?(args, "shuttle-tests-dependent")
+      cmd == "tmux" and hd(args) == "new-session" and Enum.member?(args, "shuttle-tests/dependent")
     end)
   end
 
@@ -237,7 +237,7 @@ defmodule Shuttle.PollerTest do
     fiber = make_fiber("tests/haiku")
     MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/haiku", fiber)
-    MockRunner.add_tmux_session("shuttle-tests-haiku")
+    MockRunner.add_tmux_session("shuttle-tests/haiku")
 
     {:ok, poller} = Poller.start_link(
       name: :test_poller_6,
@@ -278,7 +278,7 @@ defmodule Shuttle.PollerTest do
     assert length(snap1.eligible) == 1
 
     # Simulate worker exit (tmux session dies)
-    MockRunner.remove_tmux_session("shuttle-tests-haiku")
+    MockRunner.remove_tmux_session("shuttle-tests/haiku")
     send(poller, {:worker_exited, "tests/haiku", :normal_exit, false})
     Process.sleep(50)
 
@@ -306,7 +306,7 @@ defmodule Shuttle.PollerTest do
 
     # Close the fiber
     MockRunner.set_fiber("tests/haiku", %{fiber | "status" => "closed"})
-    MockRunner.remove_tmux_session("shuttle-tests-haiku")
+    MockRunner.remove_tmux_session("shuttle-tests/haiku")
     send(poller, {:worker_exited, "tests/haiku", :normal_exit, false})
     Process.sleep(50)
 
@@ -318,7 +318,7 @@ defmodule Shuttle.PollerTest do
   test "poller adopts orphan tmux sessions on startup" do
     fiber = make_fiber("tests/orphan")
     MockRunner.set_fiber("tests/orphan", fiber)
-    MockRunner.add_tmux_session("shuttle-tests-orphan")
+    MockRunner.add_tmux_session("shuttle-tests/orphan")
 
     {:ok, poller} = Poller.start_link(
       name: :test_poller_9,

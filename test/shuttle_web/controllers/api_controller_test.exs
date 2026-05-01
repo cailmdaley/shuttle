@@ -169,7 +169,7 @@ defmodule ShuttleWeb.APIControllerTest do
     body = Jason.decode!(conn.resp_body)
     assert body["dispatched"] == true
     assert body["fiber_id"] == "tests/api-dispatch"
-    assert body["tmux_session"] == "shuttle-tests-api-dispatch"
+    assert body["tmux_session"] == "shuttle-tests/api-dispatch"
     assert body["notify_on_exit"] == true
     assert body["channel_topic"] == "shuttle:worker:tests/api-dispatch"
   end
@@ -177,7 +177,7 @@ defmodule ShuttleWeb.APIControllerTest do
   test "dispatch returns 409 for already running fiber" do
     fiber = make_fiber("tests/api-dispatch-2")
     MockRunner.set_fiber("tests/api-dispatch-2", fiber)
-    MockRunner.add_tmux_session("shuttle-tests-api-dispatch-2")
+    MockRunner.add_tmux_session("shuttle-tests/api-dispatch-2")
 
     conn = post(api_conn(), "/api/v1/dispatch", Jason.encode!(%{
       "fiber_id" => "tests/api-dispatch-2"

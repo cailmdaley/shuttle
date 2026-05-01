@@ -68,12 +68,16 @@ defmodule Shuttle.Dispatcher do
   end
 
   @doc """
-  Sanitizes a fiber ID into a valid tmux session name.
-  Replaces `/` with `-` since tmux does not permit `/` in session names.
+  tmux session name for a fiber ID.
+
+  tmux on macOS and Linux accepts `/` in session names; preserving the
+  literal fiber ID makes `tmux attach -t shuttle-<id>` work without
+transformation, and keeps the kanban's `listShuttleSessions` probe
+aligned with the Elixir Shuttle's naming.
   """
   @spec session_name(String.t()) :: String.t()
   def session_name(fiber_id) do
-    "shuttle-" <> String.replace(fiber_id, "/", "-")
+    "shuttle-" <> fiber_id
   end
 
   # ── Internal ──
