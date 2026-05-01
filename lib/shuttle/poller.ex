@@ -1,0 +1,643 @@
+defmodule Shuttle.Poller do
+  @moduledoc """
+  Polls the felt fiber tree and dispatches workers for eligible constitutions.
+
+  A single GenServer owns the dispatch tick, eligibility predicate, retry
+  scheduling, and reconciliation. It starts `Shuttle.WorkerWatcher` processes
+  under a `DynamicSupervisor` to track each worker's tmux session from outside.
+
+  Lifted from Symphony's orchestrator.ex with the integration layer replaced:
+  - Linear API → felt CLI
+  - Issue model → fiber model
+  - Codex app-server → tmux + loom shell wrappers
+  """
+
+  use GenServer
+  require Logger
+  import Bitwise, only: [<<<: 2]
+
+  alias Shuttle.{Dispatcher, WorkerWatcher}
+
+  @default_poll_interval_ms 30_000
+  @default_max_concurrent_workers 10
+  @default_heartbeat_interval_ms 5_000
+  @default_stall_timeout_ms 300_000
+  @continuation_retry_delay_ms 1_000
+  @failure_retry_base_ms 10_000
+  @default_max_retry_backoff_ms 300_000
+
+  defmodule State do
+    @moduledoc false
+    defstruct [
+      :poll_interval_ms,
+      :max_concurrent_workers,
+      :heartbeat_interval_ms,
+      :stall_timeout_ms,
+      :max_retry_backoff_ms,
+      :next_poll_due_at_ms,
+      :tick_timer_ref,
+      :tick_token,
+      :felt_host,
+      :runner,
+      poll_check_in_progress: false,
+      running: %{},
+      claimed: MapSet.new(),
+      retry_queue: %{}
+    ]
+  end
+
+  # ── Client ──
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts \\ []) do
+    name = Keyword.get(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: name)
+  end
+
+  @spec snapshot() :: map()
+  def snapshot, do: snapshot(__MODULE__)
+
+  @spec snapshot(GenServer.server()) :: map()
+  def snapshot(server) do
+    GenServer.call(server, :snapshot)
+  end
+
+  # ── Server ──
+
+  @impl true
+  def init(opts) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    felt_host = Keyword.get(opts, :felt_host, default_felt_host())
+    runner = Keyword.get(opts, :runner, Shuttle.Runner.Default)
+
+    state = %State{
+      poll_interval_ms: Keyword.get(opts, :poll_interval_ms, @default_poll_interval_ms),
+      max_concurrent_workers: Keyword.get(opts, :max_concurrent_workers, @default_max_concurrent_workers),
+      heartbeat_interval_ms: Keyword.get(opts, :heartbeat_interval_ms, @default_heartbeat_interval_ms),
+      stall_timeout_ms: Keyword.get(opts, :stall_timeout_ms, @default_stall_timeout_ms),
+      max_retry_backoff_ms: Keyword.get(opts, :max_retry_backoff_ms, @default_max_retry_backoff_ms),
+      next_poll_due_at_ms: now_ms,
+      tick_timer_ref: nil,
+      tick_token: nil,
+      felt_host: felt_host,
+      runner: runner
+    }
+
+    # Adopt existing tmux sessions on startup
+    state = adopt_orphans(state)
+
+    # Schedule first tick immediately
+    state = schedule_tick(state, 0)
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_info({:tick, tick_token}, %{tick_token: tick_token} = state)
+      when is_reference(tick_token) do
+    state = %{state | poll_check_in_progress: true, next_poll_due_at_ms: nil, tick_timer_ref: nil, tick_token: nil}
+    :ok = schedule_poll_cycle()
+    {:noreply, state}
+  end
+
+  def handle_info({:tick, _}, state), do: {:noreply, state}
+
+  def handle_info(:run_poll_cycle, state) do
+    state = maybe_dispatch(state)
+    state = schedule_tick(state, state.poll_interval_ms)
+    {:noreply, state}
+  end
+
+  def handle_info({:worker_exited, fiber_id, reason, session_alive?}, state) do
+    state = handle_worker_exit(state, fiber_id, reason, session_alive?)
+    {:noreply, state}
+  end
+
+  def handle_info({:retry, fiber_id, retry_token}, state) do
+    result =
+      case pop_retry(state, fiber_id, retry_token) do
+        {:ok, retry, state} -> handle_retry(state, fiber_id, retry)
+        :missing -> {:noreply, state}
+      end
+
+    result
+  end
+
+  def handle_info({:retry, _}, state), do: {:noreply, state}
+
+  def handle_info(msg, state) do
+    Logger.debug("Poller ignored message: #{inspect(msg)}")
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_call(:snapshot, _from, state) do
+    now = DateTime.utc_now()
+    now_ms = System.monotonic_time(:millisecond)
+
+    running =
+      Enum.map(state.running, fn {fiber_id, meta} ->
+        %{
+          fiber_id: fiber_id,
+          tmux_session: meta.session,
+          agent_id: meta.agent_id,
+          state: "running",
+          started_at: meta.started_at,
+          last_activity_at: meta.last_activity_at,
+          runtime_seconds: runtime_seconds(meta.started_at, now)
+        }
+      end)
+
+    retrying =
+      Enum.map(state.retry_queue, fn {fiber_id, retry} ->
+        %{
+          fiber_id: fiber_id,
+          attempt: retry.attempt,
+          due_in_ms: max(0, retry.due_at_ms - now_ms),
+          error: Map.get(retry, :error)
+        }
+      end)
+
+    {:reply,
+     %{
+       poll_at: now_ms,
+       host: hostname(),
+       running: running,
+       retrying: retrying,
+       claimed_count: MapSet.size(state.claimed),
+       max_concurrent: state.max_concurrent_workers
+     }, state}
+  end
+
+  # ── Dispatch ──
+
+  defp maybe_dispatch(%State{} = state) do
+    state = reconcile(state)
+
+    with {:ok, candidates} <- discover_candidates(state),
+         true <- available_slots(state) > 0 do
+      candidates
+      |> filter_eligible(state)
+      |> sort_candidates()
+      |> Enum.reduce(state, fn fiber, state_acc ->
+        if available_slots(state_acc) > 0 do
+          dispatch_fiber(state_acc, fiber)
+        else
+          state_acc
+        end
+      end)
+    else
+      {:error, reason} ->
+        Logger.error("Poll cycle failed: #{inspect(reason)}")
+        state
+
+      false ->
+        state
+    end
+  end
+
+  defp discover_candidates(state) do
+    case run_felt(state, ["ls", "-t", "constitution", "-j", "-s", "all"]) do
+      {:ok, output} ->
+        case Jason.decode(output) do
+          {:ok, fibers} when is_list(fibers) -> {:ok, fibers}
+          {:ok, _} -> {:error, :invalid_felt_ls_json}
+          {:error, reason} -> {:error, {:json_decode_error, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, {:felt_ls_failed, reason}}
+    end
+  end
+
+  defp filter_eligible(candidates, state) do
+    Enum.filter(candidates, fn fiber -> eligible?(fiber, state) end)
+  end
+
+  defp eligible?(fiber, state) do
+    tags = Map.get(fiber, "tags", [])
+    status = Map.get(fiber, "status", "")
+    fiber_id = Map.get(fiber, "id", "")
+
+    cond do
+      # Must have constitution tag
+      "constitution" not in tags -> false
+
+      # Must not have draft tag
+      "draft" in tags -> false
+
+      # Must not be closed
+      status == "closed" -> false
+
+      # Must not already be running
+      Map.has_key?(state.running, fiber_id) -> false
+
+      # Must not be claimed (retry queued)
+      MapSet.member?(state.claimed, fiber_id) -> false
+
+      # Dependencies must be satisfied
+      true -> dependencies_satisfied?(fiber_id, state)
+    end
+  end
+
+  defp dependencies_satisfied?(fiber_id, state) do
+    case fetch_fiber_full(fiber_id, state) do
+      {:ok, full_fiber} ->
+        deps = Map.get(full_fiber, "depends_on", [])
+
+        if deps == [] or is_nil(deps) do
+          true
+        else
+          Enum.all?(deps, fn dep_id ->
+            case fetch_fiber_full(dep_id, state) do
+              {:ok, dep} -> Map.get(dep, "tempered", false) == true
+              {:error, _} -> false
+            end
+          end)
+        end
+
+      {:error, _} ->
+        false
+    end
+  end
+
+  defp sort_candidates(candidates) do
+    Enum.sort_by(candidates, fn fiber ->
+      created = Map.get(fiber, "created_at", "")
+      {created, Map.get(fiber, "id", "")}
+    end)
+  end
+
+  defp dispatch_fiber(%State{} = state, fiber) do
+    fiber_id = Map.get(fiber, "id", "")
+
+    case Dispatcher.dispatch(fiber_id, runner: state.runner, work_dir: state.felt_host) do
+      {:ok, session} ->
+        {:ok, agent} = Shuttle.Agents.resolve(Map.get(fiber, "tags", []))
+
+        # Start a watcher for this worker
+        watcher_opts = [
+          fiber_id: fiber_id,
+          session: session,
+          poller: self(),
+          runner: state.runner,
+          heartbeat_interval_ms: state.heartbeat_interval_ms
+        ]
+
+        case DynamicSupervisor.start_child(Shuttle.WatcherSupervisor, {WorkerWatcher, watcher_opts}) do
+          {:ok, watcher_pid} ->
+            now = DateTime.utc_now()
+
+            running = Map.put(state.running, fiber_id, %{
+              pid: watcher_pid,
+              session: session,
+              agent_id: agent.id,
+              started_at: now,
+              last_activity_at: now
+            })
+
+            %{
+              state
+              | running: running,
+                claimed: MapSet.put(state.claimed, fiber_id)
+            }
+
+          {:error, reason} ->
+            Logger.error("Failed to start watcher for #{fiber_id}: #{inspect(reason)}")
+            schedule_retry(state, fiber_id, 1, %{error: "watcher start failed: #{inspect(reason)}"})
+        end
+
+      {:error, :already_running} ->
+        # Session exists but we don't have a watcher — adopt it
+        adopt_session(state, fiber_id)
+
+      {:error, reason} ->
+        Logger.warning("Dispatch failed for #{fiber_id}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  # ── Reconciliation ──
+
+  defp reconcile(%State{} = state) do
+    state = reconcile_fiber_closures(state)
+    state = reconcile_orphaned_sessions(state)
+    state
+  end
+
+  defp reconcile_fiber_closures(%State{running: running} = state) when map_size(running) == 0 do
+    state
+  end
+
+  defp reconcile_fiber_closures(%State{} = state) do
+    Enum.reduce(state.running, state, fn {fiber_id, meta}, state_acc ->
+      case fetch_fiber_full(fiber_id, state_acc) do
+        {:ok, fiber} ->
+          if Map.get(fiber, "status") == "closed" do
+            Logger.info("Fiber closed externally: #{fiber_id}; stopping watcher")
+            stop_watcher(meta)
+            remove_running(state_acc, fiber_id)
+          else
+            state_acc
+          end
+
+        {:error, _} ->
+          state_acc
+      end
+    end)
+  end
+
+  defp reconcile_orphaned_sessions(%State{} = state) do
+    # Find tmux sessions that exist but have no watcher
+    {:ok, sessions} = list_shuttle_sessions(state)
+    running_sessions = Enum.map(state.running, fn {_, meta} -> meta.session end) |> MapSet.new()
+
+    Enum.reduce(sessions, state, fn session, state_acc ->
+      if MapSet.member?(running_sessions, session) do
+        state_acc
+      else
+        adopt_session(state_acc, session_to_fiber_id(session))
+      end
+    end)
+  end
+
+  defp adopt_orphans(%State{} = state) do
+    {:ok, sessions} = list_shuttle_sessions(state)
+
+    Enum.reduce(sessions, state, fn session, state_acc ->
+      fiber_id = session_to_fiber_id(session)
+
+      if Map.has_key?(state_acc.running, fiber_id) do
+        state_acc
+      else
+        adopt_session(state_acc, fiber_id)
+      end
+    end)
+  end
+
+  defp adopt_session(state, fiber_id) do
+    session = Dispatcher.session_name(fiber_id)
+
+    case fetch_fiber_full(fiber_id, state) do
+      {:ok, fiber} ->
+        if Map.get(fiber, "status") != "closed" do
+          {:ok, agent} = Shuttle.Agents.resolve(Map.get(fiber, "tags", []))
+
+          watcher_opts = [
+            fiber_id: fiber_id,
+            session: session,
+            poller: self(),
+            runner: state.runner,
+            heartbeat_interval_ms: state.heartbeat_interval_ms
+          ]
+
+          case DynamicSupervisor.start_child(Shuttle.WatcherSupervisor, {WorkerWatcher, watcher_opts}) do
+            {:ok, watcher_pid} ->
+              now = DateTime.utc_now()
+
+              running = Map.put(state.running, fiber_id, %{
+                pid: watcher_pid,
+                session: session,
+                agent_id: agent.id,
+                started_at: now,
+                last_activity_at: now
+              })
+
+              Logger.info("Adopted orphan session: #{session}")
+              %{state | running: running, claimed: MapSet.put(state.claimed, fiber_id)}
+
+            {:error, reason} ->
+              Logger.warning("Failed to adopt session #{session}: #{inspect(reason)}")
+              state
+          end
+        else
+          # Fiber is closed but tmux session still exists — kill it
+          Logger.info("Killing stale session for closed fiber: #{session}")
+          _ = state.runner.cmd("tmux", ["kill-session", "-t", session], stderr_to_stdout: true)
+          state
+        end
+
+      {:error, _} ->
+        # Fiber not found — skip, don't kill (could be from another host or test)
+        Logger.debug("Skipping orphan session for unknown fiber: #{session}")
+        state
+    end
+  end
+
+  # ── Worker Exit Handling ──
+
+  defp handle_worker_exit(%State{} = state, fiber_id, _reason, _session_alive?) do
+    case Map.pop(state.running, fiber_id) do
+      {nil, _} ->
+        state
+
+      {_meta, running} ->
+        state = %{state | running: running}
+
+        # Re-read fiber to determine next action
+        case fetch_fiber_full(fiber_id, state) do
+          {:ok, fiber} ->
+            status = Map.get(fiber, "status", "")
+
+            cond do
+              status == "closed" ->
+                # Work complete or blocked — release claim
+                release_claim(state, fiber_id)
+
+              true ->
+                # Still active — schedule continuation retry
+                attempt = next_retry_attempt(state, fiber_id)
+                schedule_retry(state, fiber_id, attempt, %{delay_type: :continuation})
+            end
+
+          {:error, _} ->
+            # Can't read fiber — schedule failure retry
+            attempt = next_retry_attempt(state, fiber_id)
+            schedule_retry(state, fiber_id, attempt, %{error: "fiber read failed after exit"})
+        end
+    end
+  end
+
+  # ── Retry ──
+
+  defp handle_retry(%State{} = state, fiber_id, _retry) do
+    case fetch_fiber_full(fiber_id, state) do
+      {:ok, fiber} ->
+        if eligible?(fiber, state) do
+          dispatch_fiber(state, fiber)
+        else
+          Logger.debug("Retry no longer eligible: #{fiber_id}")
+          release_claim(state, fiber_id)
+        end
+
+      {:error, _} ->
+        Logger.debug("Retry fiber not found: #{fiber_id}")
+        release_claim(state, fiber_id)
+    end
+  end
+
+  defp schedule_retry(%State{} = state, fiber_id, attempt, metadata) when is_map(metadata) do
+    previous = Map.get(state.retry_queue, fiber_id, %{attempt: 0})
+    next_attempt = if is_integer(attempt), do: attempt, else: previous.attempt + 1
+    delay_ms = retry_delay(next_attempt, metadata, state.max_retry_backoff_ms)
+    retry_token = make_ref()
+    due_at_ms = System.monotonic_time(:millisecond) + delay_ms
+
+    # Cancel old timer if present
+    if is_reference(previous[:timer_ref]) do
+      Process.cancel_timer(previous.timer_ref)
+    end
+
+    timer_ref = Process.send_after(self(), {:retry, fiber_id, retry_token}, delay_ms)
+
+    error = Map.get(metadata, :error)
+    delay_type = Map.get(metadata, :delay_type, :failure)
+
+    error_suffix = if is_binary(error), do: " error=#{error}", else: ""
+    Logger.info("Retry scheduled: fiber_id=#{fiber_id} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
+
+    retry_queue =
+      Map.put(state.retry_queue, fiber_id, %{
+        attempt: next_attempt,
+        timer_ref: timer_ref,
+        retry_token: retry_token,
+        due_at_ms: due_at_ms,
+        error: error,
+        delay_type: delay_type
+      })
+
+    %{state | retry_queue: retry_queue, claimed: MapSet.put(state.claimed, fiber_id)}
+  end
+
+  defp pop_retry(%State{} = state, fiber_id, retry_token) when is_reference(retry_token) do
+    case Map.get(state.retry_queue, fiber_id) do
+      %{retry_token: ^retry_token} = retry ->
+        {:ok, retry, %{state | retry_queue: Map.delete(state.retry_queue, fiber_id)}}
+
+      _ ->
+        :missing
+    end
+  end
+
+  defp retry_delay(attempt, %{delay_type: :continuation}, _max_backoff) when attempt == 1 do
+    @continuation_retry_delay_ms
+  end
+
+  defp retry_delay(attempt, _metadata, max_backoff) when is_integer(attempt) and attempt > 0 do
+    max_delay_power = min(attempt - 1, 10)
+    min(@failure_retry_base_ms * (1 <<< max_delay_power), max_backoff)
+  end
+
+  defp next_retry_attempt(state, fiber_id) do
+    case Map.get(state.retry_queue, fiber_id) do
+      %{attempt: attempt} when is_integer(attempt) and attempt > 0 -> attempt + 1
+      _ -> 1
+    end
+  end
+
+  # ── Helpers ──
+
+  defp available_slots(%State{} = state) do
+    max(state.max_concurrent_workers - map_size(state.running), 0)
+  end
+
+  defp release_claim(%State{} = state, fiber_id) do
+    %{state | claimed: MapSet.delete(state.claimed, fiber_id)}
+  end
+
+  defp remove_running(%State{} = state, fiber_id) do
+    %{state | running: Map.delete(state.running, fiber_id), claimed: MapSet.delete(state.claimed, fiber_id)}
+  end
+
+  defp stop_watcher(meta) do
+    if is_pid(meta.pid) and Process.alive?(meta.pid) do
+      WorkerWatcher.stop(meta.pid)
+    end
+  end
+
+  defp fetch_fiber_full(fiber_id, state) do
+    case run_felt(state, ["show", fiber_id, "--json"]) do
+      {:ok, output} ->
+        case Jason.decode(output) do
+          {:ok, fiber} -> {:ok, fiber}
+          {:error, _} -> {:error, :invalid_json}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp run_felt(state, args) do
+    opts = [cd: state.felt_host, stderr_to_stdout: true]
+
+    case state.runner.cmd("felt", args, opts) do
+      {output, 0} -> {:ok, output}
+      {output, _} -> {:error, output}
+    end
+  end
+
+  defp list_shuttle_sessions(state) do
+    case state.runner.cmd("tmux", ["ls", "-F", "\#{session_name}"], stderr_to_stdout: true) do
+      {output, 0} ->
+        sessions =
+          output
+          |> String.split("\n")
+          |> Enum.map(&String.trim/1)
+          |> Enum.filter(&String.starts_with?(&1, "shuttle-"))
+
+        {:ok, sessions}
+
+      {_, _} ->
+        # No tmux server running
+        {:ok, []}
+    end
+  end
+
+  defp session_to_fiber_id("shuttle-" <> rest) do
+    String.replace(rest, "-", "/")
+  end
+
+  defp session_to_fiber_id(other), do: other
+
+  defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
+    if is_reference(state.tick_timer_ref) do
+      Process.cancel_timer(state.tick_timer_ref)
+    end
+
+    tick_token = make_ref()
+    timer_ref = Process.send_after(self(), {:tick, tick_token}, delay_ms)
+
+    %{
+      state
+      | tick_timer_ref: timer_ref,
+        tick_token: tick_token,
+        next_poll_due_at_ms: System.monotonic_time(:millisecond) + delay_ms
+    }
+  end
+
+  defp schedule_poll_cycle do
+    # Small delay to let any pending messages settle
+    :timer.send_after(20, self(), :run_poll_cycle)
+    :ok
+  end
+
+  defp runtime_seconds(nil, _), do: 0
+
+  defp runtime_seconds(%DateTime{} = started_at, %DateTime{} = now) do
+    max(0, DateTime.diff(now, started_at, :second))
+  end
+
+  defp runtime_seconds(_, _), do: 0
+
+  defp hostname do
+    case :inet.gethostname() do
+      {:ok, name} -> to_string(name)
+      _ -> "unknown"
+    end
+  end
+
+  defp default_felt_host do
+    System.user_home() <> "/loom"
+  end
+end

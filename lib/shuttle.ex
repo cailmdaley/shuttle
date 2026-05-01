@@ -23,8 +23,15 @@ defmodule Shuttle.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      # Stage 3+: add poller, worker watcher supervisor, etc.
+      {DynamicSupervisor, strategy: :one_for_one, name: Shuttle.WatcherSupervisor}
     ]
+
+    children =
+      if Application.get_env(:shuttle, :start_poller, true) do
+        children ++ [Shuttle.Poller]
+      else
+        children
+      end
 
     Supervisor.start_link(children, strategy: :one_for_one, name: Shuttle.Supervisor)
   end

@@ -41,11 +41,34 @@ defmodule Shuttle.CLI do
             System.halt(1)
         end
 
+      ["start"] ->
+        IO.puts("Starting Shuttle daemon...")
+        {:ok, _} = Application.ensure_all_started(:shuttle)
+        IO.puts("Shuttle running. Press Ctrl+C to exit.")
+        Process.sleep(:infinity)
+
+      ["snapshot"] ->
+        case Application.ensure_all_started(:shuttle) do
+          {:ok, _} ->
+            snap = Shuttle.Poller.snapshot()
+            IO.puts(Jason.encode!(snap))
+
+          _ ->
+            IO.puts(:stderr, "Failed to start Shuttle")
+            System.halt(1)
+        end
+
       ["version"] ->
         IO.puts(Shuttle.version())
 
       _ ->
-        IO.puts("Usage: shuttle dispatch <fiber-id> | shuttle version")
+        IO.puts("Usage: shuttle <command>")
+        IO.puts("")
+        IO.puts("Commands:")
+        IO.puts("  dispatch <fiber-id>  Dispatch a worker for a specific fiber")
+        IO.puts("  start                Start the daemon")
+        IO.puts("  snapshot             Print JSON snapshot of current state")
+        IO.puts("  version              Print version")
         System.halt(1)
     end
   end
