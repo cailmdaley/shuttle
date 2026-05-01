@@ -2,8 +2,9 @@ defmodule Shuttle.Agents do
   @moduledoc """
   Agent configuration loading and tag resolution.
 
-  For Stage 2, agents are hardcoded inline. Stage 3+ will load from
-  config/agents.exs.
+  Agents are configured through `config :shuttle, :agents`. The built-in
+  records are the fallback so tests and local escripts still have a complete
+  default surface when no config file has been loaded.
   """
 
   @type agent_record :: %{
@@ -86,7 +87,11 @@ defmodule Shuttle.Agents do
   Returns the list of configured agent records.
   """
   @spec list() :: [agent_record()]
-  def list, do: @default_agents
+  def list do
+    :shuttle
+    |> Application.get_env(:agents, @default_agents)
+    |> normalize_agents()
+  end
 
   @doc """
   Resolves an agent record from a fiber's tags.
@@ -117,7 +122,7 @@ defmodule Shuttle.Agents do
     bare_pi = if "pi" in tags, do: find_by_alias(agents, "pi"), else: nil
 
     # 4. Default
-    default = Enum.find(agents, & &1.default)
+    default = Enum.find(agents, & &1.default) || List.first(agents)
 
     case compound || bare_codex || bare_pi || default do
       nil -> {:error, "no agent configured"}
@@ -135,6 +140,67 @@ defmodule Shuttle.Agents do
 
     Enum.find(agents, fn a ->
       Enum.any?(a.aliases, &(&1 == alias_name))
+    end)
+  end
+
+  defp normalize_agents(agents) when is_list(agents) do
+    Enum.map(agents, &normalize_agent/1)
+  end
+
+  defp normalize_agent(agent) when is_map(agent) do
+    normalize_agent(Map.to_list(agent))
+  end
+
+  defp normalize_agent(agent) when is_list(agent) do
+    %{
+      id: required_string(agent, :id),
+      cli: required_string(agent, :cli),
+      wrapper: required_string(agent, :wrapper),
+      provider: optional_string(agent, :provider),
+      model: optional_string(agent, :model),
+      base_url: optional_string(agent, :base_url),
+      extra_flags: optional_string(agent, :extra_flags),
+      requires_model: Keyword.get(agent, :requires_model, false),
+      aliases: normalized_aliases(Keyword.get(agent, :aliases, [])),
+      default: Keyword.get(agent, :default, false)
+    }
+  end
+
+  defp required_string(agent, key) do
+    case Keyword.fetch(agent, key) do
+      {:ok, value} when is_binary(value) and value != "" ->
+        value
+
+      {:ok, value} ->
+        raise ArgumentError,
+              "agent #{inspect(key)} must be a non-empty string, got: #{inspect(value)}"
+
+      :error ->
+        raise ArgumentError, "agent missing required #{inspect(key)}"
+    end
+  end
+
+  defp optional_string(agent, key) do
+    case Keyword.get(agent, key) do
+      nil ->
+        nil
+
+      value when is_binary(value) ->
+        value
+
+      value ->
+        raise ArgumentError,
+              "agent #{inspect(key)} must be a string or nil, got: #{inspect(value)}"
+    end
+  end
+
+  defp normalized_aliases(aliases) when is_list(aliases) do
+    Enum.map(aliases, fn
+      alias_name when is_binary(alias_name) ->
+        String.downcase(alias_name)
+
+      alias_name ->
+        raise ArgumentError, "agent alias must be a string, got: #{inspect(alias_name)}"
     end)
   end
 
