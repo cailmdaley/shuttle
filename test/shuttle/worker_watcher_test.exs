@@ -2,6 +2,7 @@ defmodule Shuttle.WorkerWatcherTest do
   use ExUnit.Case
 
   alias Shuttle.WorkerWatcher
+  alias Shuttle.Dispatcher
 
   # ── Mock Runner ──
 
@@ -15,8 +16,12 @@ defmodule Shuttle.WorkerWatcherTest do
     end
 
     def reset, do: Agent.update(__MODULE__, fn _ -> %{sessions: MapSet.new()} end)
-    def add_session(s), do: Agent.update(__MODULE__, &%{&1 | sessions: MapSet.put(&1.sessions, s)})
-    def remove_session(s), do: Agent.update(__MODULE__, &%{&1 | sessions: MapSet.delete(&1.sessions, s)})
+
+    def add_session(s),
+      do: Agent.update(__MODULE__, &%{&1 | sessions: MapSet.put(&1.sessions, s)})
+
+    def remove_session(s),
+      do: Agent.update(__MODULE__, &%{&1 | sessions: MapSet.delete(&1.sessions, s)})
 
     @impl true
     def cmd("tmux", ["has-session", "-t", session], _opts) do
@@ -43,15 +48,17 @@ defmodule Shuttle.WorkerWatcherTest do
   # ── Tests ──
 
   test "watcher detects session death and notifies poller" do
-    MockRunner.add_session("shuttle-tests-haiku")
+    session = Dispatcher.session_name("tests/haiku")
+    MockRunner.add_session(session)
 
-    {:ok, watcher} = WorkerWatcher.start_link(
-      fiber_id: "tests/haiku",
-      session: "shuttle-tests-haiku",
-      poller: self(),
-      runner: MockRunner,
-      heartbeat_interval_ms: 50
-    )
+    {:ok, watcher} =
+      WorkerWatcher.start_link(
+        fiber_id: "tests/haiku",
+        session: session,
+        poller: self(),
+        runner: MockRunner,
+        heartbeat_interval_ms: 50
+      )
 
     # Wait for a few heartbeats
     Process.sleep(120)
@@ -60,7 +67,7 @@ defmodule Shuttle.WorkerWatcherTest do
     refute_receive {:worker_exited, _, _, _}, 50
 
     # Kill the session
-    MockRunner.remove_session("shuttle-tests-haiku")
+    MockRunner.remove_session(session)
     Process.sleep(120)
 
     # Should receive exit notification
@@ -71,27 +78,30 @@ defmodule Shuttle.WorkerWatcherTest do
   end
 
   test "watcher exits immediately if session does not exist on init" do
-    assert {:error, :normal} = WorkerWatcher.start_link(
-      fiber_id: "tests/missing",
-      session: "shuttle-tests-missing",
-      poller: self(),
-      runner: MockRunner,
-      heartbeat_interval_ms: 50
-    )
+    assert {:error, :normal} =
+             WorkerWatcher.start_link(
+               fiber_id: "tests/missing",
+               session: Dispatcher.session_name("tests/missing"),
+               poller: self(),
+               runner: MockRunner,
+               heartbeat_interval_ms: 50
+             )
 
     assert_receive {:worker_exited, "tests/missing", :session_not_found, _}, 200
   end
 
   test "watcher can be stopped gracefully" do
-    MockRunner.add_session("shuttle-tests-haiku")
+    session = Dispatcher.session_name("tests/haiku")
+    MockRunner.add_session(session)
 
-    {:ok, watcher} = WorkerWatcher.start_link(
-      fiber_id: "tests/haiku",
-      session: "shuttle-tests-haiku",
-      poller: self(),
-      runner: MockRunner,
-      heartbeat_interval_ms: 50
-    )
+    {:ok, watcher} =
+      WorkerWatcher.start_link(
+        fiber_id: "tests/haiku",
+        session: session,
+        poller: self(),
+        runner: MockRunner,
+        heartbeat_interval_ms: 50
+      )
 
     assert Process.alive?(watcher)
     WorkerWatcher.stop(watcher)

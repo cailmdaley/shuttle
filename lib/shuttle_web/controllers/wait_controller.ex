@@ -7,7 +7,7 @@ defmodule ShuttleWeb.WaitController do
   `shuttle:wait:<fiber_id>` for the tempered event.
   """
 
-  use Phoenix.Controller
+  use Phoenix.Controller, formats: [:json]
 
   def create(conn, params) do
     fiber_id = Map.get(params, "fiber_id")
@@ -20,9 +20,7 @@ defmodule ShuttleWeb.WaitController do
     else
       channel_topic = "shuttle:wait:#{fiber_id}"
 
-      case Shuttle.Poller.wait_for_tempered(fiber_id, timeout_ms,
-             channel_topic: channel_topic
-           ) do
+      case Shuttle.Poller.wait_for_tempered(fiber_id, timeout_ms, channel_topic: channel_topic) do
         {:ok, :already_tempered} ->
           json(conn, %{
             accepted: true,

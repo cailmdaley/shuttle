@@ -8,8 +8,9 @@ defmodule ShuttleWeb.UserSocket do
 
   use Phoenix.Socket
 
-  channel "shuttle:snapshot", ShuttleWeb.SnapshotChannel
-  channel "shuttle:worker:*", ShuttleWeb.WorkerChannel
+  channel("shuttle:snapshot", ShuttleWeb.SnapshotChannel)
+  channel("shuttle:worker:*", ShuttleWeb.WorkerChannel)
+  channel("shuttle:wait:*", ShuttleWeb.WaitChannel)
 
   @impl true
   def connect(_params, socket, _connect_info) do

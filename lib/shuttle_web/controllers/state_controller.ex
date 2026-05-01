@@ -6,7 +6,7 @@ defmodule ShuttleWeb.StateController do
   retry queue, reservations, and waiters.
   """
 
-  use Phoenix.Controller
+  use Phoenix.Controller, formats: [:json]
 
   def show(conn, _params) do
     state = Shuttle.Poller.orchestrator_state()

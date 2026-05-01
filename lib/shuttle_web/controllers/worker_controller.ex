@@ -5,7 +5,7 @@ defmodule ShuttleWeb.WorkerController do
   Returns whether a worker is running on the given fiber, with runtime metadata.
   """
 
-  use Phoenix.Controller
+  use Phoenix.Controller, formats: [:json]
 
   def show(conn, %{"fiber_id" => fiber_id}) do
     fiber_id = normalize_fiber_id(fiber_id)

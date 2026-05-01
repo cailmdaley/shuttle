@@ -53,7 +53,7 @@ defmodule ShuttleWeb.SnapshotChannel do
 
   @impl true
   def handle_info({:snapshot, snap}, socket) do
-    broadcast(socket, "snapshot", snap)
+    push(socket, "snapshot", snap)
     {:noreply, socket}
   end
 end

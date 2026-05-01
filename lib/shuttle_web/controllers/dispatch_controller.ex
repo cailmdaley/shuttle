@@ -7,7 +7,7 @@ defmodule ShuttleWeb.DispatchController do
   `shuttle:worker:<fiber_id>` for exit notification.
   """
 
-  use Phoenix.Controller
+  use Phoenix.Controller, formats: [:json]
 
   def create(conn, params) do
     fiber_id = Map.get(params, "fiber_id")

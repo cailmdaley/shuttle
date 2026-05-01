@@ -132,9 +132,10 @@ defmodule Shuttle.DispatcherTest do
     assert {:ok, "shuttle-tests/haiku"} = result
 
     commands = MockRunner.commands()
+
     assert Enum.any?(commands, fn {cmd, args} ->
-      cmd == "tmux" and hd(args) == "new-session"
-    end)
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
   end
 
   test "dispatch refuses closed fiber" do
@@ -144,7 +145,7 @@ defmodule Shuttle.DispatcherTest do
 
   test "dispatch refuses already-running fiber" do
     # Pre-seed the tmux session
-    MockRunner.add_tmux_session("shuttle-tests/haiku")
+    MockRunner.add_tmux_session(Dispatcher.session_name("tests/haiku"))
 
     result = Dispatcher.dispatch("tests/haiku", runner: MockRunner)
     assert {:error, :already_running} = result
@@ -152,11 +153,15 @@ defmodule Shuttle.DispatcherTest do
 
   test "dispatch resolves pi agent from bare tag" do
     result = Dispatcher.dispatch("tests/pi-tagged", runner: MockRunner)
-    assert {:ok, "shuttle-tests/pi-tagged"} = result
+    assert {:ok, session} = result
+    assert session == Dispatcher.session_name("tests/pi-tagged")
 
     # Verify the tmux new-session command was issued
     commands = MockRunner.commands()
-    {_, args} = Enum.find(commands, fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
+
+    {_, args} =
+      Enum.find(commands, fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
+
     assert hd(args) == "new-session"
   end
 

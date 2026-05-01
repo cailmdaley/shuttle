@@ -21,7 +21,7 @@ defmodule Shuttle.WorkerWatcher do
 
   Options:
     * `:fiber_id` — required. The fiber being watched.
-    * `:session` — required. The tmux session name (e.g. "shuttle-tests-haiku").
+    * `:session` — required. The tmux session name (e.g. "shuttle-tests/haiku").
     * `:poller` — required. The pid of the Poller GenServer to notify on exit.
     * `:runner` — module implementing `Shuttle.Runner` behavior. Defaults to `Shuttle.Runner.Default`.
     * `:heartbeat_interval_ms` — interval between tmux liveness checks. Default 5_000.

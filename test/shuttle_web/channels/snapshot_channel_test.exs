@@ -12,27 +12,39 @@ defmodule ShuttleWeb.SnapshotChannelTest do
     use Agent
 
     def start_link(_ \\ []) do
-      Agent.start_link(fn -> %{
-        commands: [],
-        tmux_sessions: MapSet.new(),
-        fibers: %{},
-        felt_ls: []
-      } end, name: __MODULE__)
+      Agent.start_link(
+        fn ->
+          %{
+            commands: [],
+            tmux_sessions: MapSet.new(),
+            fibers: %{},
+            felt_ls: []
+          }
+        end,
+        name: __MODULE__
+      )
     end
 
     def reset do
-      Agent.update(__MODULE__, fn _ -> %{
-        commands: [],
-        tmux_sessions: MapSet.new(),
-        fibers: %{},
-        felt_ls: []
-      } end)
+      Agent.update(__MODULE__, fn _ ->
+        %{
+          commands: [],
+          tmux_sessions: MapSet.new(),
+          fibers: %{},
+          felt_ls: []
+        }
+      end)
     end
 
     def set_fiber(id, fiber), do: Agent.update(__MODULE__, &put_in(&1.fibers[id], fiber))
     def set_felt_ls(fibers), do: Agent.update(__MODULE__, &%{&1 | felt_ls: fibers})
-    def add_tmux_session(session), do: Agent.update(__MODULE__, &%{&1 | tmux_sessions: MapSet.put(&1.tmux_sessions, session)})
-    def remove_tmux_session(session), do: Agent.update(__MODULE__, &%{&1 | tmux_sessions: MapSet.delete(&1.tmux_sessions, session)})
+
+    def add_tmux_session(session),
+      do: Agent.update(__MODULE__, &%{&1 | tmux_sessions: MapSet.put(&1.tmux_sessions, session)})
+
+    def remove_tmux_session(session),
+      do:
+        Agent.update(__MODULE__, &%{&1 | tmux_sessions: MapSet.delete(&1.tmux_sessions, session)})
 
     @impl true
     def cmd(command, args, _opts) do
@@ -90,13 +102,16 @@ defmodule ShuttleWeb.SnapshotChannelTest do
   end
 
   defp make_fiber(id, attrs \\ %{}) do
-    Map.merge(%{
-      "id" => id,
-      "name" => id,
-      "status" => "active",
-      "tags" => ["constitution"],
-      "created_at" => "2026-04-28T00:00:00Z"
-    }, attrs)
+    Map.merge(
+      %{
+        "id" => id,
+        "name" => id,
+        "status" => "active",
+        "tags" => ["constitution"],
+        "created_at" => "2026-04-28T00:00:00Z"
+      },
+      attrs
+    )
   end
 
   test "snapshot channel sends current snapshot on join" do
@@ -104,11 +119,12 @@ defmodule ShuttleWeb.SnapshotChannelTest do
     MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/haiku", fiber)
 
-    {:ok, poller} = Poller.start_link(
-      runner: MockRunner,
-      poll_interval_ms: 60_000,
-      felt_host: "/tmp"
-    )
+    {:ok, poller} =
+      Poller.start_link(
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
 
     # Trigger dispatch
     send(poller, :run_poll_cycle)
@@ -118,7 +134,7 @@ defmodule ShuttleWeb.SnapshotChannelTest do
     {:ok, socket} = connect(UserSocket, %{}, connect_info: %{})
     {:ok, payload, _socket} = subscribe_and_join(socket, "shuttle:snapshot", %{})
 
-    assert payload.host == "dapmcw68"
+    assert is_binary(payload.host)
     assert length(payload.eligible) == 1
     assert hd(payload.eligible).fiber_id == "tests/haiku"
   end
@@ -128,11 +144,12 @@ defmodule ShuttleWeb.SnapshotChannelTest do
     MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/haiku", fiber)
 
-    {:ok, poller} = Poller.start_link(
-      runner: MockRunner,
-      poll_interval_ms: 60_000,
-      felt_host: "/tmp"
-    )
+    {:ok, poller} =
+      Poller.start_link(
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
 
     # Connect and join
     {:ok, socket} = connect(UserSocket, %{}, connect_info: %{})
@@ -141,7 +158,7 @@ defmodule ShuttleWeb.SnapshotChannelTest do
     # Trigger dispatch — should broadcast
     send(poller, :run_poll_cycle)
 
-    assert_broadcast "snapshot", payload, 500
+    assert_push("snapshot", payload, 500)
     assert length(payload.eligible) == 1
     assert hd(payload.eligible).fiber_id == "tests/haiku"
   end

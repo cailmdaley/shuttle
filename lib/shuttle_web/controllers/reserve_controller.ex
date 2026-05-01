@@ -6,7 +6,7 @@ defmodule ShuttleWeb.ReserveController do
   First-come-first-served with expiration.
   """
 
-  use Phoenix.Controller
+  use Phoenix.Controller, formats: [:json]
 
   def create(conn, params) do
     resource = Map.get(params, "resource")

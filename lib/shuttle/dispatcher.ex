@@ -72,8 +72,8 @@ defmodule Shuttle.Dispatcher do
 
   tmux on macOS and Linux accepts `/` in session names; preserving the
   literal fiber ID makes `tmux attach -t shuttle-<id>` work without
-transformation, and keeps the kanban's `listShuttleSessions` probe
-aligned with the Elixir Shuttle's naming.
+  transformation, and keeps the kanban's `listShuttleSessions` probe
+  aligned with the Elixir Shuttle's naming.
   """
   @spec session_name(String.t()) :: String.t()
   def session_name(fiber_id) do
@@ -148,7 +148,9 @@ aligned with the Elixir Shuttle's naming.
     run_script = build_run_script(fiber_id, command, agent.id)
 
     # Write run script to temp file
-    tmp_path = Path.join(System.tmp_dir!(), "shuttle-run-#{System.unique_integer([:positive])}.sh")
+    tmp_path =
+      Path.join(System.tmp_dir!(), "shuttle-run-#{System.unique_integer([:positive])}.sh")
+
     File.write!(tmp_path, run_script)
     File.chmod!(tmp_path, 0o755)
 
@@ -181,6 +183,7 @@ aligned with the Elixir Shuttle's naming.
     """
     #!/bin/bash
     set -e
+    trap 'rm -f "$0"' EXIT
 
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

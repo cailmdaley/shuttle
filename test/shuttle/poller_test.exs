@@ -2,6 +2,7 @@ defmodule Shuttle.PollerTest do
   use ExUnit.Case
 
   alias Shuttle.Poller
+  alias Shuttle.Dispatcher
 
   # ── Mock Runner ──
 
@@ -11,27 +12,40 @@ defmodule Shuttle.PollerTest do
     use Agent
 
     def start_link(_ \\ []) do
-      Agent.start_link(fn -> %{
-        commands: [],
-        tmux_sessions: MapSet.new(),
-        fibers: %{},
-        felt_ls: []
-      } end, name: __MODULE__)
+      Agent.start_link(
+        fn ->
+          %{
+            commands: [],
+            tmux_sessions: MapSet.new(),
+            fibers: %{},
+            felt_ls: []
+          }
+        end,
+        name: __MODULE__
+      )
     end
 
     def reset do
-      Agent.update(__MODULE__, fn _ -> %{
-        commands: [],
-        tmux_sessions: MapSet.new(),
-        fibers: %{},
-        felt_ls: []
-      } end)
+      Agent.update(__MODULE__, fn _ ->
+        %{
+          commands: [],
+          tmux_sessions: MapSet.new(),
+          fibers: %{},
+          felt_ls: []
+        }
+      end)
     end
 
     def set_fiber(id, fiber), do: Agent.update(__MODULE__, &put_in(&1.fibers[id], fiber))
     def set_felt_ls(fibers), do: Agent.update(__MODULE__, &%{&1 | felt_ls: fibers})
-    def add_tmux_session(session), do: Agent.update(__MODULE__, &%{&1 | tmux_sessions: MapSet.put(&1.tmux_sessions, session)})
-    def remove_tmux_session(session), do: Agent.update(__MODULE__, &%{&1 | tmux_sessions: MapSet.delete(&1.tmux_sessions, session)})
+
+    def add_tmux_session(session),
+      do: Agent.update(__MODULE__, &%{&1 | tmux_sessions: MapSet.put(&1.tmux_sessions, session)})
+
+    def remove_tmux_session(session),
+      do:
+        Agent.update(__MODULE__, &%{&1 | tmux_sessions: MapSet.delete(&1.tmux_sessions, session)})
+
     def commands, do: Agent.get(__MODULE__, & &1.commands)
 
     @impl true
@@ -103,13 +117,16 @@ defmodule Shuttle.PollerTest do
   # ── Helpers ──
 
   defp make_fiber(id, attrs \\ %{}) do
-    Map.merge(%{
-      "id" => id,
-      "name" => id,
-      "status" => "active",
-      "tags" => ["constitution"],
-      "created_at" => "2026-04-28T00:00:00Z"
-    }, attrs)
+    Map.merge(
+      %{
+        "id" => id,
+        "name" => id,
+        "status" => "active",
+        "tags" => ["constitution"],
+        "created_at" => "2026-04-28T00:00:00Z"
+      },
+      attrs
+    )
   end
 
   # ── Tests ──
@@ -119,12 +136,13 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/haiku", fiber)
 
-    {:ok, poller} = Poller.start_link(
-      name: :test_poller_1,
-      runner: MockRunner,
-      poll_interval_ms: 60_000,
-      felt_host: "/tmp"
-    )
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_1,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
 
     # Trigger a poll cycle manually
     send(poller, {:tick, Poller.snapshot(poller) |> Map.get(:tick_token)})
@@ -133,9 +151,10 @@ defmodule Shuttle.PollerTest do
 
     # Check that tmux new-session was called
     commands = MockRunner.commands()
+
     assert Enum.any?(commands, fn {cmd, args} ->
-      cmd == "tmux" and hd(args) == "new-session"
-    end)
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
 
     # Check snapshot shows running worker
     snap = Poller.snapshot(poller)
@@ -148,20 +167,22 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/closed", fiber)
 
-    {:ok, poller} = Poller.start_link(
-      name: :test_poller_2,
-      runner: MockRunner,
-      poll_interval_ms: 60_000,
-      felt_host: "/tmp"
-    )
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_2,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
 
     send(poller, :run_poll_cycle)
     Process.sleep(50)
 
     commands = MockRunner.commands()
+
     refute Enum.any?(commands, fn {cmd, args} ->
-      cmd == "tmux" and hd(args) == "new-session"
-    end)
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
   end
 
   test "poller skips draft fibers" do
@@ -169,20 +190,22 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/draft", fiber)
 
-    {:ok, poller} = Poller.start_link(
-      name: :test_poller_3,
-      runner: MockRunner,
-      poll_interval_ms: 60_000,
-      felt_host: "/tmp"
-    )
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_3,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
 
     send(poller, :run_poll_cycle)
     Process.sleep(50)
 
     commands = MockRunner.commands()
+
     refute Enum.any?(commands, fn {cmd, args} ->
-      cmd == "tmux" and hd(args) == "new-session"
-    end)
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
   end
 
   test "poller respects dependency satisfaction" do
@@ -193,20 +216,46 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_fiber("tests/dependent", fiber)
     MockRunner.set_fiber("tests/dep", dep)
 
-    {:ok, poller} = Poller.start_link(
-      name: :test_poller_4,
-      runner: MockRunner,
-      poll_interval_ms: 60_000,
-      felt_host: "/tmp"
-    )
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_4,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
 
     send(poller, :run_poll_cycle)
     Process.sleep(50)
 
     commands = MockRunner.commands()
+
     refute Enum.any?(commands, fn {cmd, args} ->
-      cmd == "tmux" and hd(args) == "new-session" and Enum.member?(args, "shuttle-tests/dependent")
-    end)
+             cmd == "tmux" and hd(args) == "new-session" and
+               Enum.member?(args, Dispatcher.session_name("tests/dependent"))
+           end)
+  end
+
+  test "poller skips untracked fibers" do
+    fiber = make_fiber("tests/untracked", %{"status" => "untracked"})
+    MockRunner.set_felt_ls([fiber])
+    MockRunner.set_fiber("tests/untracked", fiber)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_untracked,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
+
+    send(poller, :run_poll_cycle)
+    Process.sleep(50)
+
+    commands = MockRunner.commands()
+
+    refute Enum.any?(commands, fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
   end
 
   test "poller dispatches when dependencies are tempered" do
@@ -217,34 +266,37 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_fiber("tests/dependent", fiber)
     MockRunner.set_fiber("tests/dep", dep)
 
-    {:ok, poller} = Poller.start_link(
-      name: :test_poller_5,
-      runner: MockRunner,
-      poll_interval_ms: 60_000,
-      felt_host: "/tmp"
-    )
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_5,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
 
     send(poller, :run_poll_cycle)
     Process.sleep(100)
 
     commands = MockRunner.commands()
+
     assert Enum.any?(commands, fn {cmd, args} ->
-      cmd == "tmux" and hd(args) == "new-session"
-    end)
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
   end
 
   test "poller does not double-dispatch" do
     fiber = make_fiber("tests/haiku")
     MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/haiku", fiber)
-    MockRunner.add_tmux_session("shuttle-tests/haiku")
+    MockRunner.add_tmux_session(Dispatcher.session_name("tests/haiku"))
 
-    {:ok, poller} = Poller.start_link(
-      name: :test_poller_6,
-      runner: MockRunner,
-      poll_interval_ms: 60_000,
-      felt_host: "/tmp"
-    )
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_6,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
 
     send(poller, :run_poll_cycle)
     Process.sleep(50)
@@ -263,12 +315,13 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/haiku", fiber)
 
-    {:ok, poller} = Poller.start_link(
-      name: :test_poller_7,
-      runner: MockRunner,
-      poll_interval_ms: 60_000,
-      felt_host: "/tmp"
-    )
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_7,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
 
     # Dispatch
     send(poller, :run_poll_cycle)
@@ -278,7 +331,7 @@ defmodule Shuttle.PollerTest do
     assert length(snap1.eligible) == 1
 
     # Simulate worker exit (tmux session dies)
-    MockRunner.remove_tmux_session("shuttle-tests/haiku")
+    MockRunner.remove_tmux_session(Dispatcher.session_name("tests/haiku"))
     send(poller, {:worker_exited, "tests/haiku", :normal_exit, false})
     Process.sleep(50)
 
@@ -286,6 +339,15 @@ defmodule Shuttle.PollerTest do
     assert length(snap2.eligible) == 0
     assert length(snap2.retrying) == 1
     assert hd(snap2.retrying).fiber_id == "tests/haiku"
+
+    Process.sleep(1_100)
+
+    new_session_count =
+      MockRunner.commands()
+      |> Enum.filter(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
+      |> length()
+
+    assert new_session_count == 2
   end
 
   test "poller releases claim when worker exits and fiber is closed" do
@@ -293,12 +355,13 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/haiku", fiber)
 
-    {:ok, poller} = Poller.start_link(
-      name: :test_poller_8,
-      runner: MockRunner,
-      poll_interval_ms: 60_000,
-      felt_host: "/tmp"
-    )
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_8,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
 
     # Dispatch
     send(poller, :run_poll_cycle)
@@ -306,7 +369,7 @@ defmodule Shuttle.PollerTest do
 
     # Close the fiber
     MockRunner.set_fiber("tests/haiku", %{fiber | "status" => "closed"})
-    MockRunner.remove_tmux_session("shuttle-tests/haiku")
+    MockRunner.remove_tmux_session(Dispatcher.session_name("tests/haiku"))
     send(poller, {:worker_exited, "tests/haiku", :normal_exit, false})
     Process.sleep(50)
 
@@ -318,19 +381,40 @@ defmodule Shuttle.PollerTest do
   test "poller adopts orphan tmux sessions on startup" do
     fiber = make_fiber("tests/orphan")
     MockRunner.set_fiber("tests/orphan", fiber)
-    MockRunner.add_tmux_session("shuttle-tests/orphan")
+    MockRunner.add_tmux_session(Dispatcher.session_name("tests/orphan"))
 
-    {:ok, poller} = Poller.start_link(
-      name: :test_poller_9,
-      runner: MockRunner,
-      poll_interval_ms: 60_000,
-      felt_host: "/tmp"
-    )
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_9,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
 
     Process.sleep(100)
 
     snap = Poller.snapshot(poller)
     assert length(snap.eligible) == 1
     assert hd(snap.eligible).fiber_id == "tests/orphan"
+  end
+
+  test "poller adopts orphan sessions with literal hyphenated fiber ids" do
+    fiber_id = "ai-futures/shuttle/constitution-shuttle-standalone"
+    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "codex"]})
+    MockRunner.set_fiber(fiber_id, fiber)
+    MockRunner.add_tmux_session(Dispatcher.session_name(fiber_id))
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_10,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
+
+    Process.sleep(100)
+
+    snap = Poller.snapshot(poller)
+    assert [%{fiber_id: ^fiber_id, tmux_session: "shuttle-" <> ^fiber_id}] = snap.eligible
   end
 end

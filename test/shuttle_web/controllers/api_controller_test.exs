@@ -11,6 +11,7 @@ defmodule ShuttleWeb.APIControllerTest do
   @endpoint ShuttleWeb.Endpoint
 
   alias Shuttle.Poller
+  alias Shuttle.Dispatcher
   alias ShuttleWeb.UserSocket
 
   # ── Mock Runner ──
@@ -21,27 +22,40 @@ defmodule ShuttleWeb.APIControllerTest do
     use Agent
 
     def start_link(_ \\ []) do
-      Agent.start_link(fn -> %{
-        commands: [],
-        tmux_sessions: MapSet.new(),
-        fibers: %{},
-        felt_ls: []
-      } end, name: __MODULE__)
+      Agent.start_link(
+        fn ->
+          %{
+            commands: [],
+            tmux_sessions: MapSet.new(),
+            fibers: %{},
+            felt_ls: []
+          }
+        end,
+        name: __MODULE__
+      )
     end
 
     def reset do
-      Agent.update(__MODULE__, fn _ -> %{
-        commands: [],
-        tmux_sessions: MapSet.new(),
-        fibers: %{},
-        felt_ls: []
-      } end)
+      Agent.update(__MODULE__, fn _ ->
+        %{
+          commands: [],
+          tmux_sessions: MapSet.new(),
+          fibers: %{},
+          felt_ls: []
+        }
+      end)
     end
 
     def set_fiber(id, fiber), do: Agent.update(__MODULE__, &put_in(&1.fibers[id], fiber))
     def set_felt_ls(fibers), do: Agent.update(__MODULE__, &%{&1 | felt_ls: fibers})
-    def add_tmux_session(session), do: Agent.update(__MODULE__, &%{&1 | tmux_sessions: MapSet.put(&1.tmux_sessions, session)})
-    def remove_tmux_session(session), do: Agent.update(__MODULE__, &%{&1 | tmux_sessions: MapSet.delete(&1.tmux_sessions, session)})
+
+    def add_tmux_session(session),
+      do: Agent.update(__MODULE__, &%{&1 | tmux_sessions: MapSet.put(&1.tmux_sessions, session)})
+
+    def remove_tmux_session(session),
+      do:
+        Agent.update(__MODULE__, &%{&1 | tmux_sessions: MapSet.delete(&1.tmux_sessions, session)})
+
     def commands, do: Agent.get(__MODULE__, & &1.commands)
 
     @impl true
@@ -118,13 +132,16 @@ defmodule ShuttleWeb.APIControllerTest do
   end
 
   defp make_fiber(id, attrs \\ %{}) do
-    Map.merge(%{
-      "id" => id,
-      "name" => id,
-      "status" => "active",
-      "tags" => ["constitution"],
-      "created_at" => "2026-04-28T00:00:00Z"
-    }, attrs)
+    Map.merge(
+      %{
+        "id" => id,
+        "name" => id,
+        "status" => "active",
+        "tags" => ["constitution"],
+        "created_at" => "2026-04-28T00:00:00Z"
+      },
+      attrs
+    )
   end
 
   # ── GET /api/v1/workers/:fiber_id ──
@@ -160,16 +177,21 @@ defmodule ShuttleWeb.APIControllerTest do
     fiber = make_fiber("tests/api-dispatch")
     MockRunner.set_fiber("tests/api-dispatch", fiber)
 
-    conn = post(api_conn(), "/api/v1/dispatch", Jason.encode!(%{
-      "fiber_id" => "tests/api-dispatch",
-      "notify_on_exit" => true
-    }))
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/dispatch",
+        Jason.encode!(%{
+          "fiber_id" => "tests/api-dispatch",
+          "notify_on_exit" => true
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
     assert body["dispatched"] == true
     assert body["fiber_id"] == "tests/api-dispatch"
-    assert body["tmux_session"] == "shuttle-tests/api-dispatch"
+    assert body["tmux_session"] == Dispatcher.session_name("tests/api-dispatch")
     assert body["notify_on_exit"] == true
     assert body["channel_topic"] == "shuttle:worker:tests/api-dispatch"
   end
@@ -177,11 +199,16 @@ defmodule ShuttleWeb.APIControllerTest do
   test "dispatch returns 409 for already running fiber" do
     fiber = make_fiber("tests/api-dispatch-2")
     MockRunner.set_fiber("tests/api-dispatch-2", fiber)
-    MockRunner.add_tmux_session("shuttle-tests/api-dispatch-2")
+    MockRunner.add_tmux_session(Dispatcher.session_name("tests/api-dispatch-2"))
 
-    conn = post(api_conn(), "/api/v1/dispatch", Jason.encode!(%{
-      "fiber_id" => "tests/api-dispatch-2"
-    }))
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/dispatch",
+        Jason.encode!(%{
+          "fiber_id" => "tests/api-dispatch-2"
+        })
+      )
 
     assert conn.status == 409
     body = Jason.decode!(conn.resp_body)
@@ -202,10 +229,15 @@ defmodule ShuttleWeb.APIControllerTest do
     fiber = make_fiber("tests/wait-active")
     MockRunner.set_fiber("tests/wait-active", fiber)
 
-    conn = post(api_conn(), "/api/v1/wait", Jason.encode!(%{
-      "fiber_id" => "tests/wait-active",
-      "timeout_ms" => 5000
-    }))
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/wait",
+        Jason.encode!(%{
+          "fiber_id" => "tests/wait-active",
+          "timeout_ms" => 5000
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
@@ -218,9 +250,14 @@ defmodule ShuttleWeb.APIControllerTest do
     fiber = make_fiber("tests/wait-tempered", %{"tempered" => true})
     MockRunner.set_fiber("tests/wait-tempered", fiber)
 
-    conn = post(api_conn(), "/api/v1/wait", Jason.encode!(%{
-      "fiber_id" => "tests/wait-tempered"
-    }))
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/wait",
+        Jason.encode!(%{
+          "fiber_id" => "tests/wait-tempered"
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
@@ -228,15 +265,71 @@ defmodule ShuttleWeb.APIControllerTest do
     assert body["status"] == "already_tempered"
   end
 
+  test "wait channel receives tempered event" do
+    fiber = make_fiber("tests/wait-channel")
+    MockRunner.set_fiber("tests/wait-channel", fiber)
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/wait",
+        Jason.encode!(%{
+          "fiber_id" => "tests/wait-channel",
+          "timeout_ms" => 5_000
+        })
+      )
+
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+
+    {:ok, socket} = Phoenix.ChannelTest.connect(UserSocket, %{}, connect_info: %{})
+    {:ok, _reply, _channel_socket} = subscribe_and_join(socket, body["channel_topic"], %{})
+
+    MockRunner.set_fiber("tests/wait-channel", Map.put(fiber, "tempered", true))
+    send(Shuttle.Poller, :run_poll_cycle)
+
+    assert_push("tempered", payload, 500)
+    assert payload.fiber_id == "tests/wait-channel"
+  end
+
+  test "wait channel receives timeout event" do
+    fiber = make_fiber("tests/wait-timeout")
+    MockRunner.set_fiber("tests/wait-timeout", fiber)
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/wait",
+        Jason.encode!(%{
+          "fiber_id" => "tests/wait-timeout",
+          "timeout_ms" => 20
+        })
+      )
+
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+
+    {:ok, socket} = Phoenix.ChannelTest.connect(UserSocket, %{}, connect_info: %{})
+    {:ok, _reply, _channel_socket} = subscribe_and_join(socket, body["channel_topic"], %{})
+
+    assert_push("timed_out", payload, 500)
+    assert payload.fiber_id == "tests/wait-timeout"
+  end
+
   # ── POST /api/v1/reserve ──
 
   test "reserve succeeds for available resource" do
-    conn = post(api_conn(), "/api/v1/reserve", Jason.encode!(%{
-      "resource" => "gpu",
-      "host" => "candide",
-      "duration_ms" => 3600000,
-      "fiber_id" => "tests/reserve-gpu"
-    }))
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/reserve",
+        Jason.encode!(%{
+          "resource" => "gpu",
+          "host" => "candide",
+          "duration_ms" => 3_600_000,
+          "fiber_id" => "tests/reserve-gpu"
+        })
+      )
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
@@ -246,19 +339,28 @@ defmodule ShuttleWeb.APIControllerTest do
   end
 
   test "reserve returns 409 for already reserved resource" do
-    post(api_conn(), "/api/v1/reserve", Jason.encode!(%{
-      "resource" => "gpu",
-      "host" => "candide",
-      "duration_ms" => 3600000,
-      "fiber_id" => "tests/reserve-gpu-first"
-    }))
+    post(
+      api_conn(),
+      "/api/v1/reserve",
+      Jason.encode!(%{
+        "resource" => "gpu",
+        "host" => "candide",
+        "duration_ms" => 3_600_000,
+        "fiber_id" => "tests/reserve-gpu-first"
+      })
+    )
 
-    conn = post(api_conn(), "/api/v1/reserve", Jason.encode!(%{
-      "resource" => "gpu",
-      "host" => "candide",
-      "duration_ms" => 3600000,
-      "fiber_id" => "tests/reserve-gpu-second"
-    }))
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/reserve",
+        Jason.encode!(%{
+          "resource" => "gpu",
+          "host" => "candide",
+          "duration_ms" => 3_600_000,
+          "fiber_id" => "tests/reserve-gpu-second"
+        })
+      )
 
     assert conn.status == 409
     body = Jason.decode!(conn.resp_body)
@@ -267,9 +369,15 @@ defmodule ShuttleWeb.APIControllerTest do
   end
 
   test "reserve returns 400 without resource or fiber_id" do
-    conn = post(api_conn(), "/api/v1/reserve", Jason.encode!(%{
-      "fiber_id" => "tests/missing-resource"
-    }))
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/reserve",
+        Jason.encode!(%{
+          "fiber_id" => "tests/missing-resource"
+        })
+      )
+
     assert conn.status == 400
     body = Jason.decode!(conn.resp_body)
     assert body["error"] == "resource and fiber_id are required"
@@ -306,12 +414,14 @@ defmodule ShuttleWeb.APIControllerTest do
     Process.sleep(100)
 
     {:ok, socket} = Phoenix.ChannelTest.connect(UserSocket, %{}, connect_info: %{})
-    {:ok, _reply, _channel_socket} = subscribe_and_join(socket, "shuttle:worker:tests/channel", %{})
 
-    MockRunner.remove_tmux_session("shuttle-tests-channel")
+    {:ok, _reply, _channel_socket} =
+      subscribe_and_join(socket, "shuttle:worker:tests/channel", %{})
+
+    MockRunner.remove_tmux_session(Dispatcher.session_name("tests/channel"))
     send(Shuttle.Poller, {:worker_exited, "tests/channel", :normal_exit, false})
 
-    assert_push "worker_exited", payload, 500
+    assert_push("worker_exited", payload, 500)
     assert payload.fiber_id == "tests/channel"
   end
 end
