@@ -44,7 +44,9 @@ defmodule Shuttle.Poller do
       poll_check_in_progress: false,
       running: %{},
       claimed: MapSet.new(),
-      retry_queue: %{}
+      retry_queue: %{},
+      waiters: %{},
+      reservations: %{}
     ]
   end
 
@@ -62,6 +64,49 @@ defmodule Shuttle.Poller do
   @spec snapshot(GenServer.server()) :: map()
   def snapshot(server) do
     GenServer.call(server, :snapshot)
+  end
+
+  # ── Agent-API Client ──
+
+  @spec worker_status(String.t()) :: map() | nil
+  def worker_status(fiber_id), do: worker_status(__MODULE__, fiber_id)
+
+  @spec worker_status(GenServer.server(), String.t()) :: map() | nil
+  def worker_status(server, fiber_id) do
+    GenServer.call(server, {:worker_status, fiber_id})
+  end
+
+  @spec dispatch_fiber(String.t(), keyword()) :: {:ok, String.t()} | {:error, atom()}
+  def dispatch_fiber(fiber_id, opts \\ []), do: dispatch_fiber(__MODULE__, fiber_id, opts)
+
+  @spec dispatch_fiber(GenServer.server(), String.t(), keyword()) :: {:ok, String.t()} | {:error, atom()}
+  def dispatch_fiber(server, fiber_id, opts) do
+    GenServer.call(server, {:dispatch, fiber_id, opts})
+  end
+
+  @spec wait_for_tempered(String.t(), non_neg_integer(), keyword()) :: {:ok, atom()} | {:error, term()}
+  def wait_for_tempered(fiber_id, timeout_ms, opts \\ []), do: wait_for_tempered(__MODULE__, fiber_id, timeout_ms, opts)
+
+  @spec wait_for_tempered(GenServer.server(), String.t(), non_neg_integer(), keyword()) :: {:ok, atom()} | {:error, term()}
+  def wait_for_tempered(server, fiber_id, timeout_ms, opts) do
+    GenServer.call(server, {:wait, fiber_id, timeout_ms, opts})
+  end
+
+  @spec reserve_resource(String.t(), String.t(), non_neg_integer(), String.t()) :: {:ok, atom()} | {:error, String.t()}
+  def reserve_resource(resource, host, duration_ms, fiber_id),
+    do: reserve_resource(__MODULE__, resource, host, duration_ms, fiber_id)
+
+  @spec reserve_resource(GenServer.server(), String.t(), String.t(), non_neg_integer(), String.t()) :: {:ok, atom()} | {:error, String.t()}
+  def reserve_resource(server, resource, host, duration_ms, fiber_id) do
+    GenServer.call(server, {:reserve, resource, host, duration_ms, fiber_id})
+  end
+
+  @spec orchestrator_state() :: map()
+  def orchestrator_state, do: orchestrator_state(__MODULE__)
+
+  @spec orchestrator_state(GenServer.server()) :: map()
+  def orchestrator_state(server) do
+    GenServer.call(server, :orchestrator_state)
   end
 
   # ── Server ──
@@ -129,6 +174,21 @@ defmodule Shuttle.Poller do
 
   def handle_info({:retry, _}, state), do: {:noreply, state}
 
+  def handle_info({:wait_timeout, fiber_id, caller_pid}, state) do
+    waiters = Map.get(state.waiters, fiber_id, [])
+    {timed_out, remaining} = Enum.split_with(waiters, fn waiter -> waiter.pid == caller_pid end)
+
+    Enum.each(timed_out, fn waiter ->
+      if waiter.pid, do: send(waiter.pid, {:wait_timeout, fiber_id})
+      if waiter.channel_topic do
+        Phoenix.PubSub.broadcast(Shuttle.PubSub, waiter.channel_topic, %{event: "timed_out", fiber_id: fiber_id})
+      end
+    end)
+
+    new_waiters = if remaining == [], do: Map.delete(state.waiters, fiber_id), else: Map.put(state.waiters, fiber_id, remaining)
+    {:noreply, %{state | waiters: new_waiters}}
+  end
+
   def handle_info(msg, state) do
     Logger.debug("Poller ignored message: #{inspect(msg)}")
     {:noreply, state}
@@ -137,6 +197,84 @@ defmodule Shuttle.Poller do
   @impl true
   def handle_call(:snapshot, _from, state) do
     {:reply, build_snapshot(state), state}
+  end
+
+  def handle_call({:worker_status, fiber_id}, _from, state) do
+    {:reply, Map.get(state.running, fiber_id), state}
+  end
+
+  def handle_call({:dispatch, fiber_id, _opts}, _from, state) do
+    session = Dispatcher.session_name(fiber_id)
+
+    cond do
+      Map.has_key?(state.running, fiber_id) or MapSet.member?(state.claimed, fiber_id) ->
+        {:reply, {:error, :already_running}, state}
+
+      already_running_session?(state, session) ->
+        {:reply, {:error, :already_running}, state}
+
+      true ->
+        case fetch_fiber_full(fiber_id, state) do
+          {:ok, fiber} ->
+            if eligible?(fiber, state) do
+              new_state = do_dispatch_fiber(state, fiber)
+              if Map.has_key?(new_state.running, fiber_id) do
+                {:reply, {:ok, session}, new_state}
+              else
+                {:reply, {:error, :dispatch_failed}, new_state}
+              end
+            else
+              {:reply, {:error, :not_eligible}, state}
+            end
+
+          {:error, reason} ->
+            {:reply, {:error, reason}, state}
+        end
+    end
+  end
+
+  def handle_call({:wait, fiber_id, timeout_ms, opts}, _from, state) do
+    channel_topic = Keyword.get(opts, :channel_topic)
+    notify_pid = Keyword.get(opts, :notify_pid)
+
+    case fetch_fiber_full(fiber_id, state) do
+      {:ok, fiber} ->
+        if Map.get(fiber, "tempered", false) do
+          if notify_pid, do: send(notify_pid, {:tempered, fiber_id})
+          if channel_topic do
+            Phoenix.PubSub.broadcast(Shuttle.PubSub, channel_topic, %{event: "tempered", fiber_id: fiber_id})
+          end
+          {:reply, {:ok, :already_tempered}, state}
+        else
+          timeout_ref = if notify_pid, do: Process.send_after(self(), {:wait_timeout, fiber_id, notify_pid}, timeout_ms), else: nil
+          waiters = Map.get(state.waiters, fiber_id, [])
+          waiters = [%{pid: notify_pid, timeout_ref: timeout_ref, channel_topic: channel_topic} | waiters]
+          {:reply, {:ok, :monitoring}, %{state | waiters: Map.put(state.waiters, fiber_id, waiters)}}
+        end
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:reserve, resource, host, duration_ms, fiber_id}, _from, state) do
+    key = {resource, host}
+    state = clean_expired_reservations(state)
+    now_ms = System.monotonic_time(:millisecond)
+
+    case Map.get(state.reservations, key) do
+      nil ->
+        expires_at = now_ms + duration_ms
+        reservation = %{fiber_id: fiber_id, expires_at_ms: expires_at}
+        {:reply, {:ok, :reserved}, %{state | reservations: Map.put(state.reservations, key, reservation)}}
+
+      existing ->
+        {:reply, {:error, "already reserved by #{existing.fiber_id}"}, state}
+    end
+  end
+
+  def handle_call(:orchestrator_state, _from, state) do
+    {:reply, build_full_state(state), state}
   end
 
   # ── Snapshot ──
@@ -153,8 +291,8 @@ defmodule Shuttle.Poller do
           tmux_session: meta.session,
           agent: meta.agent_id,
           state: "running",
-          started_at: meta.started_at,
-          last_activity_at: meta.last_activity_at,
+          started_at: DateTime.to_unix(meta.started_at, :millisecond),
+          last_activity_at: DateTime.to_unix(meta.last_activity_at, :millisecond),
           runtime_seconds: runtime_seconds(meta.started_at, now)
         }
       end)
@@ -199,7 +337,7 @@ defmodule Shuttle.Poller do
       |> sort_candidates()
       |> Enum.reduce(state, fn fiber, state_acc ->
         if available_slots(state_acc) > 0 do
-          dispatch_fiber(state_acc, fiber)
+          do_dispatch_fiber(state_acc, fiber)
         else
           state_acc
         end
@@ -286,7 +424,7 @@ defmodule Shuttle.Poller do
     end)
   end
 
-  defp dispatch_fiber(%State{} = state, fiber) do
+  defp do_dispatch_fiber(%State{} = state, fiber) do
     fiber_id = Map.get(fiber, "id", "")
 
     case Dispatcher.dispatch(fiber_id, runner: state.runner, work_dir: state.felt_host) do
@@ -343,6 +481,7 @@ defmodule Shuttle.Poller do
   defp reconcile(%State{} = state) do
     state = reconcile_fiber_closures(state)
     state = reconcile_orphaned_sessions(state)
+    state = reconcile_waiters(state)
     state
   end
 
@@ -447,7 +586,10 @@ defmodule Shuttle.Poller do
 
   # ── Worker Exit Handling ──
 
-  defp handle_worker_exit(%State{} = state, fiber_id, _reason, _session_alive?) do
+  defp handle_worker_exit(%State{} = state, fiber_id, reason, _session_alive?) do
+    # Notify any channel subscribers watching this worker
+    Phoenix.PubSub.broadcast(Shuttle.PubSub, "shuttle:worker:#{fiber_id}", {:worker_exited, fiber_id, reason})
+
     case Map.pop(state.running, fiber_id) do
       {nil, _} ->
         state
@@ -485,7 +627,7 @@ defmodule Shuttle.Poller do
     case fetch_fiber_full(fiber_id, state) do
       {:ok, fiber} ->
         if eligible?(fiber, state) do
-          dispatch_fiber(state, fiber)
+          do_dispatch_fiber(state, fiber)
         else
           Logger.debug("Retry no longer eligible: #{fiber_id}")
           release_claim(state, fiber_id)
@@ -502,7 +644,7 @@ defmodule Shuttle.Poller do
     next_attempt = if is_integer(attempt), do: attempt, else: previous.attempt + 1
     delay_ms = retry_delay(next_attempt, metadata, state.max_retry_backoff_ms)
     retry_token = make_ref()
-    due_at_ms = System.monotonic_time(:millisecond) + delay_ms
+    due_at_ms = DateTime.to_unix(DateTime.utc_now(), :millisecond) + delay_ms
 
     # Cancel old timer if present
     if is_reference(previous[:timer_ref]) do
@@ -560,6 +702,13 @@ defmodule Shuttle.Poller do
 
   # ── Helpers ──
 
+  defp already_running_session?(%State{} = state, session) do
+    case state.runner.cmd("tmux", ["has-session", "-t", session], stderr_to_stdout: true) do
+      {_, 0} -> true
+      {_, _} -> false
+    end
+  end
+
   defp available_slots(%State{} = state) do
     max(state.max_concurrent_workers - map_size(state.running), 0)
   end
@@ -570,6 +719,46 @@ defmodule Shuttle.Poller do
 
   defp remove_running(%State{} = state, fiber_id) do
     %{state | running: Map.delete(state.running, fiber_id), claimed: MapSet.delete(state.claimed, fiber_id)}
+  end
+
+  defp reconcile_waiters(%State{waiters: waiters} = state) when map_size(waiters) == 0, do: state
+  defp reconcile_waiters(%State{} = state) do
+    remaining =
+      Enum.filter(state.waiters, fn {fiber_id, waiters_list} ->
+        case fetch_fiber_full(fiber_id, state) do
+          {:ok, fiber} ->
+            if Map.get(fiber, "tempered", false) do
+              Enum.each(waiters_list, fn waiter ->
+                if waiter.timeout_ref && is_reference(waiter.timeout_ref), do: Process.cancel_timer(waiter.timeout_ref)
+                if waiter.pid, do: send(waiter.pid, {:tempered, fiber_id})
+                if waiter.channel_topic do
+                  Phoenix.PubSub.broadcast(Shuttle.PubSub, waiter.channel_topic, %{event: "tempered", fiber_id: fiber_id})
+                end
+              end)
+              false
+            else
+              true
+            end
+
+          {:error, _} ->
+            Enum.each(waiters_list, fn waiter ->
+              if waiter.timeout_ref && is_reference(waiter.timeout_ref), do: Process.cancel_timer(waiter.timeout_ref)
+              if waiter.pid, do: send(waiter.pid, {:tempered_error, fiber_id, :not_found})
+              if waiter.channel_topic do
+                Phoenix.PubSub.broadcast(Shuttle.PubSub, waiter.channel_topic, %{event: "error", fiber_id: fiber_id, reason: "not_found"})
+              end
+            end)
+            false
+        end
+      end)
+
+    %{state | waiters: Map.new(remaining)}
+  end
+
+  defp clean_expired_reservations(%State{} = state) do
+    now_ms = System.monotonic_time(:millisecond)
+    remaining = Enum.filter(state.reservations, fn {_key, res} -> res.expires_at_ms > now_ms end)
+    %{state | reservations: Map.new(remaining)}
   end
 
   defp stop_watcher(meta) do
@@ -662,5 +851,42 @@ defmodule Shuttle.Poller do
 
   defp default_felt_host do
     System.user_home() <> "/loom"
+  end
+
+  defp build_full_state(state) do
+    snap = build_snapshot(state)
+
+    running_detail =
+      Enum.map(state.running, fn {fiber_id, meta} ->
+        %{
+          fiber_id: fiber_id,
+          pid: inspect(meta.pid),
+          session: meta.session,
+          agent_id: meta.agent_id,
+          started_at: DateTime.to_unix(meta.started_at, :millisecond),
+          last_activity_at: DateTime.to_unix(meta.last_activity_at, :millisecond)
+        }
+      end)
+
+    reservations =
+      Enum.map(state.reservations, fn {{resource, host}, res} ->
+        %{
+          resource: resource,
+          host: host,
+          fiber_id: res.fiber_id,
+          expires_in_ms: max(0, res.expires_at_ms - System.monotonic_time(:millisecond))
+        }
+      end)
+
+    waiters =
+      Enum.map(state.waiters, fn {fiber_id, waiters_list} ->
+        %{fiber_id: fiber_id, waiter_count: length(waiters_list)}
+      end)
+
+    Map.merge(snap, %{
+      running_detail: running_detail,
+      reservations: reservations,
+      waiters: waiters
+    })
   end
 end
