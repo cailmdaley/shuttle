@@ -165,15 +165,16 @@ defmodule Shuttle.DispatcherTest do
     assert hd(args) == "new-session"
   end
 
-  test "agent resolution: default is claude" do
+  test "agent resolution: default is claude-sonnet" do
     assert {:ok, agent} = Agents.resolve(["constitution"])
-    assert agent.id == "claude"
+    assert agent.id == "claude-sonnet"
+    assert agent.model == "sonnet"
   end
 
   test "agent resolution: compound tag" do
-    assert {:ok, agent} = Agents.resolve(["constitution", "agent:pi-google"])
-    assert agent.id == "pi-google"
-    assert agent.provider == "google"
+    assert {:ok, agent} = Agents.resolve(["constitution", "agent:pi-kimi"])
+    assert agent.id == "pi-kimi"
+    assert agent.provider == "openrouter"
   end
 
   test "agent resolution: bare codex tag" do
@@ -181,9 +182,10 @@ defmodule Shuttle.DispatcherTest do
     assert agent.id == "codex"
   end
 
-  test "agent resolution: bare pi tag" do
+  test "agent resolution: bare pi tag resolves to pi-deepseek-flash" do
     assert {:ok, agent} = Agents.resolve(["constitution", "pi"])
-    assert agent.id == "pi-google"
+    assert agent.id == "pi-deepseek-flash"
+    assert agent.model == "deepseek/deepseek-v4-flash"
   end
 
   test "agent resolution reads application config" do
@@ -234,7 +236,8 @@ defmodule Shuttle.DispatcherTest do
   end
 
   test "build_command for claude uses here-string" do
-    agent = Enum.find(Agents.list(), &(&1.id == "claude"))
+    agent = Enum.find(Agents.list(), &(&1.id == "claude-sonnet"))
+    refute is_nil(agent), "expected claude-sonnet agent in defaults"
     cmd = Agents.build_command(agent, "hello world")
     assert cmd =~ "claude"
     assert cmd =~ "<<<"
@@ -250,10 +253,11 @@ defmodule Shuttle.DispatcherTest do
   end
 
   test "build_command for pi includes provider and model" do
-    agent = Enum.find(Agents.list(), &(&1.id == "pi-google"))
+    agent = Enum.find(Agents.list(), &(&1.id == "pi-kimi"))
+    refute is_nil(agent), "expected pi-kimi agent in defaults"
     cmd = Agents.build_command(agent, "hello world")
     assert cmd =~ "pi"
-    assert cmd =~ "--provider 'google'"
-    assert cmd =~ "--model 'google/gemini-2.5-pro-preview'"
+    assert cmd =~ "--provider 'openrouter'"
+    assert cmd =~ "--model 'moonshotai/kimi-k2.6'"
   end
 end

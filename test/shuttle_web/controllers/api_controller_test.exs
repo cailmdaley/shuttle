@@ -159,7 +159,7 @@ defmodule ShuttleWeb.APIControllerTest do
     body = Jason.decode!(conn.resp_body)
     assert body["running"] == true
     assert body["fiber_id"] == "tests/haiku"
-    assert body["agent"] == "claude"
+    assert body["agent"] == "claude-sonnet"
     assert body["runtime_seconds"] >= 0
   end
 
