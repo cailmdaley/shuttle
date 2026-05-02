@@ -16,7 +16,7 @@ defmodule Shuttle.Poller do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias Shuttle.{Dispatcher, WorkerWatcher}
+  alias Shuttle.{Dispatcher, StandingRole, WorkerWatcher}
 
   @pubsub_topic "shuttle:snapshot"
 
@@ -46,7 +46,8 @@ defmodule Shuttle.Poller do
       claimed: MapSet.new(),
       retry_queue: %{},
       waiters: %{},
-      reservations: %{}
+      reservations: %{},
+      completed_standing_runs: MapSet.new()
     ]
   end
 
@@ -343,7 +344,8 @@ defmodule Shuttle.Poller do
           fiber_id: fiber_id,
           tmux_session: meta.session,
           agent: meta.agent_id,
-          state: "running",
+          state: Map.get(meta, :state, "running"),
+          run_id: Map.get(meta, :run_id),
           started_at: DateTime.to_unix(meta.started_at, :millisecond),
           last_activity_at: DateTime.to_unix(meta.last_activity_at, :millisecond),
           runtime_seconds: runtime_seconds(meta.started_at, now)
@@ -367,6 +369,7 @@ defmodule Shuttle.Poller do
       blocked: [],
       orphans: [],
       retrying: retrying,
+      standing_roles: standing_role_snapshots(state, now),
       claimed_count: MapSet.size(state.claimed),
       max_concurrent: state.max_concurrent_workers
     }
@@ -430,17 +433,31 @@ defmodule Shuttle.Poller do
 
     cond do
       # Must have constitution tag
-      "constitution" not in tags -> false
+      "constitution" not in tags ->
+        false
+
       # Must not have draft tag
-      "draft" in tags -> false
+      "draft" in tags ->
+        false
+
       # Must be committed to active work
-      status not in ["open", "active"] -> false
+      status not in ["open", "active"] ->
+        false
+
       # Must not already be running
-      Map.has_key?(state.running, fiber_id) -> false
+      Map.has_key?(state.running, fiber_id) ->
+        false
+
       # Must not be claimed (retry queued)
-      MapSet.member?(state.claimed, fiber_id) -> false
+      MapSet.member?(state.claimed, fiber_id) ->
+        false
+
+      standing_role?(fiber, state) ->
+        standing_role_due?(fiber_id, state)
+
       # Dependencies must be satisfied
-      true -> dependencies_satisfied?(fiber_id, state)
+      true ->
+        dependencies_satisfied?(fiber_id, state)
     end
   end
 
@@ -475,7 +492,14 @@ defmodule Shuttle.Poller do
   defp do_dispatch_fiber(%State{} = state, fiber) do
     fiber_id = Map.get(fiber, "id", "")
 
-    case Dispatcher.dispatch(fiber_id, runner: state.runner, work_dir: state.felt_host) do
+    prompt_context = dispatch_prompt_context(fiber, state)
+
+    case Dispatcher.dispatch(
+           fiber_id,
+           runner: state.runner,
+           work_dir: state.felt_host,
+           prompt_context: prompt_context
+         ) do
       {:ok, session} ->
         {:ok, agent} = Shuttle.Agents.resolve(Map.get(fiber, "tags", []))
 
@@ -495,14 +519,17 @@ defmodule Shuttle.Poller do
           {:ok, watcher_pid} ->
             now = DateTime.utc_now()
 
-            running =
-              Map.put(state.running, fiber_id, %{
+            running_meta =
+              %{
                 pid: watcher_pid,
                 session: session,
                 agent_id: agent.id,
                 started_at: now,
                 last_activity_at: now
-              })
+              }
+              |> Map.merge(running_prompt_metadata(prompt_context))
+
+            running = Map.put(state.running, fiber_id, running_meta)
 
             state = %{
               state
@@ -658,7 +685,7 @@ defmodule Shuttle.Poller do
       {nil, _} ->
         state
 
-      {_meta, running} ->
+      {meta, running} ->
         state = %{state | running: running}
 
         # Re-read fiber to determine next action
@@ -670,6 +697,11 @@ defmodule Shuttle.Poller do
               status == "closed" ->
                 # Work complete or blocked — release claim
                 release_claim(state, fiber_id)
+
+              standing_role?(fiber, state) ->
+                state
+                |> remember_completed_standing_run(fiber_id, Map.get(meta, :run_id))
+                |> release_claim(fiber_id)
 
               true ->
                 # Still active — schedule continuation retry
@@ -886,6 +918,92 @@ defmodule Shuttle.Poller do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp standing_role?(fiber, state) do
+    tags = Map.get(fiber, "tags", [])
+
+    "standing" in tags or
+      case fetch_standing_role(Map.get(fiber, "id", ""), state) do
+        {:ok, role} -> StandingRole.standing?(role)
+        {:error, _} -> false
+      end
+  end
+
+  defp standing_role_due?(fiber_id, state) do
+    with true <- dependencies_satisfied?(fiber_id, state),
+         {:ok, role} <- fetch_standing_role(fiber_id, state) do
+      StandingRole.due?(role, DateTime.utc_now()) and
+        not completed_standing_run?(
+          state,
+          fiber_id,
+          StandingRole.next_run_id(role, DateTime.utc_now())
+        )
+    else
+      _ -> false
+    end
+  end
+
+  defp dispatch_prompt_context(fiber, state) do
+    fiber_id = Map.get(fiber, "id", "")
+
+    case fetch_standing_role(fiber_id, state) do
+      {:ok, role} ->
+        if StandingRole.standing?(role) do
+          {:standing_run, StandingRole.next_run_id(role, DateTime.utc_now())}
+        else
+          :constitution
+        end
+
+      _ ->
+        :constitution
+    end
+  end
+
+  defp running_prompt_metadata({:standing_run, run_id}), do: %{state: "running", run_id: run_id}
+  defp running_prompt_metadata(_), do: %{}
+
+  defp fetch_standing_role(fiber_id, state) do
+    case run_felt(state, ["show", fiber_id, "--field", "shuttle"]) do
+      {:ok, output} -> StandingRole.parse(fiber_id, output)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp remember_completed_standing_run(state, _fiber_id, nil), do: state
+
+  defp remember_completed_standing_run(state, fiber_id, run_id) do
+    %{
+      state
+      | completed_standing_runs: MapSet.put(state.completed_standing_runs, {fiber_id, run_id})
+    }
+  end
+
+  defp completed_standing_run?(state, fiber_id, run_id) do
+    MapSet.member?(state.completed_standing_runs, {fiber_id, run_id})
+  end
+
+  defp standing_role_snapshots(state, now) do
+    with {:ok, candidates} <- discover_candidates(state) do
+      candidates
+      |> Enum.filter(fn fiber ->
+        "standing" in Map.get(fiber, "tags", []) or
+          standing_role?(fiber, state)
+      end)
+      |> Enum.flat_map(fn fiber ->
+        fiber_id = Map.get(fiber, "id", "")
+
+        case fetch_standing_role(fiber_id, state) do
+          {:ok, role} ->
+            [StandingRole.to_snapshot(role, now, Map.has_key?(state.running, fiber_id))]
+
+          {:error, _} ->
+            []
+        end
+      end)
+    else
+      _ -> []
     end
   end
 

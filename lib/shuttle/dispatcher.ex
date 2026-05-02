@@ -37,13 +37,14 @@ defmodule Shuttle.Dispatcher do
   def dispatch(fiber_id, opts \\ []) do
     runner = Keyword.get(opts, :runner, Shuttle.Runner.Default)
     work_dir = Keyword.get(opts, :work_dir, File.cwd!())
+    prompt_context = Keyword.get(opts, :prompt_context, :constitution)
 
     with {:ok, fiber} <- fetch_fiber(fiber_id, runner),
          :ok <- check_not_closed(fiber),
          :ok <- check_not_running(fiber_id, runner),
          {:ok, agent} <- resolve_agent(fiber),
          :ok <- validate_agent(agent),
-         {:ok, session} <- create_tmux_session(fiber_id, agent, work_dir, runner) do
+         {:ok, session} <- create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context) do
       {:ok, session}
     end
   end
@@ -63,6 +64,30 @@ defmodule Shuttle.Dispatcher do
     Read the constitution fresh via `felt show #{fiber_id}`. The work may take one session or many. End this session with `kill $PPID` when context fills, when you've reached a clean break, or when the constitution is realized.
 
     Update the constitution's `outcome:` to reflect where the work now stands, and append an editorial event with `felt history append #{fiber_id} --summary "…"` as the handoff for the next worker; file crystallizations as sub-fibers; commit. Status `closed` signals the constitution is realized; `tempered: true` is human-only.
+    """
+    |> String.trim()
+  end
+
+  @doc """
+  Renders a standing-role run prompt for one scheduled occurrence.
+  """
+  @spec render_standing_run_prompt(String.t(), String.t()) :: String.t()
+  def render_standing_run_prompt(fiber_id, run_id) do
+    """
+    Shuttle standing-role run. Fiber ID: #{fiber_id}
+    Run ID: #{run_id}
+
+    You are a scheduled Shuttle worker for this standing role.
+
+    Activate the shuttle and felt skills before anything else, then follow them.
+
+    Read the role fresh via `felt show #{fiber_id}`. This is one due occurrence of the same durable responsibility, not a new fiber.
+
+    Write the latest work product into the role fiber's `outcome:`. Append an editorial event with `felt history append #{fiber_id} --summary "Run #{run_id}: …"` that archives the run and includes stable decision handles for anything the user may ask you to revisit. File crystallizations as sub-fibers when they are durable.
+
+    Before exiting, manually edit the role fiber's `shuttle:` frontmatter into the awaiting-review shape: `review.state: awaiting`, `review.run_id: #{run_id}`, `review.completed_at: <now>`, `review.accepted_run_id: null`, `next_due_at: null`, and `last_run_at: <now>`. Leave `status: active`.
+
+    Recurrence resumes only after a human or agent manually accepts the reviewed run by editing `shuttle.review` to accepted/scheduled, setting `accepted_run_id` to this run id, and setting the next `next_due_at`. End this session with `kill $PPID` when the run is complete or at a clean break.
     """
     |> String.trim()
   end
@@ -139,9 +164,9 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
-  defp create_tmux_session(fiber_id, agent, work_dir, runner) do
+  defp create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context) do
     session = session_name(fiber_id)
-    prompt = render_prompt(fiber_id)
+    prompt = render_context_prompt(fiber_id, prompt_context)
     command = Agents.build_command(agent, prompt)
 
     # Build the run script — same shape as shuttle-worker.sh's RUN_SCRIPT
@@ -178,6 +203,12 @@ defmodule Shuttle.Dispatcher do
         {:error, "tmux failed: #{output}"}
     end
   end
+
+  defp render_context_prompt(fiber_id, {:standing_run, run_id}) do
+    render_standing_run_prompt(fiber_id, run_id)
+  end
+
+  defp render_context_prompt(fiber_id, _), do: render_prompt(fiber_id)
 
   defp build_run_script(fiber_id, command, agent_id) do
     """

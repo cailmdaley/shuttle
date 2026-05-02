@@ -1,0 +1,191 @@
+defmodule Shuttle.StandingRole do
+  @moduledoc """
+  Parses and classifies `shuttle.mode: standing` fiber declarations.
+
+  Standing roles are still felt fibers. Shuttle only interprets the `shuttle:`
+  frontmatter block to decide whether a role is sleeping, due, running, or in
+  review.
+  """
+
+  defstruct [
+    :fiber_id,
+    :mode,
+    :schedule,
+    :review,
+    :next_due_at,
+    :last_run_at,
+    :run_id,
+    validation_errors: []
+  ]
+
+  @type t :: %__MODULE__{
+          fiber_id: String.t(),
+          mode: String.t() | nil,
+          schedule: map(),
+          review: map(),
+          next_due_at: DateTime.t() | nil,
+          last_run_at: DateTime.t() | nil,
+          run_id: String.t() | nil,
+          validation_errors: [String.t()]
+        }
+
+  @spec parse(String.t(), String.t()) :: {:ok, t()} | {:error, term()}
+  def parse(fiber_id, yaml) when is_binary(yaml) do
+    yaml = String.trim(yaml)
+
+    if yaml == "" do
+      {:error, :missing}
+    else
+      with {:ok, data} <- YamlElixir.read_from_string(yaml),
+           true <- is_map(data) || {:error, :invalid_shuttle_block} do
+        role = %__MODULE__{
+          fiber_id: fiber_id,
+          mode: string(data["mode"]),
+          schedule: map(data["schedule"]),
+          review: map(data["review"]),
+          next_due_at: parse_datetime(data["next_due_at"]),
+          last_run_at: parse_datetime(data["last_run_at"]),
+          run_id: string(get_in(data, ["review", "run_id"]))
+        }
+
+        {:ok, %{role | validation_errors: validation_errors(role)}}
+      end
+    end
+  end
+
+  @spec standing?(t() | nil) :: boolean()
+  def standing?(%__MODULE__{mode: "standing"}), do: true
+  def standing?(_), do: false
+
+  @spec state(t(), DateTime.t(), boolean()) :: String.t()
+  def state(%__MODULE__{} = role, now, running?) do
+    review_state = role.review["state"] || "scheduled"
+
+    cond do
+      running? -> "running"
+      review_state in ["awaiting", "review", "in_review"] -> "review"
+      review_state == "accepted" -> "accepted"
+      due?(role, now) -> "due"
+      true -> "scheduled"
+    end
+  end
+
+  @spec due?(t(), DateTime.t()) :: boolean()
+  def due?(
+        %__MODULE__{next_due_at: %DateTime{} = next_due_at, review: review} = role,
+        %DateTime{} = now
+      ) do
+    valid?(role) and (review["state"] || "scheduled") in ["scheduled", "accepted", "due"] and
+      DateTime.compare(next_due_at, now) != :gt
+  end
+
+  def due?(_, _), do: false
+
+  @spec valid?(t()) :: boolean()
+  def valid?(%__MODULE__{validation_errors: []}), do: true
+  def valid?(_), do: false
+
+  @spec next_run_id(t(), DateTime.t()) :: String.t()
+  def next_run_id(%__MODULE__{next_due_at: %DateTime{} = next_due_at}, _now) do
+    Calendar.strftime(next_due_at, "%Y%m%dT%H%M%S%z")
+  end
+
+  def next_run_id(%__MODULE__{}, now) do
+    Calendar.strftime(now, "%Y%m%dT%H%M%S%z")
+  end
+
+  @spec to_snapshot(t(), DateTime.t(), boolean()) :: map()
+  def to_snapshot(%__MODULE__{} = role, now, running?) do
+    %{
+      fiber_id: role.fiber_id,
+      state: state(role, now, running?),
+      run_id: role.run_id,
+      next_due_at: unix_ms(role.next_due_at),
+      last_run_at: unix_ms(role.last_run_at),
+      schedule: role.schedule,
+      review: role.review,
+      validation_errors: role.validation_errors
+    }
+  end
+
+  defp validation_errors(%__MODULE__{} = role) do
+    [
+      validate_mode(role),
+      validate_review_state(role),
+      validate_next_due(role),
+      validate_acceptance_ids(role)
+    ]
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp validate_mode(%__MODULE__{mode: "standing"}), do: nil
+  defp validate_mode(%__MODULE__{mode: mode}), do: "mode must be standing, got #{inspect(mode)}"
+
+  defp validate_review_state(%__MODULE__{review: review}) do
+    state = review["state"] || "scheduled"
+
+    if state in ["scheduled", "accepted", "awaiting", "review", "in_review", "due"] do
+      nil
+    else
+      "unsupported review state #{inspect(state)}"
+    end
+  end
+
+  defp validate_next_due(%__MODULE__{review: review, next_due_at: next_due_at}) do
+    state = review["state"] || "scheduled"
+
+    cond do
+      state in ["scheduled", "accepted", "due"] and is_nil(next_due_at) ->
+        "scheduleable state #{state} requires next_due_at"
+
+      state in ["awaiting", "review", "in_review"] and not is_nil(next_due_at) ->
+        "review state #{state} must clear next_due_at"
+
+      true ->
+        nil
+    end
+  end
+
+  defp validate_acceptance_ids(%__MODULE__{review: review}) do
+    state = review["state"] || "scheduled"
+    run_id = string(review["run_id"])
+    accepted_run_id = string(review["accepted_run_id"])
+
+    cond do
+      state == "accepted" and (is_nil(run_id) or run_id == "") ->
+        "accepted review state requires run_id"
+
+      state == "accepted" and accepted_run_id != run_id ->
+        "accepted_run_id must match run_id in accepted review state"
+
+      state in ["awaiting", "review", "in_review"] and (is_nil(run_id) or run_id == "") ->
+        "review state requires run_id"
+
+      true ->
+        nil
+    end
+  end
+
+  defp parse_datetime(nil), do: nil
+  defp parse_datetime(""), do: nil
+
+  defp parse_datetime(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, dt, _} -> dt
+      {:error, _} -> nil
+    end
+  end
+
+  defp parse_datetime(%DateTime{} = value), do: value
+  defp parse_datetime(_), do: nil
+
+  defp map(value) when is_map(value), do: value
+  defp map(_), do: %{}
+
+  defp string(value) when is_binary(value), do: value
+  defp string(nil), do: nil
+  defp string(value), do: to_string(value)
+
+  defp unix_ms(%DateTime{} = dt), do: DateTime.to_unix(dt, :millisecond)
+  defp unix_ms(_), do: nil
+end

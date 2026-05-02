@@ -18,6 +18,7 @@ defmodule Shuttle.PollerTest do
             commands: [],
             tmux_sessions: MapSet.new(),
             fibers: %{},
+            shuttle: %{},
             felt_ls: []
           }
         end,
@@ -31,12 +32,14 @@ defmodule Shuttle.PollerTest do
           commands: [],
           tmux_sessions: MapSet.new(),
           fibers: %{},
+          shuttle: %{},
           felt_ls: []
         }
       end)
     end
 
     def set_fiber(id, fiber), do: Agent.update(__MODULE__, &put_in(&1.fibers[id], fiber))
+    def set_shuttle(id, yaml), do: Agent.update(__MODULE__, &put_in(&1.shuttle[id], yaml))
     def set_felt_ls(fibers), do: Agent.update(__MODULE__, &%{&1 | felt_ls: fibers})
 
     def add_tmux_session(session),
@@ -60,6 +63,12 @@ defmodule Shuttle.PollerTest do
         command == "felt" and String.contains?(full_args, "ls") ->
           fibers = Agent.get(__MODULE__, & &1.felt_ls)
           {Jason.encode!(fibers), 0}
+
+        command == "felt" and String.contains?(full_args, "show") and
+            String.contains?(full_args, "--field shuttle") ->
+          fiber_id = extract_fiber_id(args)
+          shuttle = Agent.get(__MODULE__, & &1.shuttle)
+          {Map.get(shuttle, fiber_id, ""), 0}
 
         command == "felt" and String.contains?(full_args, "show") ->
           fiber_id = extract_fiber_id(args)
@@ -101,8 +110,11 @@ defmodule Shuttle.PollerTest do
     end
 
     defp extract_fiber_id(args) do
-      # args like ["show", "tests/haiku", "--json"]
-      Enum.find(args, "", fn arg -> arg != "show" and arg != "--json" end)
+      # args like ["show", "tests/haiku", "--json"] or
+      # ["show", "tests/haiku", "--field", "shuttle"]
+      args
+      |> Enum.reject(&(&1 in ["show", "--json", "--field", "shuttle"]))
+      |> List.first("")
     end
   end
 
@@ -206,6 +218,196 @@ defmodule Shuttle.PollerTest do
     refute Enum.any?(commands, fn {cmd, args} ->
              cmd == "tmux" and hd(args) == "new-session"
            end)
+  end
+
+  test "poller does not dispatch a scheduled standing role before it is due" do
+    fiber = make_fiber("tests/standing-sleeping", %{"tags" => ["constitution", "standing"]})
+    MockRunner.set_felt_ls([fiber])
+    MockRunner.set_fiber("tests/standing-sleeping", fiber)
+
+    MockRunner.set_shuttle(
+      "tests/standing-sleeping",
+      """
+      mode: standing
+      schedule:
+        kind: cron
+        expr: "0 9 * * 1-5"
+        timezone: Europe/Paris
+      review:
+        state: scheduled
+      next_due_at: "2999-01-01T09:00:00+01:00"
+      """
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_standing_sleeping,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
+
+    send(poller, :run_poll_cycle)
+    Process.sleep(50)
+
+    refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
+
+    assert [%{fiber_id: "tests/standing-sleeping", state: "scheduled"}] =
+             Poller.snapshot(poller).standing_roles
+  end
+
+  test "poller dispatches a due standing role with run context and does not hot-loop after exit" do
+    fiber = make_fiber("tests/standing-due", %{"tags" => ["constitution", "standing", "codex"]})
+    MockRunner.set_felt_ls([fiber])
+    MockRunner.set_fiber("tests/standing-due", fiber)
+
+    MockRunner.set_shuttle(
+      "tests/standing-due",
+      """
+      mode: standing
+      schedule:
+        kind: cron
+        expr: "0 9 * * 1-5"
+        timezone: Europe/Paris
+      review:
+        state: scheduled
+      next_due_at: "2000-01-03T09:00:00+01:00"
+      """
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_standing_due,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
+
+    send(poller, :run_poll_cycle)
+    Process.sleep(100)
+
+    assert [%{fiber_id: "tests/standing-due", state: "running", run_id: run_id}] =
+             Poller.snapshot(poller).eligible
+
+    assert is_binary(run_id)
+
+    MockRunner.remove_tmux_session(Dispatcher.session_name("tests/standing-due"))
+    send(poller, {:worker_exited, "tests/standing-due", :normal_exit, false})
+    Process.sleep(50)
+
+    refute Enum.any?(Poller.snapshot(poller).retrying, &(&1.fiber_id == "tests/standing-due"))
+
+    send(poller, :run_poll_cycle)
+    Process.sleep(50)
+
+    new_session_count =
+      MockRunner.commands()
+      |> Enum.filter(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
+      |> length()
+
+    assert new_session_count == 1
+
+    refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "felt" and Enum.take(args, 2) == ["standing", "review"]
+           end)
+  end
+
+  test "poller rejects stale accepted standing metadata" do
+    fiber = make_fiber("tests/standing-stale", %{"tags" => ["constitution", "standing"]})
+    MockRunner.set_felt_ls([fiber])
+    MockRunner.set_fiber("tests/standing-stale", fiber)
+
+    MockRunner.set_shuttle(
+      "tests/standing-stale",
+      """
+      mode: standing
+      schedule:
+        kind: cron
+        expr: "0 9 * * 1-5"
+        timezone: Europe/Paris
+      review:
+        state: accepted
+        run_id: run-2
+        accepted_run_id: run-1
+      next_due_at: "2000-01-03T09:00:00+01:00"
+      """
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_standing_stale,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
+
+    send(poller, :run_poll_cycle)
+    Process.sleep(50)
+
+    refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
+
+    assert [%{fiber_id: "tests/standing-stale", validation_errors: errors}] =
+             Poller.snapshot(poller).standing_roles
+
+    assert Enum.any?(errors, &String.contains?(&1, "accepted_run_id"))
+  end
+
+  test "snapshot exposes review and accepted standing states" do
+    review = make_fiber("tests/standing-review", %{"tags" => ["constitution", "standing"]})
+    accepted = make_fiber("tests/standing-accepted", %{"tags" => ["constitution", "standing"]})
+    MockRunner.set_felt_ls([review, accepted])
+    MockRunner.set_fiber("tests/standing-review", review)
+    MockRunner.set_fiber("tests/standing-accepted", accepted)
+
+    MockRunner.set_shuttle(
+      "tests/standing-review",
+      """
+      mode: standing
+      schedule:
+        kind: cron
+        expr: "0 9 * * 1-5"
+        timezone: Europe/Paris
+      review:
+        state: awaiting
+        run_id: run-1
+        accepted_run_id: null
+      next_due_at: null
+      last_run_at: "2026-05-02T09:12:00+02:00"
+      """
+    )
+
+    MockRunner.set_shuttle(
+      "tests/standing-accepted",
+      """
+      mode: standing
+      schedule:
+        kind: cron
+        expr: "0 9 * * 1-5"
+        timezone: Europe/Paris
+      review:
+        state: accepted
+        run_id: run-2
+        accepted_run_id: run-2
+      next_due_at: "2999-01-01T09:00:00+01:00"
+      last_run_at: "2026-05-02T09:12:00+02:00"
+      """
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_standing_snapshot_states,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
+
+    roles = Poller.snapshot(poller).standing_roles
+    assert Enum.find(roles, &(&1.fiber_id == "tests/standing-review")).state == "review"
+    assert Enum.find(roles, &(&1.fiber_id == "tests/standing-accepted")).state == "accepted"
   end
 
   test "poller respects dependency satisfaction" do
