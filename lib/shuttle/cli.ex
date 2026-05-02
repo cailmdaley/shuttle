@@ -82,7 +82,8 @@ defmodule Shuttle.CLI do
     end
   end
 
-  defp print_status(snap) do
+  @doc false
+  def print_status(snap) do
     IO.puts("Shuttle v#{Shuttle.version()} — #{snap.host}")
     IO.puts("Poll at: #{DateTime.from_unix!(snap.poll_at, :millisecond)}")
     IO.puts("")
@@ -91,9 +92,13 @@ defmodule Shuttle.CLI do
       IO.puts("No running workers.")
     else
       IO.puts("Running workers (#{length(snap.eligible)}):")
+
       Enum.each(snap.eligible, fn w ->
         IO.puts("  • #{w.fiber_id}")
-        IO.puts("    session: #{w.tmux_session}  agent: #{w.agent}  runtime: #{w.runtime_seconds}s")
+
+        IO.puts(
+          "    session: #{w.tmux_session}  agent: #{w.agent}  runtime: #{w.runtime_seconds}s"
+        )
       end)
     end
 
@@ -103,9 +108,44 @@ defmodule Shuttle.CLI do
       IO.puts("No retry queue.")
     else
       IO.puts("Retry queue (#{length(snap.retrying)}):")
+
       Enum.each(snap.retrying, fn r ->
         IO.puts("  • #{r.fiber_id} — attempt #{r.attempt}, due in #{r.due_in_ms}ms")
       end)
     end
+
+    IO.puts("")
+    print_standing_roles(Map.get(snap, :standing_roles, []))
+  end
+
+  defp print_standing_roles([]) do
+    IO.puts("No standing roles.")
+  end
+
+  defp print_standing_roles(roles) do
+    IO.puts("Standing roles (#{length(roles)}):")
+
+    Enum.each(roles, fn role ->
+      IO.puts("  • #{role.fiber_id} — #{role.state}")
+      print_optional("run", role.run_id)
+      print_optional("next due", format_unix_ms(role.next_due_at))
+      print_optional("last run", format_unix_ms(role.last_run_at))
+
+      if role.validation_errors != [] do
+        IO.puts("    validation: #{Enum.join(role.validation_errors, "; ")}")
+      end
+    end)
+  end
+
+  defp print_optional(_label, nil), do: :ok
+  defp print_optional(_label, ""), do: :ok
+  defp print_optional(label, value), do: IO.puts("    #{label}: #{value}")
+
+  defp format_unix_ms(nil), do: nil
+
+  defp format_unix_ms(ms) do
+    ms
+    |> DateTime.from_unix!(:millisecond)
+    |> DateTime.to_iso8601()
   end
 end
