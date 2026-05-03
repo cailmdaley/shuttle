@@ -51,10 +51,17 @@ defmodule Shuttle.Dispatcher do
 
   @doc """
   Renders the universal dispatch prompt for a fiber ID.
+
+  Reads pending (unconsumed) review-comment events from felt history and
+  prepends them to the prompt so the worker sees Cail's directives before
+  the constitution body. The worker is responsible for incorporating each
+  directive and calling `felt history mark-consumed` after.
   """
   @spec render_prompt(String.t()) :: String.t()
   def render_prompt(fiber_id) do
-    """
+    review_block = render_pending_review_comments(fiber_id)
+
+    base = """
     Shuttle dispatch. Fiber ID: #{fiber_id}
 
     You are a Shuttle-dispatched worker on this fiber.
@@ -65,7 +72,74 @@ defmodule Shuttle.Dispatcher do
 
     Update the constitution's `outcome:` to reflect where the work now stands, and append an editorial event with `felt history append #{fiber_id} --summary "…"` as the handoff for the next worker; file crystallizations as sub-fibers; commit. Status `closed` signals the constitution is realized; `tempered: true` is human-only.
     """
+
+    (review_block <> base)
     |> String.trim()
+  end
+
+  @doc """
+  Reads pending (unconsumed) review-comment events for `fiber_id` and renders
+  a directive block for inclusion at the top of the dispatch prompt.
+
+  Returns an empty string when there are no pending review comments, so
+  callers can concatenate unconditionally. On failure (felt not available,
+  no history yet) falls back to empty string — dispatch continues without
+  the review block rather than failing.
+
+  Workers are expected to:
+    1. Read the directive shown here.
+    2. Incorporate it into the work.
+    3. Call `felt history mark-consumed #{fiber_id} --rowid <N>` for each event.
+  """
+  @spec render_pending_review_comments(String.t()) :: String.t()
+  def render_pending_review_comments(fiber_id) do
+    loom = System.user_home() <> "/loom"
+
+    case System.cmd(
+           "felt",
+           [
+             "-C",
+             loom,
+             "history",
+             fiber_id,
+             "--kind",
+             "review-comment",
+             "--unconsumed",
+             "--json"
+           ],
+           stderr_to_stdout: true
+         ) do
+      {output, 0} ->
+        case Jason.decode(output) do
+          {:ok, events} when is_list(events) and length(events) > 0 ->
+            directives =
+              events
+              |> Enum.map(fn e ->
+                rowid = Map.get(e, "rowid", "?")
+                actor = Map.get(e, "actor", "")
+                summary = get_in(e, ["payload", "summary"]) || ""
+                "  [rowid=#{rowid} from #{actor}]\n  #{String.replace(summary, "\n", "\n  ")}"
+              end)
+              |> Enum.join("\n\n")
+
+            """
+            ┌─ Pending review directive(s) from Cail ─────────────────────────────────
+            #{directives}
+
+            Incorporate the directive(s) above into the constitution/work, then mark
+            each consumed via:
+              felt history mark-consumed #{fiber_id} --rowid <N>
+            └──────────────────────────────────────────────────────────────────────────
+
+            """
+
+          _ ->
+            ""
+        end
+
+      _ ->
+        ""
+    end
   end
 
   @doc """
@@ -152,8 +226,18 @@ defmodule Shuttle.Dispatcher do
   end
 
   defp resolve_agent(fiber) do
-    tags = Map.get(fiber, "tags", [])
-    Agents.resolve(tags)
+    # Prefer the post-migration shuttle.agent field when present; fall back
+    # to legacy tag-based resolution (agent:<name> compound + bare aliases).
+    # `felt show --json` returns the shuttle: block as a nested map keyed by
+    # string in the fiber JSON.
+    case get_in(fiber, ["shuttle", "agent"]) do
+      name when is_binary(name) and name != "" ->
+        Agents.resolve_by_name(name)
+
+      _ ->
+        tags = Map.get(fiber, "tags", [])
+        Agents.resolve(tags)
+    end
   end
 
   defp validate_agent(agent) do
