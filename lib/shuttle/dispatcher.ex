@@ -61,7 +61,7 @@ defmodule Shuttle.Dispatcher do
 
     Activate the shuttle and felt skills before anything else, then follow them.
 
-    Read the constitution fresh via `felt show #{fiber_id}`. The work may take one session or many. End this session with `kill $PPID` when context fills, when you've reached a clean break, or when the constitution is realized.
+    Read the constitution fresh via `felt show #{fiber_id}`. The work may take one session or many — Shuttle redispatches a fresh worker on the next poll, and `felt history #{fiber_id} --last 1` lands them warm. **Exit before context is half-full.** Auto-compact mid-thought hands the next worker a degraded summary, and the editorial event you'd write afterward gets composed from that degraded view rather than full attention. A clean break at the next sub-task boundary, well before half, is a stronger handoff than pushing through. End this session with `kill $PPID` at a clean break, when you're blocked, or when the constitution is realized.
 
     Update the constitution's `outcome:` to reflect where the work now stands, and append an editorial event with `felt history append #{fiber_id} --summary "…"` as the handoff for the next worker; file crystallizations as sub-fibers; commit. Status `closed` signals the constitution is realized; `tempered: true` is human-only.
     """
@@ -87,7 +87,7 @@ defmodule Shuttle.Dispatcher do
 
     Before exiting, manually edit the role fiber's `shuttle:` frontmatter into the awaiting-review shape: `review.state: awaiting`, `review.run_id: #{run_id}`, `review.completed_at: <now>`, `review.accepted_run_id: null`, `next_due_at: null`, and `last_run_at: <now>`. Leave `status: active`.
 
-    Recurrence resumes only after a human or agent manually accepts the reviewed run by editing `shuttle.review` to accepted/scheduled, setting `accepted_run_id` to this run id, and setting the next `next_due_at`. End this session with `kill $PPID` when the run is complete or at a clean break.
+    Recurrence resumes only after a human or agent manually accepts the reviewed run by editing `shuttle.review` to accepted/scheduled, setting `accepted_run_id` to this run id, and setting the next `next_due_at`. End this session with `kill $PPID` when the run is complete or at a clean break — exit before context is half-full, so the run summary is written from full attention rather than post-compact.
     """
     |> String.trim()
   end
