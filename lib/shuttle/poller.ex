@@ -20,8 +20,7 @@ defmodule Shuttle.Poller do
       LOOM_HOMES=~/loom,~/wedding,~/Documents/projects/lightcone
 
   Single-host setups (the common case) are unchanged: `felt_hosts` defaults to
-  `[LOOM_HOME || ~/loom]`, the same resolution as the previous single-string
-  `felt_host` field.
+  `[LOOM_HOME || ~/loom]`.
 
   Each fiber resolves to exactly one host: the first configured host whose
   `.felt/` directory contains the fiber file. The resolution is cached in
@@ -58,8 +57,6 @@ defmodule Shuttle.Poller do
       :tick_timer_ref,
       :tick_token,
       # List of felt host directories, in resolution-priority order.
-      # Replaces the former single-string :felt_host field. The backward-compat
-      # :felt_host init option is normalized to [host] in init/1.
       :felt_hosts,
       :runner,
       poll_check_in_progress: false,
@@ -182,18 +179,7 @@ defmodule Shuttle.Poller do
   def init(opts) do
     now_ms = System.monotonic_time(:millisecond)
 
-    # Accept felt_hosts: [list] (new) or felt_host: "string" (backward-compat alias).
-    felt_hosts =
-      case Keyword.fetch(opts, :felt_hosts) do
-        {:ok, hosts} when is_list(hosts) ->
-          hosts
-
-        :error ->
-          case Keyword.fetch(opts, :felt_host) do
-            {:ok, host} when is_binary(host) -> [host]
-            _ -> default_felt_hosts()
-          end
-      end
+    felt_hosts = Keyword.get(opts, :felt_hosts, default_felt_hosts())
 
     runner = Keyword.get(opts, :runner, Shuttle.Runner.Default)
 
@@ -499,37 +485,113 @@ defmodule Shuttle.Poller do
     end
   end
 
-  # Queries every configured felt host for constitution-tagged fibers and
-  # unions the results. Returns {:ok, fibers, host_map} where host_map is
-  # %{fiber_id => felt_host} for all discovered fibers.
+  # Discovers candidate fibers by walking <host>/.felt/ for files that carry a
+  # shuttle: frontmatter block. No tag predicate — the block is the source of
+  # truth, matching what Portolan's kanban already does via hasShuttleBlock.
   #
-  # Individual host failures are logged but don't abort the cycle — we return
-  # what we got from the responsive hosts.
+  # Returns {:ok, fibers, host_map} where:
+  #   fibers   — [%{"id" => id, "status" => status}] across all hosts
+  #   host_map — %{fiber_id => felt_host} for host resolution
+  #
+  # Earlier-configured hosts take precedence when the same fiber ID appears in
+  # multiple hosts (same collision semantics as the old felt ls union).
   defp discover_candidates(state) do
     {all_fibers, host_map} =
       Enum.reduce(state.felt_hosts, {[], %{}}, fn host, {acc_fibers, acc_map} ->
-        case run_felt(host, state.runner, ["ls", "-t", "constitution", "-j", "-s", "all"]) do
-          {:ok, output} ->
-            case Jason.decode(output) do
-              {:ok, fibers} when is_list(fibers) ->
-                # Map fiber_id → host for this batch. acc_map (earlier-
-                # configured hosts) takes precedence for ID collisions.
-                new_entries = Map.new(fibers, fn f -> {Map.get(f, "id", ""), host} end)
-                merged_map = Map.merge(new_entries, acc_map)
-                {acc_fibers ++ fibers, merged_map}
-
-              _ ->
-                Logger.warning("Unexpected felt ls output from host #{host}")
-                {acc_fibers, acc_map}
-            end
-
-          {:error, reason} ->
-            Logger.warning("felt ls failed for host #{host}: #{inspect(reason)}")
-            {acc_fibers, acc_map}
-        end
+        fibers = walk_shuttle_fibers(host)
+        # Earlier-configured hosts win on ID collision.
+        new_entries = Map.new(fibers, fn f -> {Map.get(f, "id", ""), host} end)
+        merged_map = Map.merge(new_entries, acc_map)
+        {acc_fibers ++ fibers, merged_map}
       end)
 
     {:ok, all_fibers, host_map}
+  end
+
+  # Walk <host>/.felt/ and return one %{"id" => id, "status" => status} map
+  # per fiber file that contains a shuttle: frontmatter block.  Hidden
+  # subdirectories (other than .felt itself) are skipped.
+  defp walk_shuttle_fibers(host) do
+    felt_dir = Path.join(host, ".felt")
+
+    felt_dir
+    |> do_walk_felt_dir()
+    |> Enum.filter(&String.ends_with?(&1, ".md"))
+    |> Enum.flat_map(fn path ->
+      case parse_shuttle_fiber(host, path) do
+        {:ok, fiber} -> [fiber]
+        {:error, _} -> []
+      end
+    end)
+  end
+
+  defp do_walk_felt_dir(dir) do
+    case File.ls(dir) do
+      {:ok, entries} ->
+        Enum.flat_map(entries, fn entry ->
+          path = Path.join(dir, entry)
+
+          cond do
+            File.dir?(path) and not String.starts_with?(entry, ".") ->
+              do_walk_felt_dir(path)
+
+            File.dir?(path) ->
+              # Skip hidden subdirectories (symlinks to gitignored zones, etc.)
+              []
+
+            true ->
+              [path]
+          end
+        end)
+
+      {:error, _} ->
+        []
+    end
+  end
+
+  # Parse one fiber .md file, returning {:ok, %{"id" => id, "status" => status}}
+  # when the frontmatter contains a shuttle: block, {:error, _} otherwise.
+  defp parse_shuttle_fiber(host, path) do
+    felt_dir = Path.join(host, ".felt")
+    rel = Path.relative_to(path, felt_dir)
+
+    with {:ok, content} <- File.read(path),
+         [fm] <-
+           Regex.run(~r/\A---\r?\n(.*?)\r?\n---(?:\r?\n|\z)/ms, content,
+             capture: :all_but_first
+           ),
+         {:ok, data} when is_map(data) <- YamlElixir.read_from_string(fm),
+         shuttle when is_map(shuttle) <- Map.get(data, "shuttle") do
+      fiber_id = derive_fiber_id_from_rel(rel)
+      status = Map.get(data, "status", "open")
+      {:ok, %{"id" => fiber_id, "status" => status}}
+    else
+      _ -> {:error, :no_shuttle_block}
+    end
+  end
+
+  # Derive the felt fiber ID from a path relative to <host>/.felt/.
+  #
+  # Directory fibers:  "ai-futures/shuttle/constitution-x/constitution-x.md"
+  #                    → "ai-futures/shuttle/constitution-x"
+  # Bare fibers:       "some-fiber.md"
+  #                    → "some-fiber"
+  defp derive_fiber_id_from_rel(rel) do
+    parts = Path.split(rel)
+
+    if length(parts) >= 2 do
+      basename = List.last(parts)
+      dir_parts = Enum.take(parts, length(parts) - 1)
+      dir_base = List.last(dir_parts)
+
+      if String.replace_suffix(basename, ".md", "") == dir_base do
+        Path.join(dir_parts)
+      else
+        String.replace_suffix(rel, ".md", "")
+      end
+    else
+      String.replace_suffix(rel, ".md", "")
+    end
   end
 
   defp filter_eligible(candidates, state) do
@@ -1340,7 +1402,7 @@ defmodule Shuttle.Poller do
   # 2. LOOM_HOME env var (single path; wrapped in a list)
   # 3. ~/loom
   #
-  # This is the default-fallback only; explicit :felt_hosts/:felt_host opts
+  # This is the default-fallback only; explicit :felt_hosts opts
   # in start_link take precedence via init/1.
   defp default_felt_hosts do
     case System.get_env("LOOM_HOMES") do
@@ -1351,16 +1413,8 @@ defmodule Shuttle.Poller do
         |> Enum.reject(&(&1 == ""))
 
       _ ->
-        [default_felt_host()]
-    end
-  end
-
-  # Single-host fallback. Mirrors `Shuttle.Dispatcher.default_felt_host/0`
-  # so both Poller and Dispatcher re-point together when LOOM_HOME is set.
-  defp default_felt_host do
-    case System.get_env("LOOM_HOME") do
-      v when is_binary(v) and v != "" -> v
-      _ -> System.user_home() <> "/loom"
+        loom_home = System.get_env("LOOM_HOME")
+        [if(is_binary(loom_home) and loom_home != "", do: loom_home, else: System.user_home() <> "/loom")]
     end
   end
 

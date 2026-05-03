@@ -42,17 +42,24 @@ defmodule Shuttle.PollerTest do
 
     def set_fiber(id, fiber), do: Agent.update(__MODULE__, &put_in(&1.fibers[id], fiber))
 
-    def set_shuttle(id, yaml) do
-      # Write a real .md file so read_fiber_shuttle_block can find it.
+    # Write a real .md file carrying the given shuttle: block and felt status so
+    # that walk_shuttle_fibers (the new file-walk discovery path) can find it.
+    # The status defaults to "active" — pass an explicit value for tests that
+    # verify eligibility gates (closed, untracked, etc.).
+    def set_shuttle(id, yaml, status \\ "active") do
       felt_dir = "/tmp/.felt"
       segments = String.split(id, "/")
       basename = List.last(segments)
       dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
       File.mkdir_p!(Path.dirname(dir_path))
       indented = yaml |> String.trim() |> String.split("\n") |> Enum.map_join("\n", &("  " <> &1))
-      File.write!(dir_path, "---\nshuttle:\n#{indented}\n---\nbody\n")
+      File.write!(dir_path, "---\nstatus: #{status}\nshuttle:\n#{indented}\n---\nbody\n")
       Agent.update(__MODULE__, &put_in(&1.shuttle[id], yaml))
     end
+
+    # Kept for backward compat; no longer consulted by discover_candidates
+    # (discovery now walks files for shuttle: blocks).  Still used by the
+    # mock's felt ls handler which other code paths may call.
     def set_felt_ls(fibers), do: Agent.update(__MODULE__, &%{&1 | felt_ls: fibers})
 
     def add_tmux_session(session),
@@ -160,17 +167,18 @@ defmodule Shuttle.PollerTest do
   # ── Tests ──
 
   test "poller discovers and dispatches eligible fibers" do
-    fiber = make_fiber("tests/haiku")
-    MockRunner.set_felt_ls([fiber])
-    MockRunner.set_fiber("tests/haiku", fiber)
-    MockRunner.set_shuttle("tests/haiku", @oneshot_shuttle)
+    # Use a fiber ID unique to this test to avoid collisions with sessions left
+    # alive by other tests' long-lived Pollers/Watchers.
+    fiber = make_fiber("tests/haiku-dispatch")
+    MockRunner.set_fiber("tests/haiku-dispatch", fiber)
+    MockRunner.set_shuttle("tests/haiku-dispatch", @oneshot_shuttle)
 
     {:ok, poller} =
       Poller.start_link(
         name: :test_poller_1,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     # Trigger a poll cycle manually
@@ -188,20 +196,20 @@ defmodule Shuttle.PollerTest do
     # Check snapshot shows running worker
     snap = Poller.snapshot(poller)
     assert length(snap.eligible) == 1
-    assert hd(snap.eligible).fiber_id == "tests/haiku"
+    assert hd(snap.eligible).fiber_id == "tests/haiku-dispatch"
   end
 
   test "poller skips closed fibers" do
     fiber = make_fiber("tests/closed", %{"status" => "closed"})
-    MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/closed", fiber)
+    MockRunner.set_shuttle("tests/closed", @oneshot_shuttle, "closed")
 
     {:ok, poller} =
       Poller.start_link(
         name: :test_poller_2,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -215,16 +223,17 @@ defmodule Shuttle.PollerTest do
   end
 
   test "poller skips draft fibers" do
-    fiber = make_fiber("tests/draft", %{"tags" => ["constitution", "draft"]})
-    MockRunner.set_felt_ls([fiber])
+    fiber = make_fiber("tests/draft", %{"tags" => ["constitution", "draft"], "status" => "open"})
     MockRunner.set_fiber("tests/draft", fiber)
+    # Draft = shuttle block present but enabled: false; status open (not yet committed to In flight).
+    MockRunner.set_shuttle("tests/draft", "enabled: false\nkind: oneshot\n", "open")
 
     {:ok, poller} =
       Poller.start_link(
         name: :test_poller_3,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -239,7 +248,6 @@ defmodule Shuttle.PollerTest do
 
   test "poller does not dispatch a scheduled standing role before it is due" do
     fiber = make_fiber("tests/standing-sleeping", %{"tags" => ["constitution", "standing"]})
-    MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/standing-sleeping", fiber)
 
     MockRunner.set_shuttle(
@@ -262,7 +270,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_standing_sleeping,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -279,7 +287,6 @@ defmodule Shuttle.PollerTest do
   test "poller dispatches a due standing role with run context and does not hot-loop after exit" do
     # Uses new-format "kind: standing" (vs legacy "mode: standing") to test backward compat.
     fiber = make_fiber("tests/standing-due", %{"tags" => ["constitution", "standing"]})
-    MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/standing-due", fiber)
 
     MockRunner.set_shuttle(
@@ -302,7 +309,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_standing_due,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -336,7 +343,6 @@ defmodule Shuttle.PollerTest do
 
   test "poller rejects stale accepted standing metadata" do
     fiber = make_fiber("tests/standing-stale", %{"tags" => ["constitution", "standing"]})
-    MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/standing-stale", fiber)
 
     MockRunner.set_shuttle(
@@ -361,7 +367,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_standing_stale,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -380,7 +386,6 @@ defmodule Shuttle.PollerTest do
   test "snapshot exposes review and accepted standing states" do
     review = make_fiber("tests/standing-review", %{"tags" => ["constitution", "standing"]})
     accepted = make_fiber("tests/standing-accepted", %{"tags" => ["constitution", "standing"]})
-    MockRunner.set_felt_ls([review, accepted])
     MockRunner.set_fiber("tests/standing-review", review)
     MockRunner.set_fiber("tests/standing-accepted", accepted)
 
@@ -425,7 +430,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_standing_snapshot_states,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     roles = Poller.snapshot(poller).standing_roles
@@ -437,7 +442,6 @@ defmodule Shuttle.PollerTest do
     dep = make_fiber("tests/dep", %{"tempered" => false, "tags" => []})
     fiber = make_fiber("tests/dependent", %{"depends_on" => ["tests/dep"]})
 
-    MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/dependent", fiber)
     MockRunner.set_fiber("tests/dep", dep)
     MockRunner.set_shuttle("tests/dependent", @oneshot_shuttle)
@@ -447,7 +451,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_4,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -463,15 +467,15 @@ defmodule Shuttle.PollerTest do
 
   test "poller skips untracked fibers" do
     fiber = make_fiber("tests/untracked", %{"status" => "untracked"})
-    MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/untracked", fiber)
+    MockRunner.set_shuttle("tests/untracked", @oneshot_shuttle, "untracked")
 
     {:ok, poller} =
       Poller.start_link(
         name: :test_poller_untracked,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -488,7 +492,6 @@ defmodule Shuttle.PollerTest do
     dep = make_fiber("tests/dep", %{"tempered" => true})
     fiber = make_fiber("tests/dependent", %{"depends_on" => ["tests/dep"]})
 
-    MockRunner.set_felt_ls([fiber, dep])
     MockRunner.set_fiber("tests/dependent", fiber)
     MockRunner.set_fiber("tests/dep", dep)
     MockRunner.set_shuttle("tests/dependent", @oneshot_shuttle)
@@ -498,7 +501,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_5,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -512,18 +515,17 @@ defmodule Shuttle.PollerTest do
   end
 
   test "poller does not double-dispatch" do
-    fiber = make_fiber("tests/haiku")
-    MockRunner.set_felt_ls([fiber])
-    MockRunner.set_fiber("tests/haiku", fiber)
-    MockRunner.set_shuttle("tests/haiku", @oneshot_shuttle)
-    MockRunner.add_tmux_session(Dispatcher.session_name("tests/haiku"))
+    fiber = make_fiber("tests/haiku-dedup")
+    MockRunner.set_fiber("tests/haiku-dedup", fiber)
+    MockRunner.set_shuttle("tests/haiku-dedup", @oneshot_shuttle)
+    MockRunner.add_tmux_session(Dispatcher.session_name("tests/haiku-dedup"))
 
     {:ok, poller} =
       Poller.start_link(
         name: :test_poller_6,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -539,17 +541,19 @@ defmodule Shuttle.PollerTest do
   end
 
   test "poller schedules retry when worker exits and fiber still active" do
-    fiber = make_fiber("tests/haiku")
-    MockRunner.set_felt_ls([fiber])
-    MockRunner.set_fiber("tests/haiku", fiber)
-    MockRunner.set_shuttle("tests/haiku", @oneshot_shuttle)
+    # Uses "tests/haiku-retry" to avoid session collisions — this test leaves two
+    # WorkerWatcher processes alive (initial + retry) that would interfere with
+    # subsequent tests using the same session name "shuttle-tests/haiku".
+    fiber = make_fiber("tests/haiku-retry")
+    MockRunner.set_fiber("tests/haiku-retry", fiber)
+    MockRunner.set_shuttle("tests/haiku-retry", @oneshot_shuttle)
 
     {:ok, poller} =
       Poller.start_link(
         name: :test_poller_7,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     # Dispatch
@@ -560,14 +564,14 @@ defmodule Shuttle.PollerTest do
     assert length(snap1.eligible) == 1
 
     # Simulate worker exit (tmux session dies)
-    MockRunner.remove_tmux_session(Dispatcher.session_name("tests/haiku"))
-    send(poller, {:worker_exited, "tests/haiku", :normal_exit, false})
+    MockRunner.remove_tmux_session(Dispatcher.session_name("tests/haiku-retry"))
+    send(poller, {:worker_exited, "tests/haiku-retry", :normal_exit, false})
     Process.sleep(50)
 
     snap2 = Poller.snapshot(poller)
     assert length(snap2.eligible) == 0
     assert length(snap2.retrying) == 1
-    assert hd(snap2.retrying).fiber_id == "tests/haiku"
+    assert hd(snap2.retrying).fiber_id == "tests/haiku-retry"
 
     Process.sleep(1_100)
 
@@ -580,17 +584,18 @@ defmodule Shuttle.PollerTest do
   end
 
   test "poller releases claim when worker exits and fiber is closed" do
-    fiber = make_fiber("tests/haiku")
-    MockRunner.set_felt_ls([fiber])
-    MockRunner.set_fiber("tests/haiku", fiber)
-    MockRunner.set_shuttle("tests/haiku", @oneshot_shuttle)
+    # Use a fiber ID unique to this test — shared names (like "tests/haiku") can
+    # collide with sessions left over from other tests' Pollers/Watchers.
+    fiber = make_fiber("tests/haiku-close")
+    MockRunner.set_fiber("tests/haiku-close", fiber)
+    MockRunner.set_shuttle("tests/haiku-close", @oneshot_shuttle)
 
     {:ok, poller} =
       Poller.start_link(
         name: :test_poller_8,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     # Dispatch
@@ -598,9 +603,9 @@ defmodule Shuttle.PollerTest do
     Process.sleep(100)
 
     # Close the fiber
-    MockRunner.set_fiber("tests/haiku", %{fiber | "status" => "closed"})
-    MockRunner.remove_tmux_session(Dispatcher.session_name("tests/haiku"))
-    send(poller, {:worker_exited, "tests/haiku", :normal_exit, false})
+    MockRunner.set_fiber("tests/haiku-close", %{fiber | "status" => "closed"})
+    MockRunner.remove_tmux_session(Dispatcher.session_name("tests/haiku-close"))
+    send(poller, {:worker_exited, "tests/haiku-close", :normal_exit, false})
     Process.sleep(50)
 
     snap = Poller.snapshot(poller)
@@ -618,7 +623,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_9,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     Process.sleep(100)
@@ -635,7 +640,6 @@ defmodule Shuttle.PollerTest do
     File.mkdir_p!(project_dir)
 
     fiber = make_fiber("tests/project-dir-fiber")
-    MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/project-dir-fiber", fiber)
 
     MockRunner.set_shuttle("tests/project-dir-fiber", """
@@ -649,7 +653,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_project_dir,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -671,7 +675,6 @@ defmodule Shuttle.PollerTest do
 
   test "poller falls back to felt_host when shuttle.project_dir does not exist" do
     fiber = make_fiber("tests/missing-project-dir")
-    MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/missing-project-dir", fiber)
 
     MockRunner.set_shuttle("tests/missing-project-dir", """
@@ -685,7 +688,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_missing_project_dir,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -696,7 +699,7 @@ defmodule Shuttle.PollerTest do
         cmd == "tmux" and hd(args) == "new-session"
       end)
 
-    # work_dir should fall back to felt_host
+    # work_dir should fall back to the felt host
     assert Enum.at(args, 5) == "/tmp"
   end
 
@@ -711,13 +714,43 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_10,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     Process.sleep(100)
 
     snap = Poller.snapshot(poller)
     assert [%{fiber_id: ^fiber_id, tmux_session: "shuttle-" <> ^fiber_id}] = snap.eligible
+  end
+
+  # Regression: a fiber with a shuttle: block but *no* constitution tag must be
+  # discovered and dispatched. This is the core invariant from the cutover —
+  # the block is the source of truth, not the tag.
+  test "poller discovers and dispatches a fiber with shuttle block but no constitution tag" do
+    fiber_id = "tests/untagged-shuttle"
+    fiber = make_fiber(fiber_id, %{"tags" => []})
+    MockRunner.set_fiber(fiber_id, fiber)
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_untagged_shuttle,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_hosts: ["/tmp"]
+      )
+
+    send(poller, {:tick, Poller.snapshot(poller) |> Map.get(:tick_token)})
+    Process.sleep(100)
+
+    commands = MockRunner.commands()
+
+    assert Enum.any?(commands, fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
+
+    snap = Poller.snapshot(poller)
+    assert Enum.any?(snap.eligible, &(&1.fiber_id == fiber_id))
   end
 
   # ── Multi-host tests ──
@@ -874,21 +907,6 @@ defmodule Shuttle.PollerTest do
       Path.wildcard(Path.join(System.tmp_dir!(), "shuttle-multi-host-*")),
       &File.rm_rf/1
     )
-  end
-
-  test "single-host backward compat: felt_host: opt works unchanged" do
-    # Verify felt_host: single-string opt is normalized to felt_hosts: [host].
-    # No dispatch triggered — just check the snapshot's felt_hosts field.
-    {:ok, poller} =
-      Poller.start_link(
-        name: :test_multi_host_compat,
-        runner: MockRunner,
-        poll_interval_ms: 60_000,
-        felt_host: "/tmp"
-      )
-
-    snap = Poller.snapshot(poller)
-    assert snap.felt_hosts == ["/tmp"]
   end
 
   test "snapshot includes felt_hosts list" do
