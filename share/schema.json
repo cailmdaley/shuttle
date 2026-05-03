@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cailmdaley/shuttle-cli/shuttle-block",
+  "title": "Shuttle fiber frontmatter block",
+  "description": "The shuttle: YAML block written and validated by the shuttle CLI. Daemon-owned fields are documented but not written by the CLI.",
+  "type": "object",
+  "required": ["enabled", "kind"],
+  "properties": {
+    "enabled": {
+      "type": "boolean",
+      "description": "The dispatch signal. CLI sets true on install, false on uninstall. Daemon flips to false after successful oneshot run."
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["oneshot", "standing"],
+      "description": "Dispatch mode. oneshot: dispatched once (daemon clears enabled after run). standing: recurring per schedule."
+    },
+    "agent": {
+      "type": "string",
+      "description": "Agent ID from the agent registry. Defaults to the registry's default agent when absent."
+    },
+    "schedule": {
+      "type": "object",
+      "description": "Present when kind=standing. Defines the recurrence.",
+      "required": ["expr", "tz"],
+      "properties": {
+        "expr": {
+          "type": "string",
+          "description": "Standard 5-field cron expression (minute hour dom month dow). Example: '0 9 * * 1-5'."
+        },
+        "tz": {
+          "type": "string",
+          "description": "IANA timezone name. Example: 'Europe/Paris'."
+        }
+      },
+      "additionalProperties": false
+    },
+    "review": {
+      "type": "object",
+      "description": "Review state. Daemon-managed for most transitions; CLI writes accepted/aborted states.",
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": ["scheduled", "running", "awaiting", "accepted", "aborted"],
+          "description": "Current review state. scheduled→running (daemon), running→awaiting (daemon after run), awaiting→accepted (CLI accept), awaiting→aborted (CLI abort), accepted→scheduled (CLI accept, via next_due_at advance)."
+        },
+        "run_id": {
+          "type": ["string", "null"],
+          "description": "Current run identifier. Set by daemon when dispatching."
+        },
+        "accepted_run_id": {
+          "type": ["string", "null"],
+          "description": "Run id of the last accepted run. Set by CLI accept."
+        }
+      }
+    },
+    "next_due_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "ISO 8601 datetime. Daemon-owned for standing roles after the first install; CLI sets initial value on repeat and advances on accept."
+    },
+    "last_run_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Daemon-owned. Set when a run completes."
+    }
+  },
+  "additionalProperties": false,
+  "if": {
+    "properties": { "kind": { "const": "standing" } }
+  },
+  "then": {
+    "required": ["schedule"]
+  },
+  "notes": {
+    "writer_ownership": "CLI owns: enabled, kind, agent, schedule, review.state (accepted/aborted transitions only), review.accepted_run_id, next_due_at (initial and accept advance). Daemon owns: review.state (scheduled/running/awaiting transitions), review.run_id, last_run_at, enabled (false flip after oneshot run), next_due_at (standing role advance after run).",
+    "schema_tz_migration": "Pre-CLI standing roles used schedule.timezone. Migration renames to schedule.tz. The Elixir daemon reads tz after migration.",
+    "kind_migration": "Pre-CLI standing roles used shuttle.mode instead of shuttle.kind. Migration renames to kind."
+  }
+}
