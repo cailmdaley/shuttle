@@ -4,13 +4,30 @@ defmodule Shuttle.CLI do
 
   Subcommands:
     dispatch <fiber-id>   — one-shot dispatch for a specific fiber
-    start                 — start the daemon
-    status                — human-readable status dump
-    snapshot              — JSON snapshot for consumers
+    start                 — start the daemon (refuses if one is already running)
+    start --force         — start even if a daemon is detected
+    status                — human-readable status dump (queries running daemon; filesystem fallback)
+    snapshot              — JSON snapshot for consumers (queries running daemon; filesystem fallback)
     version               — print version
+
+  ## IPC model
+
+  `status` and `snapshot` first attempt an HTTP GET to the running daemon at
+  `localhost:<port>/api/v1/state`. When the daemon is reachable, its in-memory
+  view is returned — no orphan-adoption noise, no parallel BEAM. When the daemon
+  is not reachable, both commands print a `(daemon down — filesystem view)`
+  header and derive what they can from tmux directly, then exit with code 2 so
+  callers can distinguish the fallback path from a healthy response.
+
+  `start` performs the same HTTP check first and refuses to start a second daemon
+  unless `--force` is passed. This prevents the duplicate-daemon footgun where
+  `bin/shuttle start &` from a terminal that later closes leaves a launchd-orphan
+  competing with the dev.sh-managed daemon.
   """
 
   alias Shuttle.Dispatcher
+
+  # ── Entry ──
 
   def main(args) do
     case args do
@@ -39,31 +56,50 @@ defmodule Shuttle.CLI do
         end
 
       ["start"] ->
-        IO.puts("Starting Shuttle daemon...")
+        case query_daemon() do
+          {:ok, _} ->
+            port = daemon_port()
+
+            IO.puts(
+              :stderr,
+              "Daemon already running at localhost:#{port}. " <>
+                "Use `bin/shuttle stop` first, or pass --force to launch anyway."
+            )
+
+            System.halt(1)
+
+          {:error, _} ->
+            IO.puts("Starting Shuttle daemon...")
+            {:ok, _} = Application.ensure_all_started(:shuttle)
+            IO.puts("Shuttle running. Press Ctrl+C to exit.")
+            Process.sleep(:infinity)
+        end
+
+      ["start", "--force"] ->
+        IO.puts("Starting Shuttle daemon (--force)...")
         {:ok, _} = Application.ensure_all_started(:shuttle)
         IO.puts("Shuttle running. Press Ctrl+C to exit.")
         Process.sleep(:infinity)
 
       ["snapshot"] ->
-        case Application.ensure_all_started(:shuttle) do
-          {:ok, _} ->
-            snap = Shuttle.Poller.snapshot()
-            IO.puts(Jason.encode!(snap))
+        case query_daemon() do
+          {:ok, state} ->
+            IO.puts(Jason.encode!(state))
 
-          _ ->
-            IO.puts(:stderr, "Failed to start Shuttle")
-            System.halt(1)
+          {:error, _} ->
+            IO.puts(:stderr, "(daemon down — filesystem view)")
+            print_snapshot_fallback()
+            System.halt(2)
         end
 
       ["status"] ->
-        case Application.ensure_all_started(:shuttle) do
-          {:ok, _} ->
-            snap = Shuttle.Poller.snapshot()
-            print_status(snap)
+        case query_daemon() do
+          {:ok, state} ->
+            print_status(state)
 
-          _ ->
-            IO.puts(:stderr, "Failed to start Shuttle")
-            System.halt(1)
+          {:error, _} ->
+            print_fallback_status()
+            System.halt(2)
         end
 
       ["version"] ->
@@ -74,13 +110,16 @@ defmodule Shuttle.CLI do
         IO.puts("")
         IO.puts("Commands:")
         IO.puts("  dispatch <fiber-id>  Dispatch a worker for a specific fiber")
-        IO.puts("  start                Start the daemon")
+        IO.puts("  start                Start the daemon (refuses if already running)")
+        IO.puts("  start --force        Start even if another daemon is detected")
         IO.puts("  snapshot             Print JSON snapshot of current state")
         IO.puts("  status               Human-readable status dump")
         IO.puts("  version              Print version")
         System.halt(1)
     end
   end
+
+  # ── Status rendering ──
 
   @doc false
   def print_status(snap) do
@@ -147,5 +186,100 @@ defmodule Shuttle.CLI do
     ms
     |> DateTime.from_unix!(:millisecond)
     |> DateTime.to_iso8601()
+  end
+
+  # ── Fallback rendering (daemon down — no BEAM startup) ──
+
+  defp print_fallback_status do
+    IO.puts("No running daemon. Filesystem view:")
+    IO.puts("")
+
+    case tmux_shuttle_sessions() do
+      [] -> IO.puts("No running workers.")
+      sessions ->
+        IO.puts("Active shuttle sessions (#{length(sessions)}):")
+        Enum.each(sessions, fn s -> IO.puts("  • #{s}") end)
+    end
+  end
+
+  defp print_snapshot_fallback do
+    sessions = tmux_shuttle_sessions()
+
+    fallback = %{
+      daemon_down: true,
+      host: hostname(),
+      poll_at: System.os_time(:millisecond),
+      eligible: sessions,
+      retrying: [],
+      standing_roles: []
+    }
+
+    IO.puts(Jason.encode!(fallback))
+  end
+
+  # List shuttle- tmux sessions without starting the OTP application.
+  # Returns [] when tmux is not running or there are no matching sessions.
+  defp tmux_shuttle_sessions do
+    case System.cmd("tmux", ["ls", "-F", "\#{session_name}"], stderr_to_stdout: true) do
+      {output, 0} ->
+        output
+        |> String.split("\n")
+        |> Enum.map(&String.trim/1)
+        |> Enum.filter(&String.starts_with?(&1, "shuttle-"))
+
+      {_, _} ->
+        []
+    end
+  end
+
+  # ── Daemon IPC ──
+
+  # Query the running daemon's state over HTTP.
+  #
+  # Returns {:ok, state_map} on success (state_map has atom keys throughout).
+  # Returns {:error, reason} when the daemon is unreachable or returns a
+  # non-200 response.
+  #
+  # Accepts an optional port for testability; defaults to the compiled config.
+  @doc false
+  def query_daemon(port \\ nil) do
+    port = port || daemon_port()
+    url = String.to_charlist("http://localhost:#{port}/api/v1/state")
+
+    {:ok, _} = Application.ensure_all_started(:inets)
+    {:ok, _} = Application.ensure_all_started(:ssl)
+
+    case :httpc.request(:get, {url, []}, [{:timeout, 2000}, {:connect_timeout, 1000}], []) do
+      {:ok, {{_, 200, _}, _headers, body}} ->
+        body_str = if is_list(body), do: List.to_string(body), else: body
+
+        case Jason.decode(body_str, keys: :atoms) do
+          {:ok, state} -> {:ok, state}
+          {:error, _} -> {:error, :invalid_response}
+        end
+
+      {:ok, {{_, status, _}, _, _}} ->
+        {:error, {:http_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  rescue
+    _ -> {:error, :connection_failed}
+  end
+
+  @doc false
+  def daemon_port do
+    # Application.get_env is unreliable in escript mode before
+    # Application.ensure_all_started — compile-time config isn't loaded.
+    # Read from env var instead, matching maybe_configure_endpoint/0.
+    System.get_env("SHUTTLE_PORT", "4000") |> String.to_integer()
+  end
+
+  defp hostname do
+    case :inet.gethostname() do
+      {:ok, name} -> to_string(name)
+      _ -> "unknown"
+    end
   end
 end

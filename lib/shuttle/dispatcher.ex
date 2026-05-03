@@ -89,7 +89,7 @@ defmodule Shuttle.Dispatcher do
   Workers are expected to:
     1. Read the directive shown here.
     2. Incorporate it into the work.
-    3. Call `felt history mark-consumed #{fiber_id} --rowid <N>` for each event.
+    3. Call `felt history mark-consumed <fiber-id> --rowid <N>` for each event.
   """
   @spec render_pending_review_comments(String.t()) :: String.t()
   def render_pending_review_comments(fiber_id) do

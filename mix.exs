@@ -23,7 +23,13 @@ defmodule Shuttle.MixProject do
     [
       main_module: Shuttle.CLI,
       name: "shuttle",
-      path: "bin/shuttle"
+      path: "bin/shuttle",
+      # Don't auto-start the Shuttle OTP application on escript boot.
+      # Only `bin/shuttle start` explicitly calls Application.ensure_all_started(:shuttle).
+      # Read subcommands (status, snapshot) query the running daemon over HTTP
+      # and fall back to direct filesystem/tmux reads — no Poller, no orphan
+      # adoption, no leaked BEAMs.
+      app: nil
     ]
   end
 
