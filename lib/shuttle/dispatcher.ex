@@ -464,17 +464,23 @@ defmodule Shuttle.Dispatcher do
   # - Codex/Pi: capture UUID from session file asynchronously with backoff.
   # - None: agent doesn't support session IDs; skip.
   defp store_session_id(fiber_id, agent_id, {:claude, uuid}, _runner) do
-    case System.cmd("shuttle-ctl", ["session-set", fiber_id, uuid, "--agent", agent_id],
-           stderr_to_stdout: true
-         ) do
-      {_, 0} ->
-        Logger.info("Stored session UUID #{uuid} for #{fiber_id}")
+    # Fire-and-forget: storing the UUID is best-effort; blocking dispatch on a
+    # shuttle-ctl call would delay WorkerWatcher startup and cause flaky tests
+    # (the watcher init checks the session, but the session can be removed by
+    # other actors while we wait for shuttle-ctl to finish).
+    Task.start(fn ->
+      case System.cmd("shuttle-ctl", ["session-set", fiber_id, uuid, "--agent", agent_id],
+             stderr_to_stdout: true
+           ) do
+        {_, 0} ->
+          Logger.info("Stored session UUID #{uuid} for #{fiber_id}")
 
-      {output, code} ->
-        Logger.warning(
-          "Could not store session UUID for #{fiber_id}: exit #{code}: #{String.trim(output)}"
-        )
-    end
+        {output, code} ->
+          Logger.warning(
+            "Could not store session UUID for #{fiber_id}: exit #{code}: #{String.trim(output)}"
+          )
+      end
+    end)
   end
 
   defp store_session_id(fiber_id, agent_id, {:capture, cli, work_dir}, _runner) do
