@@ -22,3 +22,6 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 shuttle-*.tar
 
+# Go binaries (build with `go build` from cmd/shuttle/)
+/bin/shuttle-ctl
+/shuttle
