@@ -719,4 +719,188 @@ defmodule Shuttle.PollerTest do
     snap = Poller.snapshot(poller)
     assert [%{fiber_id: ^fiber_id, tmux_session: "shuttle-" <> ^fiber_id}] = snap.eligible
   end
+
+  # ── Multi-host tests ──
+  #
+  # These tests exercise the multi-felt-host path directly against the file
+  # system; they bypass MockRunner's in-memory fiber store and write real
+  # .felt/ directories instead. They use `resolve_fiber_host/2` (the public
+  # GenServer call) to verify host_for_fiber resolution without depending on
+  # dispatch (which requires the full OTP tree).
+
+  # Helper: write a minimal fiber .md file with a shuttle: block into
+  # <host>/.felt/<id>/<basename>.md so read_fiber_shuttle_block can find it.
+  defp write_fiber_file(host, fiber_id, shuttle_yaml \\ "enabled: true\nkind: oneshot\n") do
+    felt_dir = Path.join(host, ".felt")
+    segments = String.split(fiber_id, "/")
+    basename = List.last(segments)
+    dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
+    File.mkdir_p!(Path.dirname(dir_path))
+    indented =
+      shuttle_yaml
+      |> String.trim()
+      |> String.split("\n")
+      |> Enum.map_join("\n", &("  " <> &1))
+    File.write!(dir_path, "---\nstatus: active\nshuttle:\n#{indented}\n---\nbody\n")
+    dir_path
+  end
+
+  test "resolve_fiber_host finds a fiber in the first configured host" do
+    host_a = Path.join(System.tmp_dir!(), "shuttle-multi-host-a-#{System.unique_integer([:positive])}")
+    host_b = Path.join(System.tmp_dir!(), "shuttle-multi-host-b-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(host_a)
+    File.mkdir_p!(host_b)
+
+    write_fiber_file(host_a, "tests/fiber-in-a")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_multi_host_resolve_a,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_hosts: [host_a, host_b]
+      )
+
+    assert {:ok, ^host_a} = Poller.resolve_fiber_host(poller, "tests/fiber-in-a")
+  after
+    Enum.each(
+      Path.wildcard(Path.join(System.tmp_dir!(), "shuttle-multi-host-*")),
+      &File.rm_rf/1
+    )
+  end
+
+  test "resolve_fiber_host finds a fiber in the second configured host" do
+    host_a = Path.join(System.tmp_dir!(), "shuttle-multi-host-a-#{System.unique_integer([:positive])}")
+    host_b = Path.join(System.tmp_dir!(), "shuttle-multi-host-b-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(host_a)
+    File.mkdir_p!(host_b)
+
+    write_fiber_file(host_b, "tests/fiber-in-b")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_multi_host_resolve_b,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_hosts: [host_a, host_b]
+      )
+
+    assert {:ok, ^host_b} = Poller.resolve_fiber_host(poller, "tests/fiber-in-b")
+  after
+    Enum.each(
+      Path.wildcard(Path.join(System.tmp_dir!(), "shuttle-multi-host-*")),
+      &File.rm_rf/1
+    )
+  end
+
+  test "resolve_fiber_host returns :not_found for an unknown fiber" do
+    host_a = Path.join(System.tmp_dir!(), "shuttle-multi-host-a-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(host_a)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_multi_host_not_found,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_hosts: [host_a]
+      )
+
+    assert {:error, :not_found} = Poller.resolve_fiber_host(poller, "tests/no-such-fiber")
+  after
+    Enum.each(
+      Path.wildcard(Path.join(System.tmp_dir!(), "shuttle-multi-host-*")),
+      &File.rm_rf/1
+    )
+  end
+
+  test "first-configured host wins for ID collisions" do
+    host_a = Path.join(System.tmp_dir!(), "shuttle-multi-host-a-#{System.unique_integer([:positive])}")
+    host_b = Path.join(System.tmp_dir!(), "shuttle-multi-host-b-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(host_a)
+    File.mkdir_p!(host_b)
+
+    # Same fiber ID in both hosts
+    write_fiber_file(host_a, "tests/collision-fiber")
+    write_fiber_file(host_b, "tests/collision-fiber")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_multi_host_collision,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_hosts: [host_a, host_b]
+      )
+
+    # host_a is first-configured → wins
+    assert {:ok, ^host_a} = Poller.resolve_fiber_host(poller, "tests/collision-fiber")
+  after
+    Enum.each(
+      Path.wildcard(Path.join(System.tmp_dir!(), "shuttle-multi-host-*")),
+      &File.rm_rf/1
+    )
+  end
+
+  test "bust_fiber_host_cache allows re-resolution after a fiber moves" do
+    host_a = Path.join(System.tmp_dir!(), "shuttle-multi-host-a-#{System.unique_integer([:positive])}")
+    host_b = Path.join(System.tmp_dir!(), "shuttle-multi-host-b-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(host_a)
+    File.mkdir_p!(host_b)
+
+    path_a = write_fiber_file(host_a, "tests/movable-fiber")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_multi_host_bust,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_hosts: [host_a, host_b]
+      )
+
+    # Initially resolves to host_a
+    assert {:ok, ^host_a} = Poller.resolve_fiber_host(poller, "tests/movable-fiber")
+
+    # "Move" the fiber to host_b (delete from a, write to b)
+    File.rm_rf!(Path.dirname(path_a))
+    write_fiber_file(host_b, "tests/movable-fiber")
+
+    # Cache still returns host_a without busting
+    assert {:ok, ^host_a} = Poller.resolve_fiber_host(poller, "tests/movable-fiber")
+
+    # After bust, re-probes the file system → host_b
+    :ok = Poller.bust_fiber_host_cache(poller, "tests/movable-fiber")
+    assert {:ok, ^host_b} = Poller.resolve_fiber_host(poller, "tests/movable-fiber")
+  after
+    Enum.each(
+      Path.wildcard(Path.join(System.tmp_dir!(), "shuttle-multi-host-*")),
+      &File.rm_rf/1
+    )
+  end
+
+  test "single-host backward compat: felt_host: opt works unchanged" do
+    # Verify felt_host: single-string opt is normalized to felt_hosts: [host].
+    # No dispatch triggered — just check the snapshot's felt_hosts field.
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_multi_host_compat,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
+
+    snap = Poller.snapshot(poller)
+    assert snap.felt_hosts == ["/tmp"]
+  end
+
+  test "snapshot includes felt_hosts list" do
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_multi_host_snap,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_hosts: ["/tmp/host-one", "/tmp/host-two"]
+      )
+
+    snap = Poller.snapshot(poller)
+    assert snap.felt_hosts == ["/tmp/host-one", "/tmp/host-two"]
+  end
 end

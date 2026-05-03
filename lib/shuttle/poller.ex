@@ -10,6 +10,24 @@ defmodule Shuttle.Poller do
   - Linear API → felt CLI
   - Issue model → fiber model
   - Codex app-server → tmux + loom shell wrappers
+
+  ## Multi-host support
+
+  The Poller manages one or more felt hosts on the same machine. Configure via:
+
+      config :shuttle, felt_hosts: ["~/loom", "~/wedding", "~/Documents/projects/lightcone"]
+      # or env var (comma-separated, takes precedence over config):
+      LOOM_HOMES=~/loom,~/wedding,~/Documents/projects/lightcone
+
+  Single-host setups (the common case) are unchanged: `felt_hosts` defaults to
+  `[LOOM_HOME || ~/loom]`, the same resolution as the previous single-string
+  `felt_host` field.
+
+  Each fiber resolves to exactly one host: the first configured host whose
+  `.felt/` directory contains the fiber file. The resolution is cached in
+  `State.fiber_host_cache` for the daemon's lifetime. Call
+  `bust_fiber_host_cache/1` or `POST /api/v1/cache/bust` to evict an entry
+  when a fiber moves between hosts.
   """
 
   use GenServer
@@ -39,7 +57,10 @@ defmodule Shuttle.Poller do
       :next_poll_due_at_ms,
       :tick_timer_ref,
       :tick_token,
-      :felt_host,
+      # List of felt host directories, in resolution-priority order.
+      # Replaces the former single-string :felt_host field. The backward-compat
+      # :felt_host init option is normalized to [host] in init/1.
+      :felt_hosts,
       :runner,
       poll_check_in_progress: false,
       running: %{},
@@ -47,7 +68,11 @@ defmodule Shuttle.Poller do
       retry_queue: %{},
       waiters: %{},
       reservations: %{},
-      completed_standing_runs: MapSet.new()
+      completed_standing_runs: MapSet.new(),
+      # %{fiber_id => felt_host} — populated by discover_candidates/1 on each
+      # poll cycle and by host_for_fiber/2 on demand. Entries are never evicted
+      # automatically; call bust_fiber_host_cache/1 when a fiber moves hosts.
+      fiber_host_cache: %{}
     ]
   end
 
@@ -121,13 +146,55 @@ defmodule Shuttle.Poller do
     GenServer.call(server, :orchestrator_state)
   end
 
+  @doc """
+  Returns `{:ok, felt_host}` for the first configured host that contains
+  `fiber_id`, or `{:error, :not_found}` if the fiber isn't in any host.
+
+  The result is cached in the Poller's state for the daemon's lifetime.
+  Used by `GET /api/v1/fiber/:id/host` so external callers (portolan,
+  shuttle-ctl) can route their felt operations to the right index without
+  re-implementing host resolution.
+  """
+  @spec resolve_fiber_host(String.t()) :: {:ok, String.t()} | {:error, :not_found}
+  def resolve_fiber_host(fiber_id), do: resolve_fiber_host(__MODULE__, fiber_id)
+
+  @spec resolve_fiber_host(GenServer.server(), String.t()) ::
+          {:ok, String.t()} | {:error, :not_found}
+  def resolve_fiber_host(server, fiber_id) do
+    GenServer.call(server, {:resolve_fiber_host, fiber_id})
+  end
+
+  @doc """
+  Evicts the cached felt-host resolution for `fiber_id`. The daemon
+  re-resolves on the next access. Use after a fiber moves between hosts.
+  """
+  @spec bust_fiber_host_cache(String.t()) :: :ok
+  def bust_fiber_host_cache(fiber_id), do: bust_fiber_host_cache(__MODULE__, fiber_id)
+
+  @spec bust_fiber_host_cache(GenServer.server(), String.t()) :: :ok
+  def bust_fiber_host_cache(server, fiber_id) do
+    GenServer.call(server, {:bust_fiber_host_cache, fiber_id})
+  end
+
   # ── Server ──
 
   @impl true
   def init(opts) do
     now_ms = System.monotonic_time(:millisecond)
 
-    felt_host = Keyword.get(opts, :felt_host, default_felt_host())
+    # Accept felt_hosts: [list] (new) or felt_host: "string" (backward-compat alias).
+    felt_hosts =
+      case Keyword.fetch(opts, :felt_hosts) do
+        {:ok, hosts} when is_list(hosts) ->
+          hosts
+
+        :error ->
+          case Keyword.fetch(opts, :felt_host) do
+            {:ok, host} when is_binary(host) -> [host]
+            _ -> default_felt_hosts()
+          end
+      end
+
     runner = Keyword.get(opts, :runner, Shuttle.Runner.Default)
 
     state = %State{
@@ -142,7 +209,7 @@ defmodule Shuttle.Poller do
       next_poll_due_at_ms: now_ms,
       tick_timer_ref: nil,
       tick_token: nil,
-      felt_host: felt_host,
+      felt_hosts: felt_hosts,
       runner: runner
     }
 
@@ -331,6 +398,23 @@ defmodule Shuttle.Poller do
     {:reply, build_full_state(state), state}
   end
 
+  def handle_call({:resolve_fiber_host, fiber_id}, _from, state) do
+    case host_for_fiber(fiber_id, state) do
+      {:ok, host} ->
+        # Cache the result so subsequent calls and file-stat probes within
+        # the same daemon lifetime return quickly.
+        new_state = %{state | fiber_host_cache: Map.put(state.fiber_host_cache, fiber_id, host)}
+        {:reply, {:ok, host}, new_state}
+
+      {:error, :not_found} ->
+        {:reply, {:error, :not_found}, state}
+    end
+  end
+
+  def handle_call({:bust_fiber_host_cache, fiber_id}, _from, state) do
+    {:reply, :ok, %{state | fiber_host_cache: Map.delete(state.fiber_host_cache, fiber_id)}}
+  end
+
   # ── Snapshot ──
 
   @spec build_snapshot(State.t()) :: map()
@@ -342,6 +426,7 @@ defmodule Shuttle.Poller do
       Enum.map(state.running, fn {fiber_id, meta} ->
         %{
           fiber_id: fiber_id,
+          felt_host: Map.get(state.fiber_host_cache, fiber_id),
           tmux_session: meta.session,
           agent: meta.agent_id,
           state: Map.get(meta, :state, "running"),
@@ -365,6 +450,7 @@ defmodule Shuttle.Poller do
     %{
       poll_at: now_ms,
       host: hostname(),
+      felt_hosts: state.felt_hosts,
       eligible: eligible,
       blocked: [],
       orphans: [],
@@ -386,8 +472,13 @@ defmodule Shuttle.Poller do
   defp maybe_dispatch(%State{} = state) do
     state = reconcile(state)
 
-    with {:ok, candidates} <- discover_candidates(state),
+    with {:ok, candidates, new_host_map} <- discover_candidates(state),
          true <- available_slots(state) > 0 do
+      # Merge newly resolved host entries into the cache. Existing entries
+      # are not evicted — earlier-configured hosts win for ID collisions,
+      # and cache entries are stable for the daemon's lifetime.
+      state = %{state | fiber_host_cache: Map.merge(new_host_map, state.fiber_host_cache)}
+
       candidates
       |> filter_eligible(state)
       |> sort_candidates()
@@ -408,18 +499,37 @@ defmodule Shuttle.Poller do
     end
   end
 
+  # Queries every configured felt host for constitution-tagged fibers and
+  # unions the results. Returns {:ok, fibers, host_map} where host_map is
+  # %{fiber_id => felt_host} for all discovered fibers.
+  #
+  # Individual host failures are logged but don't abort the cycle — we return
+  # what we got from the responsive hosts.
   defp discover_candidates(state) do
-    case run_felt(state, ["ls", "-t", "constitution", "-j", "-s", "all"]) do
-      {:ok, output} ->
-        case Jason.decode(output) do
-          {:ok, fibers} when is_list(fibers) -> {:ok, fibers}
-          {:ok, _} -> {:error, :invalid_felt_ls_json}
-          {:error, reason} -> {:error, {:json_decode_error, reason}}
-        end
+    {all_fibers, host_map} =
+      Enum.reduce(state.felt_hosts, {[], %{}}, fn host, {acc_fibers, acc_map} ->
+        case run_felt(host, state.runner, ["ls", "-t", "constitution", "-j", "-s", "all"]) do
+          {:ok, output} ->
+            case Jason.decode(output) do
+              {:ok, fibers} when is_list(fibers) ->
+                # Map fiber_id → host for this batch. acc_map (earlier-
+                # configured hosts) takes precedence for ID collisions.
+                new_entries = Map.new(fibers, fn f -> {Map.get(f, "id", ""), host} end)
+                merged_map = Map.merge(new_entries, acc_map)
+                {acc_fibers ++ fibers, merged_map}
 
-      {:error, reason} ->
-        {:error, {:felt_ls_failed, reason}}
-    end
+              _ ->
+                Logger.warning("Unexpected felt ls output from host #{host}")
+                {acc_fibers, acc_map}
+            end
+
+          {:error, reason} ->
+            Logger.warning("felt ls failed for host #{host}: #{inspect(reason)}")
+            {acc_fibers, acc_map}
+        end
+      end)
+
+    {:ok, all_fibers, host_map}
   end
 
   defp filter_eligible(candidates, state) do
@@ -466,42 +576,82 @@ defmodule Shuttle.Poller do
     end
   end
 
+  # Resolves which configured felt host owns `fiber_id`.
+  #
+  # Resolution order:
+  # 1. State cache (fast; populated by discover_candidates/1 each poll cycle)
+  # 2. Direct file-stat across each configured host's .felt/ directory
+  #
+  # Returns {:ok, host} for the first-configured host that contains the fiber,
+  # or {:error, :not_found} when no host claims it.
+  #
+  # Cache updates are the caller's responsibility (discover_candidates/1 does
+  # it for the whole poll cycle; handle_call(:resolve_fiber_host) returns the
+  # result without caching since it can't mutate state on the reply path without
+  # a cast).
+  defp host_for_fiber(fiber_id, state) do
+    case Map.get(state.fiber_host_cache, fiber_id) do
+      host when is_binary(host) ->
+        {:ok, host}
+
+      nil ->
+        segments = String.split(fiber_id, "/")
+        basename = List.last(segments)
+
+        found =
+          Enum.find_value(state.felt_hosts, fn host ->
+            felt_dir = Path.join(host, ".felt")
+            dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
+            bare_path = Path.join(felt_dir, "#{basename}.md")
+            if File.exists?(dir_path) or File.exists?(bare_path), do: host, else: nil
+          end)
+
+        case found do
+          nil -> {:error, :not_found}
+          host -> {:ok, host}
+        end
+    end
+  end
+
   # Read the shuttle: block from the fiber's .md file directly, without shelling
   # out to the felt CLI. File read + YAML parse is much faster than spawning a
   # process, making it viable for every candidate in the poll cycle.
   #
+  # Uses host_for_fiber/2 to locate the right felt host across all configured
+  # hosts.
+  #
   # Returns {:ok, map()} when the block is present, {:error, reason} otherwise.
   defp read_fiber_shuttle_block(fiber_id, state) do
-    felt_dir = Path.join(state.felt_host, ".felt")
-    segments = String.split(fiber_id, "/")
-    basename = List.last(segments)
+    with {:ok, host} <- host_for_fiber(fiber_id, state) do
+      felt_dir = Path.join(host, ".felt")
+      segments = String.split(fiber_id, "/")
+      basename = List.last(segments)
 
-    # Directory fiber: .felt/<id>/<basename>.md
-    dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
-    # Bare/root fiber: .felt/<basename>.md
-    bare_path = Path.join(felt_dir, "#{basename}.md")
+      dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
+      bare_path = Path.join(felt_dir, "#{basename}.md")
 
-    path =
-      cond do
-        File.exists?(dir_path) -> dir_path
-        File.exists?(bare_path) -> bare_path
-        true -> nil
-      end
+      path =
+        cond do
+          File.exists?(dir_path) -> dir_path
+          File.exists?(bare_path) -> bare_path
+          true -> nil
+        end
 
-    if path do
-      with {:ok, content} <- File.read(path),
-           [fm] <-
-             Regex.run(~r/\A---\r?\n(.*?)\r?\n---(?:\r?\n|\z)/ms, content,
-               capture: :all_but_first
-             ),
-           {:ok, data} when is_map(data) <- YamlElixir.read_from_string(fm),
-           shuttle when is_map(shuttle) <- Map.get(data, "shuttle") do
-        {:ok, shuttle}
+      if path do
+        with {:ok, content} <- File.read(path),
+             [fm] <-
+               Regex.run(~r/\A---\r?\n(.*?)\r?\n---(?:\r?\n|\z)/ms, content,
+                 capture: :all_but_first
+               ),
+             {:ok, data} when is_map(data) <- YamlElixir.read_from_string(fm),
+             shuttle when is_map(shuttle) <- Map.get(data, "shuttle") do
+          {:ok, shuttle}
+        else
+          _ -> {:error, :no_shuttle_block}
+        end
       else
-        _ -> {:error, :no_shuttle_block}
+        {:error, :file_not_found}
       end
-    else
-      {:error, :file_not_found}
     end
   end
 
@@ -532,16 +682,23 @@ defmodule Shuttle.Poller do
   # directory. This lets workers load the project's CLAUDE.md (read at session
   # start from CWD upwards) rather than always starting in the loom root.
   #
-  # Tilde-prefixed paths are expanded. Falls back to `state.felt_host` when
-  # `project_dir` is absent, empty, or does not exist on disk.
+  # Tilde-prefixed paths are expanded. Falls back to the fiber's resolved felt
+  # host (or the first configured host if resolution fails) when `project_dir`
+  # is absent, empty, or does not exist on disk.
   defp fiber_work_dir(fiber_id, state) do
+    fallback_host =
+      case host_for_fiber(fiber_id, state) do
+        {:ok, h} -> h
+        {:error, _} -> hd(state.felt_hosts)
+      end
+
     with {:ok, shuttle} <- read_fiber_shuttle_block(fiber_id, state),
          dir when is_binary(dir) and dir != "" <- Map.get(shuttle, "project_dir"),
          expanded = Path.expand(dir),
          true <- File.dir?(expanded) do
       expanded
     else
-      _ -> state.felt_host
+      _ -> fallback_host
     end
   end
 
@@ -576,6 +733,12 @@ defmodule Shuttle.Poller do
   defp do_dispatch_fiber(%State{} = state, fiber) do
     fiber_id = Map.get(fiber, "id", "")
 
+    felt_host =
+      case host_for_fiber(fiber_id, state) do
+        {:ok, h} -> h
+        {:error, _} -> hd(state.felt_hosts)
+      end
+
     prompt_context = dispatch_prompt_context(fiber, state)
 
     case Dispatcher.dispatch(
@@ -583,7 +746,7 @@ defmodule Shuttle.Poller do
            runner: state.runner,
            work_dir: fiber_work_dir(fiber_id, state),
            prompt_context: prompt_context,
-           felt_host: state.felt_host
+           felt_host: felt_host
          ) do
       {:ok, session} ->
         agent_name = fetch_shuttle_agent_name(fiber_id, state)
@@ -995,8 +1158,16 @@ defmodule Shuttle.Poller do
     end
   end
 
+  # Fetch a fiber's full JSON representation via the felt CLI. Routes to the
+  # fiber's owning host via host_for_fiber/2 (cache → file-stat probe).
   defp fetch_fiber_full(fiber_id, state) do
-    case run_felt(state, ["show", fiber_id, "--json"]) do
+    host =
+      case host_for_fiber(fiber_id, state) do
+        {:ok, h} -> h
+        {:error, _} -> hd(state.felt_hosts)
+      end
+
+    case run_felt(host, state.runner, ["show", fiber_id, "--json"]) do
       {:ok, output} ->
         case Jason.decode(output) do
           {:ok, fiber} -> {:ok, fiber}
@@ -1070,7 +1241,7 @@ defmodule Shuttle.Poller do
   end
 
   defp standing_role_snapshots(state, now) do
-    with {:ok, candidates} <- discover_candidates(state) do
+    with {:ok, candidates, _host_map} <- discover_candidates(state) do
       candidates
       |> Enum.filter(fn fiber ->
         standing_role?(fiber, state)
@@ -1091,10 +1262,12 @@ defmodule Shuttle.Poller do
     end
   end
 
-  defp run_felt(state, args) do
-    opts = [cd: state.felt_host, stderr_to_stdout: true]
+  # Run a felt CLI command against an explicit host directory.
+  # Every felt-touching helper calls this directly with the resolved host.
+  defp run_felt(host, runner, args) when is_binary(host) do
+    opts = [cd: host, stderr_to_stdout: true]
 
-    case state.runner.cmd("felt", args, opts) do
+    case runner.cmd("felt", args, opts) do
       {output, 0} -> {:ok, output}
       {output, _} -> {:error, output}
     end
@@ -1160,10 +1333,30 @@ defmodule Shuttle.Poller do
     end
   end
 
-  # Same resolution as `Shuttle.Dispatcher.default_felt_host/0` — checks
-  # `$LOOM_HOME` first so a user can re-point both Poller and Dispatcher (and
-  # portolan, which uses the same env var) by exporting one variable, then
-  # falls back to `~/loom`.
+  # Returns the configured felt hosts list.
+  #
+  # Resolution order (highest wins):
+  # 1. LOOM_HOMES env var (comma-separated paths)
+  # 2. LOOM_HOME env var (single path; wrapped in a list)
+  # 3. ~/loom
+  #
+  # This is the default-fallback only; explicit :felt_hosts/:felt_host opts
+  # in start_link take precedence via init/1.
+  defp default_felt_hosts do
+    case System.get_env("LOOM_HOMES") do
+      v when is_binary(v) and v != "" ->
+        v
+        |> String.split(",")
+        |> Enum.map(&String.trim/1)
+        |> Enum.reject(&(&1 == ""))
+
+      _ ->
+        [default_felt_host()]
+    end
+  end
+
+  # Single-host fallback. Mirrors `Shuttle.Dispatcher.default_felt_host/0`
+  # so both Poller and Dispatcher re-point together when LOOM_HOME is set.
   defp default_felt_host do
     case System.get_env("LOOM_HOME") do
       v when is_binary(v) and v != "" -> v
