@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/robfig/cron/v3"
+	"gopkg.in/yaml.v3"
 )
 
 // ---- Types -----------------------------------------------------------------
@@ -29,6 +30,29 @@ type Block struct {
 type Schedule struct {
 	Expr string `yaml:"expr"`
 	TZ   string `yaml:"tz"`
+}
+
+// UnmarshalYAML accepts the canonical `tz` field as well as the legacy
+// `timezone` alias used by pre-CLI standing-role frontmatter. Pre-CLI blocks
+// also carried `kind: cron` on the schedule itself; we silently drop it (the
+// outer `kind:` field on Block carries the role kind in the new schema).
+// Output always uses `tz` so the legacy alias is rewritten on the next save.
+func (s *Schedule) UnmarshalYAML(value *yaml.Node) error {
+	var aux struct {
+		Expr     string `yaml:"expr"`
+		TZ       string `yaml:"tz"`
+		Timezone string `yaml:"timezone"`
+		Kind     string `yaml:"kind"` // legacy: ignored
+	}
+	if err := value.Decode(&aux); err != nil {
+		return err
+	}
+	s.Expr = aux.Expr
+	s.TZ = aux.TZ
+	if s.TZ == "" {
+		s.TZ = aux.Timezone
+	}
+	return nil
 }
 
 // Review holds the current review state for a standing role.

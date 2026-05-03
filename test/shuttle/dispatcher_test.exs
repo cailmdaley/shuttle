@@ -51,6 +51,12 @@ defmodule Shuttle.DispatcherTest do
         command == "felt" and String.contains?(full_args, "tests/pi-tagged") ->
           {pi_fiber_json(), 0}
 
+        command == "felt" and String.contains?(full_args, "tests/shuttle-agent-block") ->
+          {shuttle_agent_block_fiber_json(), 0}
+
+        command == "felt" and String.contains?(full_args, "tests/shuttle-agent-overrides-tag") ->
+          {shuttle_agent_overrides_tag_fiber_json(), 0}
+
         command == "felt" ->
           {"fiber not found", 1}
 
@@ -99,6 +105,30 @@ defmodule Shuttle.DispatcherTest do
         "name" => "Pi Tagged",
         "status" => "active",
         "tags" => ["constitution", "pi"],
+        "created_at" => "2026-04-28T00:00:00Z"
+      })
+    end
+
+    defp shuttle_agent_block_fiber_json do
+      Jason.encode!(%{
+        "id" => "tests/shuttle-agent-block",
+        "name" => "Shuttle agent block",
+        "status" => "active",
+        "tags" => ["constitution"],
+        "shuttle" => %{"enabled" => true, "kind" => "oneshot", "agent" => "claude-opus"},
+        "created_at" => "2026-04-28T00:00:00Z"
+      })
+    end
+
+    defp shuttle_agent_overrides_tag_fiber_json do
+      # Even with a legacy bare `pi` tag (would resolve to pi-deepseek-flash),
+      # shuttle.agent should win — the post-migration source of truth.
+      Jason.encode!(%{
+        "id" => "tests/shuttle-agent-overrides-tag",
+        "name" => "Shuttle agent overrides tag",
+        "status" => "active",
+        "tags" => ["constitution", "pi"],
+        "shuttle" => %{"enabled" => true, "kind" => "oneshot", "agent" => "claude-opus"},
         "created_at" => "2026-04-28T00:00:00Z"
       })
     end
@@ -163,6 +193,34 @@ defmodule Shuttle.DispatcherTest do
       Enum.find(commands, fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
 
     assert hd(args) == "new-session"
+  end
+
+  test "dispatch resolves agent from shuttle.agent block when present" do
+    assert {:ok, _session} = Dispatcher.dispatch("tests/shuttle-agent-block", runner: MockRunner)
+    script = read_run_script_for("shuttle-tests/shuttle-agent-block")
+    assert script =~ "agent=claude-opus"
+    refute script =~ "agent=claude-sonnet"
+  end
+
+  test "dispatch: shuttle.agent overrides legacy bare tag" do
+    assert {:ok, _session} =
+             Dispatcher.dispatch("tests/shuttle-agent-overrides-tag", runner: MockRunner)
+
+    script = read_run_script_for("shuttle-tests/shuttle-agent-overrides-tag")
+    assert script =~ "agent=claude-opus"
+    refute script =~ "agent=pi-deepseek-flash"
+  end
+
+  # The dispatched tmux command takes a run-script tempfile as the last arg
+  # (after `bash -l`). Read the script back to verify the agent embedded in it.
+  defp read_run_script_for(session) do
+    {_, args} =
+      Enum.find(MockRunner.commands(), fn {cmd, args} ->
+        cmd == "tmux" and hd(args) == "new-session" and Enum.at(args, 3) == session
+      end)
+
+    script_path = List.last(args)
+    File.read!(script_path)
   end
 
   test "agent resolution: default is claude-sonnet" do

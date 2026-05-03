@@ -18,6 +18,7 @@ var rootCmd = &cobra.Command{
 	Long: `shuttle manages the shuttle: frontmatter block that drives fiber dispatch.
 
 Write verbs (offline, validate-before-write):
+  install     Install a fiber as a one-shot dispatch role
   repeat      Install a fiber as a standing (recurring) role
   pause       Pause dispatch without disturbing the schedule
   resume      Resume a paused standing role
