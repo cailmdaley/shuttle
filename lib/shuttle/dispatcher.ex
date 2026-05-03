@@ -32,34 +32,90 @@ defmodule Shuttle.Dispatcher do
     * `:runner` — module implementing `Shuttle.Runner` behavior for test injection.
       Defaults to `Shuttle.Runner.Default`.
     * `:work_dir` — working directory for the tmux session. Defaults to `File.cwd!()`.
+    * `:felt_host` — directory containing the `.felt/` index this dispatch
+      should read fibers and history from. Defaults to `default_felt_host/0`.
+      The Poller passes its configured `state.felt_host` here so each shuttle
+      instance is consistent within itself; running multiple shuttle instances
+      against different felt hosts (e.g. one for `~/loom`, another for a
+      standalone project root) is the supported way to span felt hosts.
+    * `:prompt_context` — `:constitution` (default) or `:standing_run`.
   """
   @spec dispatch(String.t(), keyword()) :: dispatch_result()
   def dispatch(fiber_id, opts \\ []) do
     runner = Keyword.get(opts, :runner, Shuttle.Runner.Default)
     work_dir = Keyword.get(opts, :work_dir, File.cwd!())
     prompt_context = Keyword.get(opts, :prompt_context, :constitution)
+    felt_host = Keyword.get(opts, :felt_host, default_felt_host())
 
-    with {:ok, fiber} <- fetch_fiber(fiber_id, runner),
+    with {:ok, fiber} <- fetch_fiber(fiber_id, runner, felt_host: felt_host),
          :ok <- check_not_closed(fiber),
          :ok <- check_not_running(fiber_id, runner),
          {:ok, agent} <- resolve_agent(fiber),
          :ok <- validate_agent(agent),
-         {:ok, session} <- create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context) do
+         {:ok, session} <-
+           create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context,
+             felt_host: felt_host
+           ) do
       {:ok, session}
+    end
+  end
+
+  @doc """
+  Returns shuttle's default felt host. Mirrors `Shuttle.Poller.default_felt_host/0`
+  — kept locally so `Dispatcher` works standalone (e.g. via the CLI) without a
+  running Poller.
+
+  Resolution order:
+
+    1. `$LOOM_HOME` if set (matches portolan's `resolveGlobalFiberId`, so
+       both processes can be pointed at the same root by exporting one
+       env var).
+    2. `~/loom` as a final fallback (Cail's primary felt host).
+
+  Projects that live outside the configured felt host should run their own
+  shuttle instance with `felt_host:` pointing at the project root, rather
+  than relying on the default.
+  """
+  @spec default_felt_host() :: String.t()
+  def default_felt_host do
+    case System.get_env("LOOM_HOME") do
+      v when is_binary(v) and v != "" -> v
+      _ -> System.user_home() <> "/loom"
     end
   end
 
   @doc """
   Renders the universal dispatch prompt for a fiber ID.
 
-  Reads pending (unconsumed) review-comment events from felt history and
-  prepends them to the prompt so the worker sees Cail's directives before
-  the constitution body. The worker is responsible for incorporating each
-  directive and calling `felt history mark-consumed` after.
+  Inlines two pieces of context directly into the prompt so the worker
+  has them in context immediately, no tool calls required:
+
+    - The most recent `review-comment` event (Cail's latest directive),
+      if any. Persists across arbitrarily many worker handoffs — only
+      replaced when Cail files a newer directive. The worker reads the
+      directive *and* the editorial chain to decide whether it's still
+      in play; we deliberately don't track "consumed" because it pushes
+      a brittle ack-or-the-directive-is-lost burden onto the worker.
+    - The most recent editorial event (the previous worker's handoff
+      or this fiber's bootstrap), if any.
+
+  Both sections are omitted when empty so the prompt stays clean for
+  fresh fibers. On felt failure (binary missing, no history yet) we
+  fall back to empty strings — dispatch continues rather than failing.
+
+  ## Options
+
+    * `:felt_host` — directory containing the `.felt/` index to query.
+      Defaults to `default_felt_host/0`. The Poller threads its
+      configured `state.felt_host` here so each shuttle instance
+      reads from the felt host it's responsible for, rather than a
+      hardcoded loom root.
   """
-  @spec render_prompt(String.t()) :: String.t()
-  def render_prompt(fiber_id) do
-    review_block = render_pending_review_comments(fiber_id)
+  @spec render_prompt(String.t(), keyword()) :: String.t()
+  def render_prompt(fiber_id, opts \\ []) do
+    felt_host = Keyword.get(opts, :felt_host, default_felt_host())
+    directive_block = render_latest_review_directive(fiber_id, felt_host: felt_host)
+    handoff_block = render_latest_editorial(fiber_id, felt_host: felt_host)
 
     base = """
     Shuttle dispatch. Fiber ID: #{fiber_id}
@@ -68,78 +124,111 @@ defmodule Shuttle.Dispatcher do
 
     Activate the shuttle and felt skills before anything else, then follow them.
 
-    Read the constitution fresh via `felt show #{fiber_id}`. The work may take one session or many — Shuttle redispatches a fresh worker on the next poll, and `felt history #{fiber_id} --last 1` lands them warm. **Exit before context is half-full.** Auto-compact mid-thought hands the next worker a degraded summary, and the editorial event you'd write afterward gets composed from that degraded view rather than full attention. A clean break at the next sub-task boundary, well before half, is a stronger handoff than pushing through. End this session with `kill $PPID` at a clean break, when you're blocked, or when the constitution is realized.
+    Read the constitution fresh via `felt show #{fiber_id}`. The work may take one session or many — Shuttle redispatches a fresh worker on the next poll. **Exit before context is half-full.** Auto-compact mid-thought hands the next worker a degraded summary, and the editorial event you'd write afterward gets composed from that degraded view rather than full attention. A clean break at the next sub-task boundary, well before half, is a stronger handoff than pushing through. End this session with `kill $PPID` at a clean break, when you're blocked, or when the constitution is realized.
 
     Update the constitution's `outcome:` to reflect where the work now stands, and append an editorial event with `felt history append #{fiber_id} --summary "…"` as the handoff for the next worker; file crystallizations as sub-fibers; commit. Status `closed` signals the constitution is realized; `tempered: true` is human-only.
     """
 
-    (review_block <> base)
+    (directive_block <> handoff_block <> base)
     |> String.trim()
   end
 
   @doc """
-  Reads pending (unconsumed) review-comment events for `fiber_id` and renders
-  a directive block for inclusion at the top of the dispatch prompt.
+  Reads the most recent `--kind review-comment` event for `fiber_id` and
+  renders a directive block for inclusion at the top of the dispatch
+  prompt. Returns "" if there are no review-comment events.
 
-  Returns an empty string when there are no pending review comments, so
-  callers can concatenate unconditionally. On failure (felt not available,
-  no history yet) falls back to empty string — dispatch continues without
-  the review block rather than failing.
+  Persistence semantics: the latest directive is shown to every worker
+  until Cail files a newer one. There is no "consumed" flag — the worker
+  sees both the directive and the editorial chain, and decides from the
+  chain whether the directive has already been addressed.
 
-  Workers are expected to:
-    1. Read the directive shown here.
-    2. Incorporate it into the work.
-    3. Call `felt history mark-consumed <fiber-id> --rowid <N>` for each event.
+  Pass `felt_host:` to control which `.felt/` index is queried.
   """
-  @spec render_pending_review_comments(String.t()) :: String.t()
-  def render_pending_review_comments(fiber_id) do
-    loom = System.user_home() <> "/loom"
+  @spec render_latest_review_directive(String.t(), keyword()) :: String.t()
+  def render_latest_review_directive(fiber_id, opts \\ []) do
+    case query_history(fiber_id, ["--kind", "review-comment", "--last", "1", "--json"], opts) do
+      [event | _] ->
+        actor = Map.get(event, "actor", "")
+        when_iso = Map.get(event, "occurred_at", "")
+        summary = get_in(event, ["payload", "summary"]) || ""
 
-    case System.cmd(
-           "felt",
-           [
-             "-C",
-             loom,
-             "history",
-             fiber_id,
-             "--kind",
-             "review-comment",
-             "--unconsumed",
-             "--json"
-           ],
-           stderr_to_stdout: true
-         ) do
-      {output, 0} ->
-        case Jason.decode(output) do
-          {:ok, events} when is_list(events) and length(events) > 0 ->
-            directives =
-              events
-              |> Enum.map(fn e ->
-                rowid = Map.get(e, "rowid", "?")
-                actor = Map.get(e, "actor", "")
-                summary = get_in(e, ["payload", "summary"]) || ""
-                "  [rowid=#{rowid} from #{actor}]\n  #{String.replace(summary, "\n", "\n  ")}"
-              end)
-              |> Enum.join("\n\n")
+        """
+        ┌─ Most recent directive from Cail (#{when_iso}, #{actor}) ──────────────────
+        #{indent_block(summary, "  ")}
 
-            """
-            ┌─ Pending review directive(s) from Cail ─────────────────────────────────
-            #{directives}
+        Read this alongside the prior handoff below and the editorial chain
+        (`felt history #{fiber_id}`). If the chain shows the directive has
+        already been addressed in a previous loop, treat it as historical
+        context; otherwise incorporate it into your work.
+        └──────────────────────────────────────────────────────────────────────────
 
-            Incorporate the directive(s) above into the constitution/work, then mark
-            each consumed via:
-              felt history mark-consumed #{fiber_id} --rowid <N>
-            └──────────────────────────────────────────────────────────────────────────
-
-            """
-
-          _ ->
-            ""
-        end
+        """
 
       _ ->
         ""
     end
+  end
+
+  @doc """
+  Reads the most recent editorial event for `fiber_id` and renders it as
+  a "previous handoff" block. Returns "" if there are no editorial events.
+
+  Inlining `--last 1` directly into the prompt removes the worker's tool
+  call to fetch it — the previous handoff is in context the moment the
+  worker wakes.
+
+  Pass `felt_host:` to control which `.felt/` index is queried.
+  """
+  @spec render_latest_editorial(String.t(), keyword()) :: String.t()
+  def render_latest_editorial(fiber_id, opts \\ []) do
+    case query_history(fiber_id, ["--last", "1", "--json"], opts) do
+      [event | _] ->
+        actor = Map.get(event, "actor", "")
+        when_iso = Map.get(event, "occurred_at", "")
+        summary = get_in(event, ["payload", "summary"]) || ""
+
+        """
+        ┌─ Previous editorial handoff (#{when_iso}, #{actor}) ──────────────────────
+        #{indent_block(summary, "  ")}
+        └──────────────────────────────────────────────────────────────────────────
+
+        """
+
+      _ ->
+        ""
+    end
+  end
+
+  # Shared `felt history` JSON query with graceful fallback to []. Used by
+  # both the directive block (filters on --kind review-comment) and the
+  # handoff block (default editorial filter). `felt_host:` opt selects the
+  # `.felt/` index to query — defaults to `default_felt_host/0` so callers
+  # without a configured host (e.g. CLI smoke tests) still work.
+  defp query_history(fiber_id, extra_args, opts) do
+    felt_host = Keyword.get(opts, :felt_host, default_felt_host())
+    args = ["-C", felt_host, "history", fiber_id] ++ extra_args
+
+    case System.cmd("felt", args, stderr_to_stdout: true) do
+      {output, 0} ->
+        case Jason.decode(output) do
+          {:ok, events} when is_list(events) -> events
+          _ -> []
+        end
+
+      _ ->
+        []
+    end
+  end
+
+  # Indent every line of `text` by `prefix`. Used to inset event summaries
+  # under the box header so multi-line directives stay visually grouped.
+  defp indent_block(text, prefix) do
+    text
+    |> String.trim()
+    |> String.split("\n")
+    |> Enum.map(&(prefix <> &1))
+    |> Enum.join("\n")
   end
 
   @doc """
@@ -181,7 +270,16 @@ defmodule Shuttle.Dispatcher do
 
   # ── Internal ──
 
-  defp fetch_fiber(fiber_id, runner) do
+  # First tries the runner's default cwd (so tests / one-off CLI invocations
+  # in a project's working directory still resolve the fiber against that
+  # project's `.felt/`). Falls back to the configured `felt_host` so the
+  # daemon path always lands in the right index regardless of where the BEAM
+  # process happens to be running. The default `felt_host` is
+  # `default_felt_host/0` (~/loom) — pass `:felt_host` explicitly to point at
+  # a different root.
+  defp fetch_fiber(fiber_id, runner, opts) do
+    felt_host = Keyword.get(opts, :felt_host, default_felt_host())
+
     case run_felt(runner, ["show", fiber_id, "--json"]) do
       {:ok, output} ->
         case Jason.decode(output) do
@@ -190,10 +288,7 @@ defmodule Shuttle.Dispatcher do
         end
 
       {:error, _} ->
-        # Try ~/loom as fallback
-        loom = System.user_home() <> "/loom"
-
-        case run_felt(runner, ["show", fiber_id, "--json"], cd: loom) do
+        case run_felt(runner, ["show", fiber_id, "--json"], cd: felt_host) do
           {:ok, output} ->
             case Jason.decode(output) do
               {:ok, fiber} -> {:ok, fiber}
@@ -248,9 +343,9 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
-  defp create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context) do
+  defp create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, opts) do
     session = session_name(fiber_id)
-    prompt = render_context_prompt(fiber_id, prompt_context)
+    prompt = render_context_prompt(fiber_id, prompt_context, opts)
     command = Agents.build_command(agent, prompt)
 
     # Build the run script — same shape as shuttle-worker.sh's RUN_SCRIPT
@@ -288,11 +383,14 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
-  defp render_context_prompt(fiber_id, {:standing_run, run_id}) do
+  # The standing-run prompt currently doesn't read history, so it ignores
+  # `felt_host`. Threaded through anyway for symmetry — if a future variant
+  # wants to inline the prior run's editorial event, the plumbing is in place.
+  defp render_context_prompt(fiber_id, {:standing_run, run_id}, _opts) do
     render_standing_run_prompt(fiber_id, run_id)
   end
 
-  defp render_context_prompt(fiber_id, _), do: render_prompt(fiber_id)
+  defp render_context_prompt(fiber_id, _, opts), do: render_prompt(fiber_id, opts)
 
   defp build_run_script(fiber_id, command, agent_id) do
     """

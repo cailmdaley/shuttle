@@ -582,7 +582,8 @@ defmodule Shuttle.Poller do
            fiber_id,
            runner: state.runner,
            work_dir: fiber_work_dir(fiber_id, state),
-           prompt_context: prompt_context
+           prompt_context: prompt_context,
+           felt_host: state.felt_host
          ) do
       {:ok, session} ->
         agent_name = fetch_shuttle_agent_name(fiber_id, state)
@@ -1159,8 +1160,15 @@ defmodule Shuttle.Poller do
     end
   end
 
+  # Same resolution as `Shuttle.Dispatcher.default_felt_host/0` — checks
+  # `$LOOM_HOME` first so a user can re-point both Poller and Dispatcher (and
+  # portolan, which uses the same env var) by exporting one variable, then
+  # falls back to `~/loom`.
   defp default_felt_host do
-    System.user_home() <> "/loom"
+    case System.get_env("LOOM_HOME") do
+      v when is_binary(v) and v != "" -> v
+      _ -> System.user_home() <> "/loom"
+    end
   end
 
   defp build_full_state(state) do
