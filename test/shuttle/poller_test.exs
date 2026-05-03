@@ -628,6 +628,78 @@ defmodule Shuttle.PollerTest do
     assert hd(snap.eligible).fiber_id == "tests/orphan"
   end
 
+  test "poller uses shuttle.project_dir as work_dir when it exists" do
+    project_dir =
+      Path.join(System.tmp_dir!(), "shuttle-test-proj-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(project_dir)
+
+    fiber = make_fiber("tests/project-dir-fiber")
+    MockRunner.set_felt_ls([fiber])
+    MockRunner.set_fiber("tests/project-dir-fiber", fiber)
+
+    MockRunner.set_shuttle("tests/project-dir-fiber", """
+    enabled: true
+    kind: oneshot
+    project_dir: #{project_dir}
+    """)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_project_dir,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
+
+    send(poller, :run_poll_cycle)
+    Process.sleep(100)
+
+    # tmux args: ["new-session", "-d", "-s", session, "-c", work_dir, "bash", "-l", script]
+    # work_dir is at index 5
+    {_, args} =
+      Enum.find(MockRunner.commands(), fn {cmd, args} ->
+        cmd == "tmux" and hd(args) == "new-session"
+      end)
+
+    assert Enum.at(args, 5) == project_dir
+  after
+    File.rm_rf(
+      Path.join(System.tmp_dir!(), "shuttle-test-proj-*")
+    )
+  end
+
+  test "poller falls back to felt_host when shuttle.project_dir does not exist" do
+    fiber = make_fiber("tests/missing-project-dir")
+    MockRunner.set_felt_ls([fiber])
+    MockRunner.set_fiber("tests/missing-project-dir", fiber)
+
+    MockRunner.set_shuttle("tests/missing-project-dir", """
+    enabled: true
+    kind: oneshot
+    project_dir: /nonexistent/path/shuttle-test-missing
+    """)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_missing_project_dir,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_host: "/tmp"
+      )
+
+    send(poller, :run_poll_cycle)
+    Process.sleep(100)
+
+    {_, args} =
+      Enum.find(MockRunner.commands(), fn {cmd, args} ->
+        cmd == "tmux" and hd(args) == "new-session"
+      end)
+
+    # work_dir should fall back to felt_host
+    assert Enum.at(args, 5) == "/tmp"
+  end
+
   test "poller adopts orphan sessions with literal hyphenated fiber ids" do
     fiber_id = "ai-futures/shuttle/constitution-shuttle-standalone"
     fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "codex"]})

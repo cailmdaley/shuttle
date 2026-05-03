@@ -525,6 +525,26 @@ defmodule Shuttle.Poller do
     end
   end
 
+  # Returns the working directory to use when dispatching this fiber.
+  #
+  # When the fiber's shuttle block contains a `project_dir` key pointing to an
+  # existing directory, that directory is used as the tmux session's starting
+  # directory. This lets workers load the project's CLAUDE.md (read at session
+  # start from CWD upwards) rather than always starting in the loom root.
+  #
+  # Tilde-prefixed paths are expanded. Falls back to `state.felt_host` when
+  # `project_dir` is absent, empty, or does not exist on disk.
+  defp fiber_work_dir(fiber_id, state) do
+    with {:ok, shuttle} <- read_fiber_shuttle_block(fiber_id, state),
+         dir when is_binary(dir) and dir != "" <- Map.get(shuttle, "project_dir"),
+         expanded = Path.expand(dir),
+         true <- File.dir?(expanded) do
+      expanded
+    else
+      _ -> state.felt_host
+    end
+  end
+
   defp dependencies_satisfied?(fiber_id, state) do
     case fetch_fiber_full(fiber_id, state) do
       {:ok, full_fiber} ->
@@ -561,7 +581,7 @@ defmodule Shuttle.Poller do
     case Dispatcher.dispatch(
            fiber_id,
            runner: state.runner,
-           work_dir: state.felt_host,
+           work_dir: fiber_work_dir(fiber_id, state),
            prompt_context: prompt_context
          ) do
       {:ok, session} ->
