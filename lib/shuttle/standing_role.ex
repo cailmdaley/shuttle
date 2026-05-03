@@ -40,7 +40,8 @@ defmodule Shuttle.StandingRole do
            true <- is_map(data) || {:error, :invalid_shuttle_block} do
         role = %__MODULE__{
           fiber_id: fiber_id,
-          mode: string(data["mode"]),
+          # New schema uses "kind"; old schema used "mode". Support both.
+          mode: string(data["kind"] || data["mode"]),
           schedule: map(data["schedule"]),
           review: map(data["review"]),
           next_due_at: parse_datetime(data["next_due_at"]),
@@ -51,6 +52,21 @@ defmodule Shuttle.StandingRole do
         {:ok, %{role | validation_errors: validation_errors(role)}}
       end
     end
+  end
+
+  @spec from_map(String.t(), map()) :: {:ok, t()} | {:error, term()}
+  def from_map(fiber_id, data) when is_map(data) do
+    role = %__MODULE__{
+      fiber_id: fiber_id,
+      mode: string(data["kind"] || data["mode"]),
+      schedule: map(data["schedule"]),
+      review: map(data["review"]),
+      next_due_at: parse_datetime(data["next_due_at"]),
+      last_run_at: parse_datetime(data["last_run_at"]),
+      run_id: string(get_in(data, ["review", "run_id"]))
+    }
+
+    {:ok, %{role | validation_errors: validation_errors(role)}}
   end
 
   @spec standing?(t() | nil) :: boolean()
@@ -119,7 +135,7 @@ defmodule Shuttle.StandingRole do
   end
 
   defp validate_mode(%__MODULE__{mode: "standing"}), do: nil
-  defp validate_mode(%__MODULE__{mode: mode}), do: "mode must be standing, got #{inspect(mode)}"
+  defp validate_mode(%__MODULE__{mode: mode}), do: "kind must be standing, got #{inspect(mode)}"
 
   defp validate_review_state(%__MODULE__{review: review}) do
     state = review["state"] || "scheduled"

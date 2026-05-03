@@ -57,6 +57,26 @@ func ReadFiber(path string) (*FiberFile, error) {
 	return f, nil
 }
 
+// RemoveTag removes a single tag value from the YAML frontmatter's `tags:` list.
+// The removal happens in the in-memory yaml.Node; it takes effect on the next
+// WriteBlock call. No-op if the tag is absent or the tags field doesn't exist.
+func (f *FiberFile) RemoveTag(tag string) {
+	if f.fmNode == nil || len(f.fmNode.Content) == 0 {
+		return
+	}
+	tagsNode := findMappingValue(f.fmNode, "tags")
+	if tagsNode == nil || tagsNode.Kind != yaml.SequenceNode {
+		return
+	}
+	filtered := make([]*yaml.Node, 0, len(tagsNode.Content))
+	for _, item := range tagsNode.Content {
+		if item.Value != tag {
+			filtered = append(filtered, item)
+		}
+	}
+	tagsNode.Content = filtered
+}
+
 // WriteBlock mutates the shuttle: key in the fiber's frontmatter YAML node and
 // writes the result atomically (temp-file + rename). Creates the shuttle: key
 // if absent. Removes it entirely when block is nil (uninstall).

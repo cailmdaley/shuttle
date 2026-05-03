@@ -91,15 +91,18 @@ by the operator after verifying migration output.`,
 				continue
 			}
 
+			// Remove agent:<name> tag in-memory before writing so the tag
+			// removal and shuttle block write happen atomically. Using
+			// `felt edit --untag` after WriteBlock would re-serialize the
+			// frontmatter without the shuttle: key we just wrote.
+			if agentTag := extractAgentTag(tags); agentTag != "" && block.Agent != "" {
+				f.RemoveTag("agent:" + agentTag)
+			}
+
 			if err := f.WriteBlock(block); err != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "  ERROR writing %s: %v\n", fiberID, err)
 				errors++
 				continue
-			}
-
-			// If we translated an agent:<name> tag, remove it via felt edit.
-			if agentTag := extractAgentTag(tags); agentTag != "" && block.Agent != "" {
-				removeAgentTag(host, fiberID, agentTag)
 			}
 			changed++
 		}
@@ -180,17 +183,10 @@ func extractAgentTag(tags []string) string {
 	return ""
 }
 
-// removeAgentTag shells out to felt edit --untag agent:<name>.
-func removeAgentTag(host, fiberID, agentTag string) {
-	tagVal := "agent:" + agentTag
-	cmd := exec.Command("felt", "-C", host, "edit", fiberID, "--untag", tagVal)
-	_ = cmd.Run()
-}
-
 // runFeltLS runs `felt ls -t constitution -j -s all` and returns parsed objects.
 // felt outputs a JSON array when -j is used.
 func runFeltLS(host string) ([]map[string]interface{}, error) {
-	out, err := exec.Command("felt", "-C", host, "ls", "-t", "constitution", "-j", "-s", "all").Output()
+	out, err := exec.Command("felt", "-C", host, "ls", "-t", "constitution", "-j", "-s", "all").Output() //nolint:gosec
 	if err != nil {
 		return nil, fmt.Errorf("felt ls: %v", err)
 	}

@@ -427,37 +427,101 @@ defmodule Shuttle.Poller do
   end
 
   defp eligible?(fiber, state) do
-    tags = Map.get(fiber, "tags", [])
     status = Map.get(fiber, "status", "")
     fiber_id = Map.get(fiber, "id", "")
 
-    cond do
-      # Must have constitution tag
-      "constitution" not in tags ->
+    # Read the shuttle: block once from disk (direct file read, no CLI spawn).
+    # All per-candidate checks are derived from this single read.
+    case read_fiber_shuttle_block(fiber_id, state) do
+      {:ok, shuttle} ->
+        cond do
+          # Must have shuttle.enabled: true
+          Map.get(shuttle, "enabled", false) != true ->
+            false
+
+          # Must be committed to active work
+          status not in ["open", "active"] ->
+            false
+
+          # Must not already be running
+          Map.has_key?(state.running, fiber_id) ->
+            false
+
+          # Must not be claimed (retry queued)
+          MapSet.member?(state.claimed, fiber_id) ->
+            false
+
+          # Standing roles have additional preconditions; oneshots go to dep check.
+          # Support both new-format (kind:) and old-format (mode:) shuttle blocks.
+          Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot")) == "standing" ->
+            standing_role_due?(fiber_id, state)
+
+          # Dependencies must be satisfied
+          true ->
+            dependencies_satisfied?(fiber_id, state)
+        end
+
+      {:error, _} ->
         false
+    end
+  end
 
-      # Must not have draft tag
-      "draft" in tags ->
-        false
+  # Read the shuttle: block from the fiber's .md file directly, without shelling
+  # out to the felt CLI. File read + YAML parse is much faster than spawning a
+  # process, making it viable for every candidate in the poll cycle.
+  #
+  # Returns {:ok, map()} when the block is present, {:error, reason} otherwise.
+  defp read_fiber_shuttle_block(fiber_id, state) do
+    felt_dir = Path.join(state.felt_host, ".felt")
+    segments = String.split(fiber_id, "/")
+    basename = List.last(segments)
 
-      # Must be committed to active work
-      status not in ["open", "active"] ->
-        false
+    # Directory fiber: .felt/<id>/<basename>.md
+    dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
+    # Bare/root fiber: .felt/<basename>.md
+    bare_path = Path.join(felt_dir, "#{basename}.md")
 
-      # Must not already be running
-      Map.has_key?(state.running, fiber_id) ->
-        false
+    path =
+      cond do
+        File.exists?(dir_path) -> dir_path
+        File.exists?(bare_path) -> bare_path
+        true -> nil
+      end
 
-      # Must not be claimed (retry queued)
-      MapSet.member?(state.claimed, fiber_id) ->
-        false
+    if path do
+      with {:ok, content} <- File.read(path),
+           [fm] <-
+             Regex.run(~r/\A---\r?\n(.*?)\r?\n---(?:\r?\n|\z)/ms, content,
+               capture: :all_but_first
+             ),
+           {:ok, data} when is_map(data) <- YamlElixir.read_from_string(fm),
+           shuttle when is_map(shuttle) <- Map.get(data, "shuttle") do
+        {:ok, shuttle}
+      else
+        _ -> {:error, :no_shuttle_block}
+      end
+    else
+      {:error, :file_not_found}
+    end
+  end
 
-      standing_role?(fiber, state) ->
-        standing_role_due?(fiber_id, state)
+  # Extract the shuttle.agent name from a pre-fetched shuttle block map.
+  # Returns nil when absent (the caller should use the default agent).
+  defp shuttle_agent_from_block(shuttle) when is_map(shuttle) do
+    case Map.get(shuttle, "agent") do
+      v when is_binary(v) and v != "" -> v
+      _ -> nil
+    end
+  end
 
-      # Dependencies must be satisfied
-      true ->
-        dependencies_satisfied?(fiber_id, state)
+  defp shuttle_agent_from_block(_), do: nil
+
+  # Returns the shuttle.agent name for a fiber, reading its block from disk.
+  # Used by dispatch paths that don't already hold the block map.
+  defp fetch_shuttle_agent_name(fiber_id, state) do
+    case read_fiber_shuttle_block(fiber_id, state) do
+      {:ok, shuttle} -> shuttle_agent_from_block(shuttle)
+      {:error, _} -> nil
     end
   end
 
@@ -501,7 +565,8 @@ defmodule Shuttle.Poller do
            prompt_context: prompt_context
          ) do
       {:ok, session} ->
-        {:ok, agent} = Shuttle.Agents.resolve(Map.get(fiber, "tags", []))
+        agent_name = fetch_shuttle_agent_name(fiber_id, state)
+        {:ok, agent} = Shuttle.Agents.resolve_by_name(agent_name)
 
         # Start a watcher for this worker
         watcher_opts = [
@@ -624,7 +689,8 @@ defmodule Shuttle.Poller do
     case fetch_fiber_full(fiber_id, state) do
       {:ok, fiber} ->
         if Map.get(fiber, "status") != "closed" do
-          {:ok, agent} = Shuttle.Agents.resolve(Map.get(fiber, "tags", []))
+          agent_name = fetch_shuttle_agent_name(fiber_id, state)
+          {:ok, agent} = Shuttle.Agents.resolve_by_name(agent_name)
 
           watcher_opts = [
             fiber_id: fiber_id,
@@ -922,13 +988,11 @@ defmodule Shuttle.Poller do
   end
 
   defp standing_role?(fiber, state) do
-    tags = Map.get(fiber, "tags", [])
-
-    "standing" in tags or
-      case fetch_standing_role(Map.get(fiber, "id", ""), state) do
-        {:ok, role} -> StandingRole.standing?(role)
-        {:error, _} -> false
-      end
+    # Tags no longer carry the standing signal; read the shuttle: block.
+    case fetch_standing_role(Map.get(fiber, "id", ""), state) do
+      {:ok, role} -> StandingRole.standing?(role)
+      {:error, _} -> false
+    end
   end
 
   defp standing_role_due?(fiber_id, state) do
@@ -965,9 +1029,9 @@ defmodule Shuttle.Poller do
   defp running_prompt_metadata(_), do: %{}
 
   defp fetch_standing_role(fiber_id, state) do
-    case run_felt(state, ["show", fiber_id, "--field", "shuttle"]) do
-      {:ok, output} -> StandingRole.parse(fiber_id, output)
-      {:error, reason} -> {:error, reason}
+    case read_fiber_shuttle_block(fiber_id, state) do
+      {:ok, shuttle} -> StandingRole.from_map(fiber_id, shuttle)
+      {:error, _} -> {:error, :no_shuttle_block}
     end
   end
 
@@ -988,8 +1052,7 @@ defmodule Shuttle.Poller do
     with {:ok, candidates} <- discover_candidates(state) do
       candidates
       |> Enum.filter(fn fiber ->
-        "standing" in Map.get(fiber, "tags", []) or
-          standing_role?(fiber, state)
+        standing_role?(fiber, state)
       end)
       |> Enum.flat_map(fn fiber ->
         fiber_id = Map.get(fiber, "id", "")

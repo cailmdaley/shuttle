@@ -265,6 +265,32 @@ defmodule Shuttle.Agents do
   end
 
   @doc """
+  Resolves an agent record from a shuttle.agent name string.
+
+  Called by the dispatch path after migration, where agent identity lives in the
+  shuttle: block rather than in agent:* tags. Falls back to the default agent
+  when name is nil or empty.
+  """
+  @spec resolve_by_name(String.t() | nil) :: {:ok, agent_record()} | {:error, String.t()}
+  def resolve_by_name(nil), do: resolve_by_name("")
+
+  def resolve_by_name(name) when is_binary(name) do
+    agents = list()
+
+    if name == "" do
+      case Enum.find(agents, & &1.default) || List.first(agents) do
+        nil -> {:error, "no agent configured"}
+        agent -> {:ok, agent}
+      end
+    else
+      case find_by_id(agents, name) do
+        nil -> {:error, "unknown agent: #{name}"}
+        agent -> {:ok, agent}
+      end
+    end
+  end
+
+  @doc """
   Builds the shell command string for invoking an agent with the dispatch prompt.
   """
   @spec build_command(agent_record(), String.t()) :: String.t()

@@ -27,6 +27,8 @@ defmodule Shuttle.PollerTest do
     end
 
     def reset do
+      # Remove any fiber files written by set_shuttle so tests start clean.
+      File.rm_rf("/tmp/.felt")
       Agent.update(__MODULE__, fn _ ->
         %{
           commands: [],
@@ -39,7 +41,18 @@ defmodule Shuttle.PollerTest do
     end
 
     def set_fiber(id, fiber), do: Agent.update(__MODULE__, &put_in(&1.fibers[id], fiber))
-    def set_shuttle(id, yaml), do: Agent.update(__MODULE__, &put_in(&1.shuttle[id], yaml))
+
+    def set_shuttle(id, yaml) do
+      # Write a real .md file so read_fiber_shuttle_block can find it.
+      felt_dir = "/tmp/.felt"
+      segments = String.split(id, "/")
+      basename = List.last(segments)
+      dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
+      File.mkdir_p!(Path.dirname(dir_path))
+      indented = yaml |> String.trim() |> String.split("\n") |> Enum.map_join("\n", &("  " <> &1))
+      File.write!(dir_path, "---\nshuttle:\n#{indented}\n---\nbody\n")
+      Agent.update(__MODULE__, &put_in(&1.shuttle[id], yaml))
+    end
     def set_felt_ls(fibers), do: Agent.update(__MODULE__, &%{&1 | felt_ls: fibers})
 
     def add_tmux_session(session),
@@ -128,6 +141,9 @@ defmodule Shuttle.PollerTest do
 
   # ── Helpers ──
 
+  # Minimal shuttle: block YAML for a oneshot fiber ready for dispatch.
+  @oneshot_shuttle "enabled: true\nkind: oneshot\n"
+
   defp make_fiber(id, attrs \\ %{}) do
     Map.merge(
       %{
@@ -147,6 +163,7 @@ defmodule Shuttle.PollerTest do
     fiber = make_fiber("tests/haiku")
     MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/haiku", fiber)
+    MockRunner.set_shuttle("tests/haiku", @oneshot_shuttle)
 
     {:ok, poller} =
       Poller.start_link(
@@ -228,6 +245,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(
       "tests/standing-sleeping",
       """
+      enabled: true
       mode: standing
       schedule:
         kind: cron
@@ -259,18 +277,20 @@ defmodule Shuttle.PollerTest do
   end
 
   test "poller dispatches a due standing role with run context and does not hot-loop after exit" do
-    fiber = make_fiber("tests/standing-due", %{"tags" => ["constitution", "standing", "codex"]})
+    # Uses new-format "kind: standing" (vs legacy "mode: standing") to test backward compat.
+    fiber = make_fiber("tests/standing-due", %{"tags" => ["constitution", "standing"]})
     MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/standing-due", fiber)
 
     MockRunner.set_shuttle(
       "tests/standing-due",
       """
-      mode: standing
+      enabled: true
+      kind: standing
+      agent: claude-sonnet
       schedule:
-        kind: cron
         expr: "0 9 * * 1-5"
-        timezone: Europe/Paris
+        tz: Europe/Paris
       review:
         state: scheduled
       next_due_at: "2000-01-03T09:00:00+01:00"
@@ -322,6 +342,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(
       "tests/standing-stale",
       """
+      enabled: true
       mode: standing
       schedule:
         kind: cron
@@ -366,6 +387,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(
       "tests/standing-review",
       """
+      enabled: true
       mode: standing
       schedule:
         kind: cron
@@ -383,6 +405,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(
       "tests/standing-accepted",
       """
+      enabled: true
       mode: standing
       schedule:
         kind: cron
@@ -417,6 +440,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/dependent", fiber)
     MockRunner.set_fiber("tests/dep", dep)
+    MockRunner.set_shuttle("tests/dependent", @oneshot_shuttle)
 
     {:ok, poller} =
       Poller.start_link(
@@ -467,6 +491,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_felt_ls([fiber, dep])
     MockRunner.set_fiber("tests/dependent", fiber)
     MockRunner.set_fiber("tests/dep", dep)
+    MockRunner.set_shuttle("tests/dependent", @oneshot_shuttle)
 
     {:ok, poller} =
       Poller.start_link(
@@ -490,6 +515,7 @@ defmodule Shuttle.PollerTest do
     fiber = make_fiber("tests/haiku")
     MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/haiku", fiber)
+    MockRunner.set_shuttle("tests/haiku", @oneshot_shuttle)
     MockRunner.add_tmux_session(Dispatcher.session_name("tests/haiku"))
 
     {:ok, poller} =
@@ -516,6 +542,7 @@ defmodule Shuttle.PollerTest do
     fiber = make_fiber("tests/haiku")
     MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/haiku", fiber)
+    MockRunner.set_shuttle("tests/haiku", @oneshot_shuttle)
 
     {:ok, poller} =
       Poller.start_link(
@@ -556,6 +583,7 @@ defmodule Shuttle.PollerTest do
     fiber = make_fiber("tests/haiku")
     MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/haiku", fiber)
+    MockRunner.set_shuttle("tests/haiku", @oneshot_shuttle)
 
     {:ok, poller} =
       Poller.start_link(
