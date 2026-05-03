@@ -25,6 +25,11 @@ picks up on its next poll once enabled.
 The shuttle: block is validated before any file is touched.
 The running daemon picks it up on its next poll when enabled.
 
+When installing without --disabled, the felt-native status field is set to
+"active" if it was missing or any value other than "active"/"open" — the
+poller's eligibility filter requires this. Closed fibers must be reopened
+in the markdown before installing.
+
 Use 'shuttle repeat' for standing (recurring) roles.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -57,6 +62,23 @@ Use 'shuttle repeat' for standing (recurring) roles.`,
 			return fmt.Errorf("invalid input")
 		}
 
+		// Ensure felt status is dispatchable when we're installing enabled.
+		// The shuttle daemon's poller filters on status in [active, open]
+		// (lib/shuttle/poller.ex `eligible?/2`); a missing field is treated
+		// as ineligible — silent failure for users who run `install` and
+		// expect dispatch on next poll.
+		statusBefore := f.Status()
+		statusChanged := false
+		if !installDisabled {
+			if statusBefore == "closed" {
+				return fmt.Errorf("fiber %s has status: closed; reopen it (set status: active in the markdown) before installing, or use --disabled to park in drafts", args[0])
+			}
+			if statusBefore != "active" && statusBefore != "open" {
+				f.SetStatus("active")
+				statusChanged = true
+			}
+		}
+
 		if err := f.WriteBlock(block); err != nil {
 			return fmt.Errorf("writing fiber: %w", err)
 		}
@@ -68,6 +90,13 @@ Use 'shuttle repeat' for standing (recurring) roles.`,
 		fmt.Printf("installed %s as oneshot role (%s)\n", args[0], state)
 		if block.Agent != "" {
 			fmt.Printf("  agent: %s\n", block.Agent)
+		}
+		if statusChanged {
+			if statusBefore == "" {
+				fmt.Println("  status: active (set; was missing)")
+			} else {
+				fmt.Printf("  status: %s → active\n", statusBefore)
+			}
 		}
 		return nil
 	},

@@ -65,6 +65,19 @@ The running daemon picks it up on its next poll.`,
 		block.NextDueAt = &next
 		block.Review = &schema.Review{State: "scheduled"}
 
+		// Ensure felt status is dispatchable. The poller filters on
+		// status in [active, open]; a missing field is treated as
+		// ineligible. See lib/shuttle/poller.ex `eligible?/2`.
+		statusBefore := f.Status()
+		statusChanged := false
+		if statusBefore == "closed" {
+			return fmt.Errorf("fiber %s has status: closed; reopen it (set status: active in the markdown) before installing", args[0])
+		}
+		if statusBefore != "active" && statusBefore != "open" {
+			f.SetStatus("active")
+			statusChanged = true
+		}
+
 		if err := f.WriteBlock(block); err != nil {
 			return fmt.Errorf("writing fiber: %w", err)
 		}
@@ -75,6 +88,13 @@ The running daemon picks it up on its next poll.`,
 			fmt.Printf("  agent:    %s\n", block.Agent)
 		}
 		fmt.Printf("  next due: %s\n", next.Format(time.RFC3339))
+		if statusChanged {
+			if statusBefore == "" {
+				fmt.Println("  status:   active (set; was missing)")
+			} else {
+				fmt.Printf("  status:   %s → active\n", statusBefore)
+			}
+		}
 		return nil
 	},
 }

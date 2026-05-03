@@ -57,6 +57,37 @@ func ReadFiber(path string) (*FiberFile, error) {
 	return f, nil
 }
 
+// Status returns the felt-native `status:` value from the frontmatter, or "" if
+// the field is missing. The shuttle daemon's eligibility filter
+// (lib/shuttle/poller.ex `eligible?/2`) requires status to be "active" or
+// "open" — a missing field is treated as ineligible. Callers managing the
+// dispatch lifecycle (install, resume) should ensure this is set.
+func (f *FiberFile) Status() string {
+	if f.fmNode == nil || len(f.fmNode.Content) == 0 {
+		return ""
+	}
+	statusNode := findMappingValue(f.fmNode, "status")
+	if statusNode == nil || statusNode.Kind != yaml.ScalarNode {
+		return ""
+	}
+	return statusNode.Value
+}
+
+// SetStatus mutates the felt-native `status:` field in the frontmatter. The
+// change takes effect on the next WriteBlock call. Creates the field if
+// absent.
+func (f *FiberFile) SetStatus(status string) {
+	if f.fmNode == nil || len(f.fmNode.Content) == 0 {
+		return
+	}
+	mappingNode := f.fmNode.Content[0]
+	if mappingNode.Kind != yaml.MappingNode {
+		return
+	}
+	valueNode := &yaml.Node{Kind: yaml.ScalarNode, Value: status, Tag: "!!str"}
+	setMappingValue(mappingNode, "status", valueNode)
+}
+
 // RemoveTag removes a single tag value from the YAML frontmatter's `tags:` list.
 // The removal happens in the in-memory yaml.Node; it takes effect on the next
 // WriteBlock call. No-op if the tag is absent or the tags field doesn't exist.

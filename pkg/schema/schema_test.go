@@ -299,3 +299,129 @@ func TestValidate_UnknownAgent(t *testing.T) {
 		t.Fatalf("expected field=agent, got %q", errs[0].Field)
 	}
 }
+
+// ---- Status helpers --------------------------------------------------------
+
+func TestStatus_Present(t *testing.T) {
+	path := writeTmpFiber(t, sampleFiber) // sampleFiber has status: active
+	f, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("ReadFiber: %v", err)
+	}
+	if got := f.Status(); got != "active" {
+		t.Fatalf("expected status=active, got %q", got)
+	}
+}
+
+func TestStatus_Missing(t *testing.T) {
+	noStatus := `---
+name: No Status Fiber
+tags:
+  - constitution
+created-at: 2026-01-01T00:00:00Z
+---
+
+Body.
+`
+	path := writeTmpFiber(t, noStatus)
+	f, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("ReadFiber: %v", err)
+	}
+	if got := f.Status(); got != "" {
+		t.Fatalf("expected empty status for missing field, got %q", got)
+	}
+}
+
+func TestSetStatus_AddsField(t *testing.T) {
+	noStatus := `---
+name: No Status Fiber
+tags:
+  - constitution
+created-at: 2026-01-01T00:00:00Z
+---
+
+Body.
+`
+	path := writeTmpFiber(t, noStatus)
+	f, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("ReadFiber: %v", err)
+	}
+	f.SetStatus("active")
+	if err := f.WriteBlock(nil); err != nil {
+		t.Fatalf("WriteBlock: %v", err)
+	}
+
+	// Re-read and verify.
+	f2, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	if got := f2.Status(); got != "active" {
+		t.Fatalf("expected status=active after SetStatus, got %q", got)
+	}
+
+	// Confirm body and other fields are preserved.
+	raw, _ := os.ReadFile(path)
+	if !strings.Contains(string(raw), "Body.") {
+		t.Fatal("body lost after SetStatus")
+	}
+	if !strings.Contains(string(raw), "name: No Status Fiber") {
+		t.Fatal("name field lost after SetStatus")
+	}
+}
+
+func TestSetStatus_OverwritesExisting(t *testing.T) {
+	path := writeTmpFiber(t, sampleFiber) // status: active
+	f, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("ReadFiber: %v", err)
+	}
+	f.SetStatus("closed")
+	if err := f.WriteBlock(nil); err != nil {
+		t.Fatalf("WriteBlock: %v", err)
+	}
+
+	f2, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	if got := f2.Status(); got != "closed" {
+		t.Fatalf("expected status=closed after SetStatus, got %q", got)
+	}
+}
+
+func TestSetStatus_RoundTripsWithBlock(t *testing.T) {
+	// Confirm SetStatus + WriteBlock(non-nil) writes both atomically.
+	noStatus := `---
+name: No Status Fiber
+tags:
+  - constitution
+created-at: 2026-01-01T00:00:00Z
+---
+
+Body.
+`
+	path := writeTmpFiber(t, noStatus)
+	f, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("ReadFiber: %v", err)
+	}
+	f.SetStatus("active")
+	block := &Block{Enabled: true, Kind: "oneshot"}
+	if err := f.WriteBlock(block); err != nil {
+		t.Fatalf("WriteBlock: %v", err)
+	}
+
+	f2, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	if got := f2.Status(); got != "active" {
+		t.Fatalf("expected status=active, got %q", got)
+	}
+	if f2.Block == nil || !f2.Block.Enabled || f2.Block.Kind != "oneshot" {
+		t.Fatalf("expected shuttle block enabled+oneshot, got %+v", f2.Block)
+	}
+}

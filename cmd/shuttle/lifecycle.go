@@ -29,19 +29,46 @@ var pauseCmd = &cobra.Command{
 
 var resumeCmd = &cobra.Command{
 	Use:   "resume <fiber>",
-	Short: "Resume a paused standing role",
-	Args:  cobra.ExactArgs(1),
+	Short: "Resume a paused fiber (enabled=true; ensures status: active)",
+	Long: `Sets shuttle.enabled = true and ensures the felt-native status field is
+"active" so the daemon's eligibility filter accepts the fiber on its next
+poll. A missing or non-dispatchable status would otherwise leave the fiber
+silently un-dispatched even with enabled=true.
+
+Refuses if status is currently "closed" — closed fibers must be explicitly
+reopened in the markdown before resuming.`,
+	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		path, _ := resolveFiber(args[0])
 		f := readFiber(path)
 		if f.Block == nil {
 			return fmt.Errorf("fiber %s has no shuttle: block", args[0])
 		}
+
+		// Mirror install: ensure status is dispatchable before flipping
+		// enabled. See lib/shuttle/poller.ex `eligible?/2` for the filter.
+		statusBefore := f.Status()
+		statusChanged := false
+		if statusBefore == "closed" {
+			return fmt.Errorf("fiber %s has status: closed; reopen it (set status: active in the markdown) before resuming", args[0])
+		}
+		if statusBefore != "active" && statusBefore != "open" {
+			f.SetStatus("active")
+			statusChanged = true
+		}
+
 		f.Block.Enabled = true
 		if err := f.WriteBlock(f.Block); err != nil {
 			return fmt.Errorf("writing fiber: %w", err)
 		}
 		fmt.Printf("resumed %s (enabled=true)\n", args[0])
+		if statusChanged {
+			if statusBefore == "" {
+				fmt.Println("  status: active (set; was missing)")
+			} else {
+				fmt.Printf("  status: %s → active\n", statusBefore)
+			}
+		}
 		return nil
 	},
 }
