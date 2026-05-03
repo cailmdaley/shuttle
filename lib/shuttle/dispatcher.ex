@@ -15,6 +15,7 @@ defmodule Shuttle.Dispatcher do
   require Logger
 
   alias Shuttle.Agents
+  import Bitwise
 
   @type dispatch_result ::
           {:ok, String.t()}
@@ -51,12 +52,48 @@ defmodule Shuttle.Dispatcher do
          :ok <- check_not_closed(fiber),
          :ok <- check_not_running(fiber_id, runner),
          {:ok, agent} <- resolve_agent(fiber),
-         :ok <- validate_agent(agent),
-         {:ok, session} <-
-           create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context,
-             felt_host: felt_host
-           ) do
-      {:ok, session}
+         :ok <- validate_agent(agent) do
+      resume_intent = check_resume_intent(fiber_id, fiber, felt_host: felt_host)
+      create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent,
+        felt_host: felt_host
+      )
+    end
+  end
+
+  @doc """
+  Checks whether the most recent review-comment requests resume of the previous
+  worker session and, if so, whether a stored session UUID is available.
+
+  Returns one of:
+  - `:fresh` — no resume requested, or no session UUID stored. Always the safe
+    default: the worker gets a clean slate with the full dispatch prompt.
+  - `{:previous, session_id}` — resume requested and session UUID available.
+    The dispatcher will invoke the harness-appropriate resume command.
+
+  Reads the latest `--kind review-comment` event from felt history. The
+  `resume_mode` field in the event payload is set at requeue time by the user
+  clicking "Requeue fresh" or "Resume previous" in the Kanban UI.
+  """
+  @spec check_resume_intent(String.t(), map(), keyword()) ::
+          :fresh | {:previous, String.t()}
+  def check_resume_intent(fiber_id, fiber, opts \\ []) do
+    felt_host = Keyword.get(opts, :felt_host, default_felt_host())
+
+    case query_history(fiber_id, ["--kind", "review-comment", "--last", "1", "--json"],
+           felt_host: felt_host
+         ) do
+      [event | _] ->
+        resume_mode = get_in(event, ["payload", "resume_mode"])
+        session_id = get_in(fiber, ["shuttle", "session", "id"])
+
+        if resume_mode == "previous" and is_binary(session_id) and session_id != "" do
+          {:previous, session_id}
+        else
+          :fresh
+        end
+
+      _ ->
+        :fresh
     end
   end
 
@@ -343,34 +380,73 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
-  defp create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, opts) do
+  # Dispatch: fresh worker (new session) or resume previous.
+  # `resume_intent` is `:fresh | {:previous, session_id}` from check_resume_intent/3.
+  defp create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent, opts) do
     session = session_name(fiber_id)
+
+    case resume_intent do
+      {:previous, session_id} ->
+        # Resume mode: invoke the harness-appropriate resume command.
+        # No new prompt is passed — the worker picks up from its transcript.
+        Logger.info(
+          "Resuming #{fiber_id} session #{session_id} via #{agent.id} → tmux #{session}"
+        )
+
+        command = Agents.build_resume_command(agent, session_id)
+        run_script = build_run_script(fiber_id, command, agent.id)
+        spawn_tmux(session, work_dir, run_script, runner)
+
+      :fresh ->
+        # Fresh mode: build the full dispatch prompt.
+        {command, session_uuid} = build_fresh_command(agent, fiber_id, prompt_context, opts)
+        Logger.info("Dispatching #{fiber_id} via #{agent.id} → tmux session #{session}")
+        run_script = build_run_script(fiber_id, command, agent.id)
+
+        case spawn_tmux(session, work_dir, run_script, runner) do
+          {:ok, _} = result ->
+            # Store the session UUID so "Resume previous" is available next time.
+            store_session_id(fiber_id, agent.id, session_uuid, runner)
+            result
+
+          error ->
+            error
+        end
+    end
+  end
+
+  # Build the fresh dispatch command. For Claude we generate and inject a UUID
+  # upfront (--session-id) so we can store it synchronously. For codex/pi we
+  # dispatch normally and capture the UUID asynchronously after spawn.
+  defp build_fresh_command(agent, fiber_id, prompt_context, opts) do
     prompt = render_context_prompt(fiber_id, prompt_context, opts)
-    command = Agents.build_command(agent, prompt)
 
-    # Build the run script — same shape as shuttle-worker.sh's RUN_SCRIPT
-    run_script = build_run_script(fiber_id, command, agent.id)
+    case agent.cli do
+      "claude" ->
+        uuid = generate_uuid4()
+        command = Agents.build_command(agent, prompt, session_id: uuid)
+        {command, {:claude, uuid}}
 
-    # Write run script to temp file
+      cli when cli in ["codex", "pi"] ->
+        command = Agents.build_command(agent, prompt)
+        work_dir = Keyword.get(opts, :work_dir, File.cwd!())
+        {command, {:capture, cli, work_dir}}
+
+      _ ->
+        command = Agents.build_command(agent, prompt)
+        {command, :none}
+    end
+  end
+
+  # Spawn a tmux session from a run-script string.
+  defp spawn_tmux(session, work_dir, run_script, runner) do
     tmp_path =
       Path.join(System.tmp_dir!(), "shuttle-run-#{System.unique_integer([:positive])}.sh")
 
     File.write!(tmp_path, run_script)
     File.chmod!(tmp_path, 0o755)
 
-    args = [
-      "new-session",
-      "-d",
-      "-s",
-      session,
-      "-c",
-      work_dir,
-      "bash",
-      "-l",
-      tmp_path
-    ]
-
-    Logger.info("Dispatching #{fiber_id} via #{agent.id} → tmux session #{session}")
+    args = ["new-session", "-d", "-s", session, "-c", work_dir, "bash", "-l", tmp_path]
 
     case runner.cmd("tmux", args, stderr_to_stdout: true) do
       {_, 0} ->
@@ -381,6 +457,184 @@ defmodule Shuttle.Dispatcher do
         File.rm(tmp_path)
         {:error, "tmux failed: #{output}"}
     end
+  end
+
+  # Store the session UUID after a successful fresh dispatch.
+  # - Claude: UUID was pre-specified; write synchronously.
+  # - Codex/Pi: capture UUID from session file asynchronously with backoff.
+  # - None: agent doesn't support session IDs; skip.
+  defp store_session_id(fiber_id, agent_id, {:claude, uuid}, _runner) do
+    case System.cmd("shuttle-ctl", ["session-set", fiber_id, uuid, "--agent", agent_id],
+           stderr_to_stdout: true
+         ) do
+      {_, 0} ->
+        Logger.info("Stored session UUID #{uuid} for #{fiber_id}")
+
+      {output, code} ->
+        Logger.warning(
+          "Could not store session UUID for #{fiber_id}: exit #{code}: #{String.trim(output)}"
+        )
+    end
+  end
+
+  defp store_session_id(fiber_id, agent_id, {:capture, cli, work_dir}, _runner) do
+    # Fire-and-forget: capture the session UUID from the harness's JSONL file
+    # in a background task. The race window (50 ms × 20 attempts = ~1 s) is
+    # short enough that the kanban card will show "Resume previous" by the
+    # next manual refresh.
+    Task.start(fn ->
+      case capture_session_uuid(cli, work_dir, 20) do
+        {:ok, uuid} ->
+          case System.cmd("shuttle-ctl", ["session-set", fiber_id, uuid, "--agent", agent_id],
+                 stderr_to_stdout: true
+               ) do
+            {_, 0} ->
+              Logger.info("Captured and stored session UUID #{uuid} for #{fiber_id}")
+
+            {output, code} ->
+              Logger.warning(
+                "Captured UUID #{uuid} but could not store for #{fiber_id}: " <>
+                  "exit #{code}: #{String.trim(output)}"
+              )
+          end
+
+        {:error, reason} ->
+          Logger.warning(
+            "Could not capture session UUID for #{fiber_id} (#{cli}): #{reason}. " <>
+              "Resume previous will be unavailable."
+          )
+      end
+    end)
+  end
+
+  defp store_session_id(_fiber_id, _agent_id, :none, _runner), do: :ok
+
+  # Poll for the session UUID written by codex/pi to their respective session
+  # JSONL files. Tries `attempts` times with 50 ms between each.
+  #
+  # Disk layouts:
+  #   codex: ~/.codex/sessions/YYYY/MM/DD/rollout-<iso>-<uuid>.jsonl
+  #          First line: {"type":"session_meta","payload":{"id":"<uuid>","cwd":"..."}}
+  #   pi:    ~/.pi/agent/sessions/<encoded-cwd>/<iso>_<uuid>.jsonl
+  #          First line: {"type":"session","id":"<uuid>","cwd":"..."}
+  #
+  # Both harnesses use UUIDv7 filenames (lexicographically = chronologically
+  # ordered), so sorting names and taking the last gives the freshest session.
+  defp capture_session_uuid(_cli, _work_dir, 0) do
+    {:error, "timed out waiting for session file"}
+  end
+
+  defp capture_session_uuid(cli, work_dir, attempts) do
+    :timer.sleep(50)
+
+    case find_session_file(cli, work_dir) do
+      {:ok, path} ->
+        read_uuid_from_jsonl(cli, path, work_dir)
+
+      {:error, _} ->
+        capture_session_uuid(cli, work_dir, attempts - 1)
+    end
+  end
+
+  defp find_session_file("codex", _work_dir) do
+    home = System.user_home!()
+    date = Date.utc_today()
+    dir = Path.join([home, ".codex", "sessions", "#{date.year}", pad2(date.month), pad2(date.day)])
+
+    case File.ls(dir) do
+      {:ok, files} ->
+        rollout_files = Enum.filter(files, &String.starts_with?(&1, "rollout-"))
+
+        case Enum.sort(rollout_files) |> List.last() do
+          nil -> {:error, :not_found}
+          file -> {:ok, Path.join(dir, file)}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp find_session_file("pi", work_dir) do
+    home = System.user_home!()
+    # Pi's encoded-cwd: absolute path with "/" replaced by "-", bracketed by "--".
+    # e.g. /Users/cd280747/loom → --Users-cd280747-loom--
+    encoded = "--" <> String.replace(work_dir, "/", "-") <> "--"
+    dir = Path.join([home, ".pi", "agent", "sessions", encoded])
+
+    case File.ls(dir) do
+      {:ok, files} ->
+        sorted = Enum.sort(files)
+
+        case List.last(sorted) do
+          nil -> {:error, :not_found}
+          file -> {:ok, Path.join(dir, file)}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp find_session_file(_cli, _work_dir), do: {:error, :unsupported}
+
+  defp read_uuid_from_jsonl("codex", path, work_dir) do
+    with {:ok, content} <- File.read(path),
+         first_line <- content |> String.split("\n") |> List.first(""),
+         {:ok, event} <- Jason.decode(first_line),
+         "session_meta" <- Map.get(event, "type"),
+         payload when is_map(payload) <- Map.get(event, "payload"),
+         uuid when is_binary(uuid) and uuid != "" <- Map.get(payload, "id"),
+         cwd when is_binary(cwd) <- Map.get(payload, "cwd") do
+      # Verify the session belongs to this worker's working directory.
+      if Path.expand(cwd) == Path.expand(work_dir) do
+        {:ok, uuid}
+      else
+        {:error, "session cwd mismatch: #{cwd} ≠ #{work_dir}"}
+      end
+    else
+      _ -> {:error, "could not parse session UUID from #{path}"}
+    end
+  end
+
+  defp read_uuid_from_jsonl("pi", path, work_dir) do
+    with {:ok, content} <- File.read(path),
+         first_line <- content |> String.split("\n") |> List.first(""),
+         {:ok, event} <- Jason.decode(first_line),
+         "session" <- Map.get(event, "type"),
+         uuid when is_binary(uuid) and uuid != "" <- Map.get(event, "id"),
+         cwd when is_binary(cwd) <- Map.get(event, "cwd") do
+      if Path.expand(cwd) == Path.expand(work_dir) do
+        {:ok, uuid}
+      else
+        {:error, "session cwd mismatch: #{cwd} ≠ #{work_dir}"}
+      end
+    else
+      _ -> {:error, "could not parse session UUID from #{path}"}
+    end
+  end
+
+  defp read_uuid_from_jsonl(_cli, path, _work_dir),
+    do: {:error, "unsupported harness for #{path}"}
+
+  defp pad2(n) when n < 10, do: "0#{n}"
+  defp pad2(n), do: "#{n}"
+
+  # Generates a random UUID v4 using Erlang's :crypto module.
+  # Sets version bits (byte 6 top nibble = 0100) and variant bits
+  # (byte 8 top 2 bits = 10) per RFC 4122.
+  defp generate_uuid4 do
+    <<b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15>> =
+      :crypto.strong_rand_bytes(16)
+
+    v6 = (b6 &&& 0x0F) ||| 0x40
+    v8 = (b8 &&& 0x3F) ||| 0x80
+
+    :io_lib.format(
+      "~2.16.0b~2.16.0b~2.16.0b~2.16.0b-~2.16.0b~2.16.0b-~2.16.0b~2.16.0b-~2.16.0b~2.16.0b-~2.16.0b~2.16.0b~2.16.0b~2.16.0b~2.16.0b~2.16.0b",
+      [b0, b1, b2, b3, b4, b5, v6, b7, v8, b9, b10, b11, b12, b13, b14, b15]
+    )
+    |> IO.chardata_to_string()
   end
 
   # The standing-run prompt currently doesn't read history, so it ignores

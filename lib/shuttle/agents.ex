@@ -292,9 +292,18 @@ defmodule Shuttle.Agents do
 
   @doc """
   Builds the shell command string for invoking an agent with the dispatch prompt.
+
+  ## Options
+
+    * `:session_id` — for Claude agents only: pre-specifies the session UUID via
+      `--session-id <uuid>`. Ignored for other harnesses. Allows the Shuttle
+      daemon to know the session UUID before the worker runs, making it storable
+      in `shuttle.session.id` before dispatch rather than via post-hoc capture.
   """
-  @spec build_command(agent_record(), String.t()) :: String.t()
-  def build_command(agent, prompt) do
+  @spec build_command(agent_record(), String.t(), keyword()) :: String.t()
+  def build_command(agent, prompt, opts \\ []) do
+    session_id = Keyword.get(opts, :session_id)
+
     flags =
       [
         flag("--provider", agent.provider),
@@ -305,11 +314,13 @@ defmodule Shuttle.Agents do
       |> Enum.join(" ")
 
     # The wrapper is a shell function sourced via bash -l.
-    # For claude: stdin via here-string
-    # For codex/pi: positional arg
+    # For claude: stdin via here-string; --session-id can be pre-specified.
+    # For codex/pi: positional arg.
     case agent.cli do
       "claude" ->
-        "#{agent.wrapper} #{flags} <<< #{shell_escape(prompt)}"
+        session_flag =
+          if session_id, do: "--session-id #{shell_escape(session_id)} ", else: ""
+        "#{agent.wrapper} #{session_flag}#{flags} <<< #{shell_escape(prompt)}"
 
       "codex" ->
         "#{agent.wrapper} #{flags} #{shell_escape(prompt)}"
@@ -319,6 +330,47 @@ defmodule Shuttle.Agents do
 
       _ ->
         "#{agent.wrapper} #{flags} #{shell_escape(prompt)}"
+    end
+  end
+
+  @doc """
+  Builds the shell command string for resuming a previous worker session.
+
+  Each harness has a distinct resume invocation:
+  - claude: `claude --resume <uuid>` (pre-specified UUID, deterministic)
+  - codex:  `codex resume <uuid>` (UUID captured post-hoc after initial dispatch)
+  - pi:     `pi --session <uuid>` (partial UUID also accepted)
+
+  Extra flags (provider, model, extra_flags) are threaded through so the
+  harness wrapper runs with the same configuration as the original session.
+  """
+  @spec build_resume_command(agent_record(), String.t()) :: String.t()
+  def build_resume_command(agent, session_id) do
+    flags =
+      [
+        flag("--provider", agent.provider),
+        flag("--model", agent.model),
+        agent.extra_flags
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join(" ")
+
+    case agent.cli do
+      "claude" ->
+        # Claude resumes from on-disk transcript — no prompt needed.
+        "#{agent.wrapper} #{flags} --resume #{shell_escape(session_id)}"
+
+      "codex" ->
+        # codex resume <uuid> [prompt] — resume subcommand, UUID positional.
+        "#{agent.wrapper} #{flags} resume #{shell_escape(session_id)}"
+
+      "pi" ->
+        # pi --session <path|partial-uuid> — accepts UUID prefix.
+        "#{agent.wrapper} #{flags} --session #{shell_escape(session_id)}"
+
+      _ ->
+        # Unknown harness: fall back to fresh dispatch with a note.
+        "#{agent.wrapper} #{flags} #{shell_escape("Resume session #{session_id} if possible.")}"
     end
   end
 
