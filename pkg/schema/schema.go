@@ -21,9 +21,27 @@ type Block struct {
 	Agent   string   `yaml:"agent,omitempty"`
 	Schedule *Schedule `yaml:"schedule,omitempty"`
 	Review  *Review  `yaml:"review,omitempty"`
+	// Session is daemon-owned: written at dispatch time, read at resume time.
+	// The CLI preserves it through lifecycle operations (pause/resume/set-model).
+	// Set via 'shuttle session-set'; cleared via 'shuttle session-clear'.
+	Session *Session `yaml:"session,omitempty"`
 	// Daemon-owned: the CLI reads these but only writes them in specific verbs.
 	NextDueAt  *time.Time `yaml:"next_due_at,omitempty"`
 	LastRunAt  *time.Time `yaml:"last_run_at,omitempty"`
+}
+
+// Session holds the most recent dispatch session for resume purposes.
+// Written by the Elixir daemon after a successful worker spawn; read at
+// the next dispatch to support resume-previous mode.
+type Session struct {
+	// ID is the harness-native session UUID.
+	// - Claude: the UUID passed via --session-id (pre-specified).
+	// - Codex/Pi: captured from the session JSONL after dispatch.
+	ID           string    `yaml:"id"`
+	// Agent is the agent ID used for this session (e.g. "claude-sonnet").
+	Agent        string    `yaml:"agent,omitempty"`
+	// DispatchedAt is when the session was spawned.
+	DispatchedAt time.Time `yaml:"dispatched_at"`
 }
 
 // Schedule holds the recurrence definition for a standing role.
