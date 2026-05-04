@@ -106,54 +106,34 @@ defmodule Shuttle.DispatcherTest do
         is_nil(fiber_id) ->
           {"fiber not found", 1}
 
-        # `felt show <id> --field shuttle` → YAML for the shuttle map, "" if nil.
-        "shuttle" in args and "--field" in args ->
-          fiber = @test_fibers[fiber_id]
-          case fiber.shuttle do
-            nil -> {"", 0}
-            map -> {to_yaml_block(map), 0}
-          end
-
-        # `felt show <id> --field tags` → one tag per line.
-        "tags" in args and "--field" in args ->
-          fiber = @test_fibers[fiber_id]
-          {Enum.join(fiber.tags, "\n"), 0}
-
-        # `felt show <id> --json` → the restricted JSON real felt emits
-        # (no shuttle, no tags). The dispatcher's fetch_fiber merges
-        # those back in via the --field calls above.
+        # `felt show <id> --json` (felt v1.0.4+) — tool-owned namespaces
+        # like `shuttle:` round-trip as flat top-level JSON keys alongside
+        # the parsed fields. The dispatcher reads `shuttle.agent` and
+        # `tags` directly off the JSON map.
         "--json" in args ->
           fiber = @test_fibers[fiber_id]
 
-          {Jason.encode!(%{
-             "id" => fiber_id,
-             "name" => fiber_id,
-             "status" => fiber.status,
-             "created_at" => "2026-04-28T00:00:00Z",
-             "body" => "",
-             "modified_at" => "2026-04-28T00:00:00Z"
-           }), 0}
+          payload =
+            %{
+              "id" => fiber_id,
+              "name" => fiber_id,
+              "status" => fiber.status,
+              "tags" => fiber.tags,
+              "created_at" => "2026-04-28T00:00:00Z",
+              "body" => "",
+              "modified_at" => "2026-04-28T00:00:00Z"
+            }
+            |> maybe_put("shuttle", fiber.shuttle)
+
+          {Jason.encode!(payload), 0}
 
         true ->
           {"", 0}
       end
     end
 
-    # Minimal YAML emitter for the test shuttle blocks: scalars on the same
-    # line as their key, no nesting needed for the current fixtures. Mirrors
-    # what `felt show --field shuttle` would produce against real frontmatter
-    # well enough for YamlElixir to round-trip the values the dispatcher reads.
-    defp to_yaml_block(map) when is_map(map) do
-      map
-      |> Enum.map(fn {k, v} -> "#{k}: #{format_yaml_scalar(v)}" end)
-      |> Enum.join("\n")
-    end
-
-    defp format_yaml_scalar(true), do: "true"
-    defp format_yaml_scalar(false), do: "false"
-    defp format_yaml_scalar(nil), do: "null"
-    defp format_yaml_scalar(s) when is_binary(s), do: s
-    defp format_yaml_scalar(n) when is_number(n), do: to_string(n)
+    defp maybe_put(map, _key, nil), do: map
+    defp maybe_put(map, key, value), do: Map.put(map, key, value)
   end
 
   # ── Setup ──

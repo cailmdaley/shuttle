@@ -317,26 +317,6 @@ defmodule Shuttle.Dispatcher do
   defp fetch_fiber(fiber_id, runner, opts) do
     felt_host = Keyword.get(opts, :felt_host, default_felt_host())
 
-    with {:ok, base} <- felt_show_json(fiber_id, runner, felt_host) do
-      # `felt show --json` does not include the `shuttle:` block or `tags:`
-      # — its JSON output is restricted to id/name/status/created_at/body/
-      # modified_at. The dispatcher consumes both (resolve_agent reads
-      # shuttle.agent + tags; check_resume_intent reads shuttle.session.id),
-      # so we enrich here via dedicated --field calls. See finding fiber:
-      # ai-futures/shuttle/finding-dispatcher-felt-show-json-misses-shuttle-block.
-      shuttle = fetch_shuttle_field(fiber_id, runner, felt_host)
-      tags = fetch_tags_field(fiber_id, runner, felt_host)
-
-      fiber =
-        base
-        |> maybe_put("shuttle", shuttle)
-        |> maybe_put("tags", tags)
-
-      {:ok, fiber}
-    end
-  end
-
-  defp felt_show_json(fiber_id, runner, felt_host) do
     case run_felt(runner, ["show", fiber_id, "--json"]) do
       {:ok, output} ->
         case Jason.decode(output) do
@@ -357,63 +337,6 @@ defmodule Shuttle.Dispatcher do
         end
     end
   end
-
-  # Reads the `shuttle:` frontmatter block via `felt show --field shuttle`,
-  # which emits structured (map) values as YAML. Returns the parsed map, or
-  # nil on absence/parse failure. Tries the explicit felt host on initial
-  # failure (mirrors felt_show_json's dual-attempt shape).
-  defp fetch_shuttle_field(fiber_id, runner, felt_host) do
-    case run_felt(runner, ["show", fiber_id, "--field", "shuttle"]) do
-      {:ok, output} ->
-        parse_shuttle_yaml(output)
-
-      {:error, _} ->
-        case run_felt(runner, ["show", fiber_id, "--field", "shuttle"], cd: felt_host) do
-          {:ok, output} -> parse_shuttle_yaml(output)
-          {:error, _} -> nil
-        end
-    end
-  end
-
-  defp parse_shuttle_yaml(output) when is_binary(output) do
-    trimmed = String.trim(output)
-
-    if trimmed == "" do
-      nil
-    else
-      case YamlElixir.read_from_string(trimmed) do
-        {:ok, map} when is_map(map) -> map
-        _ -> nil
-      end
-    end
-  end
-
-  # Reads the `tags:` frontmatter via `felt show --field tags`, which emits
-  # sequences of scalars one-per-line (per `felt show --help`). Returns the
-  # list, [] on absence.
-  defp fetch_tags_field(fiber_id, runner, felt_host) do
-    case run_felt(runner, ["show", fiber_id, "--field", "tags"]) do
-      {:ok, output} ->
-        parse_tags_lines(output)
-
-      {:error, _} ->
-        case run_felt(runner, ["show", fiber_id, "--field", "tags"], cd: felt_host) do
-          {:ok, output} -> parse_tags_lines(output)
-          {:error, _} -> []
-        end
-    end
-  end
-
-  defp parse_tags_lines(output) when is_binary(output) do
-    output
-    |> String.split("\n", trim: true)
-    |> Enum.map(&String.trim/1)
-    |> Enum.reject(&(&1 == ""))
-  end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, _key, []), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp check_not_closed(fiber) do
     status = Map.get(fiber, "status", "")
@@ -437,8 +360,9 @@ defmodule Shuttle.Dispatcher do
   defp resolve_agent(fiber) do
     # Prefer the post-migration shuttle.agent field when present; fall back
     # to legacy tag-based resolution (agent:<name> compound + bare aliases).
-    # `fetch_fiber` enriches the JSON via `--field shuttle` and `--field
-    # tags` calls, since `felt show --json` strips both fields.
+    # `felt show --json` rounds-trip-the-bytes (felt v1.0.4+): tool-owned
+    # frontmatter namespaces like `shuttle:` and `tags:` appear as flat
+    # top-level JSON keys.
     case get_in(fiber, ["shuttle", "agent"]) do
       name when is_binary(name) and name != "" ->
         Agents.resolve_by_name(name)
