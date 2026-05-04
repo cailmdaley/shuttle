@@ -90,13 +90,34 @@ defmodule Shuttle.PollerTest do
           shuttle = Agent.get(__MODULE__, & &1.shuttle)
           {Map.get(shuttle, fiber_id, ""), 0}
 
+        command == "felt" and String.contains?(full_args, "show") and
+            String.contains?(full_args, "--field tags") ->
+          fiber_id = extract_fiber_id(args)
+          fibers = Agent.get(__MODULE__, & &1.fibers)
+
+          tags =
+            fibers
+            |> Map.get(fiber_id, %{})
+            |> Map.get("tags", [])
+
+          {Enum.join(tags, "\n"), 0}
+
         command == "felt" and String.contains?(full_args, "show") ->
+          # `felt show --json` strips `shuttle:` and `tags:` from output (real
+          # felt behaviour as of 2026-05-04). Dispatcher reads them via
+          # `--field shuttle` and `--field tags` instead.
           fiber_id = extract_fiber_id(args)
           fibers = Agent.get(__MODULE__, & &1.fibers)
 
           case Map.get(fibers, fiber_id) do
-            nil -> {"fiber not found", 1}
-            fiber -> {Jason.encode!(fiber), 0}
+            nil ->
+              {"fiber not found", 1}
+
+            fiber ->
+              fiber
+              |> Map.drop(["shuttle", "tags"])
+              |> Jason.encode!()
+              |> then(&{&1, 0})
           end
 
         command == "tmux" and hd(args) == "has-session" ->
@@ -133,7 +154,7 @@ defmodule Shuttle.PollerTest do
       # args like ["show", "tests/haiku", "--json"] or
       # ["show", "tests/haiku", "--field", "shuttle"]
       args
-      |> Enum.reject(&(&1 in ["show", "--json", "--field", "shuttle"]))
+      |> Enum.reject(&(&1 in ["show", "--json", "--field", "shuttle", "tags"]))
       |> List.first("")
     end
   end

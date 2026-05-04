@@ -33,32 +33,52 @@ defmodule Shuttle.DispatcherTest do
       Agent.get(__MODULE__, & &1.tmux_sessions)
     end
 
+    # Test fiber registry: id → %{status:, tags:, shuttle:}.
+    #
+    # `felt show --json` emits id/name/status/created_at/body/modified_at *only*
+    # — it does NOT include `shuttle:` or `tags:` (verified against real felt).
+    # `felt show --field shuttle` emits structured values as YAML; `--field
+    # tags` emits sequences of scalars one-per-line. The cmd handler below
+    # routes each `felt show` flavor through the right shape.
+    @test_fibers %{
+      "tests/haiku" => %{
+        status: "active",
+        tags: ["constitution"],
+        shuttle: nil
+      },
+      "tests/closed" => %{
+        status: "closed",
+        tags: ["constitution"],
+        shuttle: nil
+      },
+      "tests/pi-tagged" => %{
+        status: "active",
+        tags: ["constitution", "pi"],
+        shuttle: nil
+      },
+      "tests/shuttle-agent-block" => %{
+        status: "active",
+        tags: ["constitution"],
+        shuttle: %{"enabled" => true, "kind" => "oneshot", "agent" => "claude-opus"}
+      },
+      "tests/shuttle-agent-overrides-tag" => %{
+        # Even with a legacy bare `pi` tag (would resolve to pi-deepseek-flash),
+        # shuttle.agent should win — the post-migration source of truth.
+        status: "active",
+        tags: ["constitution", "pi"],
+        shuttle: %{"enabled" => true, "kind" => "oneshot", "agent" => "claude-opus"}
+      }
+    }
+
     @impl true
     def cmd(command, args, _opts) do
       Agent.update(__MODULE__, fn state ->
         %{state | commands: state.commands ++ [{command, args}]}
       end)
 
-      full_args = Enum.join(args, " ")
-
       cond do
-        command == "felt" and String.contains?(full_args, "tests/haiku") ->
-          {haiku_fiber_json(), 0}
-
-        command == "felt" and String.contains?(full_args, "tests/closed") ->
-          {closed_fiber_json(), 0}
-
-        command == "felt" and String.contains?(full_args, "tests/pi-tagged") ->
-          {pi_fiber_json(), 0}
-
-        command == "felt" and String.contains?(full_args, "tests/shuttle-agent-block") ->
-          {shuttle_agent_block_fiber_json(), 0}
-
-        command == "felt" and String.contains?(full_args, "tests/shuttle-agent-overrides-tag") ->
-          {shuttle_agent_overrides_tag_fiber_json(), 0}
-
         command == "felt" ->
-          {"fiber not found", 1}
+          handle_felt(args)
 
         command == "tmux" and hd(args) == "has-session" ->
           session = Enum.at(args, 2)
@@ -79,59 +99,61 @@ defmodule Shuttle.DispatcherTest do
       end
     end
 
-    defp haiku_fiber_json do
-      Jason.encode!(%{
-        "id" => "tests/haiku",
-        "name" => "Haiku",
-        "status" => "active",
-        "tags" => ["constitution"],
-        "created_at" => "2026-04-28T00:00:00Z"
-      })
+    defp handle_felt(args) do
+      fiber_id = Enum.find(args, &Map.has_key?(@test_fibers, &1))
+
+      cond do
+        is_nil(fiber_id) ->
+          {"fiber not found", 1}
+
+        # `felt show <id> --field shuttle` → YAML for the shuttle map, "" if nil.
+        "shuttle" in args and "--field" in args ->
+          fiber = @test_fibers[fiber_id]
+          case fiber.shuttle do
+            nil -> {"", 0}
+            map -> {to_yaml_block(map), 0}
+          end
+
+        # `felt show <id> --field tags` → one tag per line.
+        "tags" in args and "--field" in args ->
+          fiber = @test_fibers[fiber_id]
+          {Enum.join(fiber.tags, "\n"), 0}
+
+        # `felt show <id> --json` → the restricted JSON real felt emits
+        # (no shuttle, no tags). The dispatcher's fetch_fiber merges
+        # those back in via the --field calls above.
+        "--json" in args ->
+          fiber = @test_fibers[fiber_id]
+
+          {Jason.encode!(%{
+             "id" => fiber_id,
+             "name" => fiber_id,
+             "status" => fiber.status,
+             "created_at" => "2026-04-28T00:00:00Z",
+             "body" => "",
+             "modified_at" => "2026-04-28T00:00:00Z"
+           }), 0}
+
+        true ->
+          {"", 0}
+      end
     end
 
-    defp closed_fiber_json do
-      Jason.encode!(%{
-        "id" => "tests/closed",
-        "name" => "Closed",
-        "status" => "closed",
-        "tags" => ["constitution"],
-        "created_at" => "2026-04-28T00:00:00Z"
-      })
+    # Minimal YAML emitter for the test shuttle blocks: scalars on the same
+    # line as their key, no nesting needed for the current fixtures. Mirrors
+    # what `felt show --field shuttle` would produce against real frontmatter
+    # well enough for YamlElixir to round-trip the values the dispatcher reads.
+    defp to_yaml_block(map) when is_map(map) do
+      map
+      |> Enum.map(fn {k, v} -> "#{k}: #{format_yaml_scalar(v)}" end)
+      |> Enum.join("\n")
     end
 
-    defp pi_fiber_json do
-      Jason.encode!(%{
-        "id" => "tests/pi-tagged",
-        "name" => "Pi Tagged",
-        "status" => "active",
-        "tags" => ["constitution", "pi"],
-        "created_at" => "2026-04-28T00:00:00Z"
-      })
-    end
-
-    defp shuttle_agent_block_fiber_json do
-      Jason.encode!(%{
-        "id" => "tests/shuttle-agent-block",
-        "name" => "Shuttle agent block",
-        "status" => "active",
-        "tags" => ["constitution"],
-        "shuttle" => %{"enabled" => true, "kind" => "oneshot", "agent" => "claude-opus"},
-        "created_at" => "2026-04-28T00:00:00Z"
-      })
-    end
-
-    defp shuttle_agent_overrides_tag_fiber_json do
-      # Even with a legacy bare `pi` tag (would resolve to pi-deepseek-flash),
-      # shuttle.agent should win — the post-migration source of truth.
-      Jason.encode!(%{
-        "id" => "tests/shuttle-agent-overrides-tag",
-        "name" => "Shuttle agent overrides tag",
-        "status" => "active",
-        "tags" => ["constitution", "pi"],
-        "shuttle" => %{"enabled" => true, "kind" => "oneshot", "agent" => "claude-opus"},
-        "created_at" => "2026-04-28T00:00:00Z"
-      })
-    end
+    defp format_yaml_scalar(true), do: "true"
+    defp format_yaml_scalar(false), do: "false"
+    defp format_yaml_scalar(nil), do: "null"
+    defp format_yaml_scalar(s) when is_binary(s), do: s
+    defp format_yaml_scalar(n) when is_number(n), do: to_string(n)
   end
 
   # ── Setup ──
