@@ -143,12 +143,12 @@ func FiberIDFromPath(host, mdPath string) (string, error) {
 	return strings.TrimSuffix(rel, ".md"), nil
 }
 
-// TmuxSessionName returns the tmux session name for a fiber ID.
+// TmuxSessionName returns the canonical tmux session name for a fiber ID.
 func TmuxSessionName(fiberID string) string {
-	// Shuttle uses the last path segment for tmux names to keep them short.
-	// e.g. "ai-futures/shuttle/constitution-X" → "shuttle-constitution-X"
-	segments := strings.Split(fiberID, "/")
-	return "shuttle-" + segments[len(segments)-1]
+	// Preserve the full fiber ID so every surface (Elixir dispatcher, Go CLI,
+	// portolan UI, manual tmux attach) agrees on the same worker session name.
+	// tmux accepts `/` in session names on macOS and Linux.
+	return "shuttle-" + fiberID
 }
 
 // TmuxSessionExists checks whether a tmux session with the given name exists.

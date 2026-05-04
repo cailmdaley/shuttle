@@ -11,8 +11,8 @@ import (
 var jsonOutput bool
 
 var rootCmd = &cobra.Command{
-	Use:          "shuttle",
-	Short:        "Shuttle CLI — schema-validating agent tool for fiber dispatch",
+	Use:           "shuttle",
+	Short:         "Shuttle CLI — schema-validating agent tool for fiber dispatch",
 	SilenceUsage:  true, // don't show usage on every error
 	SilenceErrors: true, // we print errors ourselves in main()
 	Long: `shuttle manages the shuttle: frontmatter block that drives fiber dispatch.
@@ -27,10 +27,11 @@ Write verbs (offline, validate-before-write):
   uninstall   Remove the shuttle: block from a fiber
 
 Read + abort verbs (offline, no daemon IPC):
-  status      One-line-per-fiber status overview
-  ps          Live tmux worker sessions only
-  attach      Attach to a running worker's tmux session
-  abort       Kill a worker's tmux session
+  status       One-line-per-fiber status overview
+  ps           Live tmux worker sessions only
+  session-name Print the canonical tmux session name for a fiber
+  attach       Attach to a running worker's tmux session
+  abort        Kill a worker's tmux session
 
 The CLI edits shuttle: frontmatter directly. The running daemon picks up changes
 on its next poll. All write verbs validate input before touching any file.`,

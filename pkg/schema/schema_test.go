@@ -21,8 +21,8 @@ func TestValidate_ValidOneshot(t *testing.T) {
 
 func TestValidate_ValidStanding(t *testing.T) {
 	b := &Block{
-		Enabled: true,
-		Kind:    "standing",
+		Enabled:  true,
+		Kind:     "standing",
 		Schedule: &Schedule{Expr: "0 9 * * 1-5", TZ: "Europe/Paris"},
 		Review:   &Review{State: "scheduled"},
 	}
@@ -90,6 +90,20 @@ func TestNextOccurrence(t *testing.T) {
 	}
 	if next.In(paris).Hour() != 9 {
 		t.Fatalf("expected hour=9, got %d", next.In(paris).Hour())
+	}
+}
+
+func TestTmuxSessionNamePreservesFullFiberID(t *testing.T) {
+	cases := map[string]string{
+		"tests/haiku":              "shuttle-tests/haiku",
+		"ai-futures/foo/bar":       "shuttle-ai-futures/foo/bar",
+		"constitution-single-name": "shuttle-constitution-single-name",
+	}
+
+	for fiberID, want := range cases {
+		if got := TmuxSessionName(fiberID); got != want {
+			t.Fatalf("TmuxSessionName(%q) = %q, want %q", fiberID, got, want)
+		}
 	}
 }
 
