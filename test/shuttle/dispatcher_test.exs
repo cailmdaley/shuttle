@@ -320,4 +320,104 @@ defmodule Shuttle.DispatcherTest do
     assert cmd =~ "--provider 'openrouter'"
     assert cmd =~ "--model 'moonshotai/kimi-k2.6'"
   end
+
+  # ── Resume command shape ──
+
+  test "build_resume_command for claude with empty prompt: --resume only, no stdin pipe" do
+    agent = Enum.find(Agents.list(), &(&1.id == "claude-sonnet"))
+    cmd = Agents.build_resume_command(agent, "abc-123", "")
+    assert cmd =~ "claude"
+    assert cmd =~ "--resume 'abc-123'"
+    refute cmd =~ "<<<"
+  end
+
+  test "build_resume_command for claude with prompt: pipes via here-string" do
+    agent = Enum.find(Agents.list(), &(&1.id == "claude-sonnet"))
+    cmd = Agents.build_resume_command(agent, "abc-123", "address the typo")
+    assert cmd =~ "--resume 'abc-123'"
+    assert cmd =~ "<<< 'address the typo'"
+  end
+
+  test "build_resume_command for claude with whitespace-only prompt: treated as empty" do
+    agent = Enum.find(Agents.list(), &(&1.id == "claude-sonnet"))
+    cmd = Agents.build_resume_command(agent, "abc-123", "   \n  ")
+    refute cmd =~ "<<<"
+  end
+
+  test "build_resume_command for codex with prompt: positional arg" do
+    agent = Enum.find(Agents.list(), &(&1.id == "codex"))
+    cmd = Agents.build_resume_command(agent, "abc-123", "address the typo")
+    assert cmd =~ "codex"
+    assert cmd =~ "resume 'abc-123'"
+    assert cmd =~ "'address the typo'"
+    refute cmd =~ "<<<"
+  end
+
+  test "build_resume_command for codex with empty prompt: resume only" do
+    agent = Enum.find(Agents.list(), &(&1.id == "codex"))
+    cmd = Agents.build_resume_command(agent, "abc-123", "")
+    assert cmd =~ "resume 'abc-123'"
+    # No trailing prompt arg.
+    assert String.trim_trailing(cmd) |> String.ends_with?("'abc-123'")
+  end
+
+  test "build_resume_command for pi: drops prompt (no inline arg supported)" do
+    agent = Enum.find(Agents.list(), &(&1.id == "pi-kimi"))
+    cmd = Agents.build_resume_command(agent, "abc-123", "ignored directive")
+    assert cmd =~ "--session 'abc-123'"
+    refute cmd =~ "ignored directive"
+  end
+
+  test "build_resume_command/2 default-arg form still works (zero-arg prompt)" do
+    agent = Enum.find(Agents.list(), &(&1.id == "claude-sonnet"))
+    cmd = Agents.build_resume_command(agent, "abc-123")
+    assert cmd =~ "--resume 'abc-123'"
+    refute cmd =~ "<<<"
+  end
+
+  # ── Resume prompt rendering ──
+
+  test "render_resume_prompt includes resume framing and fiber id" do
+    # No felt history available in test env (no .felt index) — query_history
+    # falls back to []; the framing block still renders.
+    prompt = Dispatcher.render_resume_prompt("tests/haiku")
+    assert prompt =~ "Shuttle resume. Fiber ID: tests/haiku"
+    assert prompt =~ "Resume previous"
+    # Resume prompt deliberately omits the fresh-dispatch prologue.
+    refute prompt =~ "Activate the shuttle and felt skills"
+    refute prompt =~ "kill $PPID"
+  end
+
+  # ── Resume-warning dismiss in run script ──
+
+  test "build_run_script with dismiss_resume_warning embeds backgrounded send-keys" do
+    script =
+      Dispatcher.build_run_script("tests/haiku", "claude --resume 'abc'", "claude-sonnet",
+        dismiss_resume_warning: true,
+        session: "shuttle-tests/haiku"
+      )
+
+    assert script =~ "sleep 2"
+    assert script =~ "tmux send-keys -t 'shuttle-tests/haiku' Enter"
+    # The dismiss block runs in the background (suffixed with `&`) so it
+    # doesn't block the harness command itself.
+    assert script =~ ") &"
+  end
+
+  test "build_run_script without dismiss_resume_warning emits no send-keys" do
+    script =
+      Dispatcher.build_run_script("tests/haiku", "claude --resume 'abc'", "claude-sonnet",
+        dismiss_resume_warning: false,
+        session: "shuttle-tests/haiku"
+      )
+
+    refute script =~ "send-keys"
+  end
+
+  test "build_run_script with no opts (fresh dispatch path) emits no send-keys" do
+    # Default opts = [] → dismiss_resume_warning defaults to false. This is
+    # the path fresh dispatch takes, so fresh workers never get the dismiss.
+    script = Dispatcher.build_run_script("tests/haiku", "claude <<< 'hi'", "claude-sonnet")
+    refute script =~ "send-keys"
+  end
 end

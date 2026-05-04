@@ -28,6 +28,7 @@ defmodule ShuttleWeb.APIControllerTest do
             commands: [],
             tmux_sessions: MapSet.new(),
             fibers: %{},
+            shuttle: %{},
             felt_ls: []
           }
         end,
@@ -36,17 +37,36 @@ defmodule ShuttleWeb.APIControllerTest do
     end
 
     def reset do
+      # Remove any fiber files written by set_shuttle so tests start clean.
+      File.rm_rf("/tmp/.felt")
+
       Agent.update(__MODULE__, fn _ ->
         %{
           commands: [],
           tmux_sessions: MapSet.new(),
           fibers: %{},
+          shuttle: %{},
           felt_ls: []
         }
       end)
     end
 
     def set_fiber(id, fiber), do: Agent.update(__MODULE__, &put_in(&1.fibers[id], fiber))
+
+    # Write a real .md file carrying the given shuttle: block and felt status so
+    # that walk_shuttle_fibers (the file-walk discovery path) can find it.
+    def set_shuttle(id, yaml, status \\ "active") do
+      felt_dir = "/tmp/.felt"
+      segments = String.split(id, "/")
+      basename = List.last(segments)
+      dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
+      File.mkdir_p!(Path.dirname(dir_path))
+      indented = yaml |> String.trim() |> String.split("\n") |> Enum.map_join("\n", &("  " <> &1))
+      File.write!(dir_path, "---\nstatus: #{status}\nshuttle:\n#{indented}\n---\nbody\n")
+      Agent.update(__MODULE__, &put_in(&1.shuttle[id], yaml))
+    end
+
+    # Kept for backward compat; discovery now walks files for shuttle: blocks.
     def set_felt_ls(fibers), do: Agent.update(__MODULE__, &%{&1 | felt_ls: fibers})
 
     def add_tmux_session(session),
@@ -120,10 +140,17 @@ defmodule ShuttleWeb.APIControllerTest do
   setup do
     start_supervised!(MockRunner)
     MockRunner.reset()
-    start_supervised!({Poller, runner: MockRunner, poll_interval_ms: 600_000, felt_host: "/tmp"})
+
+    start_supervised!(
+      {Poller, runner: MockRunner, poll_interval_ms: 600_000, felt_hosts: ["/tmp"]}
+    )
+
     Process.sleep(50)
     :ok
   end
+
+  # Minimal shuttle: block YAML for a oneshot fiber ready for dispatch.
+  @oneshot_shuttle "enabled: true\nkind: oneshot\n"
 
   defp api_conn do
     build_conn()
@@ -148,8 +175,8 @@ defmodule ShuttleWeb.APIControllerTest do
 
   test "returns running worker info" do
     fiber = make_fiber("tests/haiku")
-    MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/haiku", fiber)
+    MockRunner.set_shuttle("tests/haiku", @oneshot_shuttle)
 
     send(Shuttle.Poller, :run_poll_cycle)
     Process.sleep(100)
@@ -176,6 +203,7 @@ defmodule ShuttleWeb.APIControllerTest do
   test "dispatches a fiber via API" do
     fiber = make_fiber("tests/api-dispatch")
     MockRunner.set_fiber("tests/api-dispatch", fiber)
+    MockRunner.set_shuttle("tests/api-dispatch", @oneshot_shuttle)
 
     conn =
       post(
@@ -387,8 +415,8 @@ defmodule ShuttleWeb.APIControllerTest do
 
   test "state returns full orchestrator state" do
     fiber = make_fiber("tests/state")
-    MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/state", fiber)
+    MockRunner.set_shuttle("tests/state", @oneshot_shuttle)
 
     send(Shuttle.Poller, :run_poll_cycle)
     Process.sleep(100)
@@ -407,8 +435,8 @@ defmodule ShuttleWeb.APIControllerTest do
 
   test "worker channel broadcasts exit events" do
     fiber = make_fiber("tests/channel")
-    MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/channel", fiber)
+    MockRunner.set_shuttle("tests/channel", @oneshot_shuttle)
 
     send(Shuttle.Poller, :run_poll_cycle)
     Process.sleep(100)

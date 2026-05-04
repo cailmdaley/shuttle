@@ -20,128 +20,8 @@ defmodule Shuttle.Agents do
           default: boolean()
         }
 
-  @default_agents [
-    %{
-      id: "claude-sonnet",
-      cli: "claude",
-      wrapper: "claude",
-      provider: nil,
-      model: "sonnet",
-      base_url: nil,
-      extra_flags: "--dangerously-skip-permissions",
-      requires_model: false,
-      aliases: [],
-      default: true
-    },
-    %{
-      id: "claude-opus",
-      cli: "claude",
-      wrapper: "claude",
-      provider: nil,
-      model: "opus",
-      base_url: nil,
-      extra_flags: "--dangerously-skip-permissions",
-      requires_model: false,
-      aliases: [],
-      default: false
-    },
-    %{
-      id: "claude-haiku",
-      cli: "claude",
-      wrapper: "claude",
-      provider: nil,
-      model: "haiku",
-      base_url: nil,
-      extra_flags: "--dangerously-skip-permissions",
-      requires_model: false,
-      aliases: [],
-      default: false
-    },
-    %{
-      id: "codex",
-      cli: "codex",
-      wrapper: "codex",
-      provider: nil,
-      model: "gpt-5.5",
-      base_url: nil,
-      extra_flags: "--dangerously-bypass-approvals-and-sandbox",
-      requires_model: false,
-      aliases: ["codex"],
-      default: false
-    },
-    %{
-      id: "codex-mini",
-      cli: "codex",
-      wrapper: "codex",
-      provider: nil,
-      model: "gpt-5.4-mini",
-      base_url: nil,
-      extra_flags: "--dangerously-bypass-approvals-and-sandbox",
-      requires_model: false,
-      aliases: [],
-      default: false
-    },
-    %{
-      id: "pi-sonnet",
-      cli: "pi",
-      wrapper: "pi",
-      provider: "openrouter",
-      model: "anthropic/claude-sonnet-4",
-      base_url: nil,
-      extra_flags: nil,
-      requires_model: true,
-      aliases: [],
-      default: false
-    },
-    %{
-      id: "pi-gpt",
-      cli: "pi",
-      wrapper: "pi",
-      provider: "openrouter",
-      model: "openai/gpt-4o",
-      base_url: nil,
-      extra_flags: nil,
-      requires_model: true,
-      aliases: [],
-      default: false
-    },
-    %{
-      id: "pi-kimi",
-      cli: "pi",
-      wrapper: "pi",
-      provider: "openrouter",
-      model: "moonshotai/kimi-k2.6",
-      base_url: nil,
-      extra_flags: nil,
-      requires_model: true,
-      aliases: ["pi"],
-      default: false
-    },
-    %{
-      id: "pi-deepseek-pro",
-      cli: "pi",
-      wrapper: "pi",
-      provider: "openrouter",
-      model: "deepseek/deepseek-v4-pro",
-      base_url: nil,
-      extra_flags: nil,
-      requires_model: true,
-      aliases: [],
-      default: false
-    },
-    %{
-      id: "pi-deepseek-flash",
-      cli: "pi",
-      wrapper: "pi",
-      provider: "openrouter",
-      model: "deepseek/deepseek-v4-flash",
-      base_url: nil,
-      extra_flags: nil,
-      requires_model: true,
-      aliases: [],
-      default: false
-    }
-  ]
+  @external_resource Path.expand("../../share/agents.json", __DIR__)
+  @embedded_agents File.read!(@external_resource) |> Jason.decode!(keys: :atoms)
 
   @doc """
   Returns the list of configured agent records.
@@ -149,7 +29,7 @@ defmodule Shuttle.Agents do
   @spec list() :: [agent_record()]
   def list do
     :shuttle
-    |> Application.get_env(:agents, @default_agents)
+    |> Application.get_env(:agents, @embedded_agents)
     |> normalize_agents()
   end
 
@@ -341,11 +221,22 @@ defmodule Shuttle.Agents do
   - codex:  `codex resume <uuid>` (UUID captured post-hoc after initial dispatch)
   - pi:     `pi --session <uuid>` (partial UUID also accepted)
 
+  When `prompt` is non-empty (whitespace-trimmed), it is injected as the
+  next user turn in the resumed session — mirroring the fresh-dispatch
+  pattern (claude reads it via `<<<` here-string; codex takes it as a
+  positional arg). Without it, resume would land the worker in a session
+  with no signal that it was deliberately woken — Cail's directive would
+  sit silently in `felt history` instead of surfacing.
+
+  Pi has no inline-prompt arg on `pi --session`, so the directive is
+  dropped on resume for pi today; the worker can still query
+  `felt history` to surface it.
+
   Extra flags (provider, model, extra_flags) are threaded through so the
   harness wrapper runs with the same configuration as the original session.
   """
-  @spec build_resume_command(agent_record(), String.t()) :: String.t()
-  def build_resume_command(agent, session_id) do
+  @spec build_resume_command(agent_record(), String.t(), String.t()) :: String.t()
+  def build_resume_command(agent, session_id, prompt \\ "") do
     flags =
       [
         flag("--provider", agent.provider),
@@ -355,17 +246,25 @@ defmodule Shuttle.Agents do
       |> Enum.reject(&is_nil/1)
       |> Enum.join(" ")
 
+    has_prompt = is_binary(prompt) and String.trim(prompt) != ""
+
     case agent.cli do
       "claude" ->
-        # Claude resumes from on-disk transcript — no prompt needed.
-        "#{agent.wrapper} #{flags} --resume #{shell_escape(session_id)}"
+        # Claude resumes from on-disk transcript. With a prompt, feed it
+        # via stdin (here-string) so it lands as the next user turn —
+        # mirrors fresh dispatch's `<<<` pattern.
+        base = "#{agent.wrapper} #{flags} --resume #{shell_escape(session_id)}"
+        if has_prompt, do: "#{base} <<< #{shell_escape(prompt)}", else: base
 
       "codex" ->
-        # codex resume <uuid> [prompt] — resume subcommand, UUID positional.
-        "#{agent.wrapper} #{flags} resume #{shell_escape(session_id)}"
+        # codex resume <uuid> [prompt] — resume subcommand, UUID positional,
+        # optional prompt as trailing positional.
+        base = "#{agent.wrapper} #{flags} resume #{shell_escape(session_id)}"
+        if has_prompt, do: "#{base} #{shell_escape(prompt)}", else: base
 
       "pi" ->
-        # pi --session <path|partial-uuid> — accepts UUID prefix.
+        # pi --session <path|partial-uuid> — accepts UUID prefix. No inline
+        # prompt arg today, so the directive is dropped on pi resume.
         "#{agent.wrapper} #{flags} --session #{shell_escape(session_id)}"
 
       _ ->

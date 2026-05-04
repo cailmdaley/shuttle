@@ -1,7 +1,7 @@
 import Config
 
 config :shuttle, :agents, [
-  # Claude (Anthropic) — default, alias: claude
+  # Claude (Anthropic) — default; runs against the weekly Claude subscription
   [
     id: "claude-sonnet",
     cli: "claude",
@@ -35,31 +35,43 @@ config :shuttle, :agents, [
     aliases: ["codex"],
     default: false
   ],
-  [
-    id: "codex-mini",
-    cli: "codex",
-    wrapper: "codex",
-    model: "gpt-5.4-mini",
-    extra_flags: "--dangerously-bypass-approvals-and-sandbox"
-  ],
-
-  # Anthropic via pi (OpenRouter)
+  # Anthropic via pi (GitHub Copilot, max thinking allowed) — Copilot fill-in
   [
     id: "pi-sonnet",
     cli: "pi",
     wrapper: "pi",
-    provider: "openrouter",
-    model: "anthropic/claude-sonnet-4",
+    provider: "github-copilot",
+    model: "claude-sonnet-4.6:high",
     requires_model: true
   ],
 
-  # OpenAI via pi (OpenRouter)
+  # GPT 5.4 via pi (GitHub Copilot, max thinking)
   [
-    id: "pi-gpt",
+    id: "pi-gpt-5.4",
     cli: "pi",
     wrapper: "pi",
-    provider: "openrouter",
-    model: "openai/gpt-4o",
+    provider: "github-copilot",
+    model: "gpt-5.4:xhigh",
+    requires_model: true
+  ],
+
+  # GPT 5.4 mini via pi (GitHub Copilot, 0.3× message multiplier — cheap)
+  [
+    id: "pi-gpt-5.4-mini",
+    cli: "pi",
+    wrapper: "pi",
+    provider: "github-copilot",
+    model: "gpt-5.4-mini:xhigh",
+    requires_model: true
+  ],
+
+  # GPT-5 mini via pi (GitHub Copilot, 0× multiplier — free)
+  [
+    id: "pi-gpt-5-mini",
+    cli: "pi",
+    wrapper: "pi",
+    provider: "github-copilot",
+    model: "gpt-5-mini:xhigh",
     requires_model: true
   ],
 

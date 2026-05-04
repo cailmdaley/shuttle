@@ -171,6 +171,38 @@ defmodule Shuttle.Dispatcher do
   end
 
   @doc """
+  Renders the prompt injected into a *resumed* worker session.
+
+  Mirrors the fresh dispatch prompt's directive + handoff blocks so the
+  resumed worker has the same upfront context as a fresh worker would,
+  but skips the "Activate skills / read constitution / kill $PPID" prologue
+  — those are already in the resumed transcript and repeating them is
+  noise.
+
+  When the latest review-comment has an empty summary (the kanban writes
+  one on every requeue/resume click to keep `resume_mode` aligned with
+  user intent — see `render_latest_review_directive/2`), the directive
+  block is suppressed and the worker just gets the framing sentence.
+
+  Pass `felt_host:` to control which `.felt/` index is queried; defaults
+  to `default_felt_host/0`.
+  """
+  @spec render_resume_prompt(String.t(), keyword()) :: String.t()
+  def render_resume_prompt(fiber_id, opts \\ []) do
+    directive_block = render_latest_review_directive(fiber_id, opts)
+    handoff_block = render_latest_editorial(fiber_id, opts)
+
+    base = """
+    Shuttle resume. Fiber ID: #{fiber_id}
+
+    The user clicked "Resume previous" in the kanban — your session was woken to keep working on this fiber. Skills, exit conventions, and the constitution are already in your transcript from the original dispatch. If a new directive appears above, address it; otherwise pick up from the last clean checkpoint.
+    """
+
+    (directive_block <> handoff_block <> base)
+    |> String.trim()
+  end
+
+  @doc """
   Reads the most recent `--kind review-comment` event for `fiber_id` and
   renders a directive block for inclusion at the top of the dispatch
   prompt. Returns "" if there are no review-comment events.
@@ -186,21 +218,31 @@ defmodule Shuttle.Dispatcher do
   def render_latest_review_directive(fiber_id, opts \\ []) do
     case query_history(fiber_id, ["--kind", "review-comment", "--last", "1", "--json"], opts) do
       [event | _] ->
-        actor = Map.get(event, "actor", "")
-        when_iso = Map.get(event, "occurred_at", "")
-        summary = get_in(event, ["payload", "summary"]) || ""
+        summary = (get_in(event, ["payload", "summary"]) || "") |> String.trim()
 
-        """
-        ┌─ Most recent directive from Cail (#{when_iso}, #{actor}) ──────────────────
-        #{indent_block(summary, "  ")}
+        # Empty-summary review-comment events exist by design: the kanban
+        # writes one on every Requeue/Resume click so the latest event's
+        # `resume_mode` reflects current user intent, even when Cail had
+        # nothing to add. Suppress the block in that case — an empty box
+        # would just be noise.
+        if summary == "" do
+          ""
+        else
+          actor = Map.get(event, "actor", "")
+          when_iso = Map.get(event, "occurred_at", "")
 
-        Read this alongside the prior handoff below and the editorial chain
-        (`felt history #{fiber_id}`). If the chain shows the directive has
-        already been addressed in a previous loop, treat it as historical
-        context; otherwise incorporate it into your work.
-        └──────────────────────────────────────────────────────────────────────────
+          """
+          ┌─ Most recent directive (#{when_iso}, #{actor}) ──────────────────
+          #{indent_block(summary, "  ")}
 
-        """
+          Read this alongside the prior handoff below and the editorial chain
+          (`felt history #{fiber_id}`). If the chain shows the directive has
+          already been addressed in a previous loop, treat it as historical
+          context; otherwise incorporate it into your work.
+          └──────────────────────────────────────────────────────────────────────────
+
+          """
+        end
 
       _ ->
         ""
@@ -388,14 +430,30 @@ defmodule Shuttle.Dispatcher do
 
     case resume_intent do
       {:previous, session_id} ->
-        # Resume mode: invoke the harness-appropriate resume command.
-        # No new prompt is passed — the worker picks up from its transcript.
+        # Resume mode: invoke the harness-appropriate resume command and
+        # inject a small prompt as the next user turn so the resumed
+        # worker knows it was deliberately woken (and sees the user's
+        # latest directive if there is one). Without this the worker
+        # would wake blind to the directive that triggered the resume.
         Logger.info(
           "Resuming #{fiber_id} session #{session_id} via #{agent.id} → tmux #{session}"
         )
 
-        command = Agents.build_resume_command(agent, session_id)
-        run_script = build_run_script(fiber_id, command, agent.id)
+        resume_prompt = render_resume_prompt(fiber_id, opts)
+        command = Agents.build_resume_command(agent, session_id, resume_prompt)
+
+        # claude --resume shows an interactive "you're about to use a
+        # previous session" warning that only an Enter keypress at the
+        # TTY can dismiss. The heredoc-piped prompt arrives *after* the
+        # warning, so we can't fold it in. Schedule a tmux send-keys to
+        # fire a couple seconds in. Other harnesses (codex/pi) don't
+        # show this warning.
+        run_script =
+          build_run_script(fiber_id, command, agent.id,
+            dismiss_resume_warning: agent.cli == "claude",
+            session: session
+          )
+
         spawn_tmux(session, work_dir, run_script, runner)
 
       :fresh ->
@@ -653,7 +711,28 @@ defmodule Shuttle.Dispatcher do
 
   defp render_context_prompt(fiber_id, _, opts), do: render_prompt(fiber_id, opts)
 
-  defp build_run_script(fiber_id, command, agent_id) do
+  @doc false
+  # Public for tests. Builds the bash script that wraps the harness command
+  # with start/exit banners. With `dismiss_resume_warning: true` and a
+  # `session:` name, also schedules a backgrounded tmux send-keys to
+  # dismiss claude --resume's interactive warning page.
+  def build_run_script(fiber_id, command, agent_id, opts \\ []) do
+    dismiss_resume_warning = Keyword.get(opts, :dismiss_resume_warning, false)
+    session = Keyword.get(opts, :session, "")
+
+    # When resuming claude, schedule a backgrounded tmux send-keys to
+    # dismiss the interactive warning page. Runs *inside* the same tmux
+    # session it's targeting — tmux send-keys can target the current
+    # session, the keypress lands on whatever's at the prompt (claude's
+    # warning UI). 2 seconds is a safety margin for claude startup.
+    dismiss_block =
+      if dismiss_resume_warning and session != "" do
+        # Single-quote the session name so slashes/dots don't trip the shell.
+        ~s|( sleep 2; tmux send-keys -t '#{session}' Enter ) &\n    |
+      else
+        ""
+      end
+
     """
     #!/bin/bash
     set -e
@@ -664,7 +743,7 @@ defmodule Shuttle.Dispatcher do
     echo "Shuttle worker — #{fiber_id} — agent=#{agent_id} — $(date '+%H:%M:%S')"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    #{command}
+    #{dismiss_block}#{command}
 
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

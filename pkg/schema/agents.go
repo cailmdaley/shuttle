@@ -27,28 +27,20 @@ type AgentRegistry struct {
 	agents []AgentRecord
 }
 
-// defaultAgents mirrors config/agents.exs as the Go baseline.
-// Keep in sync with share/agents.json and config/agents.exs.
-var defaultAgentRecords = []AgentRecord{
-	{ID: "claude-sonnet", CLI: "claude", Wrapper: "claude", Model: "sonnet", ExtraFlags: "--dangerously-skip-permissions", Default: true},
-	{ID: "claude-opus", CLI: "claude", Wrapper: "claude", Model: "opus", ExtraFlags: "--dangerously-skip-permissions"},
-	{ID: "claude-haiku", CLI: "claude", Wrapper: "claude", Model: "haiku", ExtraFlags: "--dangerously-skip-permissions"},
-	{ID: "codex", CLI: "codex", Wrapper: "codex", Model: "gpt-5.5", ExtraFlags: "--dangerously-bypass-approvals-and-sandbox", Aliases: []string{"codex"}},
-	{ID: "codex-mini", CLI: "codex", Wrapper: "codex", Model: "gpt-5.4-mini", ExtraFlags: "--dangerously-bypass-approvals-and-sandbox"},
-	{ID: "pi-sonnet", CLI: "pi", Wrapper: "pi", Provider: "openrouter", Model: "anthropic/claude-sonnet-4", RequiresModel: true},
-	{ID: "pi-gpt", CLI: "pi", Wrapper: "pi", Provider: "openrouter", Model: "openai/gpt-4o", RequiresModel: true},
-	{ID: "pi-kimi", CLI: "pi", Wrapper: "pi", Provider: "openrouter", Model: "moonshotai/kimi-k2.6", RequiresModel: true},
-	{ID: "pi-deepseek-pro", CLI: "pi", Wrapper: "pi", Provider: "openrouter", Model: "deepseek/deepseek-v4-pro", RequiresModel: true},
-	{ID: "pi-deepseek-flash", CLI: "pi", Wrapper: "pi", Provider: "openrouter", Model: "deepseek/deepseek-v4-flash", RequiresModel: true, Aliases: []string{"pi"}},
-}
+// embeddedAgentJSON is provided by pkg/schema/agents_embedded.go (generated from share/agents.json)
 
 // LoadAgentRegistry returns the built-in agent registry. If SHUTTLE_SHARE
 // is set and contains a readable agents.json, that file takes precedence.
+// Otherwise fall back to the embedded share/agents.json compiled into the binary.
 func LoadAgentRegistry() (*AgentRegistry, error) {
 	if path, err := findShareFile("agents.json"); err == nil {
 		return LoadAgentRegistryFromFile(path)
 	}
-	return &AgentRegistry{agents: defaultAgentRecords}, nil
+	var agents []AgentRecord
+	if err := json.Unmarshal(embeddedAgentJSON, &agents); err != nil {
+		return nil, fmt.Errorf("parsing embedded agents.json: %w", err)
+	}
+	return &AgentRegistry{agents: agents}, nil
 }
 
 // LoadAgentRegistryFromFile reads agents.json from the given path.

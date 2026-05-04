@@ -913,6 +913,97 @@ defmodule Shuttle.PollerTest do
     )
   end
 
+  test "subdirectory symlink: loom-walks-into-project subtree skipped" do
+    # Mirrors loom→lightcone topology: physical .felt lives in host_b
+    # (project-canonical, like lightcone). host_a (loom) symlinks INTO
+    # host_b's tree at .felt/ai-futures/lightcone. Walking host_a should
+    # NOT enumerate the symlinked subtree — host_b enumerates canonically.
+    # This is load-bearing: if loom enumerates the lightcone fiber under
+    # its loom-relative id, dispatch later runs `felt -C ~/loom show
+    # ai-futures/lightcone/...` which fails (loom's index doesn't have
+    # the entry) and dispatch silently never happens.
+    host_a = Path.join(System.tmp_dir!(), "shuttle-multi-host-loom-#{System.unique_integer([:positive])}")
+    host_b = Path.join(System.tmp_dir!(), "shuttle-multi-host-lightcone-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(Path.join(host_a, ".felt/ai-futures"))
+    File.mkdir_p!(host_b)
+
+    # The real fiber file is rooted in host_b's .felt/, accessible via the
+    # project-canonical id `lightcone-ui/myst-as-ast/dual-branch`.
+    write_fiber_file(host_b, "lightcone-ui/myst-as-ast/dual-branch")
+
+    # host_a (loom) symlinks INTO host_b's tree, so the same physical file
+    # is reachable as host_a/.felt/ai-futures/lightcone/lightcone-ui/.../dual-branch.md.
+    File.ln_s!(
+      Path.join(host_b, ".felt"),
+      Path.join([host_a, ".felt", "ai-futures", "lightcone"])
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_subdir_symlink_skip,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_hosts: [host_a, host_b]
+      )
+
+    # The fiber should resolve to host_b (canonical), not host_a (symlink view).
+    assert {:ok, ^host_b} =
+             Poller.resolve_fiber_host(poller, "lightcone-ui/myst-as-ast/dual-branch")
+
+    snap = Poller.snapshot(poller)
+    candidate_ids = Enum.map(snap.eligible, & &1.fiber_id)
+
+    refute "ai-futures/lightcone/lightcone-ui/myst-as-ast/dual-branch" in candidate_ids,
+           "loom-relative symlink-aliased id leaked into eligible: #{inspect(candidate_ids)}"
+  after
+    Enum.each(
+      Path.wildcard(Path.join(System.tmp_dir!(), "shuttle-multi-host-*")),
+      &File.rm_rf/1
+    )
+  end
+
+  test "host with symlinked .felt/ skipped entirely" do
+    # Mirrors project-cities-on-loom topology: project's `.felt/` is a
+    # symlink into loom's tree. Walking the project host should skip
+    # everything — loom enumerates the same files canonically.
+    loom = Path.join(System.tmp_dir!(), "shuttle-multi-host-loom-#{System.unique_integer([:positive])}")
+    project = Path.join(System.tmp_dir!(), "shuttle-multi-host-project-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(loom)
+    File.mkdir_p!(project)
+
+    # Physical fiber rooted in loom under ai-futures/portolan/.
+    write_fiber_file(loom, "ai-futures/portolan/kanban-modal")
+
+    # Project's .felt/ symlinks into loom's ai-futures/portolan/ subdir,
+    # so the same kanban-modal.md is reachable as project/.felt/kanban-modal/.
+    File.ln_s!(
+      Path.join([loom, ".felt", "ai-futures", "portolan"]),
+      Path.join(project, ".felt")
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_symlinked_felt_skipped,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_hosts: [loom, project]
+      )
+
+    # The fiber resolves to loom (canonical), not project (symlinked .felt).
+    assert {:ok, ^loom} = Poller.resolve_fiber_host(poller, "ai-futures/portolan/kanban-modal")
+
+    snap = Poller.snapshot(poller)
+    candidate_ids = Enum.map(snap.eligible, & &1.fiber_id)
+
+    refute "kanban-modal" in candidate_ids,
+           "project-symlink alias surfaced: #{inspect(candidate_ids)}"
+  after
+    Enum.each(
+      Path.wildcard(Path.join(System.tmp_dir!(), "shuttle-multi-host-*")),
+      &File.rm_rf/1
+    )
+  end
+
   test "snapshot includes felt_hosts list" do
     {:ok, poller} =
       Poller.start_link(

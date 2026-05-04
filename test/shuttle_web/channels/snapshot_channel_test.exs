@@ -18,6 +18,7 @@ defmodule ShuttleWeb.SnapshotChannelTest do
             commands: [],
             tmux_sessions: MapSet.new(),
             fibers: %{},
+            shuttle: %{},
             felt_ls: []
           }
         end,
@@ -26,17 +27,38 @@ defmodule ShuttleWeb.SnapshotChannelTest do
     end
 
     def reset do
+      # Remove any fiber files written by set_shuttle so tests start clean.
+      File.rm_rf("/tmp/.felt")
+
       Agent.update(__MODULE__, fn _ ->
         %{
           commands: [],
           tmux_sessions: MapSet.new(),
           fibers: %{},
+          shuttle: %{},
           felt_ls: []
         }
       end)
     end
 
     def set_fiber(id, fiber), do: Agent.update(__MODULE__, &put_in(&1.fibers[id], fiber))
+
+    # Write a real .md file carrying the given shuttle: block and felt status so
+    # that walk_shuttle_fibers (the file-walk discovery path) can find it. The
+    # status defaults to "active" — pass an explicit value for tests that verify
+    # eligibility gates (closed, untracked, etc.).
+    def set_shuttle(id, yaml, status \\ "active") do
+      felt_dir = "/tmp/.felt"
+      segments = String.split(id, "/")
+      basename = List.last(segments)
+      dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
+      File.mkdir_p!(Path.dirname(dir_path))
+      indented = yaml |> String.trim() |> String.split("\n") |> Enum.map_join("\n", &("  " <> &1))
+      File.write!(dir_path, "---\nstatus: #{status}\nshuttle:\n#{indented}\n---\nbody\n")
+      Agent.update(__MODULE__, &put_in(&1.shuttle[id], yaml))
+    end
+
+    # Kept for backward compat; discovery now walks files for shuttle: blocks.
     def set_felt_ls(fibers), do: Agent.update(__MODULE__, &%{&1 | felt_ls: fibers})
 
     def add_tmux_session(session),
@@ -114,16 +136,19 @@ defmodule ShuttleWeb.SnapshotChannelTest do
     )
   end
 
+  # Minimal shuttle: block YAML for a oneshot fiber ready for dispatch.
+  @oneshot_shuttle "enabled: true\nkind: oneshot\n"
+
   test "snapshot channel sends current snapshot on join" do
     fiber = make_fiber("tests/haiku")
-    MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/haiku", fiber)
+    MockRunner.set_shuttle("tests/haiku", @oneshot_shuttle)
 
     {:ok, poller} =
       Poller.start_link(
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     # Trigger dispatch
@@ -141,14 +166,14 @@ defmodule ShuttleWeb.SnapshotChannelTest do
 
   test "snapshot channel broadcasts on state change" do
     fiber = make_fiber("tests/haiku")
-    MockRunner.set_felt_ls([fiber])
     MockRunner.set_fiber("tests/haiku", fiber)
+    MockRunner.set_shuttle("tests/haiku", @oneshot_shuttle)
 
     {:ok, poller} =
       Poller.start_link(
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_host: "/tmp"
+        felt_hosts: ["/tmp"]
       )
 
     # Connect and join

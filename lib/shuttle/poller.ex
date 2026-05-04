@@ -58,6 +58,11 @@ defmodule Shuttle.Poller do
       :tick_token,
       # List of felt host directories, in resolution-priority order.
       :felt_hosts,
+      # When true, felt_hosts is re-read from the env + portolan cities each
+      # poll cycle so newly-pinned cities pop up live without a daemon restart.
+      # Set true when :felt_hosts opt isn't passed to start_link; false when
+      # caller passed an explicit list (tests, manual overrides — respect them).
+      :auto_discover_felt_hosts,
       :runner,
       poll_check_in_progress: false,
       running: %{},
@@ -179,7 +184,11 @@ defmodule Shuttle.Poller do
   def init(opts) do
     now_ms = System.monotonic_time(:millisecond)
 
-    felt_hosts = Keyword.get(opts, :felt_hosts, default_felt_hosts())
+    {felt_hosts, auto_discover} =
+      case Keyword.fetch(opts, :felt_hosts) do
+        {:ok, hosts} -> {hosts, false}
+        :error -> {default_felt_hosts(), true}
+      end
 
     runner = Keyword.get(opts, :runner, Shuttle.Runner.Default)
 
@@ -196,6 +205,7 @@ defmodule Shuttle.Poller do
       tick_timer_ref: nil,
       tick_token: nil,
       felt_hosts: felt_hosts,
+      auto_discover_felt_hosts: auto_discover,
       runner: runner
     }
 
@@ -456,7 +466,7 @@ defmodule Shuttle.Poller do
   # ── Dispatch ──
 
   defp maybe_dispatch(%State{} = state) do
-    state = reconcile(state)
+    state = state |> refresh_felt_hosts() |> reconcile()
 
     with {:ok, candidates, new_host_map} <- discover_candidates(state),
          true <- available_slots(state) > 0 do
@@ -493,36 +503,107 @@ defmodule Shuttle.Poller do
   #   fibers   — [%{"id" => id, "status" => status}] across all hosts
   #   host_map — %{fiber_id => felt_host} for host resolution
   #
-  # Earlier-configured hosts take precedence when the same fiber ID appears in
-  # multiple hosts (same collision semantics as the old felt ls union).
+  # ## Symlink discipline
+  #
+  # The same physical fiber file is often reachable from multiple felt
+  # hosts via symlinks. Two cases that occur in practice:
+  #
+  # 1. A pinned project city (`~/Documents/projects/portolan`) whose
+  #    `.felt/` is a symlink into `~/loom/.felt/ai-futures/portolan/`.
+  #    The same `kanban-modal.md` is reachable as `kanban-modal` (project
+  #    view) and `ai-futures/portolan/kanban-modal` (loom view).
+  #
+  # 2. A project-canonical felt host (lightcone) whose own `.felt/` is a
+  #    real directory, with loom symlinking *into* it at
+  #    `~/loom/.felt/ai-futures/lightcone -> ~/lightcone/.felt`. The same
+  #    fiber is reachable as `lightcone-ui/...` (lightcone view) and
+  #    `ai-futures/lightcone/lightcone-ui/...` (loom view).
+  #
+  # If we enumerate both views, dispatch races: each "different" id passes
+  # `tmux has-session` independently → multiple workers on the same file.
+  # Worse, the wrong host may win — loom's `index.db` doesn't contain the
+  # lightcone fiber under the loom-relative id, so `felt -C ~/loom show
+  # ai-futures/lightcone/...` fails and dispatch silently never happens.
+  #
+  # **Rule: a fiber should be enumerated only by the host where it is
+  # physically rooted** — i.e. reachable from `<host>/.felt/` without
+  # traversing any symlinks. We enforce this two ways:
+  #
+  # - `walk_shuttle_fibers/1` skips the host entirely if `<host>/.felt/`
+  #   itself is a symlink (case 1: project-cities-on-loom).
+  #
+  # - `do_walk_felt_dir/1` skips subdirectories that are symlinks (case 2:
+  #   loom symlinking into a project-canonical host).
+  #
+  # The result: each physical file is enumerated by exactly one host (the
+  # canonical one), and downstream `felt -C <host> show <id>` always
+  # works because the host's `index.db` knows the host-relative id.
+  #
+  # The `file_identity` MapSet below is belt-and-suspenders for esoteric
+  # cases (hard links, etc.) where two physically-distinct paths point at
+  # the same inode and both pass the symlink filter.
   defp discover_candidates(state) do
-    {all_fibers, host_map} =
-      Enum.reduce(state.felt_hosts, {[], %{}}, fn host, {acc_fibers, acc_map} ->
-        fibers = walk_shuttle_fibers(host)
-        # Earlier-configured hosts win on ID collision.
-        new_entries = Map.new(fibers, fn f -> {Map.get(f, "id", ""), host} end)
-        merged_map = Map.merge(new_entries, acc_map)
-        {acc_fibers ++ fibers, merged_map}
+    {all_fibers, host_map, _seen} =
+      Enum.reduce(state.felt_hosts, {[], %{}, MapSet.new()}, fn host,
+                                                                {acc_fibers, acc_map, seen} ->
+        fibers_with_id = walk_shuttle_fibers(host)
+
+        {kept, new_map, new_seen} =
+          Enum.reduce(fibers_with_id, {[], %{}, seen}, fn {ident, fiber}, {fs, hm, sn} ->
+            id = Map.get(fiber, "id", "")
+
+            cond do
+              ident != nil and MapSet.member?(sn, ident) ->
+                # Same physical file already claimed by an earlier host.
+                {fs, hm, sn}
+
+              true ->
+                next_seen = if ident, do: MapSet.put(sn, ident), else: sn
+                {[fiber | fs], Map.put(hm, id, host), next_seen}
+            end
+          end)
+
+        merged_map = Map.merge(new_map, acc_map)
+        {acc_fibers ++ Enum.reverse(kept), merged_map, new_seen}
       end)
 
     {:ok, all_fibers, host_map}
   end
 
-  # Walk <host>/.felt/ and return one %{"id" => id, "status" => status} map
-  # per fiber file that contains a shuttle: frontmatter block.  Hidden
-  # subdirectories (other than .felt itself) are skipped.
+  # Walk <host>/.felt/ and return [{file_identity, fiber}] for each fiber
+  # file physically rooted in this host (no symlink traversal). Skips the
+  # host entirely if `<host>/.felt/` is itself a symlink.
   defp walk_shuttle_fibers(host) do
     felt_dir = Path.join(host, ".felt")
 
-    felt_dir
-    |> do_walk_felt_dir()
-    |> Enum.filter(&String.ends_with?(&1, ".md"))
-    |> Enum.flat_map(fn path ->
-      case parse_shuttle_fiber(host, path) do
-        {:ok, fiber} -> [fiber]
-        {:error, _} -> []
-      end
-    end)
+    case File.lstat(felt_dir) do
+      {:ok, %File.Stat{type: :symlink}} ->
+        # Host's .felt/ is a symlink — its content is owned by the host
+        # where .felt is physically rooted. That host enumerates canonically.
+        []
+
+      _ ->
+        felt_dir
+        |> do_walk_felt_dir()
+        |> Enum.filter(&String.ends_with?(&1, ".md"))
+        |> Enum.flat_map(fn path ->
+          case parse_shuttle_fiber(host, path) do
+            {:ok, fiber} -> [{file_identity(path), fiber}]
+            {:error, _} -> []
+          end
+        end)
+    end
+  end
+
+  # `(major_device, inode)` from `File.stat` (follows symlinks) uniquely
+  # identifies a physical file regardless of which symlink path you used
+  # to reach it. Returns nil on stat failure so the caller can fall back
+  # to keeping the entry un-deduped.
+  defp file_identity(path) do
+    case File.stat(path) do
+      {:ok, %File.Stat{major_device: dev, inode: inode}} -> {dev, inode}
+      {:error, _} -> nil
+    end
   end
 
   defp do_walk_felt_dir(dir) do
@@ -531,16 +612,27 @@ defmodule Shuttle.Poller do
         Enum.flat_map(entries, fn entry ->
           path = Path.join(dir, entry)
 
-          cond do
-            File.dir?(path) and not String.starts_with?(entry, ".") ->
-              do_walk_felt_dir(path)
-
-            File.dir?(path) ->
-              # Skip hidden subdirectories (symlinks to gitignored zones, etc.)
+          # `lstat` (does NOT follow symlinks) lets us distinguish symlinked
+          # directories from physical ones. We never traverse a symlink — the
+          # host where the target is physically rooted enumerates it instead
+          # (see the symlink-discipline note on `discover_candidates/1`).
+          case File.lstat(path) do
+            {:ok, %File.Stat{type: :symlink}} ->
               []
 
-            true ->
+            {:ok, %File.Stat{type: :directory}} ->
+              if String.starts_with?(entry, ".") do
+                # Hidden subdirectories (e.g. .obsidian) — skip.
+                []
+              else
+                do_walk_felt_dir(path)
+              end
+
+            {:ok, _} ->
               [path]
+
+            {:error, _} ->
+              []
           end
         end)
 
@@ -1397,14 +1489,25 @@ defmodule Shuttle.Poller do
 
   # Returns the configured felt hosts list.
   #
-  # Resolution order (highest wins):
-  # 1. LOOM_HOMES env var (comma-separated paths)
-  # 2. LOOM_HOME env var (single path; wrapped in a list)
-  # 3. ~/loom
+  # Resolution:
+  # 1. Env-configured hosts: LOOM_HOMES (comma-separated) → LOOM_HOME → ~/loom
+  # 2. Portolan-pinned local cities from ~/.portolan/cities.json (originId="local")
   #
-  # This is the default-fallback only; explicit :felt_hosts opts
-  # in start_link take precedence via init/1.
+  # The two sources are unioned (env first, then any city paths not already
+  # in env), so pinning a city in portolan auto-adds it as a felt host without
+  # touching shuttle config. Remote cities (originId != "local") are skipped —
+  # they belong to other machines' daemons (see constitution-shuttle-remote-dispatch).
+  #
+  # This is the default-fallback only; explicit :felt_hosts opts in start_link
+  # take precedence via init/1 (and disable the per-poll refresh in that case).
   defp default_felt_hosts do
+    env_hosts = env_felt_hosts() |> Enum.map(&Path.expand/1)
+    city_hosts = portolan_city_hosts() |> Enum.map(&Path.expand/1)
+    extras = Enum.reject(city_hosts, &(&1 in env_hosts))
+    env_hosts ++ extras
+  end
+
+  defp env_felt_hosts do
     case System.get_env("LOOM_HOMES") do
       v when is_binary(v) and v != "" ->
         v
@@ -1415,6 +1518,41 @@ defmodule Shuttle.Poller do
       _ ->
         loom_home = System.get_env("LOOM_HOME")
         [if(is_binary(loom_home) and loom_home != "", do: loom_home, else: System.user_home() <> "/loom")]
+    end
+  end
+
+  # Reads ~/.portolan/cities.json and returns paths for cities with
+  # originId="local". Returns [] if the file is missing, malformed, or has
+  # no local cities — auto-discovery is best-effort, never fatal.
+  defp portolan_city_hosts do
+    cities_path = Path.expand("~/.portolan/cities.json")
+
+    with true <- File.exists?(cities_path),
+         {:ok, content} <- File.read(cities_path),
+         {:ok, %{"cities" => cities}} when is_list(cities) <- Jason.decode(content) do
+      cities
+      |> Enum.filter(fn c -> Map.get(c, "originId") == "local" end)
+      |> Enum.map(fn c -> Map.get(c, "path") end)
+      |> Enum.reject(&is_nil/1)
+    else
+      _ -> []
+    end
+  end
+
+  # Re-reads default_felt_hosts/0 and updates state.felt_hosts if the list
+  # changed. Called from discover_candidates/1 each poll cycle so newly-pinned
+  # portolan cities pop up live. No-op when the caller passed an explicit
+  # :felt_hosts opt (state.auto_discover_felt_hosts == false).
+  defp refresh_felt_hosts(%{auto_discover_felt_hosts: false} = state), do: state
+
+  defp refresh_felt_hosts(%{felt_hosts: current} = state) do
+    fresh = default_felt_hosts()
+
+    if fresh == current do
+      state
+    else
+      Logger.info("felt_hosts updated from portolan/env: #{inspect(current)} → #{inspect(fresh)}")
+      %{state | felt_hosts: fresh}
     end
   end
 
