@@ -1,15 +1,24 @@
-# Shuttle daemon — build + lifecycle
+# Shuttle daemon + CLI — build + lifecycle
 #
-# `make restart` is the load-bearing one: rebuilds the escript, kills the
-# running daemon, and starts a detached daemon with stdout/stderr piped to
-# ~/Library/Logs/shuttle.log. The escript loads its BEAMs at boot, so a
-# rebuild without restart is a no-op for an already-running daemon — the two
-# steps are bundled here for that reason.
+# Two artifacts share this repo:
+#   - bin/shuttle  (Elixir escript) — the daemon. Loads BEAMs at boot;
+#     `make restart` rebuilds + bounces.
+#   - shuttle-ctl  (Go binary)      — the agent-facing CLI. Built into
+#     $(CLI_DEST) which sits on PATH; `make cli` rebuilds + installs.
+#
+# `make restart` is the load-bearing daemon target. `make cli` is the
+# load-bearing CLI target — when the kanban surfaces a new shuttle-ctl
+# verb (e.g. close / reopen / set-outcome), portolan starts shelling out
+# to it immediately, so a stale binary breaks transitions silently. See
+# ai-futures/portolan/gotchas/gotcha-shuttle-ctl-binary-stale-after-source-update.
+# The daemon and CLI are independent (Elixir vs Go), so building one
+# never implies rebuilding the other; `make all` does both.
 
 LOG := $(HOME)/Library/Logs/shuttle.log
 PIDPATTERN := bin/shuttle.*-extra.*start
+CLI_DEST := $(HOME)/go/bin/shuttle-ctl
 
-.PHONY: build start stop restart logs status clean help
+.PHONY: all build cli start stop restart logs status clean help
 
 help:
 	@echo "shuttle daemon:"
@@ -20,9 +29,24 @@ help:
 	@echo "  make logs     — tail -f the daemon log"
 	@echo "  make status   — shuttle-ctl ps + snapshot summary"
 	@echo "  make clean    — remove _build and stray .beam files"
+	@echo ""
+	@echo "shuttle-ctl CLI (Go):"
+	@echo "  make cli      — go build → $(CLI_DEST) (must be on PATH)"
+	@echo ""
+	@echo "everything:"
+	@echo "  make all      — restart (daemon) + cli"
+
+all: restart cli
 
 build:
 	mix escript.build
+
+# Build the Go CLI and install to $(CLI_DEST). `go install ./cmd/shuttle`
+# would output as `shuttle` (matches cobra Use:), so we use `go build -o`
+# to land it under the historical `shuttle-ctl` name.
+cli:
+	@go build -o $(CLI_DEST) ./cmd/shuttle
+	@echo "shuttle-ctl → $(CLI_DEST) ($$($(CLI_DEST) --help 2>/dev/null | head -1))"
 
 start:
 	@if pgrep -f '$(PIDPATTERN)' >/dev/null; then \

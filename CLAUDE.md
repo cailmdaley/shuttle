@@ -19,11 +19,22 @@ running daemon until you restart. Use the Makefile:
 make build      # mix escript.build → bin/shuttle (MIX_ENV=dev)
 make start      # nohup detached; logs → ~/Library/Logs/shuttle.log
 make stop       # SIGTERM with 5s grace
-make restart    # build + stop + start (the load-bearing one)
+make restart    # build + stop + start (the load-bearing daemon target)
+make cli        # go build → ~/go/bin/shuttle-ctl (load-bearing CLI target)
+make all        # restart + cli (everything)
 make logs       # tail -f the log
 make status     # shuttle-ctl ps + snapshot summary
 make clean      # rm _build and stray Elixir.*.beam at project root
 ```
+
+**Two artifacts, two languages, two release cadences.** The Elixir daemon
+(`bin/shuttle`) and the Go CLI (`~/go/bin/shuttle-ctl`) are independent —
+rebuilding one never implies rebuilding the other. Editing `cmd/shuttle/*.go`
+needs `make cli`; editing `lib/shuttle/*.ex` needs `make restart`. When the
+kanban or any portolan path starts shelling out to a new shuttle-ctl verb,
+`make cli` becomes load-bearing — a stale binary breaks transitions
+silently. See
+[[ai-futures/portolan/gotchas/gotcha-shuttle-ctl-binary-stale-after-source-update]].
 
 **`bin/shuttle` is an escript** — it bundles BEAM bytecode at build time and loads it at boot. A restart without `make build` is a no-op for picking up source edits; `mix compile` without restart is a no-op for an already-running daemon. **`make restart` always.** When `shuttle-ctl status` sees a fiber but `bin/shuttle snapshot` doesn't list it as eligible, the daemon is stale.
 
