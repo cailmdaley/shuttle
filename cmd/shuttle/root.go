@@ -24,6 +24,7 @@ Write verbs (offline, validate-before-write):
   resume       Resume a paused, still-open fiber
   reopen       Requeue a closed fiber back into active work
   close        Close a fiber and optionally set tempered=true|false
+  set-outcome  Set the outcome field on a shuttle-managed fiber
   accept       Accept a completed standing-role run and advance the schedule
   set-model    Change the agent for a fiber
   uninstall    Remove the shuttle: block from a fiber

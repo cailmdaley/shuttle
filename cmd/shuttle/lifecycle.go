@@ -2,6 +2,9 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/cailmdaley/shuttle-cli/pkg/schema"
@@ -177,6 +180,65 @@ Tempered, or Composted back to In flight.`,
 	},
 }
 
+func newSetOutcomeCmd() *cobra.Command {
+	var outcomeValue string
+	cmd := &cobra.Command{
+		Use:   "set-outcome <fiber>",
+		Short: "Set the outcome field on a shuttle-managed fiber",
+		Long: `Updates the felt-native outcome: field while preserving the existing
+shuttle: block. Use --outcome for single-line values, or pipe multi-line text
+on stdin to preserve block-scalar output.
+
+Examples:
+  shuttle set-outcome <fiber> --outcome "Blocked: waiting on ADS token"
+  printf 'First line\nSecond line\n' | shuttle set-outcome <fiber>`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path, _ := resolveFiber(args[0])
+			f := readFiber(path)
+			if f.Block == nil {
+				return fmt.Errorf("fiber %s has no shuttle: block", args[0])
+			}
+
+			outcome, err := resolveOutcomeValue(cmd, outcomeValue)
+			if err != nil {
+				return err
+			}
+
+			f.SetOutcome(outcome)
+			if err := f.WriteBlock(f.Block); err != nil {
+				return fmt.Errorf("writing fiber: %w", err)
+			}
+
+			fmt.Printf("set outcome for %s\n", args[0])
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&outcomeValue, "outcome", "", "Outcome text; omit to read from stdin")
+	return cmd
+}
+
+var setOutcomeCmd = newSetOutcomeCmd()
+
+func resolveOutcomeValue(cmd *cobra.Command, flagValue string) (string, error) {
+	if cmd.Flags().Changed("outcome") {
+		return flagValue, nil
+	}
+
+	in := cmd.InOrStdin()
+	if file, ok := in.(*os.File); ok {
+		if stat, err := file.Stat(); err == nil && (stat.Mode()&os.ModeCharDevice) != 0 {
+			return "", fmt.Errorf("provide --outcome or pipe outcome text on stdin")
+		}
+	}
+
+	data, err := io.ReadAll(in)
+	if err != nil {
+		return "", fmt.Errorf("reading outcome from stdin: %w", err)
+	}
+	return strings.TrimRight(string(data), "\r\n"), nil
+}
+
 func parseOptionalBool(raw string) (*bool, error) {
 	switch raw {
 	case "true":
@@ -326,6 +388,7 @@ func init() {
 	rootCmd.AddCommand(resumeCmd)
 	rootCmd.AddCommand(closeCmd)
 	rootCmd.AddCommand(reopenCmd)
+	rootCmd.AddCommand(setOutcomeCmd)
 	rootCmd.AddCommand(acceptCmd)
 	rootCmd.AddCommand(setModelCmd)
 	rootCmd.AddCommand(uninstallCmd)
