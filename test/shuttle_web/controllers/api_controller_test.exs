@@ -431,6 +431,27 @@ defmodule ShuttleWeb.APIControllerTest do
     assert is_list(body["waiters"])
   end
 
+  # ── GET /api/v1/agents ──
+
+  test "agents returns the registry as a JSON array" do
+    conn = get(api_conn(), "/api/v1/agents")
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+    assert is_list(body)
+    assert length(body) > 0
+
+    # Each record carries the registry's stable shape.
+    [first | _] = body
+    assert is_binary(first["id"])
+    assert is_binary(first["cli"])
+    assert is_binary(first["wrapper"])
+
+    # Default agent (claude-sonnet at the time of writing) is present and flagged.
+    default = Enum.find(body, & &1["default"])
+    assert default != nil
+    assert is_binary(default["id"])
+  end
+
   # ── Worker Channel ──
 
   test "worker channel broadcasts exit events" do

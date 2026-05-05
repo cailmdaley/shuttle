@@ -19,6 +19,7 @@ defmodule ShuttleWeb.Router do
     post "/wait", WaitController, :create
     post "/reserve", ReserveController, :create
     get "/state", StateController, :show
+    get "/agents", AgentsController, :show
     get "/fiber/host", FiberHostController, :show
     post "/cache/bust", CacheBustController, :create
   end

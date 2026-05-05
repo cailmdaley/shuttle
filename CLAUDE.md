@@ -4,6 +4,12 @@ Local OTP-supervised dispatcher for felt constitution workers. Polls the felt
 tree, launches one tmux worker per eligible fiber, exposes a snapshot surface
 for Portolan and other consumers.
 
+**Status: Stages 0–6 complete; Stage 7 (BEAM distribution / SSH-drop resilience) deferred.**
+The Elixir engine is the production dispatcher; portolan's TS engine is retired.
+See [[ai-futures/shuttle/constitution-shuttle-standalone]] for the canonical invariants.
+
+The repo has no git remote — local-only, like portolan. Don't add one without intent.
+
 ## Build + lifecycle
 
 The escript loads its BEAMs at boot, so editing source has zero effect on a
@@ -19,6 +25,8 @@ make status     # shuttle-ctl ps + snapshot summary
 make clean      # rm _build and stray Elixir.*.beam at project root
 ```
 
+**`bin/shuttle` is an escript** — it bundles BEAM bytecode at build time and loads it at boot. A restart without `make build` is a no-op for picking up source edits; `mix compile` without restart is a no-op for an already-running daemon. **`make restart` always.** When `shuttle-ctl status` sees a fiber but `bin/shuttle snapshot` doesn't list it as eligible, the daemon is stale.
+
 Default `MIX_ENV=dev` matches the localhost:4000 endpoint config in
 `config/dev.exs`. The Phoenix endpoint binds 127.0.0.1:4000 only when
 `server: true` is set there — don't propagate that to other envs.
@@ -28,6 +36,32 @@ If `mix escript.build` warns about "redefining module Shuttle.X" with the
 first — stray `.beam` files at the project root shadow the real ones. They
 should never be committed.
 
+## Quick start — operating without rebuilding
+
+```bash
+bin/shuttle snapshot                          # JSON snapshot of daemon state
+bin/shuttle dispatch <fiber-id>               # one-shot dispatch
+
+# shuttle-ctl — agent-facing CLI; offline; schema-validating
+shuttle-ctl status                            # all fibers with shuttle: blocks
+shuttle-ctl ps                                # live tmux workers only
+shuttle-ctl install <fiber> [-m <agent-id>] [--disabled]
+shuttle-ctl repeat <fiber> --schedule "0 9 * * 1-5" --tz Europe/Paris
+shuttle-ctl pause / resume / accept <fiber>
+shuttle-ctl set-model <fiber> <agent-id>
+shuttle-ctl abort / attach <fiber>
+shuttle-ctl migrate --dry-run                 # preview eligibility migration
+```
+
+## Critical invariants
+
+- **tmux owns the worker process; Shuttle owns the watcher.** Workers stay attachable via `tmux attach -t shuttle-<fiber-id>`. Supervise watchers, not workers.
+- **Felt is the data layer; Shuttle shells out to the felt CLI.** Don't import felt internals.
+- **Agent records live in one source of truth: `share/agents.json`.** Both runtimes (Elixir daemon, Go CLI) embed it at compile time — Elixir via `@external_resource` + `File.read!` in `lib/shuttle/agents.ex`, Go via `//go:embed` (generated `pkg/schema/agents_embedded.go`). Edit the JSON, then `make restart`. There is no `config/agents.exs` and no hand-edited fallback list anywhere — see `[[ai-futures/shuttle/finding-agent-registry-four-mirrors]]` for the cleanup that landed.
+- **`shuttle.agent` field drives agent selection.** The `shuttle:` block's `agent:` field resolves against the registry. Bare `codex`/`pi` felt tags resolve via back-compat aliases when no `shuttle.agent` is set; default agent is `claude-sonnet`.
+- **shuttle-ctl is the agent-facing CLI.** Write verbs validate before write; works offline. Elixir `bin/shuttle` handles daemon lifecycle and dispatch only.
+- **No tag predicate for dispatch.** `constitution` is a human convention only — a fiber with a `shuttle:` block dispatches with or without it. Tags are free-form qualitative noticings; only `idea` is read by Portolan's kanban (for column placement).
+
 ## How dispatch works
 
 - **Poller** (`lib/shuttle/poller.ex`) is the single GenServer that owns the
@@ -35,15 +69,12 @@ should never be committed.
   frontmatter, and considers a fiber eligible iff `shuttle.enabled: true` AND
   `status in ["open", "active"]` AND not already running/claimed AND deps
   satisfied.
-- **No tag predicate.** `constitution` is a human convention only — a fiber
-  with a `shuttle:` block dispatches with or without it. (Pre-`23e7b31` the
-  daemon pre-filtered discovery on `-t constitution`; that's gone.)
 - **Configured hosts** come from `LOOM_HOMES` (comma-separated) →
   `LOOM_HOME` → default `~/loom`. Earlier-configured hosts win on fiber-id
   collisions across hosts.
-- **Dispatcher** (`lib/shuttle/dispatcher.ex`) resolves the agent from
-  `shuttle.agent` against `share/agents.json`, spawns `shuttle-<fiber-id>`
-  tmux session.
+- **Dispatcher** (`lib/shuttle/dispatcher.ex`) resolves the agent via
+  `Shuttle.Agents.resolve_by_name/1` against the embedded registry, spawns
+  `shuttle-<fiber-id>` tmux session.
 - **Standing roles** are recurring fibers — `shuttle.kind: standing` with a
   cron `schedule:`. Daemon dispatches only when `next_due_at` is due AND
   `review.state` is `scheduled` or `accepted`. Worker exit flips state to
@@ -52,55 +83,66 @@ should never be committed.
 ## Inspecting state
 
 ```
-make status                              # daemon-side view
+make status                              # daemon-side view (ps + snapshot)
 shuttle-ctl status                       # Go walker view (independent of daemon)
 shuttle-ctl status -j                    # JSON
 bin/shuttle snapshot                     # raw JSON snapshot
 ~/Library/Logs/shuttle.log               # daemon stdout/stderr
 tmux ls | grep '^shuttle-'               # live workers
+curl -s http://127.0.0.1:4000/api/v1/agents | jq   # agent registry as JSON
+curl -s http://127.0.0.1:4000/api/v1/state | jq    # full orchestrator state
 ```
 
 A useful sanity ladder when something isn't dispatching:
 
-1. `shuttle-ctl status` shows `enabled: true, idle, oneshot`? → fiber is
-   well-formed and the Go walker sees it.
-2. `bin/shuttle snapshot` lists it under `eligible[]` with `state: running`?
-   → daemon dispatched it.
-3. If shuttle-ctl sees it but daemon doesn't → daemon binary is stale. `make
-   restart`.
-4. If daemon sees it but agent never appears → check `share/agents.json` for
-   the resolved agent's `cli` and that the wrapper is on `PATH`.
-5. If the snapshot has no `felt_hosts:` field → binary pre-`297a24d`. Same
-   fix: `make restart`.
+1. `shuttle-ctl status` shows `enabled: true, idle, oneshot`? → fiber is well-formed and the Go walker sees it.
+2. `bin/shuttle snapshot` lists it under `eligible[]` with `state: running`? → daemon dispatched it.
+3. If shuttle-ctl sees it but daemon doesn't → daemon binary is stale. `make restart`.
+4. If daemon sees it but agent never appears → check `share/agents.json` for the resolved agent's `cli` and that the wrapper is on `PATH`.
+5. If the snapshot has no `felt_hosts:` field → binary pre-`297a24d`. Same fix: `make restart`.
 
 ## Codebase layout
 
-- `lib/shuttle/poller.ex` — GenServer; discover + eligibility + retry queue.
-- `lib/shuttle/dispatcher.ex` — agent resolution, tmux launch, session-UUID
-  capture for resume-previous.
-- `lib/shuttle/agents.ex` — agent registry loaded from `share/agents.json`.
-- `lib/shuttle_web/controllers/*` — agent-API HTTP endpoints (`/api/v1/...`).
-- `cmd/shuttle/` — Go CLI (`shuttle-ctl`). Walks `<host>/.felt/` independently
-  of the daemon — it's the human's view, not a dispatch dependency.
-- `share/agents.json` — agent registry (claude-{sonnet,opus,haiku},
-  codex, codex-mini, etc.).
-- `config/dev.exs` — endpoint binding (the only env where `server: true`).
+```
+shuttle/                     project root (this dir, flat — no nested shuttle/)
+├── CLAUDE.md                you're reading it
+├── Makefile                 build + daemon lifecycle
+├── mix.exs                  Mix project
+├── bin/shuttle              the daemon escript (built artifact)
+├── lib/                     Elixir source
+│   ├── shuttle/poller.ex    discover + eligibility + retry queue
+│   ├── shuttle/dispatcher.ex  agent resolution, tmux launch, session-UUID capture
+│   ├── shuttle/agents.ex    agent registry — reads share/agents.json at compile time
+│   └── shuttle_web/         agent-API HTTP endpoints (/api/v1/...)
+├── cmd/shuttle/             Go CLI (shuttle-ctl)
+├── pkg/schema/              Go schema package (types, validation, YAML I/O)
+│   ├── agents.go            registry loader (//go:embed agents_embedded.go)
+│   └── agents_embedded.go   generated — embeds share/agents.json bytes
+├── share/                   shared data (canonical for both runtimes)
+│   ├── agents.json          THE agent registry — single source of truth
+│   └── schema.json          shuttle: block frontmatter schema
+├── config/                  Elixir env config (dev/test/prod endpoint settings)
+├── test/                    Mix test suite
+└── deps/, _build/           Mix-managed; gitignored
+```
 
 ## Tests
 
 ```
-mix test                   # full Elixir suite
+mix test                   # full Elixir suite (78 tests, ~7s)
 mix test --only focus      # tagged subset
+go test ./pkg/schema/...   # Go schema tests
 ```
 
 Disk-walking tests use real fixture directories under `test/support/` rather
 than mocks — the walker is a thin filesystem read so this is faster and
 catches more.
 
-## Fibers for depth
+## Pointers
 
-- `ai-futures/shuttle/` (in `~/loom/.felt/`) — root, design fibers, all the
-  shipped/in-flight constitutions (cutover, multi-host, CLI, daemon-shuttle-
-  block-discovery, etc.).
-- Postmortems live alongside as siblings (e.g. `postmortem-2026-05-03-icloud-
-  loss`).
+- Constitution: `felt show ai-futures/shuttle/constitution-shuttle-standalone`
+- SPEC: `~/loom/.felt/ai-futures/shuttle/SPEC.md`
+- Agent registry: `share/agents.json` (single source of truth — see invariants above)
+- Loom shell wrappers: `~/loom/shell-functions.sh` (claude, codex, pi, kimi, glm)
+- Shuttle skill: `~/.claude/skills/shuttle/SKILL.md`
+- Fibers: `ai-futures/shuttle/` in `~/loom/.felt/` — design fibers, constitutions (cutover, multi-host, CLI, etc.), gotchas, postmortems.
