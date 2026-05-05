@@ -21,6 +21,7 @@ defmodule ShuttleWeb.Router do
     get "/state", StateController, :show
     get "/agents", AgentsController, :show
     get "/fiber/host", FiberHostController, :show
+    post "/felt-hosts", FeltHostsController, :create
     post "/cache/bust", CacheBustController, :create
   end
 end

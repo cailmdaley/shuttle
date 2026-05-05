@@ -5,8 +5,8 @@ defmodule ShuttleWeb.FiberHostController do
   Resolves the felt host for a fiber. Since fiber IDs contain slashes, the
   fiber ID is passed as a query parameter rather than a path segment.
 
-  Used by external callers (portolan, shuttle-ctl) so they can route their
-  own felt operations to the right index without re-implementing resolution.
+  Used by external callers so they can route their own felt operations to the
+  right index without re-implementing resolution.
 
   Returns:
     200  %{fiber_id: string, felt_host: string, resolved_at: iso8601}

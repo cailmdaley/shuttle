@@ -209,6 +209,18 @@ defmodule Shuttle.PollerTest do
     )
   end
 
+  defp wait_until(fun, attempts \\ 20)
+  defp wait_until(fun, 0), do: fun.()
+
+  defp wait_until(fun, attempts) do
+    if fun.() do
+      true
+    else
+      Process.sleep(25)
+      wait_until(fun, attempts - 1)
+    end
+  end
+
   # ── Tests ──
 
   test "poller discovers and dispatches eligible fibers" do
@@ -228,14 +240,11 @@ defmodule Shuttle.PollerTest do
 
     # Trigger a poll cycle manually
     send(poller, {:tick, Poller.snapshot(poller) |> Map.get(:tick_token)})
-    # Wait for async dispatch
-    Process.sleep(100)
 
-    # Check that tmux new-session was called
-    commands = MockRunner.commands()
-
-    assert Enum.any?(commands, fn {cmd, args} ->
-             cmd == "tmux" and hd(args) == "new-session"
+    assert wait_until(fn ->
+             Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+               cmd == "tmux" and hd(args) == "new-session"
+             end)
            end)
 
     # Check snapshot shows running worker
@@ -786,12 +795,11 @@ defmodule Shuttle.PollerTest do
       )
 
     send(poller, {:tick, Poller.snapshot(poller) |> Map.get(:tick_token)})
-    Process.sleep(100)
 
-    commands = MockRunner.commands()
-
-    assert Enum.any?(commands, fn {cmd, args} ->
-             cmd == "tmux" and hd(args) == "new-session"
+    assert wait_until(fn ->
+             Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+               cmd == "tmux" and hd(args) == "new-session"
+             end)
            end)
 
     snap = Poller.snapshot(poller)
@@ -1056,5 +1064,83 @@ defmodule Shuttle.PollerTest do
 
     snap = Poller.snapshot(poller)
     assert snap.felt_hosts == ["/tmp/host-one", "/tmp/host-two"]
+  end
+
+  test "poller reads configured hosts from persisted registration" do
+    config_path =
+      Path.join(System.tmp_dir!(), "shuttle-felt-hosts-poller-#{System.unique_integer([:positive])}.json")
+
+    original_file = System.get_env("SHUTTLE_FELT_HOSTS_FILE")
+    original_homes = System.get_env("LOOM_HOMES")
+
+    System.put_env("SHUTTLE_FELT_HOSTS_FILE", config_path)
+    System.delete_env("LOOM_HOMES")
+    File.mkdir_p!(Path.dirname(config_path))
+    File.write!(config_path, Jason.encode!(%{"version" => 1, "felt_hosts" => ["/tmp/host-a", "/tmp/host-b"]}))
+
+    on_exit(fn ->
+      File.rm(config_path)
+
+      case original_file do
+        nil -> System.delete_env("SHUTTLE_FELT_HOSTS_FILE")
+        value -> System.put_env("SHUTTLE_FELT_HOSTS_FILE", value)
+      end
+
+      case original_homes do
+        nil -> System.delete_env("LOOM_HOMES")
+        value -> System.put_env("LOOM_HOMES", value)
+      end
+    end)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_registered_felt_hosts,
+        runner: MockRunner,
+        poll_interval_ms: 60_000
+      )
+
+    assert Poller.snapshot(poller).felt_hosts == ["/tmp/host-a", "/tmp/host-b"]
+  end
+
+  test "poller refreshes configured hosts when the persisted registration changes" do
+    config_path =
+      Path.join(System.tmp_dir!(), "shuttle-felt-hosts-refresh-#{System.unique_integer([:positive])}.json")
+
+    original_file = System.get_env("SHUTTLE_FELT_HOSTS_FILE")
+    original_homes = System.get_env("LOOM_HOMES")
+
+    System.put_env("SHUTTLE_FELT_HOSTS_FILE", config_path)
+    System.delete_env("LOOM_HOMES")
+    File.mkdir_p!(Path.dirname(config_path))
+    File.write!(config_path, Jason.encode!(%{"version" => 1, "felt_hosts" => ["/tmp/host-a"]}))
+
+    on_exit(fn ->
+      File.rm(config_path)
+
+      case original_file do
+        nil -> System.delete_env("SHUTTLE_FELT_HOSTS_FILE")
+        value -> System.put_env("SHUTTLE_FELT_HOSTS_FILE", value)
+      end
+
+      case original_homes do
+        nil -> System.delete_env("LOOM_HOMES")
+        value -> System.put_env("LOOM_HOMES", value)
+      end
+    end)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_refresh_registered_felt_hosts,
+        runner: MockRunner,
+        poll_interval_ms: 60_000
+      )
+
+    assert Poller.snapshot(poller).felt_hosts == ["/tmp/host-a"]
+
+    File.write!(config_path, Jason.encode!(%{"version" => 1, "felt_hosts" => ["/tmp/host-c"]}))
+    send(poller, :run_poll_cycle)
+    Process.sleep(50)
+
+    assert Poller.snapshot(poller).felt_hosts == ["/tmp/host-c"]
   end
 end

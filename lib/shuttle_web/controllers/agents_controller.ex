@@ -4,9 +4,8 @@ defmodule ShuttleWeb.AgentsController do
 
   Returns the agent registry as a JSON array, sourced from
   `Shuttle.Agents.list/0` (which embeds `share/agents.json` at compile time).
-  Consumers like Portolan's StashForm dropdown fetch this instead of reading
-  `share/agents.json` off disk — that decouples them from shuttle's
-  filesystem layout.
+  External consumers fetch this instead of reading `share/agents.json` off
+  disk — that decouples them from shuttle's filesystem layout.
   """
 
   use Phoenix.Controller, formats: [:json]

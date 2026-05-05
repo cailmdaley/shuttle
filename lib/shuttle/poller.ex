@@ -16,11 +16,13 @@ defmodule Shuttle.Poller do
   The Poller manages one or more felt hosts on the same machine. Configure via:
 
       config :shuttle, felt_hosts: ["~/loom", "~/wedding", "~/Documents/projects/lightcone"]
-      # or env var (comma-separated, takes precedence over config):
+      # or env var (comma-separated, takes precedence over the persisted file):
       LOOM_HOMES=~/loom,~/wedding,~/Documents/projects/lightcone
+      # or persisted registration written through the HTTP API:
+      ~/.shuttle/felt_hosts.json
 
-  Single-host setups (the common case) are unchanged: `felt_hosts` defaults to
-  `[LOOM_HOME || ~/loom]`.
+  Single-host setups (the common case) are unchanged: when no explicit hosts
+  are configured, Shuttle falls back to `[LOOM_HOME || ~/loom]`.
 
   Each fiber resolves to exactly one host: the first configured host whose
   `.felt/` directory contains the fiber file. The resolution is cached in
@@ -58,10 +60,10 @@ defmodule Shuttle.Poller do
       :tick_token,
       # List of felt host directories, in resolution-priority order.
       :felt_hosts,
-      # When true, felt_hosts is re-read from the env + portolan cities each
-      # poll cycle so newly-pinned cities pop up live without a daemon restart.
-      # Set true when :felt_hosts opt isn't passed to start_link; false when
-      # caller passed an explicit list (tests, manual overrides — respect them).
+      # When true, felt_hosts is re-read from env + persisted registration on
+      # each poll cycle. Set true when :felt_hosts opt isn't passed to
+      # start_link; false when the caller passed an explicit list (tests,
+      # manual overrides — respect them).
       :auto_discover_felt_hosts,
       :runner,
       poll_check_in_progress: false,
@@ -153,9 +155,8 @@ defmodule Shuttle.Poller do
   `fiber_id`, or `{:error, :not_found}` if the fiber isn't in any host.
 
   The result is cached in the Poller's state for the daemon's lifetime.
-  Used by `GET /api/v1/fiber/:id/host` so external callers (portolan,
-  shuttle-ctl) can route their felt operations to the right index without
-  re-implementing host resolution.
+  Used by `GET /api/v1/fiber/:id/host` so external callers can route their
+  felt operations to the right index without re-implementing host resolution.
   """
   @spec resolve_fiber_host(String.t()) :: {:ok, String.t()} | {:error, :not_found}
   def resolve_fiber_host(fiber_id), do: resolve_fiber_host(__MODULE__, fiber_id)
@@ -208,6 +209,8 @@ defmodule Shuttle.Poller do
       auto_discover_felt_hosts: auto_discover,
       runner: runner
     }
+
+    Logger.info("configured felt hosts: #{inspect(felt_hosts)}")
 
     # Adopt existing tmux sessions on startup
     state = adopt_orphans(state)
@@ -497,7 +500,7 @@ defmodule Shuttle.Poller do
 
   # Discovers candidate fibers by walking <host>/.felt/ for files that carry a
   # shuttle: frontmatter block. No tag predicate — the block is the source of
-  # truth, matching what Portolan's kanban already does via hasShuttleBlock.
+  # truth, matching the same shuttle-block contract every other surface reads.
   #
   # Returns {:ok, fibers, host_map} where:
   #   fibers   — [%{"id" => id, "status" => status}] across all hosts
@@ -508,10 +511,10 @@ defmodule Shuttle.Poller do
   # The same physical fiber file is often reachable from multiple felt
   # hosts via symlinks. Two cases that occur in practice:
   #
-  # 1. A pinned project city (`~/Documents/projects/portolan`) whose
-  #    `.felt/` is a symlink into `~/loom/.felt/ai-futures/portolan/`.
-  #    The same `kanban-modal.md` is reachable as `kanban-modal` (project
-  #    view) and `ai-futures/portolan/kanban-modal` (loom view).
+  # 1. A project host (`~/work/project-a`) whose `.felt/` is a symlink into
+  #    `~/loom/.felt/work/project-a/`. The same `task-board.md` is reachable
+  #    as `task-board` (project view) and `work/project-a/task-board`
+  #    (loom view).
   #
   # 2. A project-canonical felt host (lightcone) whose own `.felt/` is a
   #    real directory, with loom symlinking *into* it at
@@ -1467,60 +1470,20 @@ defmodule Shuttle.Poller do
 
   # Returns the configured felt hosts list.
   #
-  # Resolution:
-  # 1. Env-configured hosts: LOOM_HOMES (comma-separated) → LOOM_HOME → ~/loom
-  # 2. Portolan-pinned local cities from ~/.portolan/cities.json (originId="local")
-  #
-  # The two sources are unioned (env first, then any city paths not already
-  # in env), so pinning a city in portolan auto-adds it as a felt host without
-  # touching shuttle config. Remote cities (originId != "local") are skipped —
-  # they belong to other machines' daemons (see constitution-shuttle-remote-dispatch).
+  # Resolution order lives in `Shuttle.FeltHosts`: `LOOM_HOMES` → persisted
+  # `~/.shuttle/felt_hosts.json` → `LOOM_HOME` → `~/loom`.
   #
   # This is the default-fallback only; explicit :felt_hosts opts in start_link
   # take precedence via init/1 (and disable the per-poll refresh in that case).
   defp default_felt_hosts do
-    env_hosts = env_felt_hosts() |> Enum.map(&Path.expand/1)
-    city_hosts = portolan_city_hosts() |> Enum.map(&Path.expand/1)
-    extras = Enum.reject(city_hosts, &(&1 in env_hosts))
-    env_hosts ++ extras
+    Shuttle.FeltHosts.configured_hosts()
   end
 
-  defp env_felt_hosts do
-    case System.get_env("LOOM_HOMES") do
-      v when is_binary(v) and v != "" ->
-        v
-        |> String.split(",")
-        |> Enum.map(&String.trim/1)
-        |> Enum.reject(&(&1 == ""))
-
-      _ ->
-        loom_home = System.get_env("LOOM_HOME")
-        [if(is_binary(loom_home) and loom_home != "", do: loom_home, else: System.user_home() <> "/loom")]
-    end
-  end
-
-  # Reads ~/.portolan/cities.json and returns paths for cities with
-  # originId="local". Returns [] if the file is missing, malformed, or has
-  # no local cities — auto-discovery is best-effort, never fatal.
-  defp portolan_city_hosts do
-    cities_path = Path.expand("~/.portolan/cities.json")
-
-    with true <- File.exists?(cities_path),
-         {:ok, content} <- File.read(cities_path),
-         {:ok, %{"cities" => cities}} when is_list(cities) <- Jason.decode(content) do
-      cities
-      |> Enum.filter(fn c -> Map.get(c, "originId") == "local" end)
-      |> Enum.map(fn c -> Map.get(c, "path") end)
-      |> Enum.reject(&is_nil/1)
-    else
-      _ -> []
-    end
-  end
-
-  # Re-reads default_felt_hosts/0 and updates state.felt_hosts if the list
-  # changed. Called from discover_candidates/1 each poll cycle so newly-pinned
-  # portolan cities pop up live. No-op when the caller passed an explicit
-  # :felt_hosts opt (state.auto_discover_felt_hosts == false).
+  # Re-reads the configured host list and updates state.felt_hosts if the list
+  # changed. Called from discover_candidates/1 each poll cycle so persisted
+  # host registration or env changes are picked up without a daemon restart.
+  # No-op when the caller passed an explicit :felt_hosts opt
+  # (state.auto_discover_felt_hosts == false).
   defp refresh_felt_hosts(%{auto_discover_felt_hosts: false} = state), do: state
 
   defp refresh_felt_hosts(%{felt_hosts: current} = state) do
@@ -1529,7 +1492,7 @@ defmodule Shuttle.Poller do
     if fresh == current do
       state
     else
-      Logger.info("felt_hosts updated from portolan/env: #{inspect(current)} → #{inspect(fresh)}")
+      Logger.info("felt_hosts updated from env/config: #{inspect(current)} → #{inspect(fresh)}")
       %{state | felt_hosts: fresh}
     end
   end

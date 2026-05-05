@@ -81,8 +81,9 @@ shuttle-ctl migrate --dry-run                 # preview eligibility migration
   `status in ["open", "active"]` AND not already running/claimed AND deps
   satisfied.
 - **Configured hosts** come from `LOOM_HOMES` (comma-separated) →
-  `LOOM_HOME` → default `~/loom`. Earlier-configured hosts win on fiber-id
-  collisions across hosts.
+  persisted `~/.shuttle/felt_hosts.json` → `LOOM_HOME` → default `~/loom`.
+  `POST /api/v1/felt-hosts` rewrites the persisted file; earlier-configured
+  hosts win on fiber-id collisions across hosts.
 - **Dispatcher** (`lib/shuttle/dispatcher.ex`) resolves the agent via
   `Shuttle.Agents.resolve_by_name/1` against the embedded registry, spawns
   `shuttle-<fiber-id>` tmux session.

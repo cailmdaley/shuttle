@@ -63,7 +63,29 @@ defmodule ShuttleWeb.APIControllerTest do
       File.mkdir_p!(Path.dirname(dir_path))
       indented = yaml |> String.trim() |> String.split("\n") |> Enum.map_join("\n", &("  " <> &1))
       File.write!(dir_path, "---\nstatus: #{status}\nshuttle:\n#{indented}\n---\nbody\n")
-      Agent.update(__MODULE__, &put_in(&1.shuttle[id], yaml))
+
+      shuttle_block =
+        case YamlElixir.read_from_string(yaml) do
+          {:ok, data} when is_map(data) -> data
+          _ -> %{}
+        end
+
+      Agent.update(__MODULE__, fn state ->
+        fiber =
+          state.fibers
+          |> Map.get(id, %{
+            "id" => id,
+            "name" => id,
+            "created_at" => "2026-04-28T00:00:00Z",
+            "tags" => ["constitution"]
+          })
+          |> Map.put("status", status)
+          |> Map.put("shuttle", shuttle_block)
+
+        state
+        |> put_in([:shuttle, id], yaml)
+        |> put_in([:fibers, id], fiber)
+      end)
     end
 
     # Kept for backward compat; discovery now walks files for shuttle: blocks.
@@ -88,8 +110,32 @@ defmodule ShuttleWeb.APIControllerTest do
 
       cond do
         command == "felt" and String.contains?(full_args, "ls") ->
-          fibers = Agent.get(__MODULE__, & &1.felt_ls)
+          show_all =
+            case Enum.find_index(args, &(&1 in ["-s", "--status"])) do
+              nil -> false
+              idx -> Enum.at(args, idx + 1) == "all"
+            end
+
+          fibers =
+            Agent.get(__MODULE__, fn state ->
+              entries = if state.felt_ls == [], do: Map.values(state.fibers), else: state.felt_ls
+
+              if show_all do
+                entries
+              else
+                Enum.filter(entries, fn fiber ->
+                  Map.get(fiber, "status") in ["open", "active"]
+                end)
+              end
+            end)
+
           {Jason.encode!(fibers), 0}
+
+        command == "felt" and String.contains?(full_args, "show") and
+            String.contains?(full_args, "--field shuttle") ->
+          fiber_id = extract_fiber_id(args)
+          shuttle = Agent.get(__MODULE__, & &1.shuttle)
+          {Map.get(shuttle, fiber_id, ""), 0}
 
         command == "felt" and String.contains?(full_args, "show") ->
           fiber_id = extract_fiber_id(args)
@@ -131,7 +177,9 @@ defmodule ShuttleWeb.APIControllerTest do
     end
 
     defp extract_fiber_id(args) do
-      Enum.find(args, "", fn arg -> arg != "show" and arg != "--json" end)
+      args
+      |> Enum.reject(&(&1 in ["show", "--json", "--field", "shuttle"]))
+      |> List.first("")
     end
   end
 

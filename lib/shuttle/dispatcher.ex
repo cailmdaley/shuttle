@@ -98,27 +98,16 @@ defmodule Shuttle.Dispatcher do
   end
 
   @doc """
-  Returns shuttle's default felt host. Mirrors `Shuttle.Poller.default_felt_host/0`
-  — kept locally so `Dispatcher` works standalone (e.g. via the CLI) without a
-  running Poller.
+  Returns shuttle's default felt host.
 
-  Resolution order:
-
-    1. `$LOOM_HOME` if set (matches portolan's `resolveGlobalFiberId`, so
-       both processes can be pointed at the same root by exporting one
-       env var).
-    2. `~/loom` as a final fallback (Cail's primary felt host).
-
-  Projects that live outside the configured felt host should run their own
-  shuttle instance with `felt_host:` pointing at the project root, rather
-  than relying on the default.
+  Mirrors `Shuttle.FeltHosts.configured_hosts/0` and keeps `Dispatcher`
+  working standalone (e.g. via the CLI) without a running Poller.
   """
   @spec default_felt_host() :: String.t()
   def default_felt_host do
-    case System.get_env("LOOM_HOME") do
-      v when is_binary(v) and v != "" -> v
-      _ -> System.user_home() <> "/loom"
-    end
+    Shuttle.FeltHosts.configured_hosts()
+    |> List.first()
+    |> Kernel.||(System.user_home() <> "/loom")
   end
 
   @doc """

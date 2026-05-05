@@ -2,8 +2,8 @@ defmodule ShuttleWeb.UserSocket do
   @moduledoc """
   Socket handler for Shuttle Phoenix Channels.
 
-  Clients (portolan kanban, debug dashboards) connect here and join
-  the `shuttle:snapshot` topic to receive reactive state updates.
+  Clients join the `shuttle:snapshot` topic here to receive reactive state
+  updates.
   """
 
   use Phoenix.Socket
