@@ -68,18 +68,27 @@ Other flags:
 			return runStatusCrossHost()
 		}
 
-		host := feltHostFlag
-		if host == "" {
-			defaultHost, err := schema.FeltHost()
+		// Resolve which felt hosts to scan. An explicit -C flag pins the read
+		// to that single host (useful for "what does this checkout see"); the
+		// default scans every host the daemon polls so status reflects the
+		// dispatcher's actual surface.
+		var hosts []string
+		if feltHostFlag != "" {
+			hosts = []string{feltHostFlag}
+		} else {
+			discovered, err := schema.FeltHosts()
 			if err != nil {
 				return err
 			}
-			host = defaultHost
+			hosts = discovered
 		}
 
-		// Read fibers through felt's JSON surface; shuttle remains the sole
-		// owner of shuttle-block semantics, felt remains the sole reader.
-		shuttleFibers, err := listShuttleFibers(host)
+		// Read fibers through felt's JSON surface across every host; shuttle
+		// remains the sole owner of shuttle-block semantics, felt remains the
+		// sole reader. A fiber visible from multiple hosts (e.g. via a loom
+		// symlink into a project-canonical store) canonicalizes to one
+		// FiberRef.ID, so cross-host dedup is on that key.
+		shuttleFibers, err := listShuttleFibersAcrossHosts(hosts)
 		if err != nil {
 			return fmt.Errorf("listing fibers: %w", err)
 		}
@@ -187,6 +196,42 @@ var psCmd = &cobra.Command{
 type shuttleEntry struct {
 	FiberID string
 	Block   *schema.Block
+}
+
+// listShuttleFibersAcrossHosts queries each host with listShuttleFibers and
+// merges the results, deduplicating by canonical FiberRef.ID. A host failure
+// is non-fatal: we log to stderr and continue with the rest, matching the
+// daemon's per-host best-effort scan.
+func listShuttleFibersAcrossHosts(hosts []string) ([]shuttleEntry, error) {
+	if len(hosts) == 0 {
+		return nil, fmt.Errorf("no felt hosts configured")
+	}
+	merged := make([]shuttleEntry, 0)
+	seen := map[string]bool{}
+	var firstErr error
+	for _, host := range hosts {
+		entries, err := listShuttleFibers(host)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "shuttle: host %q: %v\n", host, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		for _, e := range entries {
+			if seen[e.FiberID] {
+				continue
+			}
+			seen[e.FiberID] = true
+			merged = append(merged, e)
+		}
+	}
+	// All hosts failed → surface the first error so the operator notices;
+	// any successful host means we have data, return it.
+	if len(merged) == 0 && firstErr != nil {
+		return nil, firstErr
+	}
+	return merged, nil
 }
 
 // listShuttleFibers reads every fiber through `felt ls -s all --json` and

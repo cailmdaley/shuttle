@@ -18,10 +18,14 @@ type FiberRef struct {
 	Path string
 }
 
-// FeltHost returns Shuttle's default felt host.
+// FeltHost returns Shuttle's default felt host (single).
 // Resolution order:
 //  1. LOOM_HOME env var
 //  2. ~/loom (the standard loom location)
+//
+// Use this when one host is enough — e.g. addressing a fiber by id or running
+// a -C-style felt invocation with a single root. For surfaces that need to see
+// every fiber the daemon would dispatch, use FeltHosts (plural).
 func FeltHost() (string, error) {
 	if loom := os.Getenv("LOOM_HOME"); loom != "" {
 		return expandUserPath(loom)
@@ -31,6 +35,107 @@ func FeltHost() (string, error) {
 		return "", fmt.Errorf("resolving home directory: %w", err)
 	}
 	return filepath.Join(home, "loom"), nil
+}
+
+// FeltHosts returns every felt host the dispatcher considers. Mirrors
+// Shuttle.FeltHosts.configured_hosts/0 (lib/shuttle/felt_hosts.ex) so the Go
+// CLI sees the same surface the Elixir poller does:
+//
+//  1. LOOM_HOMES env var (comma-separated; non-empty wins)
+//  2. ~/.shuttle/felt_hosts.json (or $SHUTTLE_FELT_HOSTS_FILE) when present
+//  3. Single host from FeltHost() (LOOM_HOME, then ~/loom)
+//
+// Without this, surfaces like `shuttle status` only ever read the single
+// default host and silently miss everything pinned in the registry — which is
+// the whole reason a multi-host registry exists.
+func FeltHosts() ([]string, error) {
+	if envHosts := loomHomesEnv(); len(envHosts) > 0 {
+		return envHosts, nil
+	}
+	if registered, err := registeredFeltHosts(); err == nil && len(registered) > 0 {
+		return registered, nil
+	}
+	host, err := FeltHost()
+	if err != nil {
+		return nil, err
+	}
+	return []string{host}, nil
+}
+
+// loomHomesEnv parses LOOM_HOMES into the same shape as the Elixir reader.
+func loomHomesEnv() []string {
+	raw := os.Getenv("LOOM_HOMES")
+	if raw == "" {
+		return nil
+	}
+	return normalizeFeltHosts(strings.Split(raw, ","))
+}
+
+// registeredFeltHosts reads the persisted ~/.shuttle/felt_hosts.json file (or
+// $SHUTTLE_FELT_HOSTS_FILE override) and returns its normalized host list.
+// Missing file or empty list returns an empty slice with no error — callers
+// fall back to the single default.
+func registeredFeltHosts() ([]string, error) {
+	path, err := feltHostsRegistryPath()
+	if err != nil {
+		return nil, err
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading %s: %w", path, err)
+	}
+
+	// Tolerate both wrapping shapes the Elixir writer accepts:
+	//   {"version": 1, "felt_hosts": [...]}  ← canonical
+	//   [...]                                 ← bare list
+	var wrapped struct {
+		FeltHosts []string `json:"felt_hosts"`
+	}
+	if err := json.Unmarshal(content, &wrapped); err == nil && wrapped.FeltHosts != nil {
+		return normalizeFeltHosts(wrapped.FeltHosts), nil
+	}
+	var bare []string
+	if err := json.Unmarshal(content, &bare); err == nil {
+		return normalizeFeltHosts(bare), nil
+	}
+	return nil, fmt.Errorf("parsing %s: unexpected shape", path)
+}
+
+func feltHostsRegistryPath() (string, error) {
+	if env := os.Getenv("SHUTTLE_FELT_HOSTS_FILE"); env != "" {
+		return expandUserPath(env)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolving home directory: %w", err)
+	}
+	return filepath.Join(home, ".shuttle", "felt_hosts.json"), nil
+}
+
+// normalizeFeltHosts mirrors Shuttle.FeltHosts.normalize/1: trim, drop empty,
+// expand `~`, deduplicate while preserving first-seen order.
+func normalizeFeltHosts(hosts []string) []string {
+	seen := make(map[string]bool, len(hosts))
+	out := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		expanded, err := expandUserPath(h)
+		if err != nil {
+			continue
+		}
+		if seen[expanded] {
+			continue
+		}
+		seen[expanded] = true
+		out = append(out, expanded)
+	}
+	return out
 }
 
 // ResolveFiberPath returns the canonical absolute path of a fiber's .md file
