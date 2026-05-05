@@ -29,31 +29,6 @@ defmodule Shuttle.StandingRole do
           validation_errors: [String.t()]
         }
 
-  @spec parse(String.t(), String.t()) :: {:ok, t()} | {:error, term()}
-  def parse(fiber_id, yaml) when is_binary(yaml) do
-    yaml = String.trim(yaml)
-
-    if yaml == "" do
-      {:error, :missing}
-    else
-      with {:ok, data} <- YamlElixir.read_from_string(yaml),
-           true <- is_map(data) || {:error, :invalid_shuttle_block} do
-        role = %__MODULE__{
-          fiber_id: fiber_id,
-          # New schema uses "kind"; old schema used "mode". Support both.
-          mode: string(data["kind"] || data["mode"]),
-          schedule: map(data["schedule"]),
-          review: map(data["review"]),
-          next_due_at: parse_datetime(data["next_due_at"]),
-          last_run_at: parse_datetime(data["last_run_at"]),
-          run_id: string(get_in(data, ["review", "run_id"]))
-        }
-
-        {:ok, %{role | validation_errors: validation_errors(role)}}
-      end
-    end
-  end
-
   @spec from_map(String.t(), map()) :: {:ok, t()} | {:error, term()}
   def from_map(fiber_id, data) when is_map(data) do
     role = %__MODULE__{
