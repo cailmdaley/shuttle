@@ -40,9 +40,13 @@ Columns: fiber_id  kind  state  agent  next_due_at
 --all includes recently-exited sessions that no longer have shuttle: blocks.
 --json emits an array of objects instead.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		host, err := schema.FeltHost()
-		if err != nil {
-			return err
+		host := feltHostFlag
+		if host == "" {
+			defaultHost, err := schema.FeltHost()
+			if err != nil {
+				return err
+			}
+			host = defaultHost
 		}
 
 		// Read fibers through felt's JSON surface; shuttle remains the sole
@@ -174,6 +178,7 @@ func listShuttleFibers(host string) ([]shuttleEntry, error) {
 	}
 
 	entries := make([]shuttleEntry, 0, len(raw))
+	seen := map[string]bool{}
 	for _, fiber := range raw {
 		if fiber.FiberID == "" || len(fiber.Shuttle) == 0 || string(fiber.Shuttle) == "null" {
 			continue
@@ -182,7 +187,15 @@ func listShuttleFibers(host string) ([]shuttleEntry, error) {
 		if err := json.Unmarshal(fiber.Shuttle, &block); err != nil {
 			continue
 		}
-		entries = append(entries, shuttleEntry{FiberID: fiber.FiberID, Block: &block})
+		ref, err := schema.ResolveFiberInHost(host, fiber.FiberID)
+		if err != nil {
+			continue
+		}
+		if seen[ref.ID] {
+			continue
+		}
+		seen[ref.ID] = true
+		entries = append(entries, shuttleEntry{FiberID: ref.ID, Block: &block})
 	}
 	return entries, nil
 }

@@ -16,7 +16,7 @@ var sessionNameCmd = &cobra.Command{
 name Shuttle uses for the worker (shuttle-<fiber-id>).`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		_, fiberID := resolveFiber(args[0])
+		_, fiberID, _ := resolveFiber(args[0])
 		session := schema.TmuxSessionName(fiberID)
 
 		if jsonOutput {

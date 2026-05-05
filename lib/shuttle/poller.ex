@@ -575,6 +575,7 @@ defmodule Shuttle.Poller do
   # `<host>/.felt/` is itself a symlink.
   defp owned_fiber_ids(host) do
     felt_dir = Path.join(host, ".felt")
+    canonical_host = canonical_host_path(host)
 
     case File.lstat(felt_dir) do
       {:ok, %File.Stat{type: :symlink}} ->
@@ -594,9 +595,15 @@ defmodule Shuttle.Poller do
               {ids, seen}
 
             true ->
-              rel = Path.relative_to(path, felt_dir)
               next_seen = if ident, do: MapSet.put(seen, ident), else: seen
-              {MapSet.put(ids, derive_fiber_id_from_rel(rel)), next_seen}
+
+              case fiber_ref_from_path(path) do
+                {:ok, %{host: ^canonical_host, id: fiber_id}} ->
+                  {MapSet.put(ids, fiber_id), next_seen}
+
+                _ ->
+                  {ids, next_seen}
+              end
           end
         end)
         |> elem(0)
@@ -676,27 +683,140 @@ defmodule Shuttle.Poller do
     end
   end
 
-  # Derive the felt fiber ID from a path relative to <host>/.felt/.
-  #
-  # Directory fibers:  "ai-futures/shuttle/constitution-x/constitution-x.md"
-  #                    → "ai-futures/shuttle/constitution-x"
-  # Bare fibers:       "some-fiber.md"
-  #                    → "some-fiber"
-  defp derive_fiber_id_from_rel(rel) do
-    parts = Path.split(rel)
+  # Canonical `(host, id)` for an on-disk fiber path. The store boundary is the
+  # nearest real `.felt/` directory, so symlinked project views collapse back to
+  # Shuttle's dispatch identity (e.g. loom for portolan fibers, lightcone for
+  # project-canonical fibers).
+  defp fiber_ref_from_path(path) do
+    resolved =
+      case resolve_realpath(path) do
+        {:ok, real} -> real
+        {:error, _} -> Path.expand(path)
+      end
 
-    if length(parts) >= 2 do
-      basename = List.last(parts)
-      dir_parts = Enum.take(parts, length(parts) - 1)
-      dir_base = List.last(dir_parts)
+    segments = Path.split(resolved)
 
-      if String.replace_suffix(basename, ".md", "") == dir_base do
-        Path.join(dir_parts)
-      else
-        String.replace_suffix(rel, ".md", "")
+    felt_idx =
+      segments
+      |> Enum.with_index()
+      |> Enum.reduce(nil, fn
+        {".felt", idx}, _acc -> idx
+        _, acc -> acc
+      end)
+
+    if is_integer(felt_idx) do
+      host_parts = Enum.take(segments, felt_idx)
+      tail = Enum.drop(segments, felt_idx + 1)
+
+      with {:ok, fiber_id} <- fiber_id_from_tail(tail) do
+        host =
+          case host_parts do
+            [] -> "/"
+            parts -> Path.join(parts)
+          end
+
+        {:ok, %{host: host, id: fiber_id}}
       end
     else
-      String.replace_suffix(rel, ".md", "")
+      {:error, :no_felt_store}
+    end
+  end
+
+  defp fiber_id_from_tail([]), do: {:error, :empty_tail}
+
+  defp fiber_id_from_tail([file]) do
+    if String.ends_with?(file, ".md") do
+      {:ok, String.replace_suffix(file, ".md", "")}
+    else
+      {:error, :not_markdown}
+    end
+  end
+
+  defp fiber_id_from_tail(tail) do
+    file = List.last(tail)
+    parent = Enum.at(tail, -2)
+
+    cond do
+      not String.ends_with?(file, ".md") ->
+        {:error, :not_markdown}
+
+      String.replace_suffix(file, ".md", "") != parent ->
+        {:error, :unexpected_layout}
+
+      true ->
+        {:ok, tail |> Enum.take(length(tail) - 1) |> Path.join()}
+    end
+  end
+
+  defp resolve_realpath(path) do
+    expanded = Path.expand(path)
+
+    case Path.split(expanded) do
+      ["/" | rest] -> resolve_realpath_segments("/", rest, MapSet.new())
+      [first | rest] -> resolve_realpath_segments(first, rest, MapSet.new())
+      [] -> {:error, :empty_path}
+    end
+  end
+
+  defp resolve_realpath_segments(current, [], _seen), do: {:ok, current}
+
+  defp resolve_realpath_segments(current, [segment | rest], seen) do
+    candidate = Path.join(current, segment)
+
+    case :file.read_link(String.to_charlist(candidate)) do
+      {:ok, target} ->
+        target_path = List.to_string(target)
+
+        expanded_target =
+          case Path.type(target_path) do
+            :absolute -> Path.expand(target_path)
+            :relative -> Path.expand(target_path, Path.dirname(candidate))
+            _ -> Path.expand(target_path, Path.dirname(candidate))
+          end
+
+        if MapSet.member?(seen, candidate) do
+          {:error, :symlink_loop}
+        else
+          case Path.split(expanded_target) do
+            ["/" | target_rest] ->
+              resolve_realpath_segments("/", target_rest ++ rest, MapSet.put(seen, candidate))
+
+            [first | target_rest] ->
+              resolve_realpath_segments(first, target_rest ++ rest, MapSet.put(seen, candidate))
+
+            [] ->
+              {:error, :empty_target}
+          end
+        end
+
+      {:error, _} ->
+        resolve_realpath_segments(candidate, rest, seen)
+    end
+  end
+
+  defp canonical_host_path(host) do
+    case resolve_realpath(host) do
+      {:ok, resolved} -> resolved
+      {:error, _} -> Path.expand(host)
+    end
+  end
+
+  defp exact_fiber_path(host, fiber_id) do
+    segments = String.split(fiber_id, "/")
+    basename = List.last(segments)
+    felt_dir = Path.join(host, ".felt")
+    bare_path = Path.join(felt_dir, "#{basename}.md")
+    dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
+
+    cond do
+      not String.contains?(fiber_id, "/") and File.exists?(bare_path) ->
+        {:ok, bare_path}
+
+      File.exists?(dir_path) ->
+        {:ok, dir_path}
+
+      true ->
+        {:error, :not_found}
     end
   end
 
@@ -745,10 +865,11 @@ defmodule Shuttle.Poller do
   #
   # Resolution order:
   # 1. State cache (fast; populated by discover_candidates/1 each poll cycle)
-  # 2. Direct file-stat across each configured host's .felt/ directory
+  # 2. Exact-path probe across each configured host, followed by canonical-store
+  #    validation so symlinked project views do not claim loom-owned fibers.
   #
-  # Returns {:ok, host} for the first-configured host that contains the fiber,
-  # or {:error, :not_found} when no host claims it.
+  # Returns {:ok, host} for the first-configured host that canonically owns the
+  # fiber, or {:error, :not_found} when no host claims it.
   #
   # Cache updates are the caller's responsibility (discover_candidates/1 does
   # it for the whole poll cycle; handle_call(:resolve_fiber_host) returns the
@@ -760,15 +881,16 @@ defmodule Shuttle.Poller do
         {:ok, host}
 
       nil ->
-        segments = String.split(fiber_id, "/")
-        basename = List.last(segments)
-
         found =
           Enum.find_value(state.felt_hosts, fn host ->
-            felt_dir = Path.join(host, ".felt")
-            dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
-            bare_path = Path.join(felt_dir, "#{basename}.md")
-            if File.exists?(dir_path) or File.exists?(bare_path), do: host, else: nil
+            canonical_host = canonical_host_path(host)
+
+            with {:ok, path} <- exact_fiber_path(host, fiber_id),
+                 {:ok, %{host: ^canonical_host, id: ^fiber_id}} <- fiber_ref_from_path(path) do
+              host
+            else
+              _ -> nil
+            end
           end)
 
         case found do

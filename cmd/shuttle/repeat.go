@@ -31,7 +31,7 @@ The running daemon picks it up on its next poll.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		agents := loadAgents()
-		path, _ := resolveFiber(args[0])
+		path, _, _ := resolveFiber(args[0])
 		f := readFiber(path)
 
 		block := &schema.Block{

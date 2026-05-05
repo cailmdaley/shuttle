@@ -26,7 +26,7 @@ operations (pause, resume, set-model) and replaced on each new dispatch.`,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		agentName, _ := cmd.Flags().GetString("agent")
-		path, _ := resolveFiber(args[0])
+		path, _, _ := resolveFiber(args[0])
 		f := readFiber(path)
 		if f.Block == nil {
 			return fmt.Errorf("fiber %s has no shuttle: block", args[0])
@@ -55,7 +55,7 @@ a fiber moves to tempered/composted or when a session has aged out and
 resume is no longer meaningful.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		path, _ := resolveFiber(args[0])
+		path, _, _ := resolveFiber(args[0])
 		f := readFiber(path)
 		if f.Block == nil {
 			return fmt.Errorf("fiber %s has no shuttle: block", args[0])

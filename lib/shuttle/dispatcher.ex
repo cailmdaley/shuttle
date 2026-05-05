@@ -54,6 +54,7 @@ defmodule Shuttle.Dispatcher do
          {:ok, agent} <- resolve_agent(fiber),
          :ok <- validate_agent(agent) do
       resume_intent = check_resume_intent(fiber_id, fiber, felt_host: felt_host)
+
       create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent,
         felt_host: felt_host
       )
@@ -416,6 +417,7 @@ defmodule Shuttle.Dispatcher do
   # `resume_intent` is `:fresh | {:previous, session_id}` from check_resume_intent/3.
   defp create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent, opts) do
     session = session_name(fiber_id)
+    felt_host = Keyword.get(opts, :felt_host, default_felt_host())
 
     case resume_intent do
       {:previous, session_id} ->
@@ -454,7 +456,7 @@ defmodule Shuttle.Dispatcher do
         case spawn_tmux(session, work_dir, run_script, runner) do
           {:ok, _} = result ->
             # Store the session UUID so "Resume previous" is available next time.
-            store_session_id(fiber_id, agent.id, session_uuid, runner)
+            store_session_id(fiber_id, agent.id, session_uuid, runner, felt_host)
             result
 
           error ->
@@ -511,13 +513,15 @@ defmodule Shuttle.Dispatcher do
   # - Claude: UUID was pre-specified; write synchronously.
   # - Codex/Pi: capture UUID from session file asynchronously with backoff.
   # - None: agent doesn't support session IDs; skip.
-  defp store_session_id(fiber_id, agent_id, {:claude, uuid}, _runner) do
+  defp store_session_id(fiber_id, agent_id, {:claude, uuid}, _runner, felt_host) do
     # Fire-and-forget: storing the UUID is best-effort; blocking dispatch on a
     # shuttle-ctl call would delay WorkerWatcher startup and cause flaky tests
     # (the watcher init checks the session, but the session can be removed by
     # other actors while we wait for shuttle-ctl to finish).
     Task.start(fn ->
-      case System.cmd("shuttle-ctl", ["session-set", fiber_id, uuid, "--agent", agent_id],
+      case System.cmd(
+             "shuttle-ctl",
+             ["--host", felt_host, "session-set", fiber_id, uuid, "--agent", agent_id],
              stderr_to_stdout: true
            ) do
         {_, 0} ->
@@ -531,7 +535,7 @@ defmodule Shuttle.Dispatcher do
     end)
   end
 
-  defp store_session_id(fiber_id, agent_id, {:capture, cli, work_dir}, _runner) do
+  defp store_session_id(fiber_id, agent_id, {:capture, cli, work_dir}, _runner, felt_host) do
     # Fire-and-forget: capture the session UUID from the harness's JSONL file
     # in a background task. The race window (50 ms × 20 attempts = ~1 s) is
     # short enough that the kanban card will show "Resume previous" by the
@@ -539,7 +543,9 @@ defmodule Shuttle.Dispatcher do
     Task.start(fn ->
       case capture_session_uuid(cli, work_dir, 20) do
         {:ok, uuid} ->
-          case System.cmd("shuttle-ctl", ["session-set", fiber_id, uuid, "--agent", agent_id],
+          case System.cmd(
+                 "shuttle-ctl",
+                 ["--host", felt_host, "session-set", fiber_id, uuid, "--agent", agent_id],
                  stderr_to_stdout: true
                ) do
             {_, 0} ->
@@ -561,7 +567,7 @@ defmodule Shuttle.Dispatcher do
     end)
   end
 
-  defp store_session_id(_fiber_id, _agent_id, :none, _runner), do: :ok
+  defp store_session_id(_fiber_id, _agent_id, :none, _runner, _felt_host), do: :ok
 
   # Poll for the session UUID written by codex/pi to their respective session
   # JSONL files. Tries `attempts` times with 50 ms between each.
@@ -593,7 +599,9 @@ defmodule Shuttle.Dispatcher do
   defp find_session_file("codex", _work_dir) do
     home = System.user_home!()
     date = Date.utc_today()
-    dir = Path.join([home, ".codex", "sessions", "#{date.year}", pad2(date.month), pad2(date.day)])
+
+    dir =
+      Path.join([home, ".codex", "sessions", "#{date.year}", pad2(date.month), pad2(date.day)])
 
     case File.ls(dir) do
       {:ok, files} ->

@@ -19,7 +19,7 @@ Resolves the fiber ID to Shuttle's canonical tmux session name and executes
 tmux attach. Exits with a clear error if no session exists.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		_, fiberID := resolveFiber(args[0])
+		_, fiberID, _ := resolveFiber(args[0])
 		session := schema.TmuxSessionName(fiberID)
 
 		if !schema.TmuxSessionExists(session) {
@@ -47,7 +47,7 @@ watcher tick and reconciles: marks the run as aborted, appends history, releases
 supervision.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		path, fiberID := resolveFiber(args[0])
+		path, fiberID, _ := resolveFiber(args[0])
 		session := schema.TmuxSessionName(fiberID)
 
 		// Mark the block BEFORE killing the session so the daemon can distinguish

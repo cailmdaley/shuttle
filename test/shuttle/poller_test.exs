@@ -29,6 +29,7 @@ defmodule Shuttle.PollerTest do
     def reset do
       # Remove any fiber files written by set_shuttle so tests start clean.
       File.rm_rf("/tmp/.felt")
+
       Agent.update(__MODULE__, fn _ ->
         %{
           commands: [],
@@ -279,6 +280,7 @@ defmodule Shuttle.PollerTest do
   test "poller skips draft fibers" do
     fiber = make_fiber("tests/draft", %{"tags" => ["constitution", "draft"], "status" => "open"})
     MockRunner.set_fiber("tests/draft", fiber)
+
     # Draft = shuttle block present but enabled: false; status open (not yet committed to In flight).
     MockRunner.set_shuttle("tests/draft", "enabled: false\nkind: oneshot\n", "open")
 
@@ -722,9 +724,7 @@ defmodule Shuttle.PollerTest do
 
     assert Enum.at(args, 5) == project_dir
   after
-    File.rm_rf(
-      Path.join(System.tmp_dir!(), "shuttle-test-proj-*")
-    )
+    File.rm_rf(Path.join(System.tmp_dir!(), "shuttle-test-proj-*"))
   end
 
   test "poller falls back to felt_host when shuttle.project_dir does not exist" do
@@ -822,18 +822,24 @@ defmodule Shuttle.PollerTest do
     basename = List.last(segments)
     dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
     File.mkdir_p!(Path.dirname(dir_path))
+
     indented =
       shuttle_yaml
       |> String.trim()
       |> String.split("\n")
       |> Enum.map_join("\n", &("  " <> &1))
+
     File.write!(dir_path, "---\nstatus: active\nshuttle:\n#{indented}\n---\nbody\n")
     dir_path
   end
 
   test "resolve_fiber_host finds a fiber in the first configured host" do
-    host_a = Path.join(System.tmp_dir!(), "shuttle-multi-host-a-#{System.unique_integer([:positive])}")
-    host_b = Path.join(System.tmp_dir!(), "shuttle-multi-host-b-#{System.unique_integer([:positive])}")
+    host_a =
+      Path.join(System.tmp_dir!(), "shuttle-multi-host-a-#{System.unique_integer([:positive])}")
+
+    host_b =
+      Path.join(System.tmp_dir!(), "shuttle-multi-host-b-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(host_a)
     File.mkdir_p!(host_b)
 
@@ -856,8 +862,12 @@ defmodule Shuttle.PollerTest do
   end
 
   test "resolve_fiber_host finds a fiber in the second configured host" do
-    host_a = Path.join(System.tmp_dir!(), "shuttle-multi-host-a-#{System.unique_integer([:positive])}")
-    host_b = Path.join(System.tmp_dir!(), "shuttle-multi-host-b-#{System.unique_integer([:positive])}")
+    host_a =
+      Path.join(System.tmp_dir!(), "shuttle-multi-host-a-#{System.unique_integer([:positive])}")
+
+    host_b =
+      Path.join(System.tmp_dir!(), "shuttle-multi-host-b-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(host_a)
     File.mkdir_p!(host_b)
 
@@ -880,7 +890,9 @@ defmodule Shuttle.PollerTest do
   end
 
   test "resolve_fiber_host returns :not_found for an unknown fiber" do
-    host_a = Path.join(System.tmp_dir!(), "shuttle-multi-host-a-#{System.unique_integer([:positive])}")
+    host_a =
+      Path.join(System.tmp_dir!(), "shuttle-multi-host-a-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(host_a)
 
     {:ok, poller} =
@@ -900,8 +912,12 @@ defmodule Shuttle.PollerTest do
   end
 
   test "first-configured host wins for ID collisions" do
-    host_a = Path.join(System.tmp_dir!(), "shuttle-multi-host-a-#{System.unique_integer([:positive])}")
-    host_b = Path.join(System.tmp_dir!(), "shuttle-multi-host-b-#{System.unique_integer([:positive])}")
+    host_a =
+      Path.join(System.tmp_dir!(), "shuttle-multi-host-a-#{System.unique_integer([:positive])}")
+
+    host_b =
+      Path.join(System.tmp_dir!(), "shuttle-multi-host-b-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(host_a)
     File.mkdir_p!(host_b)
 
@@ -927,8 +943,12 @@ defmodule Shuttle.PollerTest do
   end
 
   test "bust_fiber_host_cache allows re-resolution after a fiber moves" do
-    host_a = Path.join(System.tmp_dir!(), "shuttle-multi-host-a-#{System.unique_integer([:positive])}")
-    host_b = Path.join(System.tmp_dir!(), "shuttle-multi-host-b-#{System.unique_integer([:positive])}")
+    host_a =
+      Path.join(System.tmp_dir!(), "shuttle-multi-host-a-#{System.unique_integer([:positive])}")
+
+    host_b =
+      Path.join(System.tmp_dir!(), "shuttle-multi-host-b-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(host_a)
     File.mkdir_p!(host_b)
 
@@ -971,8 +991,18 @@ defmodule Shuttle.PollerTest do
     # its loom-relative id, dispatch later runs `felt -C ~/loom show
     # ai-futures/lightcone/...` which fails (loom's index doesn't have
     # the entry) and dispatch silently never happens.
-    host_a = Path.join(System.tmp_dir!(), "shuttle-multi-host-loom-#{System.unique_integer([:positive])}")
-    host_b = Path.join(System.tmp_dir!(), "shuttle-multi-host-lightcone-#{System.unique_integer([:positive])}")
+    host_a =
+      Path.join(
+        System.tmp_dir!(),
+        "shuttle-multi-host-loom-#{System.unique_integer([:positive])}"
+      )
+
+    host_b =
+      Path.join(
+        System.tmp_dir!(),
+        "shuttle-multi-host-lightcone-#{System.unique_integer([:positive])}"
+      )
+
     File.mkdir_p!(Path.join(host_a, ".felt/ai-futures"))
     File.mkdir_p!(host_b)
 
@@ -1015,8 +1045,18 @@ defmodule Shuttle.PollerTest do
     # Mirrors project-cities-on-loom topology: project's `.felt/` is a
     # symlink into loom's tree. Walking the project host should skip
     # everything — loom enumerates the same files canonically.
-    loom = Path.join(System.tmp_dir!(), "shuttle-multi-host-loom-#{System.unique_integer([:positive])}")
-    project = Path.join(System.tmp_dir!(), "shuttle-multi-host-project-#{System.unique_integer([:positive])}")
+    loom =
+      Path.join(
+        System.tmp_dir!(),
+        "shuttle-multi-host-loom-#{System.unique_integer([:positive])}"
+      )
+
+    project =
+      Path.join(
+        System.tmp_dir!(),
+        "shuttle-multi-host-project-#{System.unique_integer([:positive])}"
+      )
+
     File.mkdir_p!(loom)
     File.mkdir_p!(project)
 
@@ -1053,6 +1093,47 @@ defmodule Shuttle.PollerTest do
     )
   end
 
+  test "resolve_fiber_host fallback ignores symlinked project view after cache bust" do
+    loom =
+      Path.join(
+        System.tmp_dir!(),
+        "shuttle-multi-host-loom-#{System.unique_integer([:positive])}"
+      )
+
+    project =
+      Path.join(
+        System.tmp_dir!(),
+        "shuttle-multi-host-project-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(loom)
+    File.mkdir_p!(project)
+
+    write_fiber_file(loom, "ai-futures/portolan/kanban-modal")
+
+    File.ln_s!(
+      Path.join([loom, ".felt", "ai-futures", "portolan"]),
+      Path.join(project, ".felt")
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_symlinked_felt_cache_bust,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_hosts: [loom, project]
+      )
+
+    :ok = Poller.bust_fiber_host_cache(poller, "ai-futures/portolan/kanban-modal")
+
+    assert {:ok, ^loom} = Poller.resolve_fiber_host(poller, "ai-futures/portolan/kanban-modal")
+  after
+    Enum.each(
+      Path.wildcard(Path.join(System.tmp_dir!(), "shuttle-multi-host-*")),
+      &File.rm_rf/1
+    )
+  end
+
   test "snapshot includes felt_hosts list" do
     {:ok, poller} =
       Poller.start_link(
@@ -1068,7 +1149,10 @@ defmodule Shuttle.PollerTest do
 
   test "poller reads configured hosts from persisted registration" do
     config_path =
-      Path.join(System.tmp_dir!(), "shuttle-felt-hosts-poller-#{System.unique_integer([:positive])}.json")
+      Path.join(
+        System.tmp_dir!(),
+        "shuttle-felt-hosts-poller-#{System.unique_integer([:positive])}.json"
+      )
 
     original_file = System.get_env("SHUTTLE_FELT_HOSTS_FILE")
     original_homes = System.get_env("LOOM_HOMES")
@@ -1076,7 +1160,11 @@ defmodule Shuttle.PollerTest do
     System.put_env("SHUTTLE_FELT_HOSTS_FILE", config_path)
     System.delete_env("LOOM_HOMES")
     File.mkdir_p!(Path.dirname(config_path))
-    File.write!(config_path, Jason.encode!(%{"version" => 1, "felt_hosts" => ["/tmp/host-a", "/tmp/host-b"]}))
+
+    File.write!(
+      config_path,
+      Jason.encode!(%{"version" => 1, "felt_hosts" => ["/tmp/host-a", "/tmp/host-b"]})
+    )
 
     on_exit(fn ->
       File.rm(config_path)
@@ -1104,7 +1192,10 @@ defmodule Shuttle.PollerTest do
 
   test "poller refreshes configured hosts when the persisted registration changes" do
     config_path =
-      Path.join(System.tmp_dir!(), "shuttle-felt-hosts-refresh-#{System.unique_integer([:positive])}.json")
+      Path.join(
+        System.tmp_dir!(),
+        "shuttle-felt-hosts-refresh-#{System.unique_integer([:positive])}.json"
+      )
 
     original_file = System.get_env("SHUTTLE_FELT_HOSTS_FILE")
     original_homes = System.get_env("LOOM_HOMES")

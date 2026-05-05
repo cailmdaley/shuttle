@@ -22,7 +22,7 @@ Open fibers keep their existing status (typically open).
 This makes pause the single-writer transition for the Kanban's Drafts target.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		path, _ := resolveFiber(args[0])
+		path, _, _ := resolveFiber(args[0])
 		f := readFiber(path)
 		if f.Block == nil {
 			return fmt.Errorf("fiber %s has no shuttle: block", args[0])
@@ -59,7 +59,7 @@ Refuses if status is currently "closed" — use 'shuttle reopen' to requeue a
 closed fiber back into active work.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		path, _ := resolveFiber(args[0])
+		path, _, _ := resolveFiber(args[0])
 		f := readFiber(path)
 		if f.Block == nil {
 			return fmt.Errorf("fiber %s has no shuttle: block", args[0])
@@ -109,7 +109,7 @@ The shuttle block stays installed; closed fibers are ignored by the daemon
 until they are reopened.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		path, _ := resolveFiber(args[0])
+		path, _, _ := resolveFiber(args[0])
 		f := readFiber(path)
 		if f.Block == nil {
 			return fmt.Errorf("fiber %s has no shuttle: block", args[0])
@@ -154,7 +154,7 @@ This is the canonical reopen path for Kanban requeues from Awaiting review,
 Tempered, or Composted back to In flight.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		path, _ := resolveFiber(args[0])
+		path, _, _ := resolveFiber(args[0])
 		f := readFiber(path)
 		if f.Block == nil {
 			return fmt.Errorf("fiber %s has no shuttle: block", args[0])
@@ -194,7 +194,7 @@ Examples:
   printf 'First line\nSecond line\n' | shuttle set-outcome <fiber>`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			path, _ := resolveFiber(args[0])
+			path, _, _ := resolveFiber(args[0])
 			f := readFiber(path)
 			if f.Block == nil {
 				return fmt.Errorf("fiber %s has no shuttle: block", args[0])
@@ -265,7 +265,7 @@ is reset to scheduled, and next_due_at is advanced to the next occurrence.
 Appends a felt history event recording the acceptance.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		path, fiberID := resolveFiber(args[0])
+		path, fiberID, host := resolveFiber(args[0])
 		f := readFiber(path)
 		if f.Block == nil {
 			return fmt.Errorf("fiber %s has no shuttle: block", args[0])
@@ -312,7 +312,7 @@ Appends a felt history event recording the acceptance.`,
 		}
 
 		// Append felt history event.
-		_ = appendFeltHistory(fiberID, fmt.Sprintf("accepted run %s; next due %s", runID, next.Format(time.RFC3339)))
+		_ = appendFeltHistory(host, fiberID, fmt.Sprintf("accepted run %s; next due %s", runID, next.Format(time.RFC3339)))
 
 		fmt.Printf("accepted run %s for %s\n", runID, args[0])
 		fmt.Printf("  next due: %s\n", next.Format(time.RFC3339))
@@ -329,7 +329,7 @@ agent registry before writing. Removes any existing agent:* felt tag
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		agents := loadAgents()
-		path, _ := resolveFiber(args[0])
+		path, _, _ := resolveFiber(args[0])
 		f := readFiber(path)
 		if f.Block == nil {
 			return fmt.Errorf("fiber %s has no shuttle: block (use 'shuttle repeat' to install first)", args[0])
@@ -357,7 +357,7 @@ var uninstallCmd = &cobra.Command{
 daemon will no longer dispatch it. The felt tags and status are not changed.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		path, _ := resolveFiber(args[0])
+		path, _, _ := resolveFiber(args[0])
 		f := readFiber(path)
 		if f.Block == nil {
 			fmt.Printf("fiber %s has no shuttle: block (nothing to do)\n", args[0])

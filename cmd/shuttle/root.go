@@ -8,7 +8,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var jsonOutput bool
+var (
+	jsonOutput   bool
+	feltHostFlag string
+)
 
 var rootCmd = &cobra.Command{
 	Use:           "shuttle",
@@ -37,12 +40,16 @@ Read + abort verbs (offline, no daemon IPC):
   abort        Kill a worker's tmux session
 
 The CLI edits shuttle: frontmatter directly. The running daemon picks up changes
-on its next poll. All write verbs validate input before touching any file.`,
+on its next poll. All write verbs validate input before touching any file.
+
+Use --host <dir> to target a specific felt host when a fiber does not live
+under the default LOOM_HOME / ~/loom store.`,
 	CompletionOptions: cobra.CompletionOptions{HiddenDefaultCmd: true},
 }
 
 func init() {
 	rootCmd.PersistentFlags().BoolVarP(&jsonOutput, "json", "j", false, "Output in JSON format")
+	rootCmd.PersistentFlags().StringVar(&feltHostFlag, "host", "", "Felt host root (directory containing .felt/)")
 }
 
 // loadAgents loads the agent registry; exits with a clear error on failure.
@@ -55,19 +62,25 @@ func loadAgents() *schema.AgentRegistry {
 	return reg
 }
 
-// resolveFiber resolves a fiber ID/query to its file path; exits on error.
-func resolveFiber(idOrQuery string) (string, string) {
-	path, err := schema.ResolveFiberPath(idOrQuery)
+// resolveFiber resolves a fiber ID/query to its canonical host/id/path triple;
+// exits on error.
+func resolveFiber(idOrQuery string) (string, string, string) {
+	host := feltHostFlag
+	if host == "" {
+		defaultHost, err := schema.FeltHost()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "shuttle: %v\n", err)
+			os.Exit(1)
+		}
+		host = defaultHost
+	}
+
+	ref, err := schema.ResolveFiberInHost(host, idOrQuery)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "shuttle: %v\n", err)
 		os.Exit(1)
 	}
-	host, _ := schema.FeltHost()
-	fiberID, err := schema.FiberIDFromPath(host, path)
-	if err != nil {
-		fiberID = idOrQuery
-	}
-	return path, fiberID
+	return ref.Path, ref.ID, ref.Host
 }
 
 // readFiber reads a fiber; exits on error.
