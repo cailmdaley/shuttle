@@ -13,12 +13,21 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var statusAll bool
+var (
+	statusIncludeOrphans bool
+	statusAll            bool
+	statusRemote         string
+)
 
 // FiberStatus is one row in the status output.
+//
+// Origin is empty for local rows; for cross-host rows (rendered via
+// `--remote` or `--all`) it carries the remote name (e.g. "candide")
+// — so JSON consumers can group/filter without re-deriving it.
 type FiberStatus struct {
 	FiberID     string `json:"fiber_id"`
-	Kind        string `json:"kind"`
+	Origin      string `json:"origin,omitempty"`
+	Kind        string `json:"kind,omitempty"`
 	Enabled     bool   `json:"enabled"`
 	Agent       string `json:"agent,omitempty"`
 	State       string `json:"state"`
@@ -27,6 +36,7 @@ type FiberStatus struct {
 	NextDueAt   string `json:"next_due_at,omitempty"`
 	LastRunAt   string `json:"last_run_at,omitempty"`
 	ReviewState string `json:"review_state,omitempty"`
+	Stale       bool   `json:"stale,omitempty"`
 }
 
 var statusCmd = &cobra.Command{
@@ -37,9 +47,27 @@ Sources: felt ls -j (for fibers with shuttle: blocks) + tmux ls (for live sessio
 
 Columns: fiber_id  kind  state  agent  next_due_at
 
---all includes recently-exited sessions that no longer have shuttle: blocks.
---json emits an array of objects instead.`,
+Cross-host (queries the local daemon's /api/v1/state/composite):
+  --all           local + every configured remote (composite snapshot).
+  --remote NAME   only the named remote.
+
+The daemon's RemoteRegistry polls each remote over its SSH-tunnel-mapped
+port; the CLI just renders that response. Rows from a remote include an
+"origin" column. Stale remotes (registry hasn't heard back recently) are
+flagged with "[stale]" in the state column.
+
+Other flags:
+  --include-orphans  include live shuttle-* tmux sessions that no longer
+                     have a shuttle: block (rare; useful for reconciling
+                     after manual cleanup).
+  --json             emit an array of objects instead.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// Cross-host paths route through the local daemon; --remote and
+		// --all are mutually exclusive (--remote NAME implies "filter").
+		if statusAll || statusRemote != "" {
+			return runStatusCrossHost()
+		}
+
 		host := feltHostFlag
 		if host == "" {
 			defaultHost, err := schema.FeltHost()
@@ -92,7 +120,7 @@ Columns: fiber_id  kind  state  agent  next_due_at
 		}
 
 		// Optionally include live sessions not matched to a shuttle: fiber.
-		if statusAll {
+		if statusIncludeOrphans {
 			for session := range liveSessions {
 				if !seenSessions[session] {
 					rows = append(rows, FiberStatus{
@@ -272,7 +300,13 @@ func truncate(s string, n int) string {
 }
 
 func init() {
-	statusCmd.Flags().BoolVar(&statusAll, "all", false, "Include exited sessions not matched to a fiber")
+	statusCmd.Flags().BoolVar(&statusIncludeOrphans, "include-orphans", false,
+		"Include live shuttle-* tmux sessions with no matching shuttle block")
+	statusCmd.Flags().BoolVar(&statusAll, "all", false,
+		"Show local plus all configured remotes (queries daemon /api/v1/state/composite)")
+	statusCmd.Flags().StringVar(&statusRemote, "remote", "",
+		"Show only the named remote (queries daemon /api/v1/state/composite)")
+	statusCmd.MarkFlagsMutuallyExclusive("all", "remote")
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(psCmd)
 }

@@ -55,6 +55,8 @@ bin/shuttle dispatch <fiber-id>               # one-shot dispatch
 
 # shuttle-ctl — agent-facing CLI; offline; schema-validating
 shuttle-ctl status                            # all fibers with shuttle: blocks
+shuttle-ctl status --all                      # local + every configured remote (via daemon /state/composite)
+shuttle-ctl status --remote candide           # single remote, filtered from the composite snapshot
 shuttle-ctl ps                                # live tmux workers only
 shuttle-ctl install <fiber> [-m <agent-id>] [--disabled]
 shuttle-ctl repeat <fiber> --schedule "0 9 * * 1-5" --tz Europe/Paris
@@ -103,7 +105,16 @@ bin/shuttle snapshot                     # raw JSON snapshot
 tmux ls | grep '^shuttle-'               # live workers
 curl -s http://127.0.0.1:4000/api/v1/agents | jq   # agent registry as JSON
 curl -s http://127.0.0.1:4000/api/v1/state | jq    # full orchestrator state
+curl -s http://127.0.0.1:4000/api/v1/state/composite | jq   # local + per-remote snapshots
 ```
+
+**Cross-host visibility.** `--all` and `--remote` go through the local
+daemon's `/api/v1/state/composite`; the daemon's `RemoteRegistry` polls
+each configured remote (`config :shuttle, :remotes, [...]`) over its
+SSH-tunnel-mapped port and merges the snapshots with freshness flags.
+The CLI never talks to remote daemons directly — `SHUTTLE_DAEMON_URL`
+overrides which local daemon to query, but remote URLs live in mix
+config alone. See [[ai-futures/shuttle/constitution-shuttle-remote-dispatch]].
 
 A useful sanity ladder when something isn't dispatching:
 
