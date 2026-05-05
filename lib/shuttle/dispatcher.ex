@@ -114,124 +114,110 @@ defmodule Shuttle.Dispatcher do
   @doc """
   Renders the universal dispatch prompt for a fiber ID.
 
-  Inlines two pieces of context directly into the prompt so the worker
-  has them in context immediately, no tool calls required:
+  The prompt opens with a single orientation paragraph — what Shuttle is,
+  what the worker is here to do, and how the practice gets loaded — then
+  inlines exactly one context block:
 
-    - The most recent `review-comment` event (Cail's latest directive),
-      if any. Persists across arbitrarily many worker handoffs — only
-      replaced when Cail files a newer directive. The worker reads the
-      directive *and* the editorial chain to decide whether it's still
-      in play; we deliberately don't track "consumed" because it pushes
-      a brittle ack-or-the-directive-is-lost burden onto the worker.
-    - The most recent editorial event (the previous worker's handoff
-      or this fiber's bootstrap), if any.
+    - **From User** — the most recent `review-comment` event, if any.
+      The user's intent for this dispatch. Persists across handoffs
+      until a newer one is filed.
 
-  Both sections are omitted when empty so the prompt stays clean for
-  fresh fibers. On felt failure (binary missing, no history yet) we
-  fall back to empty strings — dispatch continues rather than failing.
+  We deliberately *don't* inline the fiber's outcome or the last
+  editorial event. Both are already in scope after the worker calls
+  `felt show <fiber-id>` (which renders outcome + the `Recent:` line)
+  and `felt history <fiber-id>` (which renders the full editorial
+  chain). The shuttle skill prescribes that read order; duplicating
+  either here just bloats the prompt and risks drift between the
+  inlined snapshot and felt's own view.
+
+  Why keep the From User block inlined? The user's directive isn't
+  recoverable from `felt show` in the same way — it's a typed event
+  among many in the history, and having it sit at the top of the
+  prompt where causal attention sees it first conditions the worker's
+  reading of everything that follows.
+
+  Operational instructions (read the constitution, exit before half-full,
+  append an editorial event, `kill $PPID`) deliberately don't appear
+  here — they're encoded in the `shuttle` skill the worker activates
+  next. The prompt's job is orientation, not duplicating practice.
+
+  On felt failure (binary missing, no history yet) the From User block
+  falls back to empty — dispatch continues rather than failing, and
+  the worker just gets the orientation header.
 
   ## Options
 
     * `:felt_host` — directory containing the `.felt/` index to query.
       Defaults to `default_felt_host/0`. The Poller threads its
-      configured `state.felt_host` here so each shuttle instance
-      reads from the felt host it's responsible for, rather than a
-      hardcoded loom root.
+      configured `state.felt_host` here so each shuttle instance reads
+      from the felt host it's responsible for.
   """
   @spec render_prompt(String.t(), keyword()) :: String.t()
   def render_prompt(fiber_id, opts \\ []) do
-    felt_host = Keyword.get(opts, :felt_host, default_felt_host())
-    directive_block = render_latest_review_directive(fiber_id, felt_host: felt_host)
-    handoff_block = render_latest_editorial(fiber_id, felt_host: felt_host)
+    header = """
+    The orchestration system Shuttle dispatched you on this fiber. The constitution describes what "done" looks like; drive toward it across one or more sessions. The `shuttle` and `felt` skills carry the practice — activate them next.
 
-    base = """
-    Shuttle dispatch. Fiber ID: #{fiber_id}
-
-    You are a Shuttle-dispatched worker on this fiber.
-
-    Activate the shuttle and felt skills before anything else, then follow them.
-
-    Read the constitution fresh via `felt show #{fiber_id}`. The work may take one session or many — Shuttle redispatches a fresh worker on the next poll. **Exit before context is half-full.** Auto-compact mid-thought hands the next worker a degraded summary, and the editorial event you'd write afterward gets composed from that degraded view rather than full attention. A clean break at the next sub-task boundary, well before half, is a stronger handoff than pushing through. End this session with `kill $PPID` at a clean break, when you're blocked, or when the constitution is realized.
-
-    Update the constitution's `outcome:` to reflect where the work now stands, and append an editorial event with `felt history append #{fiber_id} --summary "…"` as the handoff for the next worker; file crystallizations as sub-fibers; commit. Status `closed` signals the constitution is realized; `tempered: true` is human-only.
+    Fiber: #{fiber_id}
     """
 
-    (directive_block <> handoff_block <> base)
-    |> String.trim()
+    compose_prompt(header, fiber_id, opts)
   end
 
   @doc """
   Renders the prompt injected into a *resumed* worker session.
 
-  Mirrors the fresh dispatch prompt's directive + handoff blocks so the
-  resumed worker has the same upfront context as a fresh worker would,
-  but skips the "Activate skills / read constitution / kill $PPID" prologue
-  — those are already in the resumed transcript and repeating them is
-  noise.
+  Mirrors the fresh dispatch prompt's From User block so the resumed
+  worker sees the same intent signal at the top of context. The framing
+  paragraph is shorter — skills, conventions, and the constitution are
+  already in the resumed transcript, so repeating them is noise.
 
   When the latest review-comment has an empty summary (the kanban writes
   one on every requeue/resume click to keep `resume_mode` aligned with
-  user intent — see `render_latest_review_directive/2`), the directive
-  block is suppressed and the worker just gets the framing sentence.
+  user intent — see `render_user_message_block/2`), the From User block
+  is suppressed and the worker just gets the framing sentence.
 
   Pass `felt_host:` to control which `.felt/` index is queried; defaults
   to `default_felt_host/0`.
   """
   @spec render_resume_prompt(String.t(), keyword()) :: String.t()
   def render_resume_prompt(fiber_id, opts \\ []) do
-    directive_block = render_latest_review_directive(fiber_id, opts)
-    handoff_block = render_latest_editorial(fiber_id, opts)
+    header = """
+    Shuttle resumed your previous session on this fiber. Skills and conventions are already loaded in your transcript from the original dispatch; pick up from the last clean checkpoint, or address the message below if one's there.
 
-    base = """
-    Shuttle resume. Fiber ID: #{fiber_id}
-
-    The user clicked "Resume previous" in the kanban — your session was woken to keep working on this fiber. Skills, exit conventions, and the constitution are already in your transcript from the original dispatch. If a new directive appears above, address it; otherwise pick up from the last clean checkpoint.
+    Fiber: #{fiber_id}
     """
 
-    (directive_block <> handoff_block <> base)
-    |> String.trim()
+    compose_prompt(header, fiber_id, opts)
   end
 
   @doc """
   Reads the most recent `--kind review-comment` event for `fiber_id` and
-  renders a directive block for inclusion at the top of the dispatch
-  prompt. Returns "" if there are no review-comment events.
+  renders it as a "From User · <relative time>" block for inclusion in
+  the dispatch prompt. Returns "" if there are no review-comment events
+  or the latest one has an empty summary.
 
-  Persistence semantics: the latest directive is shown to every worker
-  until Cail files a newer one. There is no "consumed" flag — the worker
-  sees both the directive and the editorial chain, and decides from the
-  chain whether the directive has already been addressed.
+  Persistence semantics: the latest user message is shown to every
+  worker until a newer one is filed. There is no "consumed" flag — the
+  worker reads it alongside the editorial chain and decides whether
+  it's been addressed already.
 
   Pass `felt_host:` to control which `.felt/` index is queried.
   """
-  @spec render_latest_review_directive(String.t(), keyword()) :: String.t()
-  def render_latest_review_directive(fiber_id, opts \\ []) do
+  @spec render_user_message_block(String.t(), keyword()) :: String.t()
+  def render_user_message_block(fiber_id, opts \\ []) do
     case query_history(fiber_id, ["--kind", "review-comment", "--last", "1", "--json"], opts) do
       [event | _] ->
         summary = (get_in(event, ["payload", "summary"]) || "") |> String.trim()
 
         # Empty-summary review-comment events exist by design: the kanban
         # writes one on every Requeue/Resume click so the latest event's
-        # `resume_mode` reflects current user intent, even when Cail had
-        # nothing to add. Suppress the block in that case — an empty box
-        # would just be noise.
+        # `resume_mode` reflects current user intent, even when the human
+        # had nothing to add. Suppress the block in that case.
         if summary == "" do
           ""
         else
-          actor = Map.get(event, "actor", "")
           when_iso = Map.get(event, "occurred_at", "")
-
-          """
-          ┌─ Most recent directive (#{when_iso}, #{actor}) ──────────────────
-          #{indent_block(summary, "  ")}
-
-          Read this alongside the prior handoff below and the editorial chain
-          (`felt history #{fiber_id}`). If the chain shows the directive has
-          already been addressed in a previous loop, treat it as historical
-          context; otherwise incorporate it into your work.
-          └──────────────────────────────────────────────────────────────────────────
-
-          """
+          render_block("From User", relative_time(when_iso), summary)
         end
 
       _ ->
@@ -239,35 +225,60 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
-  @doc """
-  Reads the most recent editorial event for `fiber_id` and renders it as
-  a "previous handoff" block. Returns "" if there are no editorial events.
+  # Render a labeled rule-bordered block. Header is "┌─ <label>[ · <time>] ─…",
+  # content is indented two spaces, closed with a matching bottom rule.
+  # Total visual width is fixed at @rule_width chars so blocks align in the
+  # terminal even when their headers differ in length.
+  @rule_width 76
+  defp render_block(label, time_suffix, content) do
+    header_text =
+      case time_suffix do
+        nil -> label
+        "" -> label
+        t -> "#{label} · #{t}"
+      end
 
-  Inlining `--last 1` directly into the prompt removes the worker's tool
-  call to fetch it — the previous handoff is in context the moment the
-  worker wakes.
+    # "┌─ " (3) + header_text + " " (1) + trailing dashes = @rule_width
+    leading = "┌─ #{header_text} "
+    trailing = max(@rule_width - String.length(leading), 3)
+    top = leading <> String.duplicate("─", trailing)
+    bottom = "└" <> String.duplicate("─", @rule_width - 1)
 
-  Pass `felt_host:` to control which `.felt/` index is queried.
-  """
-  @spec render_latest_editorial(String.t(), keyword()) :: String.t()
-  def render_latest_editorial(fiber_id, opts \\ []) do
-    case query_history(fiber_id, ["--last", "1", "--json"], opts) do
-      [event | _] ->
-        actor = Map.get(event, "actor", "")
-        when_iso = Map.get(event, "occurred_at", "")
-        summary = get_in(event, ["payload", "summary"]) || ""
+    body = indent_block(content, "  ")
 
-        """
-        ┌─ Previous editorial handoff (#{when_iso}, #{actor}) ──────────────────────
-        #{indent_block(summary, "  ")}
-        └──────────────────────────────────────────────────────────────────────────
+    "#{top}\n#{body}\n#{bottom}"
+  end
 
-        """
+  # Convert ISO 8601 timestamp to a relative-time phrase ("just now",
+  # "5 minutes ago", "2 days ago"). Granularity tops out at coarse units
+  # — we want the worker to feel the gap ("picked back up after 2 days"),
+  # not the precision. Falls back to the raw string on parse failure.
+  defp relative_time(""), do: ""
+
+  defp relative_time(iso) when is_binary(iso) do
+    case DateTime.from_iso8601(iso) do
+      {:ok, dt, _offset} ->
+        DateTime.utc_now()
+        |> DateTime.diff(dt)
+        |> max(0)
+        |> format_relative()
 
       _ ->
-        ""
+        iso
     end
   end
+
+  defp relative_time(_), do: ""
+
+  defp format_relative(s) when s < 60, do: "just now"
+  defp format_relative(s) when s < 3600, do: pluralize(div(s, 60), "minute")
+  defp format_relative(s) when s < 86_400, do: pluralize(div(s, 3600), "hour")
+  defp format_relative(s) when s < 2_592_000, do: pluralize(div(s, 86_400), "day")
+  defp format_relative(s) when s < 31_536_000, do: pluralize(div(s, 2_592_000), "month")
+  defp format_relative(s), do: pluralize(div(s, 31_536_000), "year")
+
+  defp pluralize(1, unit), do: "1 #{unit} ago"
+  defp pluralize(n, unit), do: "#{n} #{unit}s ago"
 
   # Shared `felt history` JSON query with graceful fallback to []. Used by
   # both the directive block (filters on --kind review-comment) and the
@@ -302,25 +313,40 @@ defmodule Shuttle.Dispatcher do
 
   @doc """
   Renders a standing-role run prompt for one scheduled occurrence.
+
+  Mirrors the fresh dispatch prompt's shape (orientation paragraph +
+  optional From User block). Standing roles are recurring fibers — this
+  framing makes the run feel like one due occurrence of a durable
+  responsibility rather than a new constitution. The awaiting-review
+  handoff specifics (frontmatter shape on exit) live in the shuttle
+  skill's "Standing Roles" section, not the prompt — keeping the prompt
+  oriented and the practice in one place.
   """
-  @spec render_standing_run_prompt(String.t(), String.t()) :: String.t()
-  def render_standing_run_prompt(fiber_id, run_id) do
+  @spec render_standing_run_prompt(String.t(), String.t(), keyword()) :: String.t()
+  def render_standing_run_prompt(fiber_id, run_id, opts \\ []) do
+    header = """
+    The orchestration system Shuttle dispatched you for a scheduled run of this standing role. Standing roles are recurring responsibilities — this dispatch is one due occurrence, not a new fiber. The `shuttle` and `felt` skills carry the practice — activate them next; the skill's "Standing Roles" section covers the awaiting-review handoff at run completion.
+
+    Fiber: #{fiber_id}
+    Run:   #{run_id}
     """
-    Shuttle standing-role run. Fiber ID: #{fiber_id}
-    Run ID: #{run_id}
 
-    You are a scheduled Shuttle worker for this standing role.
+    compose_prompt(header, fiber_id, opts)
+  end
 
-    Activate the shuttle and felt skills before anything else, then follow them.
+  # Shared composition for all top-level prompts: a per-prompt orientation
+  # header plus the optional From User block. The shape is documented in
+  # CLAUDE.md under "Dispatch prompt structure". Outcome and last-session
+  # are deliberately not inlined — the shuttle skill prescribes that the
+  # worker reads them via `felt show` / `felt history` on arrival, and
+  # duplicating either here risks drift between the prompt's snapshot and
+  # felt's view.
+  defp compose_prompt(header, fiber_id, opts) do
+    felt_opts = [felt_host: Keyword.get(opts, :felt_host, default_felt_host())]
 
-    Read the role fresh via `felt show #{fiber_id}`. This is one due occurrence of the same durable responsibility, not a new fiber.
-
-    Write the latest work product into the role fiber's `outcome:`. Append an editorial event with `felt history append #{fiber_id} --summary "Run #{run_id}: …"` that archives the run and includes stable decision handles for anything the user may ask you to revisit. File crystallizations as sub-fibers when they are durable.
-
-    Before exiting, manually edit the role fiber's `shuttle:` frontmatter into the awaiting-review shape: `review.state: awaiting`, `review.run_id: #{run_id}`, `review.completed_at: <now>`, `review.accepted_run_id: null`, `next_due_at: null`, and `last_run_at: <now>`. Leave `status: active`.
-
-    Recurrence resumes only after a human or agent manually accepts the reviewed run by editing `shuttle.review` to accepted/scheduled, setting `accepted_run_id` to this run id, and setting the next `next_due_at`. End this session with `kill $PPID` when the run is complete or at a clean break — exit before context is half-full, so the run summary is written from full attention rather than post-compact.
-    """
+    [String.trim(header), render_user_message_block(fiber_id, felt_opts)]
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join("\n\n")
     |> String.trim()
   end
 
@@ -699,11 +725,8 @@ defmodule Shuttle.Dispatcher do
     |> IO.chardata_to_string()
   end
 
-  # The standing-run prompt currently doesn't read history, so it ignores
-  # `felt_host`. Threaded through anyway for symmetry — if a future variant
-  # wants to inline the prior run's editorial event, the plumbing is in place.
-  defp render_context_prompt(fiber_id, {:standing_run, run_id}, _opts) do
-    render_standing_run_prompt(fiber_id, run_id)
+  defp render_context_prompt(fiber_id, {:standing_run, run_id}, opts) do
+    render_standing_run_prompt(fiber_id, run_id, opts)
   end
 
   defp render_context_prompt(fiber_id, _, opts), do: render_prompt(fiber_id, opts)

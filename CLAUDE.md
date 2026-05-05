@@ -116,6 +116,18 @@ The CLI never talks to remote daemons directly — `SHUTTLE_DAEMON_URL`
 overrides which local daemon to query, but remote URLs live in mix
 config alone. See [[ai-futures/shuttle/constitution-shuttle-remote-dispatch]].
 
+## Dispatch prompt structure
+
+The fresh, resume, and standing-run prompts all share the same shape (`compose_prompt/3` in `lib/shuttle/dispatcher.ex`):
+
+1. **Orientation paragraph** — what Shuttle is, what the worker is here to do, how the practice loads. Per-prompt, not boilerplate. Goes first because in causal attention every downstream token sees the prefix.
+2. **`Fiber: <id>`** (and `Run: <run-id>` for standing) — identity lines, grep-able.
+3. **`From User · <relative time>`** — the most recent `--kind review-comment` event, if any. Pulled fresh at dispatch. The user's intent, inlined so it sits in attention prefix.
+
+The fiber's outcome and last editorial event are *not* inlined — they're already in scope after `felt show <id>` (outcome + Recent line) and `felt history <id>` (full chain), which the shuttle skill prescribes the worker calls on arrival. Inlining either duplicates state and risks drift between the prompt's snapshot and felt's view.
+
+Operational instructions (read the constitution, exit before half-full, append an editorial event, `kill $PPID`, standing-run awaiting-review handoff) live in the `shuttle` and `felt` skills, not the prompt. The prompt's job is orientation; duplicating practice means drift.
+
 A useful sanity ladder when something isn't dispatching:
 
 1. `shuttle-ctl status` shows `enabled: true, idle, oneshot`? → fiber is well-formed and the Go walker sees it.

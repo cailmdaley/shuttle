@@ -146,12 +146,44 @@ defmodule Shuttle.DispatcherTest do
 
   # ── Tests ──
 
-  test "render_prompt includes fiber ID and skill activation" do
+  test "render_prompt opens with orientation, names the fiber, defers practice to skills" do
+    # No felt index for tests/haiku → all three context blocks render empty;
+    # this test exercises the orientation header.
     prompt = Dispatcher.render_prompt("tests/haiku")
-    assert prompt =~ "Shuttle dispatch. Fiber ID: tests/haiku"
-    assert prompt =~ "Activate the shuttle and felt skills"
-    assert prompt =~ "kill $PPID"
-    assert prompt =~ "felt history append tests/haiku"
+
+    # Orientation paragraph: names what Shuttle is, what the worker is for,
+    # how the practice gets loaded.
+    assert prompt =~ "The orchestration system Shuttle dispatched you"
+    assert prompt =~ ~s(constitution describes what "done" looks like)
+    assert prompt =~ "`shuttle` and `felt` skills carry the practice"
+
+    # Fiber identity on its own line for grep-ability.
+    assert prompt =~ "Fiber: tests/haiku"
+
+    # Operational instructions live in the shuttle skill now, not in the
+    # prompt. The prompt's job is orientation; duplicating practice in both
+    # places means drift between them.
+    refute prompt =~ "kill $PPID"
+    refute prompt =~ "felt history append"
+    refute prompt =~ "Exit before context is half-full"
+  end
+
+  test "render_prompt omits the From User block when there's no review-comment" do
+    # tests/haiku has no felt index; the user-message block suppresses to
+    # an empty string, leaving just the header.
+    prompt = Dispatcher.render_prompt("tests/haiku")
+    refute prompt =~ "From User"
+  end
+
+  test "render_prompt does not inline outcome or last-session (worker reads via felt)" do
+    # The fiber's outcome and last editorial event are reachable via
+    # `felt show <id>` and `felt history <id>` respectively. The prompt
+    # deliberately doesn't duplicate them — the shuttle skill prescribes
+    # the read order, and inlining risks drift between the prompt's
+    # snapshot and felt's view.
+    prompt = Dispatcher.render_prompt("tests/haiku")
+    refute prompt =~ "Outcome"
+    refute prompt =~ "Last session"
   end
 
   test "session_name preserves slashes" do
@@ -377,14 +409,37 @@ defmodule Shuttle.DispatcherTest do
 
   # ── Resume prompt rendering ──
 
-  test "render_resume_prompt includes resume framing and fiber id" do
-    # No felt history available in test env (no .felt index) — query_history
-    # falls back to []; the framing block still renders.
+  test "render_standing_run_prompt frames the run as a recurring occurrence" do
+    prompt = Dispatcher.render_standing_run_prompt("tests/haiku", "run-2026-05-06")
+
+    # Standing-role-specific framing
+    assert prompt =~ "scheduled run of this standing role"
+    assert prompt =~ "one due occurrence, not a new fiber"
+    assert prompt =~ "awaiting-review handoff at run completion"
+
+    # Identity lines
+    assert prompt =~ "Fiber: tests/haiku"
+    assert prompt =~ "Run:"
+    assert prompt =~ "run-2026-05-06"
+
+    # Operational instructions belong to the shuttle skill, not the prompt
+    refute prompt =~ "kill $PPID"
+    refute prompt =~ "review.state: awaiting"
+    refute prompt =~ "felt history append"
+  end
+
+  test "render_resume_prompt names the fiber and defers to the existing transcript" do
+    # No felt history available in test env (no .felt index) — context
+    # blocks suppress to empty; the framing block still renders.
     prompt = Dispatcher.render_resume_prompt("tests/haiku")
-    assert prompt =~ "Shuttle resume. Fiber ID: tests/haiku"
-    assert prompt =~ "Resume previous"
-    # Resume prompt deliberately omits the fresh-dispatch prologue.
-    refute prompt =~ "Activate the shuttle and felt skills"
+
+    assert prompt =~ "Shuttle resumed your previous session"
+    assert prompt =~ "Fiber: tests/haiku"
+    assert prompt =~ "already loaded in your transcript"
+
+    # Resume prompt deliberately omits the fresh-dispatch orientation —
+    # skills, conventions, and the constitution are already in scope.
+    refute prompt =~ "The orchestration system Shuttle dispatched you"
     refute prompt =~ "kill $PPID"
   end
 
