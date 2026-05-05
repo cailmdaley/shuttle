@@ -18,13 +18,15 @@ var rootCmd = &cobra.Command{
 	Long: `shuttle manages the shuttle: frontmatter block that drives fiber dispatch.
 
 Write verbs (offline, validate-before-write):
-  install     Install a fiber as a one-shot dispatch role
-  repeat      Install a fiber as a standing (recurring) role
-  pause       Pause dispatch without disturbing the schedule
-  resume      Resume a paused standing role
-  accept      Accept a completed standing-role run and advance the schedule
-  set-model   Change the agent for a fiber
-  uninstall   Remove the shuttle: block from a fiber
+  install      Install a fiber as a one-shot dispatch role
+  repeat       Install a fiber as a standing (recurring) role
+  pause        Pause dispatch and park a fiber in drafts
+  resume       Resume a paused, still-open fiber
+  reopen       Requeue a closed fiber back into active work
+  close        Close a fiber and optionally set tempered=true|false
+  accept       Accept a completed standing-role run and advance the schedule
+  set-model    Change the agent for a fiber
+  uninstall    Remove the shuttle: block from a fiber
 
 Read + abort verbs (offline, no daemon IPC):
   status       One-line-per-fiber status overview

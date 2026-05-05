@@ -12,11 +12,11 @@ import (
 
 // FiberFile wraps a fiber's file contents with its parsed shuttle: block.
 type FiberFile struct {
-	Path        string     // absolute path to the .md file
-	Block       *Block     // parsed shuttle: block, or nil if absent
-	rawContent  []byte     // full file bytes as-read
-	bodyStart   int        // byte offset of the body (after closing ---)
-	fmNode      *yaml.Node // parsed frontmatter document node
+	Path       string     // absolute path to the .md file
+	Block      *Block     // parsed shuttle: block, or nil if absent
+	rawContent []byte     // full file bytes as-read
+	bodyStart  int        // byte offset of the body (after closing ---)
+	fmNode     *yaml.Node // parsed frontmatter document node
 }
 
 // ReadFiber reads a fiber file, splits frontmatter/body, and parses the
@@ -86,6 +86,74 @@ func (f *FiberFile) SetStatus(status string) {
 	}
 	valueNode := &yaml.Node{Kind: yaml.ScalarNode, Value: status, Tag: "!!str"}
 	setMappingValue(mappingNode, "status", valueNode)
+}
+
+// SetTempered mutates the felt-native `tempered:` field in the frontmatter.
+// Pass nil to remove the field entirely.
+func (f *FiberFile) SetTempered(value *bool) {
+	if f.fmNode == nil || len(f.fmNode.Content) == 0 {
+		return
+	}
+	mappingNode := f.fmNode.Content[0]
+	if mappingNode.Kind != yaml.MappingNode {
+		return
+	}
+	if value == nil {
+		removeMappingKey(mappingNode, "tempered")
+		return
+	}
+	boolValue := "false"
+	if *value {
+		boolValue = "true"
+	}
+	valueNode := &yaml.Node{Kind: yaml.ScalarNode, Value: boolValue, Tag: "!!bool"}
+	setMappingValue(mappingNode, "tempered", valueNode)
+}
+
+// SetClosedAtIfMissing sets `closed-at:` only when the field is currently
+// absent.
+func (f *FiberFile) SetClosedAtIfMissing(value string) {
+	if f.fmNode == nil || len(f.fmNode.Content) == 0 {
+		return
+	}
+	mappingNode := f.fmNode.Content[0]
+	if mappingNode.Kind != yaml.MappingNode {
+		return
+	}
+	if existing := findMappingValue(mappingNode, "closed-at"); existing != nil {
+		return
+	}
+	valueNode := &yaml.Node{Kind: yaml.ScalarNode, Value: value, Tag: "!!str"}
+	setMappingValue(mappingNode, "closed-at", valueNode)
+}
+
+// ClearClosedAt removes the felt-native `closed-at:` field if present.
+func (f *FiberFile) ClearClosedAt() {
+	if f.fmNode == nil || len(f.fmNode.Content) == 0 {
+		return
+	}
+	mappingNode := f.fmNode.Content[0]
+	if mappingNode.Kind != yaml.MappingNode {
+		return
+	}
+	removeMappingKey(mappingNode, "closed-at")
+}
+
+// SetOutcome replaces or inserts the felt-native `outcome:` field. Multi-line
+// outcomes are encoded as literal block scalars so they round-trip as `|-`.
+func (f *FiberFile) SetOutcome(outcome string) {
+	if f.fmNode == nil || len(f.fmNode.Content) == 0 {
+		return
+	}
+	mappingNode := f.fmNode.Content[0]
+	if mappingNode.Kind != yaml.MappingNode {
+		return
+	}
+	valueNode := &yaml.Node{Kind: yaml.ScalarNode, Value: outcome, Tag: "!!str"}
+	if strings.Contains(outcome, "\n") {
+		valueNode.Style = yaml.LiteralStyle
+	}
+	setMappingValue(mappingNode, "outcome", valueNode)
 }
 
 // RemoveTag removes a single tag value from the YAML frontmatter's `tags:` list.

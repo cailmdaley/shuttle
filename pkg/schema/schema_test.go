@@ -439,3 +439,102 @@ Body.
 		t.Fatalf("expected shuttle block enabled+oneshot, got %+v", f2.Block)
 	}
 }
+
+func TestSetTempered_AddsAndClearsField(t *testing.T) {
+	path := writeTmpFiber(t, sampleFiber)
+	f, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("ReadFiber: %v", err)
+	}
+	value := true
+	f.SetTempered(&value)
+	if err := f.WriteBlock(nil); err != nil {
+		t.Fatalf("WriteBlock: %v", err)
+	}
+
+	raw, _ := os.ReadFile(path)
+	if !strings.Contains(string(raw), "tempered: true") {
+		t.Fatalf("expected tempered=true in frontmatter, got:\n%s", raw)
+	}
+
+	f2, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	f2.SetTempered(nil)
+	if err := f2.WriteBlock(nil); err != nil {
+		t.Fatalf("WriteBlock clear: %v", err)
+	}
+
+	raw2, _ := os.ReadFile(path)
+	if strings.Contains(string(raw2), "tempered:") {
+		t.Fatalf("expected tempered field removed, got:\n%s", raw2)
+	}
+}
+
+func TestSetClosedAtIfMissing_AndClearClosedAt(t *testing.T) {
+	path := writeTmpFiber(t, sampleFiber)
+	f, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("ReadFiber: %v", err)
+	}
+	first := "2026-05-05T12:34:56.000Z"
+	second := "2027-01-01T00:00:00.000Z"
+	f.SetClosedAtIfMissing(first)
+	if err := f.WriteBlock(nil); err != nil {
+		t.Fatalf("WriteBlock: %v", err)
+	}
+
+	f2, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	f2.SetClosedAtIfMissing(second)
+	if err := f2.WriteBlock(nil); err != nil {
+		t.Fatalf("WriteBlock second pass: %v", err)
+	}
+
+	raw, _ := os.ReadFile(path)
+	text := string(raw)
+	if !strings.Contains(text, first) {
+		t.Fatalf("expected first closed-at value preserved, got:\n%s", text)
+	}
+	if strings.Contains(text, second) {
+		t.Fatalf("expected second closed-at value ignored, got:\n%s", text)
+	}
+
+	f3, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("re-read clear: %v", err)
+	}
+	f3.ClearClosedAt()
+	if err := f3.WriteBlock(nil); err != nil {
+		t.Fatalf("WriteBlock clear: %v", err)
+	}
+
+	raw2, _ := os.ReadFile(path)
+	if strings.Contains(string(raw2), "closed-at:") {
+		t.Fatalf("expected closed-at removed, got:\n%s", raw2)
+	}
+}
+
+func TestSetOutcome_MultilineUsesLiteralBlockScalar(t *testing.T) {
+	path := writeTmpFiber(t, sampleFiber)
+	f, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("ReadFiber: %v", err)
+	}
+	f.SetOutcome("first line\nsecond line")
+	if err := f.WriteBlock(nil); err != nil {
+		t.Fatalf("WriteBlock: %v", err)
+	}
+
+	raw, _ := os.ReadFile(path)
+	text := string(raw)
+	if !strings.Contains(text, "outcome: |-\n  first line\n  second line") {
+		t.Fatalf("expected literal block-scalar outcome, got:\n%s", text)
+	}
+	if !strings.Contains(text, "Body text here.") {
+		t.Fatal("body lost after SetOutcome")
+	}
+}
