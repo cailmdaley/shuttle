@@ -1,6 +1,7 @@
 package schema_test
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -315,6 +316,44 @@ func TestValidate_UnknownAgent(t *testing.T) {
 }
 
 // ---- Status helpers --------------------------------------------------------
+
+func TestBlockUnmarshalJSON_NewFormat(t *testing.T) {
+	var block Block
+	data := []byte(`{
+	  "enabled": true,
+	  "kind": "standing",
+	  "agent": "claude-sonnet",
+	  "schedule": {"expr": "0 9 * * 1-5", "tz": "Europe/Paris"},
+	  "review": {"state": "scheduled"}
+	}`)
+	if err := json.Unmarshal(data, &block); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if !block.Enabled || block.Kind != "standing" || block.Agent != "claude-sonnet" {
+		t.Fatalf("unexpected block: %+v", block)
+	}
+	if block.Schedule == nil || block.Schedule.TZ != "Europe/Paris" {
+		t.Fatalf("unexpected schedule: %+v", block.Schedule)
+	}
+}
+
+func TestBlockUnmarshalJSON_LegacyAliases(t *testing.T) {
+	var block Block
+	data := []byte(`{
+	  "enabled": true,
+	  "mode": "standing",
+	  "schedule": {"expr": "0 9 * * 1-5", "timezone": "UTC"}
+	}`)
+	if err := json.Unmarshal(data, &block); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if block.Kind != "standing" {
+		t.Fatalf("expected legacy mode to populate Kind, got %+v", block)
+	}
+	if block.Schedule == nil || block.Schedule.TZ != "UTC" {
+		t.Fatalf("expected legacy timezone alias, got %+v", block.Schedule)
+	}
+}
 
 func TestStatus_Present(t *testing.T) {
 	path := writeTmpFiber(t, sampleFiber) // sampleFiber has status: active

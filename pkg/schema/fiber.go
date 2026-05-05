@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -70,18 +71,18 @@ func resolveFiberViaFelt(host, query string) (string, error) {
 		return "", fmt.Errorf("fiber %q not found (felt ls error: %v)", query, err)
 	}
 
-	// Parse the JSONL output: one JSON object per line.
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) == 0 || lines[0] == "" {
+	var results []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(out, &results); err != nil {
+		return "", fmt.Errorf("parsing felt ls output: %w", err)
+	}
+	if len(results) == 0 || results[0].ID == "" {
 		return "", fmt.Errorf("fiber %q not found", query)
 	}
 
 	// We just need the ID from the first result, then resolve the path.
-	// Quick-parse: look for "id":"<value>" in the first line.
-	id := extractJSONString(lines[0], "id")
-	if id == "" {
-		return "", fmt.Errorf("fiber %q not found (empty id in felt ls output)", query)
-	}
+	id := results[0].ID
 
 	// Now resolve with the canonical ID.
 	segments := strings.Split(id, "/")
@@ -101,22 +102,6 @@ func resolveFiberViaFelt(host, query string) (string, error) {
 	}
 
 	return "", fmt.Errorf("fiber %q resolved to ID %q but file not found", query, id)
-}
-
-// extractJSONString extracts the first value for key from a JSON string
-// without a full JSON parser (for lightweight use; assumes well-formed JSON).
-func extractJSONString(line, key string) string {
-	needle := `"` + key + `":"`
-	idx := strings.Index(line, needle)
-	if idx < 0 {
-		return ""
-	}
-	start := idx + len(needle)
-	end := strings.Index(line[start:], `"`)
-	if end < 0 {
-		return ""
-	}
-	return line[start : start+end]
 }
 
 // FiberIDFromPath derives a felt fiber ID from the absolute .md file path,

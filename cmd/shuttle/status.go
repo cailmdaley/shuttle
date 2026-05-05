@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -18,15 +17,15 @@ var statusAll bool
 
 // FiberStatus is one row in the status output.
 type FiberStatus struct {
-	FiberID    string `json:"fiber_id"`
-	Kind       string `json:"kind"`
-	Enabled    bool   `json:"enabled"`
-	Agent      string `json:"agent,omitempty"`
-	State      string `json:"state"`
-	Running    bool   `json:"running"`
-	Session    string `json:"session,omitempty"`
-	NextDueAt  string `json:"next_due_at,omitempty"`
-	LastRunAt  string `json:"last_run_at,omitempty"`
+	FiberID     string `json:"fiber_id"`
+	Kind        string `json:"kind"`
+	Enabled     bool   `json:"enabled"`
+	Agent       string `json:"agent,omitempty"`
+	State       string `json:"state"`
+	Running     bool   `json:"running"`
+	Session     string `json:"session,omitempty"`
+	NextDueAt   string `json:"next_due_at,omitempty"`
+	LastRunAt   string `json:"last_run_at,omitempty"`
 	ReviewState string `json:"review_state,omitempty"`
 }
 
@@ -46,10 +45,11 @@ Columns: fiber_id  kind  state  agent  next_due_at
 			return err
 		}
 
-		// Walk .felt/ for fibers with shuttle: blocks.
-		shuttleFibers, err := walkShuttleFibers(host)
+		// Read fibers through felt's JSON surface; shuttle remains the sole
+		// owner of shuttle-block semantics, felt remains the sole reader.
+		shuttleFibers, err := listShuttleFibers(host)
 		if err != nil {
-			return fmt.Errorf("walking fibers: %w", err)
+			return fmt.Errorf("listing fibers: %w", err)
 		}
 
 		// List live tmux sessions.
@@ -157,41 +157,34 @@ type shuttleEntry struct {
 	Block   *schema.Block
 }
 
-// walkShuttleFibers walks the .felt/ directory and returns all fibers that
-// have a shuttle: block, without shelling out to felt.
-func walkShuttleFibers(host string) ([]shuttleEntry, error) {
-	feltDir := filepath.Join(host, ".felt")
-	var entries []shuttleEntry
+// listShuttleFibers reads every fiber through `felt ls -s all --json` and
+// keeps the entries that carry a shuttle block.
+func listShuttleFibers(host string) ([]shuttleEntry, error) {
+	out, err := exec.Command("felt", "-C", host, "ls", "-s", "all", "--json").Output()
+	if err != nil {
+		return nil, fmt.Errorf("felt ls: %w", err)
+	}
 
-	err := filepath.Walk(feltDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // skip unreadable dirs
-		}
-		if info.IsDir() {
-			// Skip hidden dirs except .felt itself.
-			base := filepath.Base(path)
-			if base != ".felt" && strings.HasPrefix(base, ".") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !strings.HasSuffix(path, ".md") {
-			return nil
-		}
+	var raw []struct {
+		FiberID string          `json:"id"`
+		Shuttle json.RawMessage `json:"shuttle"`
+	}
+	if err := json.Unmarshal(out, &raw); err != nil {
+		return nil, fmt.Errorf("parsing felt ls JSON: %w", err)
+	}
 
-		f, err := schema.ReadFiber(path)
-		if err != nil || f.Block == nil {
-			return nil
+	entries := make([]shuttleEntry, 0, len(raw))
+	for _, fiber := range raw {
+		if fiber.FiberID == "" || len(fiber.Shuttle) == 0 || string(fiber.Shuttle) == "null" {
+			continue
 		}
-
-		fiberID, err := schema.FiberIDFromPath(host, path)
-		if err != nil {
-			return nil
+		var block schema.Block
+		if err := json.Unmarshal(fiber.Shuttle, &block); err != nil {
+			continue
 		}
-		entries = append(entries, shuttleEntry{FiberID: fiberID, Block: f.Block})
-		return nil
-	})
-	return entries, err
+		entries = append(entries, shuttleEntry{FiberID: fiber.FiberID, Block: &block})
+	}
+	return entries, nil
 }
 
 // liveTmuxSessions returns a set of tmux session names that start with "shuttle-".

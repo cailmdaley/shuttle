@@ -43,7 +43,8 @@ defmodule Shuttle.PollerTest do
     def set_fiber(id, fiber), do: Agent.update(__MODULE__, &put_in(&1.fibers[id], fiber))
 
     # Write a real .md file carrying the given shuttle: block and felt status so
-    # that walk_shuttle_fibers (the new file-walk discovery path) can find it.
+    # the poller can discover host ownership from the filesystem while reading
+    # shuttle metadata through the mocked `felt ls` / `felt show` JSON surfaces.
     # The status defaults to "active" — pass an explicit value for tests that
     # verify eligibility gates (closed, untracked, etc.).
     def set_shuttle(id, yaml, status \\ "active") do
@@ -54,7 +55,29 @@ defmodule Shuttle.PollerTest do
       File.mkdir_p!(Path.dirname(dir_path))
       indented = yaml |> String.trim() |> String.split("\n") |> Enum.map_join("\n", &("  " <> &1))
       File.write!(dir_path, "---\nstatus: #{status}\nshuttle:\n#{indented}\n---\nbody\n")
-      Agent.update(__MODULE__, &put_in(&1.shuttle[id], yaml))
+
+      shuttle_block =
+        case YamlElixir.read_from_string(yaml) do
+          {:ok, data} when is_map(data) -> data
+          _ -> %{}
+        end
+
+      Agent.update(__MODULE__, fn state ->
+        fiber =
+          state.fibers
+          |> Map.get(id, %{
+            "id" => id,
+            "name" => id,
+            "created_at" => "2026-04-28T00:00:00Z",
+            "tags" => ["constitution"]
+          })
+          |> Map.put("status", status)
+          |> Map.put("shuttle", shuttle_block)
+
+        state
+        |> put_in([:shuttle, id], yaml)
+        |> put_in([:fibers, id], fiber)
+      end)
     end
 
     # Kept for backward compat; no longer consulted by discover_candidates
@@ -81,7 +104,25 @@ defmodule Shuttle.PollerTest do
 
       cond do
         command == "felt" and String.contains?(full_args, "ls") ->
-          fibers = Agent.get(__MODULE__, & &1.felt_ls)
+          show_all =
+            case Enum.find_index(args, &(&1 in ["-s", "--status"])) do
+              nil -> false
+              idx -> Enum.at(args, idx + 1) == "all"
+            end
+
+          fibers =
+            Agent.get(__MODULE__, fn state ->
+              entries = if state.felt_ls == [], do: Map.values(state.fibers), else: state.felt_ls
+
+              if show_all do
+                entries
+              else
+                Enum.filter(entries, fn fiber ->
+                  Map.get(fiber, "status") in ["open", "active"]
+                end)
+              end
+            end)
+
           {Jason.encode!(fibers), 0}
 
         command == "felt" and String.contains?(full_args, "show") and

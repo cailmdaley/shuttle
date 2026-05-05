@@ -529,69 +529,101 @@ defmodule Shuttle.Poller do
   # physically rooted** — i.e. reachable from `<host>/.felt/` without
   # traversing any symlinks. We enforce this two ways:
   #
-  # - `walk_shuttle_fibers/1` skips the host entirely if `<host>/.felt/`
+  # - `owned_fiber_ids/1` skips the host entirely if `<host>/.felt/`
   #   itself is a symlink (case 1: project-cities-on-loom).
   #
   # - `do_walk_felt_dir/1` skips subdirectories that are symlinks (case 2:
   #   loom symlinking into a project-canonical host).
   #
-  # The result: each physical file is enumerated by exactly one host (the
-  # canonical one), and downstream `felt -C <host> show <id>` always
-  # works because the host's `index.db` knows the host-relative id.
+  # Once we know which IDs are physically rooted in a host, felt becomes the
+  # sole reader: `list_shuttle_fibers/3` shells out once per host to
+  # `felt ls --json`, then filters that JSON payload down to the owned IDs
+  # that actually carry a `shuttle:` block.
   #
   # The `file_identity` MapSet below is belt-and-suspenders for esoteric
   # cases (hard links, etc.) where two physically-distinct paths point at
   # the same inode and both pass the symlink filter.
   defp discover_candidates(state) do
-    {all_fibers, host_map, _seen} =
-      Enum.reduce(state.felt_hosts, {[], %{}, MapSet.new()}, fn host,
-                                                                {acc_fibers, acc_map, seen} ->
-        fibers_with_id = walk_shuttle_fibers(host)
+    {all_fibers, host_map} =
+      Enum.reduce(state.felt_hosts, {[], %{}}, fn host, {acc_fibers, acc_map} ->
+        owned_ids = owned_fiber_ids(host)
 
-        {kept, new_map, new_seen} =
-          Enum.reduce(fibers_with_id, {[], %{}, seen}, fn {ident, fiber}, {fs, hm, sn} ->
-            id = Map.get(fiber, "id", "")
+        case list_shuttle_fibers(host, owned_ids, state) do
+          {:ok, fibers} ->
+            new_map =
+              Enum.reduce(fibers, %{}, fn fiber, hm ->
+                id = Map.get(fiber, "id", "")
+                Map.put(hm, id, host)
+              end)
 
-            cond do
-              ident != nil and MapSet.member?(sn, ident) ->
-                # Same physical file already claimed by an earlier host.
-                {fs, hm, sn}
+            merged_map = Map.merge(new_map, acc_map)
+            {acc_fibers ++ fibers, merged_map}
 
-              true ->
-                next_seen = if ident, do: MapSet.put(sn, ident), else: sn
-                {[fiber | fs], Map.put(hm, id, host), next_seen}
-            end
-          end)
-
-        merged_map = Map.merge(new_map, acc_map)
-        {acc_fibers ++ Enum.reverse(kept), merged_map, new_seen}
+          {:error, _} ->
+            {acc_fibers, acc_map}
+        end
       end)
 
     {:ok, all_fibers, host_map}
   end
 
-  # Walk <host>/.felt/ and return [{file_identity, fiber}] for each fiber
-  # file physically rooted in this host (no symlink traversal). Skips the
-  # host entirely if `<host>/.felt/` is itself a symlink.
-  defp walk_shuttle_fibers(host) do
+  # Walk <host>/.felt/ and return the set of fiber IDs physically rooted in
+  # this host (no symlink traversal). Skips the host entirely if
+  # `<host>/.felt/` is itself a symlink.
+  defp owned_fiber_ids(host) do
     felt_dir = Path.join(host, ".felt")
 
     case File.lstat(felt_dir) do
       {:ok, %File.Stat{type: :symlink}} ->
         # Host's .felt/ is a symlink — its content is owned by the host
         # where .felt is physically rooted. That host enumerates canonically.
-        []
+        MapSet.new()
 
       _ ->
         felt_dir
         |> do_walk_felt_dir()
         |> Enum.filter(&String.ends_with?(&1, ".md"))
-        |> Enum.flat_map(fn path ->
-          case parse_shuttle_fiber(host, path) do
-            {:ok, fiber} -> [{file_identity(path), fiber}]
-            {:error, _} -> []
+        |> Enum.reduce({MapSet.new(), MapSet.new()}, fn path, {ids, seen} ->
+          ident = file_identity(path)
+
+          cond do
+            ident != nil and MapSet.member?(seen, ident) ->
+              {ids, seen}
+
+            true ->
+              rel = Path.relative_to(path, felt_dir)
+              next_seen = if ident, do: MapSet.put(seen, ident), else: seen
+              {MapSet.put(ids, derive_fiber_id_from_rel(rel)), next_seen}
           end
         end)
+        |> elem(0)
+    end
+  end
+
+  # Read one host's candidate fibers via felt's JSON output, then keep only
+  # physically-rooted IDs with a shuttle block. Felt is the canonical reader;
+  # the filesystem walk above only determines ownership across hosts.
+  defp list_shuttle_fibers(host, owned_ids, state) do
+    if MapSet.size(owned_ids) == 0 do
+      {:ok, []}
+    else
+      case run_felt(host, state.runner, ["ls", "--json"]) do
+        {:ok, output} ->
+          with {:ok, fibers} when is_list(fibers) <- Jason.decode(output) do
+            kept =
+              Enum.filter(fibers, fn fiber ->
+                id = Map.get(fiber, "id", "")
+                MapSet.member?(owned_ids, id) and is_map(Map.get(fiber, "shuttle"))
+              end)
+
+            {:ok, kept}
+          else
+            _ -> {:error, :invalid_json}
+          end
+
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 
@@ -641,27 +673,6 @@ defmodule Shuttle.Poller do
     end
   end
 
-  # Parse one fiber .md file, returning {:ok, %{"id" => id, "status" => status}}
-  # when the frontmatter contains a shuttle: block, {:error, _} otherwise.
-  defp parse_shuttle_fiber(host, path) do
-    felt_dir = Path.join(host, ".felt")
-    rel = Path.relative_to(path, felt_dir)
-
-    with {:ok, content} <- File.read(path),
-         [fm] <-
-           Regex.run(~r/\A---\r?\n(.*?)\r?\n---(?:\r?\n|\z)/ms, content,
-             capture: :all_but_first
-           ),
-         {:ok, data} when is_map(data) <- YamlElixir.read_from_string(fm),
-         shuttle when is_map(shuttle) <- Map.get(data, "shuttle") do
-      fiber_id = derive_fiber_id_from_rel(rel)
-      status = Map.get(data, "status", "open")
-      {:ok, %{"id" => fiber_id, "status" => status}}
-    else
-      _ -> {:error, :no_shuttle_block}
-    end
-  end
-
   # Derive the felt fiber ID from a path relative to <host>/.felt/.
   #
   # Directory fibers:  "ai-futures/shuttle/constitution-x/constitution-x.md"
@@ -693,40 +704,37 @@ defmodule Shuttle.Poller do
   defp eligible?(fiber, state) do
     status = Map.get(fiber, "status", "")
     fiber_id = Map.get(fiber, "id", "")
+    shuttle = Map.get(fiber, "shuttle")
 
-    # Read the shuttle: block once from disk (direct file read, no CLI spawn).
-    # All per-candidate checks are derived from this single read.
-    case read_fiber_shuttle_block(fiber_id, state) do
-      {:ok, shuttle} ->
-        cond do
-          # Must have shuttle.enabled: true
-          Map.get(shuttle, "enabled", false) != true ->
-            false
+    if is_map(shuttle) do
+      cond do
+        # Must have shuttle.enabled: true
+        Map.get(shuttle, "enabled", false) != true ->
+          false
 
-          # Must be committed to active work
-          status not in ["open", "active"] ->
-            false
+        # Must be committed to active work
+        status not in ["open", "active"] ->
+          false
 
-          # Must not already be running
-          Map.has_key?(state.running, fiber_id) ->
-            false
+        # Must not already be running
+        Map.has_key?(state.running, fiber_id) ->
+          false
 
-          # Must not be claimed (retry queued)
-          MapSet.member?(state.claimed, fiber_id) ->
-            false
+        # Must not be claimed (retry queued)
+        MapSet.member?(state.claimed, fiber_id) ->
+          false
 
-          # Standing roles have additional preconditions; oneshots go to dep check.
-          # Support both new-format (kind:) and old-format (mode:) shuttle blocks.
-          Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot")) == "standing" ->
-            standing_role_due?(fiber_id, state)
+        # Standing roles have additional preconditions; oneshots go to dep check.
+        # Support both new-format (kind:) and old-format (mode:) shuttle blocks.
+        Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot")) == "standing" ->
+          standing_role_due?(fiber_id, state)
 
-          # Dependencies must be satisfied
-          true ->
-            dependencies_satisfied?(fiber_id, state)
-        end
-
-      {:error, _} ->
-        false
+        # Dependencies must be satisfied
+        true ->
+          dependencies_satisfied?(fiber_id, state)
+      end
+    else
+      false
     end
   end
 
@@ -767,45 +775,15 @@ defmodule Shuttle.Poller do
     end
   end
 
-  # Read the shuttle: block from the fiber's .md file directly, without shelling
-  # out to the felt CLI. File read + YAML parse is much faster than spawning a
-  # process, making it viable for every candidate in the poll cycle.
-  #
-  # Uses host_for_fiber/2 to locate the right felt host across all configured
-  # hosts.
-  #
-  # Returns {:ok, map()} when the block is present, {:error, reason} otherwise.
-  defp read_fiber_shuttle_block(fiber_id, state) do
-    with {:ok, host} <- host_for_fiber(fiber_id, state) do
-      felt_dir = Path.join(host, ".felt")
-      segments = String.split(fiber_id, "/")
-      basename = List.last(segments)
-
-      dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
-      bare_path = Path.join(felt_dir, "#{basename}.md")
-
-      path =
-        cond do
-          File.exists?(dir_path) -> dir_path
-          File.exists?(bare_path) -> bare_path
-          true -> nil
-        end
-
-      if path do
-        with {:ok, content} <- File.read(path),
-             [fm] <-
-               Regex.run(~r/\A---\r?\n(.*?)\r?\n---(?:\r?\n|\z)/ms, content,
-                 capture: :all_but_first
-               ),
-             {:ok, data} when is_map(data) <- YamlElixir.read_from_string(fm),
-             shuttle when is_map(shuttle) <- Map.get(data, "shuttle") do
-          {:ok, shuttle}
-        else
-          _ -> {:error, :no_shuttle_block}
-        end
-      else
-        {:error, :file_not_found}
-      end
+  # Read a fiber through felt's JSON view and extract the shuttle block.
+  # Felt remains the canonical reader; callers that only need shuttle-owned
+  # fields route through this helper rather than reparsing frontmatter.
+  defp fetch_shuttle_block(fiber_id, state) do
+    with {:ok, fiber} <- fetch_fiber_full(fiber_id, state),
+         shuttle when is_map(shuttle) <- Map.get(fiber, "shuttle") do
+      {:ok, shuttle}
+    else
+      _ -> {:error, :no_shuttle_block}
     end
   end
 
@@ -820,10 +798,10 @@ defmodule Shuttle.Poller do
 
   defp shuttle_agent_from_block(_), do: nil
 
-  # Returns the shuttle.agent name for a fiber, reading its block from disk.
+  # Returns the shuttle.agent name for a fiber, reading its block through felt.
   # Used by dispatch paths that don't already hold the block map.
   defp fetch_shuttle_agent_name(fiber_id, state) do
-    case read_fiber_shuttle_block(fiber_id, state) do
+    case fetch_shuttle_block(fiber_id, state) do
       {:ok, shuttle} -> shuttle_agent_from_block(shuttle)
       {:error, _} -> nil
     end
@@ -846,7 +824,7 @@ defmodule Shuttle.Poller do
         {:error, _} -> hd(state.felt_hosts)
       end
 
-    with {:ok, shuttle} <- read_fiber_shuttle_block(fiber_id, state),
+    with {:ok, shuttle} <- fetch_shuttle_block(fiber_id, state),
          dir when is_binary(dir) and dir != "" <- Map.get(shuttle, "project_dir"),
          expanded = Path.expand(dir),
          true <- File.dir?(expanded) do
@@ -1375,7 +1353,7 @@ defmodule Shuttle.Poller do
   defp running_prompt_metadata(_), do: %{}
 
   defp fetch_standing_role(fiber_id, state) do
-    case read_fiber_shuttle_block(fiber_id, state) do
+    case fetch_shuttle_block(fiber_id, state) do
       {:ok, shuttle} -> StandingRole.from_map(fiber_id, shuttle)
       {:error, _} -> {:error, :no_shuttle_block}
     end
