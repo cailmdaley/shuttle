@@ -479,6 +479,74 @@ defmodule ShuttleWeb.APIControllerTest do
     assert is_list(body["waiters"])
   end
 
+  # ── GET /api/v1/state/composite ──
+
+  test "composite returns local snapshot plus per-origin remote snapshots" do
+    # Spin up a RemoteRegistry with a stub client so the composite
+    # endpoint has remote data to merge in. The client returns a fake
+    # candide snapshot that lists tests/work-on-candide as running.
+    defmodule CompositeStubClient do
+      @behaviour Shuttle.RemoteRegistry.Client
+
+      @impl true
+      def get("http://localhost:4001/api/v1/state", _timeout) do
+        body =
+          Jason.encode!(%{
+            "host" => "candide",
+            "eligible" => [%{"fiber_id" => "tests/work-on-candide"}],
+            "blocked" => [],
+            "retrying" => []
+          })
+
+        {:ok, body}
+      end
+
+      def get(_url, _timeout), do: {:error, :no_stub}
+    end
+
+    # Controller calls Shuttle.RemoteRegistry.snapshots/0, which routes
+    # to the default-named GenServer. Start one under the default name
+    # for this test (the test config disables auto-start so this name
+    # is free until we claim it).
+    start_supervised!({
+      Shuttle.RemoteRegistry,
+      remotes: [
+        %Shuttle.Remote{name: "candide", url: "http://localhost:4001"}
+      ],
+      client: CompositeStubClient,
+      tick_interval_ms: 60_000
+    })
+
+    :ok = Shuttle.RemoteRegistry.poll_now()
+
+    conn = get(api_conn(), "/api/v1/state/composite")
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+
+    assert is_map(body["local"])
+    assert is_list(body["local"]["eligible"])
+
+    assert is_map(body["remotes"])
+    candide = body["remotes"]["candide"]
+    assert candide != nil
+    assert candide["stale"] == false
+    assert candide["last_polled_at"] != nil
+    assert candide["last_error"] == nil
+    assert is_map(candide["snapshot"])
+    assert candide["snapshot"]["host"] == "candide"
+  end
+
+  test "composite degrades gracefully when no RemoteRegistry is running" do
+    # No RemoteRegistry started under the default name; controller
+    # should still return a valid composite shape.
+    conn = get(api_conn(), "/api/v1/state/composite")
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+
+    assert is_map(body["local"])
+    assert body["remotes"] == %{}
+  end
+
   # ── GET /api/v1/agents ──
 
   test "agents returns the registry as a JSON array" do

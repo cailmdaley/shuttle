@@ -34,6 +34,13 @@ defmodule Shuttle.Application do
     ]
 
     children =
+      if Application.get_env(:shuttle, :start_remote_registry, true) do
+        children ++ [Shuttle.RemoteRegistry]
+      else
+        children
+      end
+
+    children =
       if Application.get_env(:shuttle, :start_poller, true) do
         children ++ [Shuttle.Poller]
       else

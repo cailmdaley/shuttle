@@ -2,7 +2,21 @@ import Config
 
 config :shuttle,
   env: config_env(),
-  start_poller: true
+  start_poller: true,
+  start_remote_registry: true,
+  # Per-host snapshots from remote Shuttle daemons reachable via
+  # SSH tunnels. Each entry: %{name: String, url: String,
+  # poll_interval_ms: pos_integer (default 5000), request_timeout_ms:
+  # pos_integer (default 2000), stale_multiplier: pos_integer (default
+  # 2)}. Empty by default — local-only setups pay nothing.
+  #
+  # Example, after running:
+  #   autossh -N -L 4001:localhost:4000 candide
+  #
+  #   remotes: [
+  #     %{name: "candide", url: "http://localhost:4001"}
+  #   ]
+  remotes: []
 
 config :shuttle, ShuttleWeb.Endpoint,
   url: [host: "localhost"],

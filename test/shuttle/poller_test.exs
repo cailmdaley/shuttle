@@ -1234,4 +1234,143 @@ defmodule Shuttle.PollerTest do
 
     assert Poller.snapshot(poller).felt_hosts == ["/tmp/host-c"]
   end
+
+  # ── Remote dispatch deferral ──
+  #
+  # The Poller consults a registry module (default Shuttle.RemoteRegistry,
+  # overridable via :remote_registry opt) before dispatching. If a fresh
+  # remote snapshot lists the fiber as running, local dispatch defers — the
+  # fiber appears in `blocked` instead of dispatching, and no tmux session
+  # is created. Tests inject a stub registry that exposes the same shape
+  # (running_fibers/0, origin_for_running/1) without spinning up the real
+  # GenServer.
+
+  defmodule MockRegistry do
+    use Agent
+
+    def start_link(_ \\ []) do
+      Agent.start_link(fn -> %{running: MapSet.new(), origins: %{}} end, name: __MODULE__)
+    end
+
+    def reset, do: Agent.update(__MODULE__, fn _ -> %{running: MapSet.new(), origins: %{}} end)
+
+    def claim(fiber_id, origin) do
+      Agent.update(__MODULE__, fn s ->
+        %{
+          running: MapSet.put(s.running, fiber_id),
+          origins: Map.put(s.origins, fiber_id, origin)
+        }
+      end)
+    end
+
+    def running_fibers do
+      if Process.whereis(__MODULE__),
+        do: Agent.get(__MODULE__, & &1.running),
+        else: MapSet.new()
+    end
+
+    def origin_for_running(fiber_id) do
+      if Process.whereis(__MODULE__),
+        do: Agent.get(__MODULE__, &Map.get(&1.origins, fiber_id)),
+        else: nil
+    end
+  end
+
+  test "poller defers dispatch when a fresh remote claims the fiber as running" do
+    start_supervised!(MockRegistry)
+    MockRegistry.reset()
+
+    fiber = make_fiber("tests/deferred-fiber")
+    MockRunner.set_fiber("tests/deferred-fiber", fiber)
+    MockRunner.set_shuttle("tests/deferred-fiber", @oneshot_shuttle)
+
+    # Candide claims this fiber.
+    MockRegistry.claim("tests/deferred-fiber", "candide")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_deferral,
+        runner: MockRunner,
+        remote_registry: MockRegistry,
+        poll_interval_ms: 60_000,
+        felt_hosts: ["/tmp"]
+      )
+
+    send(poller, :run_poll_cycle)
+    Process.sleep(50)
+
+    # No tmux session created.
+    refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
+
+    # The deferred fiber is surfaced in `blocked` for kanban visibility,
+    # with the origin annotated.
+    snap = Poller.snapshot(poller)
+    blocked = Enum.find(snap.blocked, &(&1.fiber_id == "tests/deferred-fiber"))
+    assert blocked != nil
+    assert blocked.origin == "candide"
+    assert blocked.reason =~ "deferred to candide"
+
+    # The fiber is NOT in `running` and not in `claimed`.
+    assert snap.eligible == []
+    assert snap.claimed_count == 0
+  end
+
+  test "poller dispatches normally when no remote claims the fiber" do
+    start_supervised!(MockRegistry)
+    MockRegistry.reset()
+
+    fiber = make_fiber("tests/not-deferred")
+    MockRunner.set_fiber("tests/not-deferred", fiber)
+    MockRunner.set_shuttle("tests/not-deferred", @oneshot_shuttle)
+
+    # Registry has someone *else* running, not our fiber.
+    MockRegistry.claim("tests/someone-else", "candide")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_no_deferral,
+        runner: MockRunner,
+        remote_registry: MockRegistry,
+        poll_interval_ms: 60_000,
+        felt_hosts: ["/tmp"]
+      )
+
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+               cmd == "tmux" and hd(args) == "new-session"
+             end)
+           end)
+
+    snap = Poller.snapshot(poller)
+    assert length(snap.eligible) == 1
+    # Other deferrals (for fibers we own) don't pollute our snapshot.
+    refute Enum.any?(snap.blocked, &(&1.fiber_id == "tests/not-deferred"))
+  end
+
+  test "poller does not defer when remote_registry is nil (graceful fallback)" do
+    fiber = make_fiber("tests/no-registry")
+    MockRunner.set_fiber("tests/no-registry", fiber)
+    MockRunner.set_shuttle("tests/no-registry", @oneshot_shuttle)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_nil_registry,
+        runner: MockRunner,
+        remote_registry: nil,
+        poll_interval_ms: 60_000,
+        felt_hosts: ["/tmp"]
+      )
+
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+               cmd == "tmux" and hd(args) == "new-session"
+             end)
+           end)
+  end
 end

@@ -66,6 +66,11 @@ defmodule Shuttle.Poller do
       # manual overrides — respect them).
       :auto_discover_felt_hosts,
       :runner,
+      # Module exposing running_fibers/0 and origin_for_running/1 — used
+      # by the dispatch deferral check. Defaults to Shuttle.RemoteRegistry;
+      # tests pass a stub or `nil` (deferral becomes a no-op when the
+      # module is missing or the registry isn't running).
+      :remote_registry,
       poll_check_in_progress: false,
       running: %{},
       claimed: MapSet.new(),
@@ -76,7 +81,13 @@ defmodule Shuttle.Poller do
       # %{fiber_id => felt_host} — populated by discover_candidates/1 on each
       # poll cycle and by host_for_fiber/2 on demand. Entries are never evicted
       # automatically; call bust_fiber_host_cache/1 when a fiber moves hosts.
-      fiber_host_cache: %{}
+      fiber_host_cache: %{},
+      # %{fiber_id => %{origin: name, recorded_at: DateTime}} — fibers a
+      # fresh remote snapshot claims as running. Populated each poll
+      # cycle (and refreshed on per-call dispatch) so that no two
+      # daemons dispatch the same fiber when loom git-sync surfaces it
+      # on multiple hosts. Surfaced in build_snapshot/1 under `blocked`.
+      deferred: %{}
     ]
   end
 
@@ -192,6 +203,7 @@ defmodule Shuttle.Poller do
       end
 
     runner = Keyword.get(opts, :runner, Shuttle.Runner.Default)
+    remote_registry = Keyword.get(opts, :remote_registry, Shuttle.RemoteRegistry)
 
     state = %State{
       poll_interval_ms: Keyword.get(opts, :poll_interval_ms, @default_poll_interval_ms),
@@ -207,7 +219,8 @@ defmodule Shuttle.Poller do
       tick_token: nil,
       felt_hosts: felt_hosts,
       auto_discover_felt_hosts: auto_discover,
-      runner: runner
+      runner: runner,
+      remote_registry: remote_registry
     }
 
     Logger.info("configured felt hosts: #{inspect(felt_hosts)}")
@@ -308,6 +321,11 @@ defmodule Shuttle.Poller do
 
       already_running_session?(state, session) ->
         {:reply, {:error, :already_running}, state}
+
+      MapSet.member?(running_fibers_safe(state.remote_registry), fiber_id) ->
+        origin = origin_for_running_safe(state.remote_registry, fiber_id) || "remote"
+        Logger.info("API dispatch deferring #{fiber_id} to #{origin}")
+        {:reply, {:error, {:deferred_to, origin}}, state}
 
       true ->
         case fetch_fiber_full(fiber_id, state) do
@@ -446,12 +464,22 @@ defmodule Shuttle.Poller do
         }
       end)
 
+    blocked =
+      Enum.map(state.deferred, fn {fiber_id, info} ->
+        %{
+          fiber_id: fiber_id,
+          reason: "deferred to #{info.origin}",
+          origin: info.origin,
+          recorded_at: DateTime.to_unix(info.recorded_at, :millisecond)
+        }
+      end)
+
     %{
       poll_at: now_ms,
       host: hostname(),
       felt_hosts: state.felt_hosts,
       eligible: eligible,
-      blocked: [],
+      blocked: blocked,
       orphans: [],
       retrying: retrying,
       standing_roles: standing_role_snapshots(state, now),
@@ -478,10 +506,12 @@ defmodule Shuttle.Poller do
       # and cache entries are stable for the daemon's lifetime.
       state = %{state | fiber_host_cache: Map.merge(new_host_map, state.fiber_host_cache)}
 
-      candidates
-      |> filter_eligible(state)
-      |> sort_candidates()
-      |> Enum.reduce(state, fn fiber, state_acc ->
+      eligible = candidates |> filter_eligible(state) |> sort_candidates()
+      {deferred, dispatchable} = partition_deferred(eligible, state)
+
+      state = record_deferred(state, deferred, eligible)
+
+      Enum.reduce(dispatchable, state, fn fiber, state_acc ->
         if available_slots(state_acc) > 0 do
           do_dispatch_fiber(state_acc, fiber)
         else
@@ -497,6 +527,86 @@ defmodule Shuttle.Poller do
         state
     end
   end
+
+  # Splits eligible candidates into (deferred, dispatchable). Deferred
+  # entries carry the origin claiming the fiber as running; the rest go
+  # to the dispatch reduce. See "deferral logic only runs on the
+  # laptop" in [[constitution-shuttle-remote-dispatch]] — when the
+  # registry has no fresh remote snapshots (the common case on remote
+  # hosts), partition_deferred/2 is a near-no-op.
+  defp partition_deferred(candidates, %State{remote_registry: registry}) do
+    case running_fibers_safe(registry) do
+      empty when map_size(empty) == 0 and is_map(empty) ->
+        {[], candidates}
+
+      running_set ->
+        Enum.reduce(candidates, {[], []}, fn fiber, {def_acc, dis_acc} ->
+          fiber_id = Map.get(fiber, "id", "")
+
+          if MapSet.member?(running_set, fiber_id) do
+            origin = origin_for_running_safe(registry, fiber_id) || "remote"
+            Logger.info("Poller deferring #{fiber_id} to #{origin}")
+            {[{fiber, origin} | def_acc], dis_acc}
+          else
+            {def_acc, [fiber | dis_acc]}
+          end
+        end)
+        |> then(fn {def_acc, dis_acc} -> {Enum.reverse(def_acc), Enum.reverse(dis_acc)} end)
+    end
+  end
+
+  # Records the per-cycle deferred map. We replace rather than merge so
+  # that yesterday's deferrals (where the remote may have since
+  # finished or gone stale) don't linger in `blocked`. `_eligible` is
+  # accepted for symmetry with future filtering needs.
+  defp record_deferred(%State{} = state, deferred_pairs, _eligible) do
+    now = DateTime.utc_now()
+
+    deferred_map =
+      Map.new(deferred_pairs, fn {fiber, origin} ->
+        fiber_id = Map.get(fiber, "id", "")
+        {fiber_id, %{origin: origin, recorded_at: now}}
+      end)
+
+    %{state | deferred: deferred_map}
+  end
+
+  # Wraps RemoteRegistry calls so the Poller still works in isolation
+  # (tests, daemons started with start_remote_registry: false). When the
+  # registry isn't running, `running_fibers/0` returns an empty MapSet
+  # (no deferral) — fail-open is the safe default for a coordination
+  # primitive: we'd rather risk a (rare) duplicate than lose dispatch.
+  defp running_fibers_safe(nil), do: MapSet.new()
+
+  defp running_fibers_safe(registry) when is_atom(registry) do
+    if function_exported?(registry, :running_fibers, 0) do
+      try do
+        registry.running_fibers()
+      catch
+        _, _ -> MapSet.new()
+      end
+    else
+      MapSet.new()
+    end
+  end
+
+  defp running_fibers_safe(_), do: MapSet.new()
+
+  defp origin_for_running_safe(nil, _fiber_id), do: nil
+
+  defp origin_for_running_safe(registry, fiber_id) when is_atom(registry) do
+    if function_exported?(registry, :origin_for_running, 1) do
+      try do
+        registry.origin_for_running(fiber_id)
+      catch
+        _, _ -> nil
+      end
+    else
+      nil
+    end
+  end
+
+  defp origin_for_running_safe(_, _), do: nil
 
   # Discovers candidate fibers by walking <host>/.felt/ for files that carry a
   # shuttle: frontmatter block. No tag predicate — the block is the source of
