@@ -207,12 +207,14 @@ defmodule Shuttle.Dispatcher do
   def render_user_message_block(fiber_id, opts \\ []) do
     case query_history(fiber_id, ["--kind", "review-comment", "--last", "1", "--json"], opts) do
       [event | _] ->
-        summary = (get_in(event, ["payload", "summary"]) || "") |> String.trim()
+        # felt stores `--summary` text under `payload.text`. Read that key;
+        # `payload.summary` was a dispatcher-side misread, never written.
+        summary = (get_in(event, ["payload", "text"]) || "") |> String.trim()
 
-        # Empty-summary review-comment events exist by design: the kanban
-        # writes one on every Requeue/Resume click so the latest event's
-        # `resume_mode` reflects current user intent, even when the human
-        # had nothing to add. Suppress the block in that case.
+        # Suppress the block for empty-text events. The kanban may write
+        # a review-comment carrying only `resume_mode` (no user message)
+        # to keep the latest `resume_mode` current; those events should
+        # not render a From User block.
         if summary == "" do
           ""
         else
