@@ -47,51 +47,71 @@ This makes pause the single-writer transition for the Kanban's Drafts target.`,
 	},
 }
 
-var resumeCmd = &cobra.Command{
-	Use:   "resume <fiber>",
-	Short: "Resume a paused fiber (enabled=true; ensures status: active)",
-	Long: `Sets shuttle.enabled = true and ensures the felt-native status field is
+func newResumeCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "resume <fiber>",
+		Short: "Resume a paused fiber (enabled=true; ensures status: active)",
+		Long: `Sets shuttle.enabled = true and ensures the felt-native status field is
 "active" so the daemon's eligibility filter accepts the fiber on its next
 poll. A missing or non-dispatchable status would otherwise leave the fiber
 silently un-dispatched even with enabled=true.
 
+For standing roles in awaiting/review state, resume re-queues the fiber for
+immediate dispatch rather than just flipping enabled. The daemon's eligibility
+check (StandingRole.due?) requires review.state ∈ {scheduled, accepted} — a
+fiber in awaiting state would be silently skipped. Resume transitions the block
+to scheduled with next_due_at=now so the daemon dispatches a fresh worker on
+its next poll. The previous run's id is preserved for reference; this is
+distinct from accept, which advances next_due_at to the next cron occurrence.
+
 Refuses if status is currently "closed" — use 'shuttle reopen' to requeue a
 closed fiber back into active work.`,
-	Args: cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		path, _, _ := resolveFiber(args[0])
-		f := readFiber(path)
-		if f.Block == nil {
-			return fmt.Errorf("fiber %s has no shuttle: block", args[0])
-		}
-
-		// Mirror install: ensure status is dispatchable before flipping
-		// enabled. See lib/shuttle/poller.ex `eligible?/2` for the filter.
-		statusBefore := f.Status()
-		statusChanged := false
-		if statusBefore == "closed" {
-			return fmt.Errorf("fiber %s has status: closed; use 'shuttle reopen %s' to clear verdict fields and requeue it", args[0], args[0])
-		}
-		if statusBefore != "active" && statusBefore != "open" {
-			f.SetStatus("active")
-			statusChanged = true
-		}
-
-		f.Block.Enabled = true
-		if err := f.WriteBlock(f.Block); err != nil {
-			return fmt.Errorf("writing fiber: %w", err)
-		}
-		fmt.Printf("resumed %s (enabled=true)\n", args[0])
-		if statusChanged {
-			if statusBefore == "" {
-				fmt.Println("  status: active (set; was missing)")
-			} else {
-				fmt.Printf("  status: %s → active\n", statusBefore)
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path, fiberID, host := resolveFiber(args[0])
+			f := readFiber(path)
+			if f.Block == nil {
+				return fmt.Errorf("fiber %s has no shuttle: block", args[0])
 			}
-		}
-		return nil
-	},
+
+			// Standing roles in awaiting/review state need special handling: just
+			// enabling the fiber would leave it ineligible because the daemon's
+			// StandingRole.due? rejects review.state == "awaiting". Transition to
+			// scheduled with next_due_at=now so the daemon dispatches immediately.
+			if f.Block.Kind == "standing" && standingInReviewState(f.Block.Review) {
+				return resumeStandingFromReview(args[0], fiberID, host, f)
+			}
+
+			// Mirror install: ensure status is dispatchable before flipping
+			// enabled. See lib/shuttle/poller.ex `eligible?/2` for the filter.
+			statusBefore := f.Status()
+			statusChanged := false
+			if statusBefore == "closed" {
+				return fmt.Errorf("fiber %s has status: closed; use 'shuttle reopen %s' to clear verdict fields and requeue it", args[0], args[0])
+			}
+			if statusBefore != "active" && statusBefore != "open" {
+				f.SetStatus("active")
+				statusChanged = true
+			}
+
+			f.Block.Enabled = true
+			if err := f.WriteBlock(f.Block); err != nil {
+				return fmt.Errorf("writing fiber: %w", err)
+			}
+			fmt.Printf("resumed %s (enabled=true)\n", args[0])
+			if statusChanged {
+				if statusBefore == "" {
+					fmt.Println("  status: active (set; was missing)")
+				} else {
+					fmt.Printf("  status: %s → active\n", statusBefore)
+				}
+			}
+			return nil
+		},
+	}
 }
+
+var resumeCmd = newResumeCmd()
 
 var closeTempered string
 
@@ -380,6 +400,67 @@ func joinIDs(ids []string) string {
 		result += id
 	}
 	return result
+}
+
+// standingInReviewState returns true when a standing role's review block is in
+// a state that withholds dispatch (awaiting, review, in_review). These states
+// are excluded by StandingRole.due?/2 in the Elixir daemon, so simply enabling
+// the fiber would leave it silently ineligible.
+func standingInReviewState(review *schema.Review) bool {
+	if review == nil {
+		return false
+	}
+	s := review.State
+	return s == "awaiting" || s == "review" || s == "in_review"
+}
+
+// resumeStandingFromReview re-queues a standing role that is in awaiting/review
+// state for immediate dispatch without advancing the recurrence schedule.
+//
+// The transition is: review.state → scheduled, next_due_at → now. This makes
+// StandingRole.due?/2 return true on the next daemon poll so a fresh worker is
+// dispatched. The prior run's id is preserved in review.run_id for reference —
+// the fresh worker can compare it to the run_id in the current outcome to
+// understand it is continuing an awaiting run rather than starting a new one.
+//
+// Contrast with accept: accept advances next_due_at to the next cron occurrence
+// and marks the run as successfully completed. Resume re-dispatches without
+// advancing the schedule, intended for addressing open questions from the
+// awaiting run before the next scheduled occurrence.
+func resumeStandingFromReview(fiberRef, fiberID, host string, f *schema.FiberFile) error {
+	priorState := f.Block.Review.State
+	prevRunID := ""
+	if f.Block.Review.RunID != nil {
+		prevRunID = *f.Block.Review.RunID
+	}
+
+	now := time.Now().UTC()
+	review := &schema.Review{State: "scheduled"}
+	if prevRunID != "" {
+		review.RunID = schema.StringPtr(prevRunID)
+	}
+	f.Block.Review = review
+	f.Block.NextDueAt = &now
+	f.Block.Enabled = true
+
+	if err := f.WriteBlock(f.Block); err != nil {
+		return fmt.Errorf("writing fiber: %w", err)
+	}
+
+	histSummary := fmt.Sprintf("resumed from %s state; re-queued for immediate dispatch", priorState)
+	if prevRunID != "" {
+		histSummary += fmt.Sprintf(" (prior run_id: %s)", prevRunID)
+	}
+	_ = appendFeltHistory(host, fiberID, histSummary)
+
+	fmt.Printf("resumed %s (standing role; re-queued for immediate dispatch)\n", fiberRef)
+	fmt.Printf("  review.state: %s → scheduled\n", priorState)
+	fmt.Printf("  next_due_at:  %s (immediate)\n", now.Format(time.RFC3339))
+	if prevRunID != "" {
+		fmt.Printf("  prior run_id: %s\n", prevRunID)
+	}
+	fmt.Println("  note: use 'accept' to advance the recurrence instead")
+	return nil
 }
 
 func init() {
