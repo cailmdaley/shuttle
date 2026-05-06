@@ -106,6 +106,18 @@ closed fiber back into active work.`,
 					fmt.Printf("  status: %s → active\n", statusBefore)
 				}
 			}
+
+			// File a review-comment so the dispatcher's check_resume_intent/3
+			// can detect resume intent. Without this event the dispatcher always
+			// takes the fresh path — shuttle.session.id alone is insufficient
+			// because check_resume_intent reads only the latest review-comment.
+			// Mirror what the kanban's "Resume previous" button does.
+			if f.Block.Session != nil && f.Block.Session.ID != "" {
+				sessionID := f.Block.Session.ID
+				summary := "resumed via shuttle-ctl; session " + sessionID + " available for reattach"
+				_ = appendFeltHistoryReviewComment(host, fiberID, summary, "previous")
+				fmt.Printf("  resume_mode: previous (session %s)\n", sessionID)
+			}
 			return nil
 		},
 	}

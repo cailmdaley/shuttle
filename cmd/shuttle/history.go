@@ -13,3 +13,19 @@ func appendFeltHistory(host, fiberID, summary string) error {
 	_ = cmd.Run()
 	return nil
 }
+
+// appendFeltHistoryReviewComment files a `--kind review-comment` event so the
+// dispatcher's check_resume_intent/3 can read resume_mode from the latest event.
+// Summary may be empty (felt ≥ commit 4166815 accepts --summary "").
+func appendFeltHistoryReviewComment(host, fiberID, summary, resumeMode string) error {
+	if host == "" {
+		return nil
+	}
+	cmd := exec.Command("felt", "-C", host, "history", "append", fiberID,
+		"--kind", "review-comment",
+		"--summary", summary,
+		"--field", "resume_mode="+resumeMode,
+	)
+	_ = cmd.Run()
+	return nil
+}
