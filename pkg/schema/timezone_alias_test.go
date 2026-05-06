@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cailmdaley/shuttle-cli/pkg/schema"
+	"github.com/cailmdaley/shuttle/pkg/schema"
 	"gopkg.in/yaml.v3"
 )
 

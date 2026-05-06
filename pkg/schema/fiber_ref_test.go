@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	. "github.com/cailmdaley/shuttle-cli/pkg/schema"
+	. "github.com/cailmdaley/shuttle/pkg/schema"
 )
 
 func writeFiberFile(t *testing.T, path string) {

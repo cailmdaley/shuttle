@@ -646,7 +646,7 @@ defmodule Shuttle.Dispatcher do
   defp find_session_file("pi", work_dir) do
     home = System.user_home!()
     # Pi's encoded-cwd: absolute path with "/" replaced by "-", bracketed by "--".
-    # e.g. /Users/cd280747/loom → --Users-cd280747-loom--
+    # e.g. /home/user/loom → --home-user-loom--
     encoded = "--" <> String.replace(work_dir, "/", "-") <> "--"
     dir = Path.join([home, ".pi", "agent", "sessions", encoded])
 

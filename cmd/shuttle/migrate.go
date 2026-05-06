@@ -6,7 +6,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/cailmdaley/shuttle-cli/pkg/schema"
+	"github.com/cailmdaley/shuttle/pkg/schema"
 	"github.com/spf13/cobra"
 )
 
@@ -15,7 +15,7 @@ var migrateDryRun bool
 var migrateCmd = &cobra.Command{
 	Use:   "migrate",
 	Short: "Add shuttle: blocks to currently-eligible constitution fibers",
-	Long: `Walks the loom and adds shuttle.enabled=true / shuttle.kind=oneshot to every
+	Long: `Walks each configured felt host and adds shuttle.enabled=true / shuttle.kind=oneshot to every
 fiber that has the 'constitution' tag and not the 'draft' tag — the pre-CLI
 eligibility predicate. After migration the daemon switches to reading
 shuttle.enabled instead of tag predicates.

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/cailmdaley/shuttle-cli/pkg/schema"
+	. "github.com/cailmdaley/shuttle/pkg/schema"
 )
 
 // ---- Validation tests -------------------------------------------------------

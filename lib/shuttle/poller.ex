@@ -9,15 +9,15 @@ defmodule Shuttle.Poller do
   Lifted from Symphony's orchestrator.ex with the integration layer replaced:
   - Linear API → felt CLI
   - Issue model → fiber model
-  - Codex app-server → tmux + loom shell wrappers
+  - Codex app-server → tmux + agent CLI wrappers
 
   ## Multi-host support
 
   The Poller manages one or more felt hosts on the same machine. Configure via:
 
-      config :shuttle, felt_hosts: ["~/loom", "~/wedding", "~/Documents/projects/lightcone"]
+      config :shuttle, felt_hosts: ["~/loom", "~/other-project"]
       # or env var (comma-separated, takes precedence over the persisted file):
-      LOOM_HOMES=~/loom,~/wedding,~/Documents/projects/lightcone
+      LOOM_HOMES=~/loom,~/other-project
       # or persisted registration written through the HTTP API:
       ~/.shuttle/felt_hosts.json
 

@@ -7,10 +7,8 @@
 #     $(CLI_DEST) which sits on PATH; `make cli` rebuilds + installs.
 #
 # `make restart` is the load-bearing daemon target. `make cli` is the
-# load-bearing CLI target — when the kanban surfaces a new shuttle-ctl
-# verb (e.g. close / reopen / set-outcome), portolan starts shelling out
-# to it immediately, so a stale binary breaks transitions silently. See
-# ai-futures/portolan/gotchas/gotcha-shuttle-ctl-binary-stale-after-source-update.
+# load-bearing CLI target — when a new shuttle-ctl verb lands, any
+# tool that shells out to it will silently break with a stale binary.
 # The daemon and CLI are independent (Elixir vs Go), so building one
 # never implies rebuilding the other; `make all` does both.
 

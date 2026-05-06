@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cailmdaley/shuttle-cli/pkg/schema"
+	"github.com/cailmdaley/shuttle/pkg/schema"
 	"github.com/spf13/cobra"
 )
 

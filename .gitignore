@@ -22,6 +22,12 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 shuttle-*.tar
 
+# Shuttle daemon escript (built via `mix escript.build`)
+/bin/shuttle
+
 # Go binaries (build with `go build` from cmd/shuttle/)
 /bin/shuttle-ctl
 /shuttle
+
+# felt symlink (user-local; points to the user's felt store)
+.felt

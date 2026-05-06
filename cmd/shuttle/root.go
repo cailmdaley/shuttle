@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/cailmdaley/shuttle-cli/pkg/schema"
+	"github.com/cailmdaley/shuttle/pkg/schema"
 	"github.com/spf13/cobra"
 )
 
@@ -43,7 +43,7 @@ The CLI edits shuttle: frontmatter directly. The running daemon picks up changes
 on its next poll. All write verbs validate input before touching any file.
 
 Use --host <dir> to target a specific felt host when a fiber does not live
-under the default LOOM_HOME / ~/loom store.`,
+under the default LOOM_HOME or ~/loom felt store.`,
 	CompletionOptions: cobra.CompletionOptions{HiddenDefaultCmd: true},
 }
 

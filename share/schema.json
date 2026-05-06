@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/cailmdaley/shuttle-cli/shuttle-block",
+  "$id": "https://github.com/cailmdaley/shuttle/shuttle-block",
   "title": "Shuttle fiber frontmatter block",
   "description": "The shuttle: YAML block written and validated by the shuttle CLI. Daemon-owned fields are documented but not written by the CLI.",
   "type": "object",

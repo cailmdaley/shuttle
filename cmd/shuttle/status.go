@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cailmdaley/shuttle-cli/pkg/schema"
+	"github.com/cailmdaley/shuttle/pkg/schema"
 	"github.com/spf13/cobra"
 )
 
@@ -85,7 +85,7 @@ Other flags:
 
 		// Read fibers through felt's JSON surface across every host; shuttle
 		// remains the sole owner of shuttle-block semantics, felt remains the
-		// sole reader. A fiber visible from multiple hosts (e.g. via a loom
+		// sole reader. A fiber visible from multiple hosts (e.g. via a felt
 		// symlink into a project-canonical store) canonicalizes to one
 		// FiberRef.ID, so cross-host dedup is on that key.
 		shuttleFibers, err := listShuttleFibersAcrossHosts(hosts)
