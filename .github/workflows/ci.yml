@@ -36,6 +36,12 @@ jobs:
       - name: Install dependencies
         run: mix deps.get
 
+      - name: Install felt
+        run: |
+          curl -fsSL https://github.com/cailmdaley/felt/releases/latest/download/felt_Linux_x86_64.tar.gz \
+            | tar -xz -C /usr/local/bin felt
+          felt --version
+
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
 
