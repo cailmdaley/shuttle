@@ -44,6 +44,7 @@ defmodule Shuttle.Poller do
   @default_heartbeat_interval_ms 5_000
   @default_stall_timeout_ms 300_000
   @dispatch_call_timeout_ms 30_000
+  @orchestrator_state_call_timeout_ms 30_000
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   @default_max_retry_backoff_ms 300_000
@@ -159,7 +160,7 @@ defmodule Shuttle.Poller do
 
   @spec orchestrator_state(GenServer.server()) :: map()
   def orchestrator_state(server) do
-    GenServer.call(server, :orchestrator_state)
+    GenServer.call(server, :orchestrator_state, @orchestrator_state_call_timeout_ms)
   end
 
   @doc """

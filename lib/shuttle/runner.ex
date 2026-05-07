@@ -10,8 +10,15 @@ defmodule Shuttle.Runner do
 
   defmodule Default do
     @behaviour Shuttle.Runner
+
     def cmd(command, args, opts) do
       System.cmd(command, args, opts)
+    rescue
+      e in ErlangError ->
+        case e.original do
+          :enoent -> {"#{command}: command not found", 127}
+          _ -> reraise e, __STACKTRACE__
+        end
     end
   end
 end
