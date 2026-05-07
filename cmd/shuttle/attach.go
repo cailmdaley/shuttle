@@ -10,6 +10,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var tmuxSessionExists = schema.TmuxSessionExists
+
+var killTmuxSession = func(session string) error {
+	return exec.Command("tmux", "kill-session", "-t", session).Run()
+}
+
 var attachCmd = &cobra.Command{
 	Use:   "attach <fiber>",
 	Short: "Attach to a running worker's tmux session",
@@ -22,7 +28,7 @@ tmux attach. Exits with a clear error if no session exists.`,
 		_, fiberID, _ := resolveFiber(args[0])
 		session := schema.TmuxSessionName(fiberID)
 
-		if !schema.TmuxSessionExists(session) {
+		if !tmuxSessionExists(session) {
 			return fmt.Errorf("no tmux session %q — fiber %s has no live worker\n(run 'shuttle ps' to list active workers)", session, args[0])
 		}
 
@@ -63,12 +69,12 @@ supervision.`,
 			}
 		}
 
-		if !schema.TmuxSessionExists(session) {
+		if !tmuxSessionExists(session) {
 			fmt.Printf("no live session %q — abort marker written, nothing to kill\n", session)
 			return nil
 		}
 
-		if err := exec.Command("tmux", "kill-session", "-t", session).Run(); err != nil {
+		if err := killTmuxSession(session); err != nil {
 			return fmt.Errorf("killing tmux session %q: %w", session, err)
 		}
 

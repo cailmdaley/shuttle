@@ -124,7 +124,7 @@ Install via `shuttle-ctl install <fiber-id>` or write the block directly.
 ```bash
 shuttle-ctl install  <fiber> [-m <agent>] [--disabled]  # oneshot; --disabled = draft
 shuttle-ctl repeat   <fiber> --schedule "0 9 * * 1-5" --tz Europe/Paris  # standing
-shuttle-ctl pause    <fiber>      # enabled=false → drafts
+shuttle-ctl pause    <fiber>      # enabled=false → drafts; kills live worker unless --no-kill
 shuttle-ctl resume   <fiber>      # enabled=true → in-flight
 shuttle-ctl accept   <fiber>      # standing: advance next_due_at after review
 shuttle-ctl close    <fiber>      # mark done; optionally --tempered true|false

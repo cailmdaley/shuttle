@@ -11,41 +11,69 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var pauseCmd = &cobra.Command{
-	Use:   "pause <fiber>",
-	Short: "Pause dispatch and park a fiber in drafts",
-	Long: `Sets shuttle.enabled = false while preserving the schedule. When the fiber
+func newPauseCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "pause <fiber>",
+		Short: "Pause dispatch, kill any live worker, and park a fiber in drafts",
+		Long: `Sets shuttle.enabled = false while preserving the schedule, then kills the
+canonical worker tmux session (shuttle-<fiber-id>) if one is running. When the fiber
 is currently closed, pause also reopens it to status: active and clears
 closed-at / tempered so the card lands in Drafts rather than Awaiting review.
 Open fibers keep their existing status (typically open).
 
-This makes pause the single-writer transition for the Kanban's Drafts target.`,
-	Args: cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		path, _, _ := resolveFiber(args[0])
-		f := readFiber(path)
-		if f.Block == nil {
-			return fmt.Errorf("fiber %s has no shuttle: block", args[0])
-		}
+Use --no-kill to preserve the old stop-scheduling-only behavior and let a live
+worker finish naturally.
 
-		statusBefore := f.Status()
-		if statusBefore == "closed" {
-			f.SetStatus("active")
-		}
-		f.SetTempered(nil)
-		f.ClearClosedAt()
-		f.Block.Enabled = false
-		if err := f.WriteBlock(f.Block); err != nil {
-			return fmt.Errorf("writing fiber: %w", err)
-		}
-		fmt.Printf("paused %s (enabled=false; schedule preserved)\n", args[0])
-		if statusBefore == "closed" {
-			fmt.Println("  status: closed → active")
-			fmt.Println("  cleared: tempered, closed-at")
-		}
-		return nil
-	},
+This makes pause the single-writer transition for the Kanban's Drafts target.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			noKill, err := cmd.Flags().GetBool("no-kill")
+			if err != nil {
+				return err
+			}
+			path, fiberID, _ := resolveFiber(args[0])
+			f := readFiber(path)
+			if f.Block == nil {
+				return fmt.Errorf("fiber %s has no shuttle: block", args[0])
+			}
+
+			statusBefore := f.Status()
+			if statusBefore == "closed" {
+				f.SetStatus("active")
+			}
+			f.SetTempered(nil)
+			f.ClearClosedAt()
+			f.Block.Enabled = false
+			if err := f.WriteBlock(f.Block); err != nil {
+				return fmt.Errorf("writing fiber: %w", err)
+			}
+			fmt.Printf("paused %s (enabled=false; schedule preserved)\n", args[0])
+			if statusBefore == "closed" {
+				fmt.Println("  status: closed → active")
+				fmt.Println("  cleared: tempered, closed-at")
+			}
+			if noKill {
+				fmt.Println("  worker: left running (--no-kill)")
+				return nil
+			}
+
+			session := schema.TmuxSessionName(fiberID)
+			if !tmuxSessionExists(session) {
+				fmt.Printf("  worker: no live session %s\n", session)
+				return nil
+			}
+			if err := killTmuxSession(session); err != nil {
+				return fmt.Errorf("killing tmux session %q: %w", session, err)
+			}
+			fmt.Printf("  worker: killed %s\n", session)
+			return nil
+		},
+	}
+	cmd.Flags().Bool("no-kill", false, "Only disable future dispatch; leave any live worker tmux session running")
+	return cmd
 }
+
+var pauseCmd = newPauseCmd()
 
 func newResumeCmd() *cobra.Command {
 	return &cobra.Command{

@@ -128,6 +128,137 @@ func writeFiber(t *testing.T, host, slug, content string) string {
 	return path
 }
 
+func withStubbedTmux(t *testing.T, sessions map[string]bool) (killed *[]string) {
+	t.Helper()
+	originalExists := tmuxSessionExists
+	originalKill := killTmuxSession
+	kills := []string{}
+	tmuxSessionExists = func(session string) bool {
+		return sessions[session]
+	}
+	killTmuxSession = func(session string) error {
+		kills = append(kills, session)
+		sessions[session] = false
+		return nil
+	}
+	t.Cleanup(func() {
+		tmuxSessionExists = originalExists
+		killTmuxSession = originalKill
+	})
+	return &kills
+}
+
+func TestPauseCmd_KillsRunningWorkerByDefault(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "pause-me", `---
+name: Pause me
+status: active
+shuttle:
+  enabled: true
+  kind: oneshot
+---
+
+Body.
+`)
+	session := schema.TmuxSessionName("pause-me")
+	killed := withStubbedTmux(t, map[string]bool{session: true})
+
+	cmd := newPauseCmd()
+	cmd.SetArgs([]string{"pause-me"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "enabled: false") {
+		t.Fatalf("enabled should be false after pause:\n%s", text)
+	}
+	if got := strings.Join(*killed, ","); got != session {
+		t.Fatalf("expected killed session %q, got %q", session, got)
+	}
+}
+
+func TestPauseCmd_NoRunningWorkerDoesNotError(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "idle", `---
+name: Idle
+status: active
+shuttle:
+  enabled: true
+  kind: oneshot
+---
+
+Body.
+`)
+	killed := withStubbedTmux(t, map[string]bool{})
+
+	cmd := newPauseCmd()
+	cmd.SetArgs([]string{"idle"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "enabled: false") {
+		t.Fatalf("enabled should be false after pause:\n%s", text)
+	}
+	if len(*killed) != 0 {
+		t.Fatalf("expected no kill calls, got %v", *killed)
+	}
+}
+
+func TestPauseCmd_NoKillPreservesRunningWorker(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "let-finish", `---
+name: Let finish
+status: active
+shuttle:
+  enabled: true
+  kind: oneshot
+---
+
+Body.
+`)
+	session := schema.TmuxSessionName("let-finish")
+	sessions := map[string]bool{session: true}
+	killed := withStubbedTmux(t, sessions)
+
+	cmd := newPauseCmd()
+	cmd.SetArgs([]string{"let-finish", "--no-kill"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "enabled: false") {
+		t.Fatalf("enabled should be false after pause:\n%s", text)
+	}
+	if len(*killed) != 0 {
+		t.Fatalf("expected no kill calls, got %v", *killed)
+	}
+	if !sessions[session] {
+		t.Fatalf("expected session %q to remain running", session)
+	}
+}
+
 // TestResumeCmd_StandingAwaitingTransitionsToScheduled verifies that resume on
 // a standing role in awaiting state transitions review.state to scheduled and
 // sets next_due_at to now (making the fiber immediately eligible).

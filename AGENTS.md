@@ -59,7 +59,8 @@ shuttle-ctl status --remote <name>            # single remote
 shuttle-ctl ps                                # live tmux workers only
 shuttle-ctl install <fiber> [-m <agent-id>] [--disabled]
 shuttle-ctl repeat <fiber> --schedule "0 9 * * 1-5" --tz Europe/Paris
-shuttle-ctl pause / resume / accept <fiber>
+shuttle-ctl pause <fiber>                       # disable + kill live worker; --no-kill preserves it
+shuttle-ctl resume / accept <fiber>
 shuttle-ctl set-model <fiber> <agent-id>
 shuttle-ctl abort / attach <fiber>
 shuttle-ctl migrate --dry-run                 # preview eligibility migration
