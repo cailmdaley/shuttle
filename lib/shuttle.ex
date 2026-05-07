@@ -72,9 +72,11 @@ defmodule Shuttle.Application do
   defp maybe_configure_endpoint do
     existing = Application.get_env(:shuttle, ShuttleWeb.Endpoint, [])
 
-    # Only patch if server: true is not already set and http config is missing.
-    # When dev.exs is loaded, both are present and this is a no-op.
-    if Keyword.get(existing, :server) == true and Keyword.has_key?(existing, :http) do
+    # Only patch when there is no explicit :server setting in the existing config.
+    # If :server is set (to true or false), that is authoritative — test.exs sets
+    # server: false and we must not override it. When dev.exs is loaded (server:
+    # true, http: [...]), this is a no-op via the first branch too.
+    if Keyword.has_key?(existing, :server) do
       :ok
     else
       port =
