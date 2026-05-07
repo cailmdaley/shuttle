@@ -53,11 +53,20 @@ defmodule Shuttle.Dispatcher do
          :ok <- check_not_running(fiber_id, runner),
          {:ok, agent} <- resolve_agent(fiber),
          :ok <- validate_agent(agent) do
-      resume_intent = check_resume_intent(fiber_id, fiber, felt_host: felt_host)
+      # Human-worker no-op: when the fiber's agent is `human`, the user is
+      # working on it themselves; Shuttle has nothing to dispatch. Return a
+      # sentinel so the caller (Poller / DispatchController) can skip the
+      # watcher / running-state plumbing without surfacing it as an error.
+      if agent.id == "human" do
+        Logger.info("Human-worker dispatch for #{fiber_id} — no tmux session spawned")
+        {:ok, :human_no_op}
+      else
+        resume_intent = check_resume_intent(fiber_id, fiber, felt_host: felt_host)
 
-      create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent,
-        felt_host: felt_host
-      )
+        create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent,
+          felt_host: felt_host
+        )
+      end
     end
   end
 
@@ -227,6 +236,43 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
+  @doc """
+  Reads the most recent `--kind review-comment` event for `fiber_id` and
+  returns a prelude block instructing the worker to stay alive after its
+  initial task — when `payload.interactive == "true"`. Otherwise returns "".
+
+  The kanban's modal sets `interactive=true` when the user wants to
+  attach to the worker mid-conversation. The prelude overrides any
+  `kill $PPID` instruction in the constitution: the worker completes
+  the initial task, then waits for the human to take over.
+
+  Pass `felt_host:` to control which `.felt/` index is queried.
+  """
+  @spec render_interactive_prelude(String.t(), keyword()) :: String.t()
+  def render_interactive_prelude(fiber_id, opts \\ []) do
+    case query_history(fiber_id, ["--kind", "review-comment", "--last", "1", "--json"], opts) do
+      [event | _] ->
+        if interactive_flag?(get_in(event, ["payload", "interactive"])) do
+          render_block(
+            "Interactive Mode",
+            nil,
+            "A human will attach to this session shortly. Complete the initial task as the constitution describes, but do NOT exit via `kill $PPID` afterward — leave the agent alive at a clean checkpoint and wait for the human's next message."
+          )
+        else
+          ""
+        end
+
+      _ ->
+        ""
+    end
+  end
+
+  # felt's `--field key=value` stores the value as a string. Treat the
+  # string "true" (and the boolean true, just in case) as truthy.
+  defp interactive_flag?(true), do: true
+  defp interactive_flag?("true"), do: true
+  defp interactive_flag?(_), do: false
+
   # Render a labeled rule-bordered block. Header is "┌─ <label>[ · <time>] ─…",
   # content is indented two spaces, closed with a matching bottom rule.
   # Total visual width is fixed at @rule_width chars so blocks align in the
@@ -346,7 +392,14 @@ defmodule Shuttle.Dispatcher do
   defp compose_prompt(header, fiber_id, opts) do
     felt_opts = [felt_host: Keyword.get(opts, :felt_host, default_felt_host())]
 
-    [String.trim(header), render_user_message_block(fiber_id, felt_opts)]
+    # Order: header, interactive prelude (when set), user message block.
+    # The prelude sits before the From User block so the worker reads
+    # the "stay alive" instruction before parsing the directive itself.
+    [
+      String.trim(header),
+      render_interactive_prelude(fiber_id, felt_opts),
+      render_user_message_block(fiber_id, felt_opts)
+    ]
     |> Enum.reject(&(&1 == ""))
     |> Enum.join("\n\n")
     |> String.trim()

@@ -104,5 +104,12 @@
     "requires_model": true,
     "aliases": ["pi"],
     "default": false
+  },
+  {
+    "id": "human",
+    "cli": "human",
+    "wrapper": "human",
+    "aliases": [],
+    "default": false
   }
 ]

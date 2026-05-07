@@ -332,21 +332,42 @@ defmodule Shuttle.Poller do
       true ->
         case fetch_fiber_full(fiber_id, state) do
           {:ok, fiber} ->
-            if dispatch_eligible?(fiber, state, opts) do
-              new_state = do_dispatch_fiber(state, fiber)
+            cond do
+              # Human-worker fibers: the user works on them themselves;
+              # there's no actual dispatch to do. Reply success without
+              # touching state so the caller (kanban modal) closes
+              # cleanly and the card stays in inFlight.
+              human_worker?(fiber) ->
+                Logger.info("API dispatch for #{fiber_id} is human-worker; no-op")
+                {:reply, {:ok, "human"}, state}
 
-              if Map.has_key?(new_state.running, fiber_id) do
-                {:reply, {:ok, session}, new_state}
-              else
-                {:reply, {:error, :dispatch_failed}, new_state}
-              end
-            else
-              {:reply, {:error, :not_eligible}, state}
+              dispatch_eligible?(fiber, state, opts) ->
+                new_state = do_dispatch_fiber(state, fiber)
+
+                if Map.has_key?(new_state.running, fiber_id) do
+                  {:reply, {:ok, session}, new_state}
+                else
+                  {:reply, {:error, :dispatch_failed}, new_state}
+                end
+
+              true ->
+                {:reply, {:error, :not_eligible}, state}
             end
 
           {:error, reason} ->
             {:reply, {:error, reason}, state}
         end
+    end
+  end
+
+  # Detects fibers that opted out of agent dispatch by setting
+  # `shuttle.agent: human`. Used by the API dispatch path to short-circuit
+  # with a friendly success and by the poller-side eligibility filter to
+  # skip human-worker fibers in the auto-dispatch loop.
+  defp human_worker?(fiber) do
+    case get_in(fiber, ["shuttle", "agent"]) do
+      "human" -> true
+      _ -> false
     end
   end
 
@@ -943,6 +964,13 @@ defmodule Shuttle.Poller do
 
     if is_map(shuttle) do
       cond do
+        # Human-worker fibers opt out of auto-dispatch entirely. The user
+        # is doing the work themselves; the kanban shows the card in
+        # inFlight via status:active + enabled:true, but Shuttle never
+        # tries to spawn anything.
+        human_worker?(fiber) ->
+          false
+
         # Must have shuttle.enabled: true
         Map.get(shuttle, "enabled", false) != true ->
           false
@@ -1143,6 +1171,14 @@ defmodule Shuttle.Poller do
            prompt_context: prompt_context,
            felt_host: felt_host
          ) do
+      {:ok, :human_no_op} ->
+        # Human-worker fibers don't need a watcher or running-state entry —
+        # the user is doing the work themselves. Return state unchanged so
+        # the kanban shows the card in inFlight (status:active, enabled:true)
+        # without any tmux session to watch.
+        Logger.info("Human-worker fiber #{fiber_id} accepted; no watcher started")
+        state
+
       {:ok, session} ->
         agent_name = fetch_shuttle_agent_name(fiber_id, state)
         {:ok, agent} = Shuttle.Agents.resolve_by_name(agent_name)
