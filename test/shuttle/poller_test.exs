@@ -340,6 +340,44 @@ defmodule Shuttle.PollerTest do
              Poller.snapshot(poller).standing_roles
   end
 
+  test "direct dispatch can force a scheduled standing role before it is due" do
+    fiber_id = "tests/standing-force-now"
+    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
+    MockRunner.set_fiber(fiber_id, fiber)
+
+    MockRunner.set_shuttle(
+      fiber_id,
+      """
+      enabled: true
+      kind: standing
+      agent: claude-sonnet
+      schedule:
+        expr: "0 9 * * 1-5"
+        tz: Europe/Paris
+      review:
+        state: scheduled
+      next_due_at: "2999-01-01T09:00:00+01:00"
+      """
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_standing_force_now,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_hosts: ["/tmp"]
+      )
+
+    assert {:error, :not_eligible} = Poller.dispatch_fiber(poller, fiber_id, [])
+    assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, force: true)
+    assert session == Dispatcher.session_name(fiber_id)
+
+    assert [%{fiber_id: ^fiber_id, state: "running", run_id: run_id}] =
+             Poller.snapshot(poller).eligible
+
+    assert run_id == "29990101T080000+0000"
+  end
+
   test "poller dispatches a due standing role with run context and does not hot-loop after exit" do
     # Uses new-format "kind: standing" (vs legacy "mode: standing") to test backward compat.
     fiber = make_fiber("tests/standing-due", %{"tags" => ["constitution", "standing"]})

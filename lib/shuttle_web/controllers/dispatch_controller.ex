@@ -12,13 +12,17 @@ defmodule ShuttleWeb.DispatchController do
   def create(conn, params) do
     fiber_id = Map.get(params, "fiber_id")
     notify_on_exit = Map.get(params, "notify_on_exit", false)
+    force = truthy?(Map.get(params, "force", false))
 
     if is_nil(fiber_id) do
       conn
       |> put_status(400)
       |> json(%{error: "fiber_id is required"})
     else
-      case Shuttle.Poller.dispatch_fiber(fiber_id, notify_on_exit: notify_on_exit) do
+      case Shuttle.Poller.dispatch_fiber(fiber_id,
+             notify_on_exit: notify_on_exit,
+             force: force
+           ) do
         {:ok, session} ->
           json(conn, %{
             dispatched: true,
@@ -45,4 +49,7 @@ defmodule ShuttleWeb.DispatchController do
       end
     end
   end
+
+  defp truthy?(value) when value in [true, "true", "1", 1], do: true
+  defp truthy?(_), do: false
 end

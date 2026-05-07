@@ -312,7 +312,7 @@ defmodule Shuttle.Poller do
     {:reply, Map.get(state.running, fiber_id), state}
   end
 
-  def handle_call({:dispatch, fiber_id, _opts}, _from, state) do
+  def handle_call({:dispatch, fiber_id, opts}, _from, state) do
     session = Dispatcher.session_name(fiber_id)
 
     cond do
@@ -330,7 +330,7 @@ defmodule Shuttle.Poller do
       true ->
         case fetch_fiber_full(fiber_id, state) do
           {:ok, fiber} ->
-            if eligible?(fiber, state) do
+            if dispatch_eligible?(fiber, state, opts) do
               new_state = do_dispatch_fiber(state, fiber)
 
               if Map.has_key?(new_state.running, fiber_id) do
@@ -968,6 +968,32 @@ defmodule Shuttle.Poller do
       end
     else
       false
+    end
+  end
+
+  defp dispatch_eligible?(fiber, state, opts) do
+    if Keyword.get(opts, :force, false) and force_dispatchable_standing_role?(fiber, state) do
+      dependencies_satisfied?(Map.get(fiber, "id", ""), state)
+    else
+      eligible?(fiber, state)
+    end
+  end
+
+  defp force_dispatchable_standing_role?(fiber, state) do
+    status = Map.get(fiber, "status", "")
+    fiber_id = Map.get(fiber, "id", "")
+    shuttle = Map.get(fiber, "shuttle")
+
+    with true <- is_map(shuttle),
+         true <- Map.get(shuttle, "enabled", false) == true,
+         true <- status in ["open", "active"],
+         {:ok, role} <- fetch_standing_role(fiber_id, state),
+         true <- StandingRole.standing?(role),
+         true <- StandingRole.valid?(role) do
+      review_state = role.review["state"] || "scheduled"
+      review_state in ["scheduled", "accepted", "due"]
+    else
+      _ -> false
     end
   end
 
