@@ -33,6 +33,14 @@ in the markdown before installing.
 Use 'shuttle repeat' for standing (recurring) roles.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if !usingLocalOrigin() {
+			return postRemoteLifecycle("install", map[string]any{
+				"fiber":    args[0],
+				"model":    installModel,
+				"disabled": installDisabled,
+			})
+		}
+
 		agents := loadAgents()
 		path, _, _ := resolveFiber(args[0])
 		f := readFiber(path)

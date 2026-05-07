@@ -62,6 +62,9 @@ Other flags:
                      after manual cleanup).
   --json             emit an array of objects instead.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if !usingLocalOrigin() && !statusAll && statusRemote == "" {
+			statusRemote = normalizedOrigin()
+		}
 		// Cross-host paths route through the local daemon; --remote and
 		// --all are mutually exclusive (--remote NAME implies "filter").
 		if statusAll || statusRemote != "" {
@@ -160,6 +163,9 @@ var psCmd = &cobra.Command{
 	Short: "Live tmux worker sessions",
 	Long:  "Prints one line per live shuttle-* tmux session.",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if !usingLocalOrigin() {
+			return runRemotePS(normalizedOrigin())
+		}
 		live := liveTmuxSessions()
 		if len(live) == 0 {
 			fmt.Println("no live shuttle workers")

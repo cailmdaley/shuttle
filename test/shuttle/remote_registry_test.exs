@@ -3,6 +3,7 @@ defmodule Shuttle.RemoteRegistryTest do
 
   alias Shuttle.Remote
   alias Shuttle.RemoteRegistry
+  alias Shuttle.Runner
 
   # ── Mock Client ──
   #
@@ -30,9 +31,54 @@ defmodule Shuttle.RemoteRegistryTest do
     end
   end
 
+  defmodule MockRunner do
+    @behaviour Runner
+
+    use Agent
+
+    def start_link(_ \\ []) do
+      Agent.start_link(fn -> %{responses: %{}, calls: []} end, name: __MODULE__)
+    end
+
+    def reset, do: Agent.update(__MODULE__, fn _ -> %{responses: %{}, calls: []} end)
+
+    def set(command, responses) when is_binary(command) and is_list(responses) do
+      Agent.update(__MODULE__, fn state ->
+        put_in(state, [:responses, command], responses)
+      end)
+    end
+
+    def calls do
+      Agent.get(__MODULE__, fn state -> Enum.reverse(state.calls) end)
+    end
+
+    @impl true
+    def cmd(command, args, _opts) do
+      Agent.get_and_update(__MODULE__, fn state ->
+        queue = Map.get(state.responses, command, [])
+
+        {response, remaining} =
+          case queue do
+            [next | rest] -> {next, rest}
+            [] -> {{"", 0}, []}
+          end
+
+        new_state = %{
+          state
+          | responses: Map.put(state.responses, command, remaining),
+            calls: [{command, args} | state.calls]
+        }
+
+        {response, new_state}
+      end)
+    end
+  end
+
   setup do
     start_supervised!(MockClient)
+    start_supervised!(MockRunner)
     MockClient.reset()
+    MockRunner.reset()
     :ok
   end
 
@@ -126,6 +172,7 @@ defmodule Shuttle.RemoteRegistryTest do
           name: :reg_happy,
           remotes: [candide_remote()],
           client: MockClient,
+          auto_poll: false,
           tick_interval_ms: 60_000
         )
 
@@ -152,6 +199,7 @@ defmodule Shuttle.RemoteRegistryTest do
           name: :reg_running,
           remotes: [candide_remote()],
           client: MockClient,
+          auto_poll: false,
           tick_interval_ms: 60_000
         )
 
@@ -174,6 +222,7 @@ defmodule Shuttle.RemoteRegistryTest do
           name: :reg_origin,
           remotes: [candide_remote()],
           client: MockClient,
+          auto_poll: false,
           tick_interval_ms: 60_000
         )
 
@@ -198,6 +247,7 @@ defmodule Shuttle.RemoteRegistryTest do
           name: :reg_502,
           remotes: [candide_remote()],
           client: MockClient,
+          auto_poll: false,
           tick_interval_ms: 60_000
         )
 
@@ -221,6 +271,7 @@ defmodule Shuttle.RemoteRegistryTest do
           name: :reg_refused,
           remotes: [candide_remote()],
           client: MockClient,
+          auto_poll: false,
           tick_interval_ms: 60_000
         )
 
@@ -242,6 +293,7 @@ defmodule Shuttle.RemoteRegistryTest do
           name: :reg_garbage,
           remotes: [candide_remote()],
           client: MockClient,
+          auto_poll: false,
           tick_interval_ms: 60_000
         )
 
@@ -268,6 +320,7 @@ defmodule Shuttle.RemoteRegistryTest do
           # Tiny intervals so the test runs fast. stale = 2 × 50ms = 100ms.
           remotes: [candide_remote(poll_interval_ms: 50, stale_multiplier: 2)],
           client: MockClient,
+          auto_poll: false,
           tick_interval_ms: 60_000
         )
 
@@ -287,6 +340,130 @@ defmodule Shuttle.RemoteRegistryTest do
     end
   end
 
+  # ── Recovery cascade ──
+
+  describe "recovery cascade" do
+    test "bounces the tunnel after the failure threshold and returns healthy on the next good probe" do
+      MockClient.set(
+        "http://localhost:4001/api/v1/state",
+        {:error, :econnrefused}
+      )
+
+      MockRunner.set("launchctl", [{"", 0}])
+
+      {:ok, _pid} =
+        RemoteRegistry.start_link(
+          name: :reg_recovery_happy,
+          remotes: [candide_remote(poll_interval_ms: 1)],
+          client: MockClient,
+          runner: MockRunner,
+          auto_poll: false,
+          tick_interval_ms: 60_000,
+          failure_threshold: 3,
+          bounce_wait_ms: 1,
+          restart_wait_ms: 1,
+          backoff_schedule_ms: [5],
+          user_uid: "501"
+        )
+
+      Enum.each(1..3, fn _ ->
+        :ok = RemoteRegistry.poll_now(:reg_recovery_happy)
+        Process.sleep(2)
+      end)
+
+      degraded = RemoteRegistry.snapshot(:reg_recovery_happy, "candide")
+      assert degraded.recovery.state == :degraded
+      assert degraded.recovery.attempt == 1
+
+      MockClient.set(
+        "http://localhost:4001/api/v1/state",
+        {:ok, snapshot_with_running(["work/recovered"])}
+      )
+
+      :ok = RemoteRegistry.poll_now(:reg_recovery_happy)
+      Process.sleep(2)
+      :ok = RemoteRegistry.poll_now(:reg_recovery_happy)
+
+      healed = RemoteRegistry.snapshot(:reg_recovery_happy, "candide")
+      refute healed.stale
+      assert healed.recovery.state == :healthy
+      assert healed.recovery.attempt == 0
+      assert get_in(healed, [:snapshot, "eligible"]) == [%{"fiber_id" => "work/recovered"}]
+
+      assert [{"launchctl", ["kickstart", "-k", "gui/501/com.cailmdaley.shuttle-tunnel-candide"]}] =
+               MockRunner.calls()
+    end
+
+    test "escalates through SSH check, remote restart, and backoff" do
+      MockClient.set(
+        "http://localhost:4001/api/v1/state",
+        {:error, :econnrefused}
+      )
+
+      MockRunner.set("launchctl", [{"", 0}])
+
+      MockRunner.set("ssh", [
+        {"session=absent\nhttp=unhealthy\n", 0},
+        {"restart requested\n", 0}
+      ])
+
+      {:ok, _pid} =
+        RemoteRegistry.start_link(
+          name: :reg_recovery_backoff,
+          remotes: [candide_remote(poll_interval_ms: 1)],
+          client: MockClient,
+          runner: MockRunner,
+          auto_poll: false,
+          tick_interval_ms: 60_000,
+          failure_threshold: 3,
+          bounce_wait_ms: 1,
+          restart_wait_ms: 1,
+          backoff_schedule_ms: [2],
+          user_uid: "501"
+        )
+
+      Enum.each(1..3, fn _ ->
+        :ok = RemoteRegistry.poll_now(:reg_recovery_backoff)
+        Process.sleep(2)
+      end)
+
+      :ok = RemoteRegistry.poll_now(:reg_recovery_backoff)
+      Process.sleep(2)
+      :ok = RemoteRegistry.poll_now(:reg_recovery_backoff)
+      :ok = RemoteRegistry.poll_now(:reg_recovery_backoff)
+      :ok = RemoteRegistry.poll_now(:reg_recovery_backoff)
+      Process.sleep(2)
+      :ok = RemoteRegistry.poll_now(:reg_recovery_backoff)
+
+      unreachable = RemoteRegistry.snapshot(:reg_recovery_backoff, "candide")
+      assert unreachable.recovery.state == :unreachable
+      assert unreachable.recovery.attempt == 1
+      assert %DateTime{} = unreachable.recovery.next_retry_at
+      assert unreachable.recovery.last_action == "probe after remote restart failed"
+
+      calls = MockRunner.calls()
+      assert Enum.map(calls, &elem(&1, 0)) == ["launchctl", "ssh", "ssh"]
+
+      assert Enum.any?(calls, fn {command, args} ->
+               command == "ssh" and
+                 Enum.any?(args, &String.contains?(&1, "curl -sf --max-time 3"))
+             end)
+
+      assert Enum.any?(calls, fn {command, args} ->
+               command == "ssh" and
+                 Enum.any?(args, &String.contains?(&1, "$HOME/.local/bin/shuttle-launch"))
+             end)
+
+      Process.sleep(3)
+      :ok = RemoteRegistry.poll_now(:reg_recovery_backoff)
+
+      restarted = RemoteRegistry.snapshot(:reg_recovery_backoff, "candide")
+      assert restarted.recovery.state == :degraded
+      assert restarted.recovery.attempt == 2
+      assert restarted.recovery.last_action == "backoff probe failed; restarting recovery cascade"
+    end
+  end
+
   # ── No remotes configured ──
 
   describe "no remotes" do
@@ -296,6 +473,7 @@ defmodule Shuttle.RemoteRegistryTest do
           name: :reg_empty,
           remotes: [],
           client: MockClient,
+          auto_poll: false,
           tick_interval_ms: 60_000
         )
 

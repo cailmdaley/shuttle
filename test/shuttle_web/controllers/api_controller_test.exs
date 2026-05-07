@@ -594,6 +594,8 @@ defmodule ShuttleWeb.APIControllerTest do
     assert candide["last_error"] == nil
     assert is_map(candide["snapshot"])
     assert candide["snapshot"]["host"] == "candide"
+    assert candide["recovery"]["state"] == "healthy"
+    assert candide["recovery"]["attempt"] == 0
   end
 
   test "composite degrades gracefully when no RemoteRegistry is running" do

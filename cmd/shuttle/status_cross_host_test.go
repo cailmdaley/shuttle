@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"sort"
 	"testing"
+	"time"
 )
 
 // status_cross_host_test.go — exercises composite-snapshot rendering.
@@ -184,6 +185,59 @@ func TestCompositeRows_StalePropagatesToRows(t *testing.T) {
 	// cached data; the per-row Stale flag warns the renderer.
 	if !rows[0].Stale {
 		t.Errorf("expected Stale=true on rows from stale remote, got false")
+	}
+}
+
+func TestCompositeRows_RecoveryPlaceholderUsesRecoveryState(t *testing.T) {
+	c := &CompositeState{
+		Remotes: map[string]*RemoteSnapshot{
+			"candide": {
+				Snapshot: nil,
+				Stale:    true,
+				Recovery: &RemoteRecovery{State: "unreachable", NextRetryAt: time.Now().Add(30 * time.Second).UTC().Format(time.RFC3339)},
+			},
+		},
+	}
+
+	rows := compositeRows(c, "")
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %+v", len(rows), rows)
+	}
+	if rows[0].Origin != "candide" {
+		t.Fatalf("unexpected origin: %+v", rows[0])
+	}
+	if rows[0].FiberID != "" {
+		t.Fatalf("expected placeholder row, got fiber_id=%q", rows[0].FiberID)
+	}
+	if want := "unreachable (next:"; len(rows[0].State) < len(want) || rows[0].State[:len(want)] != want {
+		t.Fatalf("expected unreachable recovery label, got %q", rows[0].State)
+	}
+}
+
+func TestCompositeRows_RecoveryAddsOriginSummaryAlongsideSnapshotRows(t *testing.T) {
+	c := &CompositeState{
+		Remotes: map[string]*RemoteSnapshot{
+			"candide": {
+				Snapshot: &Snapshot{
+					Eligible: []SnapshotEntry{{FiberID: "remote/x", State: "running"}},
+				},
+				Recovery: &RemoteRecovery{State: "reviving", Attempt: 2, LastAction: "bounced tunnel"},
+			},
+		},
+	}
+
+	rows := compositeRows(c, "")
+	if len(rows) != 2 {
+		t.Fatalf("expected summary row + worker row, got %d: %+v", len(rows), rows)
+	}
+	if rows[0].FiberID != "" || rows[0].Origin != "candide" {
+		t.Fatalf("first row should be origin summary, got %+v", rows[0])
+	}
+	if rows[0].State != "reviving (attempt 2: bounced tunnel)" {
+		t.Fatalf("unexpected recovery label: %q", rows[0].State)
+	}
+	if rows[1].FiberID != "remote/x" || rows[1].Origin != "candide" {
+		t.Fatalf("second row should be worker row, got %+v", rows[1])
 	}
 }
 

@@ -31,6 +31,12 @@ This makes pause the single-writer transition for the Kanban's Drafts target.`,
 			if err != nil {
 				return err
 			}
+			if !usingLocalOrigin() {
+				return postRemoteLifecycle("pause", map[string]any{
+					"fiber":   args[0],
+					"no_kill": noKill,
+				})
+			}
 			path, fiberID, _ := resolveFiber(args[0])
 			f := readFiber(path)
 			if f.Block == nil {
@@ -96,6 +102,9 @@ Refuses if status is currently "closed" — use 'shuttle reopen' to requeue a
 closed fiber back into active work.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if !usingLocalOrigin() {
+				return postRemoteLifecycle("resume", map[string]any{"fiber": args[0]})
+			}
 			path, fiberID, host := resolveFiber(args[0])
 			f := readFiber(path)
 			if f.Block == nil {
@@ -334,6 +343,12 @@ a run whose digest the next worker should still see).
 Appends a felt history event recording the acceptance.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if !usingLocalOrigin() {
+				return postRemoteLifecycle("accept", map[string]any{
+					"fiber":        args[0],
+					"keep_outcome": keepOutcome,
+				})
+			}
 			path, fiberID, host := resolveFiber(args[0])
 			f := readFiber(path)
 			if f.Block == nil {
@@ -410,6 +425,12 @@ agent registry before writing. Removes any existing agent:* felt tag
 (the shuttle: block is now the authoritative source).`,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if !usingLocalOrigin() {
+			return postRemoteLifecycle("set-model", map[string]any{
+				"fiber": args[0],
+				"agent": args[1],
+			})
+		}
 		agents := loadAgents()
 		path, _, _ := resolveFiber(args[0])
 		f := readFiber(path)
@@ -439,6 +460,9 @@ var uninstallCmd = &cobra.Command{
 daemon will no longer dispatch it. The felt tags and status are not changed.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if !usingLocalOrigin() {
+			return postRemoteLifecycle("uninstall", map[string]any{"fiber": args[0]})
+		}
 		path, _, _ := resolveFiber(args[0])
 		f := readFiber(path)
 		if f.Block == nil {

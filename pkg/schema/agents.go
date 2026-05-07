@@ -11,15 +11,15 @@ import (
 
 // AgentRecord holds the configuration for one agent harness.
 type AgentRecord struct {
-	ID           string   `json:"id"`
-	CLI          string   `json:"cli"`
-	Wrapper      string   `json:"wrapper"`
-	Provider     string   `json:"provider,omitempty"`
-	Model        string   `json:"model,omitempty"`
-	ExtraFlags   string   `json:"extra_flags,omitempty"`
-	RequiresModel bool    `json:"requires_model,omitempty"`
-	Aliases      []string `json:"aliases"`
-	Default      bool     `json:"default"`
+	ID            string   `json:"id"`
+	CLI           string   `json:"cli"`
+	Wrapper       string   `json:"wrapper"`
+	Provider      string   `json:"provider,omitempty"`
+	Model         string   `json:"model,omitempty"`
+	ExtraFlags    string   `json:"extra_flags,omitempty"`
+	RequiresModel bool     `json:"requires_model,omitempty"`
+	Aliases       []string `json:"aliases"`
+	Default       bool     `json:"default"`
 }
 
 // AgentRegistry is the loaded registry of agents.
@@ -33,7 +33,7 @@ type AgentRegistry struct {
 // is set and contains a readable agents.json, that file takes precedence.
 // Otherwise fall back to the embedded share/agents.json compiled into the binary.
 func LoadAgentRegistry() (*AgentRegistry, error) {
-	if path, err := findShareFile("agents.json"); err == nil {
+	if path, err := FindSharePath("agents.json"); err == nil {
 		return LoadAgentRegistryFromFile(path)
 	}
 	var agents []AgentRecord
@@ -98,16 +98,16 @@ func (r *AgentRegistry) IDs() []string {
 	return ids
 }
 
-// findShareFile locates a file by looking in:
-//  1. The directory of the running binary (sibling share/<name>)
-//  2. The source-relative share/ dir (for go run / tests)
-//  3. SHUTTLE_SHARE env override
-func findShareFile(name string) (string, error) {
+// FindSharePath locates a path under the Shuttle share directory by looking in:
+//  1. SHUTTLE_SHARE/<rel>
+//  2. The directory of the running binary (sibling share/<rel>)
+//  3. The source-relative share/ dir (for go run / tests)
+func FindSharePath(rel string) (string, error) {
 	// Env override first.
 	if dir := os.Getenv("SHUTTLE_SHARE"); dir != "" {
-		p := filepath.Join(dir, name)
+		p := filepath.Join(dir, rel)
 		if _, err := os.Stat(p); err == nil {
-			return p, nil
+			return filepath.Clean(p), nil
 		}
 	}
 
@@ -115,12 +115,12 @@ func findShareFile(name string) (string, error) {
 	if exe, err := os.Executable(); err == nil {
 		// exe is .../bin/shuttle-ctl or .../bin/shuttle; share/ is adjacent.
 		binDir := filepath.Dir(exe)
-		for _, rel := range []string{
-			filepath.Join(binDir, "share", name),
-			filepath.Join(binDir, "..", "share", name),
+		for _, candidate := range []string{
+			filepath.Join(binDir, "share", rel),
+			filepath.Join(binDir, "..", "share", rel),
 		} {
-			if _, err := os.Stat(rel); err == nil {
-				return filepath.Clean(rel), nil
+			if _, err := os.Stat(candidate); err == nil {
+				return filepath.Clean(candidate), nil
 			}
 		}
 	}
@@ -128,11 +128,11 @@ func findShareFile(name string) (string, error) {
 	// Source-relative (development: this file lives at pkg/schema/).
 	_, thisFile, _, ok := runtime.Caller(0)
 	if ok {
-		root := filepath.Join(filepath.Dir(thisFile), "..", "..", "share", name)
-		if _, err := os.Stat(root); err == nil {
-			return filepath.Clean(root), nil
+		candidate := filepath.Join(filepath.Dir(thisFile), "..", "..", "share", rel)
+		if _, err := os.Stat(candidate); err == nil {
+			return filepath.Clean(candidate), nil
 		}
 	}
 
-	return "", fmt.Errorf("%s not found (set SHUTTLE_SHARE env to override)", name)
+	return "", fmt.Errorf("share path %q not found (set SHUTTLE_SHARE env to override)", rel)
 }

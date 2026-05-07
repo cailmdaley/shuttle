@@ -56,12 +56,16 @@ bin/shuttle dispatch <fiber-id>               # one-shot dispatch
 shuttle-ctl status                            # all fibers with shuttle: blocks
 shuttle-ctl status --all                      # local + every configured remote
 shuttle-ctl status --remote <name>            # single remote
+shuttle-ctl status --origin candide           # direct origin spelling for remote daemon routing
 shuttle-ctl ps                                # live tmux workers only
-shuttle-ctl install <fiber> [-m <agent-id>] [--disabled]
+shuttle-ctl ps --origin candide               # live workers on a selected daemon
+shuttle-ctl install <fiber> [-m <agent-id>] [--disabled] [--origin candide]
 shuttle-ctl repeat <fiber> --schedule "0 9 * * 1-5" --tz Europe/Paris
 shuttle-ctl pause <fiber>                       # disable + kill live worker; --no-kill preserves it
 shuttle-ctl resume / accept <fiber>
 shuttle-ctl set-model <fiber> <agent-id>
+shuttle-ctl dispatch <fiber> --origin candide
+shuttle-ctl snapshot --origin candide
 shuttle-ctl abort / attach <fiber>
 shuttle-ctl migrate --dry-run                 # preview eligibility migration
 ```
@@ -81,8 +85,10 @@ shuttle-ctl migrate --dry-run                 # preview eligibility migration
 - **`shuttle.agent` field drives agent selection.** The `shuttle:` block's
   `agent:` field resolves against the registry. Default agent is
   `claude-sonnet`.
-- **shuttle-ctl is the agent-facing CLI.** Write verbs validate before
-  write; works offline. `bin/shuttle` handles daemon lifecycle and dispatch.
+- **shuttle-ctl is the agent-facing CLI.** Local write verbs validate before
+  write and work offline. With `--origin <name>`, lifecycle verbs are sent to
+  that daemon over the configured tunnel so the selected host edits its own
+  local fiber store. `bin/shuttle` handles daemon lifecycle and dispatch.
 - **No tag predicate for dispatch.** The `shuttle:` block's `enabled: true`
   field is the dispatch signal. Tags are free-form qualitative noticings;
   only `idea` is load-bearing for Portolan's kanban column placement.

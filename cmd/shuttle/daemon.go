@@ -1,0 +1,92 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+)
+
+var snapshotCmd = &cobra.Command{
+	Use:   "snapshot",
+	Short: "Print the selected daemon's state snapshot",
+	Args:  cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		baseURL, err := resolveOriginURL(normalizedOrigin())
+		if err != nil {
+			return err
+		}
+		body, err := getDaemon(baseURL + "/api/v1/state")
+		if err != nil {
+			return err
+		}
+		fmt.Print(string(body))
+		if !bytes.HasSuffix(body, []byte("\n")) {
+			fmt.Println()
+		}
+		return nil
+	},
+}
+
+var dispatchCmd = &cobra.Command{
+	Use:   "dispatch <fiber>",
+	Short: "Ask the selected daemon to dispatch a fiber now",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		baseURL, err := resolveOriginURL(normalizedOrigin())
+		if err != nil {
+			return err
+		}
+		payload, _ := json.Marshal(map[string]string{"fiber_id": args[0]})
+		body, err := postDaemon(baseURL+"/api/v1/dispatch", payload)
+		if err != nil {
+			return err
+		}
+		fmt.Print(string(body))
+		if !bytes.HasSuffix(body, []byte("\n")) {
+			fmt.Println()
+		}
+		return nil
+	},
+}
+
+func getDaemon(url string) ([]byte, error) {
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("reaching daemon at %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	return readDaemonResponse(url, resp)
+}
+
+func postDaemon(url string, payload []byte) ([]byte, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(url, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("reaching daemon at %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	return readDaemonResponse(url, resp)
+}
+
+func readDaemonResponse(url string, resp *http.Response) ([]byte, error) {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading daemon response from %s: %w", url, err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("daemon at %s returned %d: %s", url, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return body, nil
+}
+
+func init() {
+	rootCmd.AddCommand(snapshotCmd)
+	rootCmd.AddCommand(dispatchCmd)
+}

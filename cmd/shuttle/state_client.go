@@ -57,23 +57,23 @@ type SnapshotEntry struct {
 // Standing-role entries don't carry `agent` (it lives in the fiber
 // frontmatter only); the CLI renders `(default)` in that column.
 type StandingRoleEntry struct {
-	FiberID    string                 `json:"fiber_id"`
-	State      string                 `json:"state,omitempty"`
-	RunID      string                 `json:"run_id,omitempty"`
-	NextDueAt  *int64                 `json:"next_due_at,omitempty"`
-	LastRunAt  *int64                 `json:"last_run_at,omitempty"`
-	Schedule   map[string]any         `json:"schedule,omitempty"`
-	Review     map[string]any         `json:"review,omitempty"`
-	Validation []any                  `json:"validation_errors,omitempty"`
-	Extra      map[string]any         `json:"-"`
+	FiberID    string         `json:"fiber_id"`
+	State      string         `json:"state,omitempty"`
+	RunID      string         `json:"run_id,omitempty"`
+	NextDueAt  *int64         `json:"next_due_at,omitempty"`
+	LastRunAt  *int64         `json:"last_run_at,omitempty"`
+	Schedule   map[string]any `json:"schedule,omitempty"`
+	Review     map[string]any `json:"review,omitempty"`
+	Validation []any          `json:"validation_errors,omitempty"`
+	Extra      map[string]any `json:"-"`
 }
 
 // RetryEntry mirrors `Poller.build_snapshot/1`'s `retrying` rows.
 type RetryEntry struct {
-	FiberID  string `json:"fiber_id"`
-	Attempt  int    `json:"attempt,omitempty"`
-	DueInMS  int64  `json:"due_in_ms,omitempty"`
-	Error    string `json:"error,omitempty"`
+	FiberID string `json:"fiber_id"`
+	Attempt int    `json:"attempt,omitempty"`
+	DueInMS int64  `json:"due_in_ms,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // Snapshot is the daemon's per-host runtime state.
@@ -87,14 +87,26 @@ type Snapshot struct {
 	ClaimedCount  int                 `json:"claimed_count,omitempty"`
 }
 
+// RemoteRecovery is the laptop daemon's per-origin self-healing state.
+// Healthy is the steady state; non-healthy values describe the current
+// recovery cascade or backoff window.
+type RemoteRecovery struct {
+	State       string `json:"state,omitempty"`
+	Attempt     int    `json:"attempt,omitempty"`
+	LastError   string `json:"last_error,omitempty"`
+	LastAction  string `json:"last_action,omitempty"`
+	NextRetryAt string `json:"next_retry_at,omitempty"`
+}
+
 // RemoteSnapshot is one entry in the composite endpoint's `remotes`
 // map: a remote daemon's snapshot plus freshness metadata maintained
 // by the laptop's `Shuttle.RemoteRegistry`.
 type RemoteSnapshot struct {
-	Snapshot     *Snapshot `json:"snapshot"`
-	LastPolledAt string    `json:"last_polled_at,omitempty"`
-	Stale        bool      `json:"stale"`
-	LastError    string    `json:"last_error,omitempty"`
+	Snapshot     *Snapshot       `json:"snapshot"`
+	LastPolledAt string          `json:"last_polled_at,omitempty"`
+	Stale        bool            `json:"stale"`
+	LastError    string          `json:"last_error,omitempty"`
+	Recovery     *RemoteRecovery `json:"recovery,omitempty"`
 }
 
 // CompositeState is the response shape of GET /api/v1/state/composite.
@@ -113,7 +125,7 @@ func fetchComposite() (*CompositeState, error) {
 }
 
 func fetchCompositeFrom(url string) (*CompositeState, error) {
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("reaching daemon at %s: %w (start the daemon with `make start` or set SHUTTLE_DAEMON_URL)", daemonURL(), err)

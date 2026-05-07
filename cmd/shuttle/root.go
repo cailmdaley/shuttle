@@ -11,6 +11,7 @@ import (
 var (
 	jsonOutput   bool
 	feltHostFlag string
+	originFlag   string
 )
 
 var rootCmd = &cobra.Command{
@@ -32,15 +33,19 @@ Write verbs (offline, validate-before-write):
   set-model    Change the agent for a fiber
   uninstall    Remove the shuttle: block from a fiber
 
-Read + abort verbs (offline, no daemon IPC):
+Read + abort verbs:
   status       One-line-per-fiber status overview
   ps           Live tmux worker sessions only
+  snapshot     Print the selected daemon's state snapshot
+  dispatch     Ask the selected daemon to dispatch a fiber now
   session-name Print the canonical tmux session name for a fiber
   attach       Attach to a running worker's tmux session
   abort        Kill a worker's tmux session
 
-The CLI edits shuttle: frontmatter directly. The running daemon picks up changes
-on its next poll. All write verbs validate input before touching any file.
+The CLI edits local shuttle: frontmatter directly. With --origin <name>,
+HTTP-backed verbs route to the selected daemon over its configured tunnel so
+that host edits or dispatches its own local fiber store. All write verbs
+validate input before touching any file.
 
 Use --host <dir> to target a specific felt host when a fiber does not live
 under the default LOOM_HOME or ~/loom felt store.`,
@@ -50,6 +55,7 @@ under the default LOOM_HOME or ~/loom felt store.`,
 func init() {
 	rootCmd.PersistentFlags().BoolVarP(&jsonOutput, "json", "j", false, "Output in JSON format")
 	rootCmd.PersistentFlags().StringVar(&feltHostFlag, "host", "", "Felt host root (directory containing .felt/)")
+	rootCmd.PersistentFlags().StringVar(&originFlag, "origin", "local", "Daemon origin for HTTP-backed commands (local, candide, cineca)")
 }
 
 // loadAgents loads the agent registry; exits with a clear error on failure.

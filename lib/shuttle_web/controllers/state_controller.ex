@@ -44,12 +44,25 @@ defmodule ShuttleWeb.StateController do
       snapshot: Map.get(entry, :snapshot),
       last_polled_at: format_dt(Map.get(entry, :last_polled_at)),
       stale: Map.get(entry, :stale, true),
-      last_error: render_error(Map.get(entry, :last_error))
+      last_error: render_error(Map.get(entry, :last_error)),
+      recovery: render_recovery(Map.get(entry, :recovery))
     }
   end
 
   defp format_dt(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
   defp format_dt(_), do: nil
+
+  defp render_recovery(%{} = recovery) do
+    %{
+      state: recovery |> Map.get(:state, :healthy) |> to_string(),
+      attempt: Map.get(recovery, :attempt, 0),
+      last_error: render_error(Map.get(recovery, :last_error)),
+      last_action: Map.get(recovery, :last_action),
+      next_retry_at: format_dt(Map.get(recovery, :next_retry_at))
+    }
+  end
+
+  defp render_recovery(_), do: nil
 
   # `:httpc` failure reasons are erlang terms (often tuples). Render as
   # a string so the JSON encoder doesn't need to know about them.

@@ -37,6 +37,11 @@ func runStatusCrossHost() error {
 	if err != nil {
 		return err
 	}
+	if statusRemote != "" {
+		if _, ok := composite.Remotes[statusRemote]; !ok {
+			return fmt.Errorf("unknown origin %q; configured: local, %s", statusRemote, joinNames(composite.Remotes))
+		}
+	}
 
 	rows := compositeRows(composite, statusRemote)
 
@@ -81,16 +86,10 @@ func compositeRows(c *CompositeState, only string) []FiberStatus {
 		if only != "" && name != only {
 			continue
 		}
+		if summary := remoteSummaryRow(name, rs); summary != nil {
+			rows = append(rows, *summary)
+		}
 		if rs == nil || rs.Snapshot == nil {
-			// Remote configured but never successfully polled — emit a
-			// placeholder row so the user sees the host exists and is
-			// stale. Without this, an unreachable remote is silently
-			// missing from the table.
-			rows = append(rows, FiberStatus{
-				Origin: name,
-				State:  staleStateLabel(rs),
-				Stale:  true,
-			})
 			continue
 		}
 		rows = append(rows, snapshotToRows(name, rs.Snapshot, rs.Stale)...)
@@ -162,6 +161,23 @@ func snapshotToRows(origin string, snap *Snapshot, stale bool) []FiberStatus {
 	return rows
 }
 
+func remoteSummaryRow(name string, rs *RemoteSnapshot) *FiberStatus {
+	if rs == nil {
+		return &FiberStatus{Origin: name, State: "unknown", Stale: true}
+	}
+	if rec := rs.Recovery; rec != nil && rec.State != "" && rec.State != "healthy" {
+		return &FiberStatus{Origin: name, State: recoveryStateLabel(rec)}
+	}
+	if rs.Snapshot == nil {
+		// Remote configured but never successfully polled — emit a
+		// placeholder row so the user sees the host exists and is
+		// stale. Without this, an unreachable remote is silently
+		// missing from the table.
+		return &FiberStatus{Origin: name, State: staleStateLabel(rs), Stale: true}
+	}
+	return nil
+}
+
 // staleStateLabel summarizes a never-polled remote's status.
 func staleStateLabel(rs *RemoteSnapshot) string {
 	if rs == nil {
@@ -171,6 +187,71 @@ func staleStateLabel(rs *RemoteSnapshot) string {
 		return "stale (" + rs.LastError + ")"
 	}
 	return "stale"
+}
+
+func recoveryStateLabel(rec *RemoteRecovery) string {
+	if rec == nil || rec.State == "" {
+		return "unknown"
+	}
+
+	switch rec.State {
+	case "reviving", "degraded":
+		detail := rec.LastAction
+		if detail == "" {
+			detail = rec.LastError
+		}
+		if detail == "" {
+			detail = "recovering"
+		}
+		attempt := rec.Attempt
+		if attempt <= 0 {
+			attempt = 1
+		}
+		return fmt.Sprintf("%s (attempt %d: %s)", rec.State, attempt, detail)
+	case "unreachable":
+		if next := relativeRetry(rec.NextRetryAt); next != "" {
+			return fmt.Sprintf("unreachable (next: %s)", next)
+		}
+		if rec.LastError != "" {
+			return "unreachable (" + rec.LastError + ")"
+		}
+		return "unreachable"
+	default:
+		return rec.State
+	}
+}
+
+func relativeRetry(ts string) string {
+	if ts == "" {
+		return ""
+	}
+	parsed, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return ts
+	}
+	delta := time.Until(parsed)
+	if delta <= 0 {
+		return "now"
+	}
+	if delta < time.Minute {
+		secs := int(delta.Round(time.Second) / time.Second)
+		if secs < 1 {
+			secs = 1
+		}
+		return fmt.Sprintf("%ds", secs)
+	}
+	if delta < time.Hour {
+		mins := int(delta.Round(time.Minute) / time.Minute)
+		if mins < 1 {
+			mins = 1
+		}
+		return fmt.Sprintf("%dm", mins)
+	}
+	hours := int(delta.Round(time.Hour) / time.Hour)
+	if hours < 1 {
+		hours = 1
+	}
+	return fmt.Sprintf("%dh", hours)
 }
 
 func formatUnixMS(ms int64) string {
@@ -241,3 +322,31 @@ func joinNames(remotes map[string]*RemoteSnapshot) string {
 	return out
 }
 
+func runRemotePS(origin string) error {
+	composite, err := fetchComposite()
+	if err != nil {
+		return err
+	}
+	rows := compositeRows(composite, origin)
+	live := make([]FiberStatus, 0)
+	for _, row := range rows {
+		if row.Running {
+			live = append(live, row)
+		}
+	}
+	sort.Slice(live, func(i, j int) bool { return live[i].Session < live[j].Session })
+
+	if jsonOutput {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(live)
+	}
+	if len(live) == 0 {
+		fmt.Printf("no live shuttle workers for origin %q\n", origin)
+		return nil
+	}
+	for _, row := range live {
+		fmt.Printf("%-12s  %-40s  %s\n", row.Origin, row.Session, row.FiberID)
+	}
+	return nil
+}

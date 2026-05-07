@@ -30,6 +30,15 @@ The shuttle: block is validated before any file is touched.
 The running daemon picks it up on its next poll.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if !usingLocalOrigin() {
+			return postRemoteLifecycle("repeat", map[string]any{
+				"fiber":    args[0],
+				"schedule": repeatSchedule,
+				"tz":       repeatTZ,
+				"model":    repeatModel,
+			})
+		}
+
 		agents := loadAgents()
 		path, _, _ := resolveFiber(args[0])
 		f := readFiber(path)
