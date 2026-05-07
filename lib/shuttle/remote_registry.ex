@@ -53,6 +53,7 @@ defmodule Shuttle.RemoteRegistry do
   @default_bounce_wait_ms 5_000
   @default_restart_wait_ms 10_000
   @default_backoff_schedule_ms [30_000, 120_000, 600_000, 1_800_000]
+  @registry_read_timeout_ms 30_000
   @ssh_connect_timeout_s 8
 
   defmodule Recovery do
@@ -136,7 +137,7 @@ defmodule Shuttle.RemoteRegistry do
   @spec snapshots(GenServer.server()) :: %{String.t() => map()}
   def snapshots(server) do
     if registry_alive?(server) do
-      GenServer.call(server, :snapshots)
+      GenServer.call(server, :snapshots, @registry_read_timeout_ms)
     else
       %{}
     end
@@ -152,7 +153,7 @@ defmodule Shuttle.RemoteRegistry do
   @spec snapshot(GenServer.server(), String.t()) :: map() | nil
   def snapshot(server, name) do
     if registry_alive?(server) do
-      GenServer.call(server, {:snapshot, name})
+      GenServer.call(server, {:snapshot, name}, @registry_read_timeout_ms)
     else
       nil
     end
@@ -176,7 +177,7 @@ defmodule Shuttle.RemoteRegistry do
   @spec running_fibers(GenServer.server()) :: MapSet.t()
   def running_fibers(server) do
     if registry_alive?(server) do
-      GenServer.call(server, :running_fibers)
+      GenServer.call(server, :running_fibers, @registry_read_timeout_ms)
     else
       MapSet.new()
     end
@@ -193,7 +194,7 @@ defmodule Shuttle.RemoteRegistry do
   @spec origin_for_running(GenServer.server(), String.t()) :: String.t() | nil
   def origin_for_running(server, fiber_id) do
     if registry_alive?(server) do
-      GenServer.call(server, {:origin_for_running, fiber_id})
+      GenServer.call(server, {:origin_for_running, fiber_id}, @registry_read_timeout_ms)
     else
       nil
     end
