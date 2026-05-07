@@ -109,6 +109,11 @@ defmodule Shuttle.Poller do
     GenServer.call(server, :snapshot)
   end
 
+  @spec snapshot(GenServer.server(), non_neg_integer()) :: map()
+  def snapshot(server, timeout_ms) when is_integer(timeout_ms) and timeout_ms >= 0 do
+    GenServer.call(server, :snapshot, timeout_ms)
+  end
+
   # ── Agent-API Client ──
 
   @spec worker_status(String.t()) :: map() | nil
@@ -161,6 +166,11 @@ defmodule Shuttle.Poller do
   @spec orchestrator_state(GenServer.server()) :: map()
   def orchestrator_state(server) do
     GenServer.call(server, :orchestrator_state, @orchestrator_state_call_timeout_ms)
+  end
+
+  @spec orchestrator_state(GenServer.server(), non_neg_integer()) :: map()
+  def orchestrator_state(server, timeout_ms) when is_integer(timeout_ms) and timeout_ms >= 0 do
+    GenServer.call(server, :orchestrator_state, timeout_ms)
   end
 
   @doc """

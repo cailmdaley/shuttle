@@ -539,6 +539,21 @@ defmodule ShuttleWeb.APIControllerTest do
     assert is_list(body["waiters"])
   end
 
+  test "state degrades to JSON when the poller is unavailable" do
+    :sys.suspend(Shuttle.Poller)
+
+    try do
+      conn = get(api_conn(), "/api/v1/state")
+      assert conn.status == 503
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"] == "poller_unavailable"
+      assert is_binary(body["host"])
+      assert is_list(body["running_detail"])
+    after
+      :sys.resume(Shuttle.Poller)
+    end
+  end
+
   # ── GET /api/v1/state/composite ──
 
   test "composite returns local snapshot plus per-origin remote snapshots" do
@@ -598,6 +613,29 @@ defmodule ShuttleWeb.APIControllerTest do
     assert candide["recovery"]["attempt"] == 0
   end
 
+  test "composite degrades remote snapshots when the remote registry is unavailable" do
+    start_supervised!({
+      Shuttle.RemoteRegistry,
+      remotes: [
+        %Shuttle.Remote{name: "candide", url: "http://localhost:4001"}
+      ],
+      tick_interval_ms: 60_000
+    })
+
+    :sys.suspend(Shuttle.RemoteRegistry)
+
+    try do
+      conn = get(api_conn(), "/api/v1/state/composite")
+      assert conn.status == 200
+      body = Jason.decode!(conn.resp_body)
+      assert body["remotes"]["_registry"]["stale"] == true
+      assert body["remotes"]["_registry"]["last_error"] != nil
+      assert body["remotes"]["_registry"]["recovery"]["state"] == "unavailable"
+    after
+      :sys.resume(Shuttle.RemoteRegistry)
+    end
+  end
+
   test "composite degrades gracefully when no RemoteRegistry is running" do
     # No RemoteRegistry started under the default name; controller
     # should still return a valid composite shape.
@@ -607,6 +645,20 @@ defmodule ShuttleWeb.APIControllerTest do
 
     assert is_map(body["local"])
     assert body["remotes"] == %{}
+  end
+
+  test "composite degrades local snapshot when the poller is unavailable" do
+    :sys.suspend(Shuttle.Poller)
+
+    try do
+      conn = get(api_conn(), "/api/v1/state/composite")
+      assert conn.status == 200
+      body = Jason.decode!(conn.resp_body)
+      assert body["local"]["error"] == "poller_unavailable"
+      assert body["remotes"] == %{}
+    after
+      :sys.resume(Shuttle.Poller)
+    end
   end
 
   # ── GET /api/v1/agents ──

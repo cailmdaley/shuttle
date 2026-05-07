@@ -12,14 +12,34 @@ defmodule ShuttleWeb.StateController do
 
   use Phoenix.Controller, formats: [:json]
 
+  @state_timeout_ms 1_500
+
   def show(conn, _params) do
-    state = Shuttle.Poller.orchestrator_state()
-    json(conn, state)
+    case poller_state() do
+      {:ok, state} ->
+        json(conn, state)
+
+      {:error, reason} ->
+        conn
+        |> put_status(:service_unavailable)
+        |> json(%{
+          host: hostname(),
+          error: "poller_unavailable",
+          reason: render_error(reason),
+          eligible: [],
+          blocked: [],
+          retrying: [],
+          running: [],
+          running_detail: [],
+          reservations: [],
+          waiters: []
+        })
+    end
   end
 
   def composite(conn, _params) do
-    local = Shuttle.Poller.snapshot()
-    remotes = Shuttle.RemoteRegistry.snapshots()
+    local = local_snapshot()
+    remotes = remote_snapshots()
 
     body = %{
       local: local,
@@ -38,6 +58,41 @@ defmodule ShuttleWeb.StateController do
   end
 
   defp render_remotes(_), do: %{}
+
+  defp poller_state do
+    {:ok, Shuttle.Poller.orchestrator_state(Shuttle.Poller, @state_timeout_ms)}
+  catch
+    :exit, reason -> {:error, reason}
+  end
+
+  defp local_snapshot do
+    Shuttle.Poller.snapshot(Shuttle.Poller, @state_timeout_ms)
+  catch
+    :exit, reason ->
+      %{
+        host: hostname(),
+        error: "poller_unavailable",
+        reason: render_error(reason),
+        eligible: [],
+        blocked: [],
+        retrying: [],
+        running: []
+      }
+  end
+
+  defp remote_snapshots do
+    Shuttle.RemoteRegistry.snapshots(Shuttle.RemoteRegistry, @state_timeout_ms)
+  catch
+    :exit, reason ->
+      %{
+        "_registry" => %{
+          snapshot: nil,
+          stale: true,
+          last_error: reason,
+          recovery: %{state: :unavailable, attempt: 0, last_error: reason}
+        }
+      }
+  end
 
   defp render_entry(%{} = entry) do
     %{
@@ -70,4 +125,11 @@ defmodule ShuttleWeb.StateController do
   defp render_error(reason) when is_binary(reason), do: reason
   defp render_error(reason) when is_atom(reason), do: to_string(reason)
   defp render_error(reason), do: inspect(reason)
+
+  defp hostname do
+    case :inet.gethostname() do
+      {:ok, name} -> List.to_string(name)
+      _ -> "unknown"
+    end
+  end
 end

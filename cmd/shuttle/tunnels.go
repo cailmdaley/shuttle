@@ -23,6 +23,7 @@ type tunnelTemplateData struct {
 	SSHHost     string
 	LocalPort   int
 	AutoSSHPath string
+	SSHAuthSock string
 	LogPath     string
 	Home        string
 }
@@ -111,6 +112,7 @@ func installTunnels(requested []string) error {
 			SSHHost:     spec.Name,
 			LocalPort:   spec.LocalPort,
 			AutoSSHPath: autosshPath,
+			SSHAuthSock: os.Getenv("SSH_AUTH_SOCK"),
 			LogPath:     logPath,
 			Home:        home,
 		})

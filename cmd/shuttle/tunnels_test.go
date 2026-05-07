@@ -26,9 +26,15 @@ func TestResolveTunnelSpecs_DefaultsAllSorted(t *testing.T) {
 func TestInstallTunnels_WriteOnlyWritesPlist(t *testing.T) {
 	oldPlistDir, oldLogDir := tunnelsPlistDir, tunnelsLogDir
 	oldAutoSSH, oldWriteOnly := tunnelsAutoSSH, tunnelsWriteOnly
+	oldSock := os.Getenv("SSH_AUTH_SOCK")
 	defer func() {
 		tunnelsPlistDir, tunnelsLogDir = oldPlistDir, oldLogDir
 		tunnelsAutoSSH, tunnelsWriteOnly = oldAutoSSH, oldWriteOnly
+		if oldSock == "" {
+			_ = os.Unsetenv("SSH_AUTH_SOCK")
+		} else {
+			_ = os.Setenv("SSH_AUTH_SOCK", oldSock)
+		}
 	}()
 
 	tmp := t.TempDir()
@@ -36,6 +42,7 @@ func TestInstallTunnels_WriteOnlyWritesPlist(t *testing.T) {
 	tunnelsLogDir = filepath.Join(tmp, "logs")
 	tunnelsAutoSSH = "/opt/homebrew/bin/autossh"
 	tunnelsWriteOnly = true
+	_ = os.Setenv("SSH_AUTH_SOCK", filepath.Join(tmp, "agent.sock"))
 
 	if err := installTunnels([]string{"candide"}); err != nil {
 		t.Fatalf("installTunnels(write-only): %v", err)
@@ -50,7 +57,13 @@ func TestInstallTunnels_WriteOnlyWritesPlist(t *testing.T) {
 	for _, want := range []string{
 		"com.cailmdaley.shuttle-tunnel-candide",
 		"/opt/homebrew/bin/autossh",
+		"<string>-S</string>",
+		"<string>none</string>",
 		"4001:localhost:4000",
+		"ControlMaster=no",
+		"ExitOnForwardFailure=yes",
+		"IdentityAgent=" + filepath.Join(tmp, "agent.sock"),
+		"<key>SSH_AUTH_SOCK</key>",
 		filepath.Join(tunnelsLogDir, "tunnel-candide.log"),
 		"<key>NetworkState</key>",
 	} {

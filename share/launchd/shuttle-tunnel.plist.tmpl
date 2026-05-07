@@ -11,10 +11,20 @@
     <string>-N</string>
     <string>-M</string>
     <string>0</string>
+    <string>-S</string>
+    <string>none</string>
     <string>-o</string>
     <string>ServerAliveInterval=30</string>
     <string>-o</string>
     <string>ServerAliveCountMax=3</string>
+    <string>-o</string>
+    <string>ControlMaster=no</string>
+    <string>-o</string>
+    <string>ExitOnForwardFailure=yes</string>
+    {{- if .SSHAuthSock }}
+    <string>-o</string>
+    <string>IdentityAgent={{ .SSHAuthSock }}</string>
+    {{- end }}
     <string>-L</string>
     <string>{{ .LocalPort }}:localhost:4000</string>
     <string>{{ .SSHHost }}</string>
@@ -24,6 +34,10 @@
   <dict>
     <key>AUTOSSH_GATETIME</key>
     <string>0</string>
+    {{- if .SSHAuthSock }}
+    <key>SSH_AUTH_SOCK</key>
+    <string>{{ .SSHAuthSock }}</string>
+    {{- end }}
   </dict>
 
   <key>RunAtLoad</key>

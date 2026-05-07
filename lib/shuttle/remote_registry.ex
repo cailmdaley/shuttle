@@ -136,8 +136,13 @@ defmodule Shuttle.RemoteRegistry do
 
   @spec snapshots(GenServer.server()) :: %{String.t() => map()}
   def snapshots(server) do
+    snapshots(server, @registry_read_timeout_ms)
+  end
+
+  @spec snapshots(GenServer.server(), non_neg_integer()) :: %{String.t() => map()}
+  def snapshots(server, timeout_ms) when is_integer(timeout_ms) and timeout_ms >= 0 do
     if registry_alive?(server) do
-      GenServer.call(server, :snapshots, @registry_read_timeout_ms)
+      GenServer.call(server, :snapshots, timeout_ms)
     else
       %{}
     end
