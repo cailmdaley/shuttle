@@ -4,7 +4,6 @@ Local OTP-supervised dispatcher for felt constitution workers. Polls the felt
 tree, launches one tmux worker per eligible fiber, exposes a snapshot surface
 for dashboards and other consumers.
 
-**Status: Stages 0–6 complete; Stage 7 (BEAM distribution / SSH-drop resilience) in progress.**
 The Elixir daemon is the production dispatcher.
 
 ## Build + lifecycle
