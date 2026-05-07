@@ -290,3 +290,115 @@ func TestStandingInReviewState(t *testing.T) {
 		t.Fatal("standingInReviewState(nil) should be false")
 	}
 }
+
+// TestAcceptCmd_ClearsOutcomeByDefault verifies that accepting a standing-role
+// awaiting-review run clears the outcome field. The next worker dispatched on
+// this fiber will see an empty outcome and write a fresh digest.
+func TestAcceptCmd_ClearsOutcomeByDefault(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "daily-report", `---
+name: Daily report
+status: active
+outcome: |-
+  2026-05-07 11:55 CEST | 8 reviewed | 16 archived | 1 fiber
+
+  ### Action needed
+  - Register on framadate
+shuttle:
+  enabled: true
+  kind: standing
+  schedule:
+    expr: "0 9 * * 1-5"
+    tz: Europe/Paris
+  review:
+    state: awaiting
+    run_id: "20260508T070000+0000"
+---
+
+Standing role body.
+`)
+
+	cmd := newAcceptCmd()
+	cmd.SetArgs([]string{"daily-report"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	text := string(raw)
+
+	// The accept-state ratchet must have advanced.
+	if !strings.Contains(text, "state: scheduled") {
+		t.Fatalf("expected review.state: scheduled:\n%s", text)
+	}
+	if !strings.Contains(text, "accepted_run_id: 20260508T070000+0000") {
+		t.Fatalf("accepted_run_id not set:\n%s", text)
+	}
+
+	// Outcome must be empty (either an empty value or absent).
+	if strings.Contains(text, "Register on framadate") {
+		t.Fatalf("outcome content survived accept:\n%s", text)
+	}
+	if strings.Contains(text, "16 archived") {
+		t.Fatalf("outcome digest survived accept:\n%s", text)
+	}
+
+	// Body must be preserved.
+	if !strings.Contains(text, "Standing role body.") {
+		t.Fatalf("body lost after accept:\n%s", text)
+	}
+}
+
+// TestAcceptCmd_KeepOutcomeFlag_PreservesOutcome verifies that --keep-outcome
+// preserves the outcome field across accept (escape hatch for the rare case
+// where the digest should survive into the next dispatch).
+func TestAcceptCmd_KeepOutcomeFlag_PreservesOutcome(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "daily-report", `---
+name: Daily report
+status: active
+outcome: |-
+  2026-05-07 11:55 CEST | 8 reviewed
+  Worth keeping across the boundary.
+shuttle:
+  enabled: true
+  kind: standing
+  schedule:
+    expr: "0 9 * * 1-5"
+    tz: Europe/Paris
+  review:
+    state: awaiting
+    run_id: "20260508T070000+0000"
+---
+
+Body.
+`)
+
+	cmd := newAcceptCmd()
+	cmd.SetArgs([]string{"daily-report", "--keep-outcome"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	text := string(raw)
+
+	// Accept-state ratchet still advances.
+	if !strings.Contains(text, "state: scheduled") {
+		t.Fatalf("expected review.state: scheduled:\n%s", text)
+	}
+	// Outcome content survives.
+	if !strings.Contains(text, "Worth keeping across the boundary.") {
+		t.Fatalf("--keep-outcome did not preserve outcome:\n%s", text)
+	}
+}

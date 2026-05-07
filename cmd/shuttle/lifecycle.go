@@ -286,71 +286,93 @@ func parseOptionalBool(raw string) (*bool, error) {
 	}
 }
 
-var acceptCmd = &cobra.Command{
-	Use:   "accept <fiber>",
-	Short: "Accept a completed standing-role run and advance the schedule",
-	Long: `Flips shuttle.review.state to accepted/scheduled and advances next_due_at.
+func newAcceptCmd() *cobra.Command {
+	var keepOutcome bool
+
+	cmd := &cobra.Command{
+		Use:   "accept <fiber>",
+		Short: "Accept a completed standing-role run and advance the schedule",
+		Long: `Flips shuttle.review.state to accepted/scheduled and advances next_due_at.
 
 The run_id from the current awaiting run becomes accepted_run_id, review.state
 is reset to scheduled, and next_due_at is advanced to the next occurrence.
 
+Clears the outcome field so the next dispatch starts with a blank slate; the
+worker treats an empty outcome as "previous run was accepted, write fresh" and
+a non-empty outcome as "prior runs unaccepted, append below." Pass
+--keep-outcome to preserve the existing outcome (rare; useful when accepting
+a run whose digest the next worker should still see).
+
 Appends a felt history event recording the acceptance.`,
-	Args: cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		path, fiberID, host := resolveFiber(args[0])
-		f := readFiber(path)
-		if f.Block == nil {
-			return fmt.Errorf("fiber %s has no shuttle: block", args[0])
-		}
-		if f.Block.Kind != "standing" {
-			return fmt.Errorf("accept only applies to standing roles (fiber has kind=%s)", f.Block.Kind)
-		}
-		if f.Block.Review == nil || f.Block.Review.State != "awaiting" {
-			state := ""
-			if f.Block.Review != nil {
-				state = f.Block.Review.State
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path, fiberID, host := resolveFiber(args[0])
+			f := readFiber(path)
+			if f.Block == nil {
+				return fmt.Errorf("fiber %s has no shuttle: block", args[0])
 			}
-			return fmt.Errorf("fiber %s is not awaiting review (state=%q)", args[0], state)
-		}
-		if f.Block.Schedule == nil {
-			return fmt.Errorf("fiber %s has no schedule", args[0])
-		}
+			if f.Block.Kind != "standing" {
+				return fmt.Errorf("accept only applies to standing roles (fiber has kind=%s)", f.Block.Kind)
+			}
+			if f.Block.Review == nil || f.Block.Review.State != "awaiting" {
+				state := ""
+				if f.Block.Review != nil {
+					state = f.Block.Review.State
+				}
+				return fmt.Errorf("fiber %s is not awaiting review (state=%q)", args[0], state)
+			}
+			if f.Block.Schedule == nil {
+				return fmt.Errorf("fiber %s has no schedule", args[0])
+			}
 
-		runID := ""
-		if f.Block.Review.RunID != nil {
-			runID = *f.Block.Review.RunID
-		}
+			runID := ""
+			if f.Block.Review.RunID != nil {
+				runID = *f.Block.Review.RunID
+			}
 
-		// Advance next_due_at from current or now.
-		from := time.Now()
-		if f.Block.NextDueAt != nil {
-			from = *f.Block.NextDueAt
-		}
-		next, err := schema.NextOccurrence(f.Block.Schedule, from)
-		if err != nil {
-			return fmt.Errorf("computing next occurrence: %w", err)
-		}
+			// Advance next_due_at from current or now.
+			from := time.Now()
+			if f.Block.NextDueAt != nil {
+				from = *f.Block.NextDueAt
+			}
+			next, err := schema.NextOccurrence(f.Block.Schedule, from)
+			if err != nil {
+				return fmt.Errorf("computing next occurrence: %w", err)
+			}
 
-		f.Block.Review = &schema.Review{
-			State:         "scheduled",
-			RunID:         schema.StringPtr(runID),
-			AcceptedRunID: schema.StringPtr(runID),
-		}
-		f.Block.NextDueAt = &next
-		f.Block.Enabled = true // ensure re-enabled after review
+			f.Block.Review = &schema.Review{
+				State:         "scheduled",
+				RunID:         schema.StringPtr(runID),
+				AcceptedRunID: schema.StringPtr(runID),
+			}
+			f.Block.NextDueAt = &next
+			f.Block.Enabled = true // ensure re-enabled after review
 
-		if err := f.WriteBlock(f.Block); err != nil {
-			return fmt.Errorf("writing fiber: %w", err)
-		}
+			// Clear outcome unless --keep-outcome. The accepted digest's signal
+			// lives in the felt history event below; outcome is the live-state
+			// surface and should be empty so the next worker writes fresh into it.
+			if !keepOutcome {
+				f.SetOutcome("")
+			}
 
-		// Append felt history event.
-		_ = appendFeltHistory(host, fiberID, fmt.Sprintf("accepted run %s; next due %s", runID, next.Format(time.RFC3339)))
+			if err := f.WriteBlock(f.Block); err != nil {
+				return fmt.Errorf("writing fiber: %w", err)
+			}
 
-		fmt.Printf("accepted run %s for %s\n", runID, args[0])
-		fmt.Printf("  next due: %s\n", next.Format(time.RFC3339))
-		return nil
-	},
+			// Append felt history event.
+			_ = appendFeltHistory(host, fiberID, fmt.Sprintf("accepted run %s; next due %s", runID, next.Format(time.RFC3339)))
+
+			fmt.Printf("accepted run %s for %s\n", runID, args[0])
+			fmt.Printf("  next due: %s\n", next.Format(time.RFC3339))
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVar(&keepOutcome, "keep-outcome", false, "Preserve the existing outcome instead of clearing it for the next dispatch")
+	return cmd
 }
+
+var acceptCmd = newAcceptCmd()
 
 var setModelCmd = &cobra.Command{
 	Use:   "set-model <fiber> <agent>",
