@@ -43,6 +43,7 @@ defmodule Shuttle.Poller do
   @default_max_concurrent_workers 10
   @default_heartbeat_interval_ms 5_000
   @default_stall_timeout_ms 300_000
+  @dispatch_call_timeout_ms 30_000
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   @default_max_retry_backoff_ms 300_000
@@ -123,7 +124,7 @@ defmodule Shuttle.Poller do
   @spec dispatch_fiber(GenServer.server(), String.t(), keyword()) ::
           {:ok, String.t()} | {:error, atom()}
   def dispatch_fiber(server, fiber_id, opts) do
-    GenServer.call(server, {:dispatch, fiber_id, opts})
+    GenServer.call(server, {:dispatch, fiber_id, opts}, @dispatch_call_timeout_ms)
   end
 
   @spec wait_for_tempered(String.t(), non_neg_integer(), keyword()) ::
@@ -313,6 +314,7 @@ defmodule Shuttle.Poller do
   end
 
   def handle_call({:dispatch, fiber_id, opts}, _from, state) do
+    state = reconcile_running_fiber(state, fiber_id)
     session = Dispatcher.session_name(fiber_id)
 
     cond do
@@ -1361,6 +1363,22 @@ defmodule Shuttle.Poller do
   end
 
   # ── Retry ──
+
+  defp reconcile_running_fiber(%State{} = state, fiber_id) do
+    case Map.get(state.running, fiber_id) do
+      nil ->
+        state
+
+      %{session: session} = meta ->
+        if already_running_session?(state, session) do
+          state
+        else
+          Logger.info("Clearing stale running worker: #{fiber_id} session=#{session}")
+          stop_watcher(meta)
+          remove_running(state, fiber_id)
+        end
+    end
+  end
 
   defp handle_retry(%State{} = state, fiber_id, _retry) do
     state = release_claim(state, fiber_id)

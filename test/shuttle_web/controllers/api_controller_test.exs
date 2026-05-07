@@ -29,7 +29,8 @@ defmodule ShuttleWeb.APIControllerTest do
             tmux_sessions: MapSet.new(),
             fibers: %{},
             shuttle: %{},
-            felt_ls: []
+            felt_ls: [],
+            new_session_delay_ms: 0
           }
         end,
         name: __MODULE__
@@ -46,7 +47,8 @@ defmodule ShuttleWeb.APIControllerTest do
           tmux_sessions: MapSet.new(),
           fibers: %{},
           shuttle: %{},
-          felt_ls: []
+          felt_ls: [],
+          new_session_delay_ms: 0
         }
       end)
     end
@@ -97,6 +99,9 @@ defmodule ShuttleWeb.APIControllerTest do
     def remove_tmux_session(session),
       do:
         Agent.update(__MODULE__, &%{&1 | tmux_sessions: MapSet.delete(&1.tmux_sessions, session)})
+
+    def set_new_session_delay(ms),
+      do: Agent.update(__MODULE__, &Map.put(&1, :new_session_delay_ms, ms))
 
     def commands, do: Agent.get(__MODULE__, & &1.commands)
 
@@ -159,6 +164,8 @@ defmodule ShuttleWeb.APIControllerTest do
         command == "tmux" and hd(args) == "new-session" ->
           session = Enum.at(args, 3)
           add_tmux_session(session)
+          delay_ms = Agent.get(__MODULE__, &Map.get(&1, :new_session_delay_ms, 0))
+          if delay_ms > 0, do: Process.sleep(delay_ms)
           {"", 0}
 
         command == "tmux" and hd(args) == "kill-session" ->
@@ -290,6 +297,59 @@ defmodule ShuttleWeb.APIControllerTest do
     body = Jason.decode!(conn.resp_body)
     assert body["dispatched"] == false
     assert body["reason"] == "already_running"
+  end
+
+  test "dispatch clears stale in-memory running state when tmux session is gone" do
+    fiber_id = "tests/api-stale-running"
+    fiber = make_fiber(fiber_id)
+    MockRunner.set_fiber(fiber_id, fiber)
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+
+    assert {:ok, session} = Poller.dispatch_fiber(fiber_id, [])
+    MockRunner.remove_tmux_session(session)
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/dispatch",
+        Jason.encode!(%{
+          "fiber_id" => fiber_id
+        })
+      )
+
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+    assert body["dispatched"] == true
+    assert body["fiber_id"] == fiber_id
+    assert body["tmux_session"] == session
+  end
+
+  test "dispatch returns 200 for slow successful dispatches past the default call timeout" do
+    fiber_id = "tests/api-slow-dispatch"
+    fiber = make_fiber(fiber_id)
+    MockRunner.set_fiber(fiber_id, fiber)
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+    MockRunner.set_new_session_delay(5_250)
+
+    started_at_ms = System.monotonic_time(:millisecond)
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/dispatch",
+        Jason.encode!(%{
+          "fiber_id" => fiber_id
+        })
+      )
+
+    elapsed_ms = System.monotonic_time(:millisecond) - started_at_ms
+
+    assert elapsed_ms >= 5_000
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+    assert body["dispatched"] == true
+    assert body["fiber_id"] == fiber_id
+    assert body["tmux_session"] == Dispatcher.session_name(fiber_id)
   end
 
   test "dispatch returns 400 without fiber_id" do

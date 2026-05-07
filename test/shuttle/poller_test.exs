@@ -19,7 +19,8 @@ defmodule Shuttle.PollerTest do
             tmux_sessions: MapSet.new(),
             fibers: %{},
             shuttle: %{},
-            felt_ls: []
+            felt_ls: [],
+            new_session_delay_ms: 0
           }
         end,
         name: __MODULE__
@@ -36,7 +37,8 @@ defmodule Shuttle.PollerTest do
           tmux_sessions: MapSet.new(),
           fibers: %{},
           shuttle: %{},
-          felt_ls: []
+          felt_ls: [],
+          new_session_delay_ms: 0
         }
       end)
     end
@@ -92,6 +94,9 @@ defmodule Shuttle.PollerTest do
     def remove_tmux_session(session),
       do:
         Agent.update(__MODULE__, &%{&1 | tmux_sessions: MapSet.delete(&1.tmux_sessions, session)})
+
+    def set_new_session_delay(ms),
+      do: Agent.update(__MODULE__, &Map.put(&1, :new_session_delay_ms, ms))
 
     def commands, do: Agent.get(__MODULE__, & &1.commands)
 
@@ -158,6 +163,8 @@ defmodule Shuttle.PollerTest do
         command == "tmux" and hd(args) == "new-session" ->
           session = Enum.at(args, 3)
           add_tmux_session(session)
+          delay_ms = Agent.get(__MODULE__, &Map.get(&1, :new_session_delay_ms, 0))
+          if delay_ms > 0, do: Process.sleep(delay_ms)
           {"", 0}
 
         command == "tmux" and hd(args) == "kill-session" ->
@@ -842,6 +849,31 @@ defmodule Shuttle.PollerTest do
 
     snap = Poller.snapshot(poller)
     assert Enum.any?(snap.eligible, &(&1.fiber_id == fiber_id))
+  end
+
+  test "dispatch_fiber waits past the default GenServer timeout for slow successful dispatches" do
+    fiber_id = "tests/slow-api-dispatch"
+    fiber = make_fiber(fiber_id)
+    MockRunner.set_fiber(fiber_id, fiber)
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+    MockRunner.set_new_session_delay(5_250)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_slow_dispatch,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_hosts: ["/tmp"]
+      )
+
+    started_at_ms = System.monotonic_time(:millisecond)
+
+    assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, [])
+
+    elapsed_ms = System.monotonic_time(:millisecond) - started_at_ms
+    assert elapsed_ms >= 5_000
+    assert session == Dispatcher.session_name(fiber_id)
+    assert Poller.snapshot(poller).eligible |> Enum.any?(&(&1.fiber_id == fiber_id))
   end
 
   # ── Multi-host tests ──
