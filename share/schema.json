@@ -45,12 +45,12 @@
     },
     "review": {
       "type": "object",
-      "description": "Review state. Daemon-managed for most transitions; CLI writes accepted/aborted states.",
+      "description": "Persisted per-run review state for standing roles. Runtime-only states such as due/running come from daemon snapshots, not frontmatter.",
       "properties": {
         "state": {
           "type": "string",
-          "enum": ["scheduled", "running", "awaiting", "accepted", "aborted"],
-          "description": "Current review state. scheduled→running (daemon), running→awaiting (daemon after run), awaiting→accepted (CLI accept), awaiting→aborted (CLI abort), accepted→scheduled (CLI accept, via next_due_at advance)."
+          "enum": ["scheduled", "awaiting", "accepted"],
+          "description": "Canonical persisted review state. scheduled means dispatchable when next_due_at is due; awaiting means a completed run needs human review; accepted records the most recently accepted run before the role returns to scheduled."
         },
         "run_id": {
           "type": ["string", "null"],
@@ -93,7 +93,9 @@
     }
   ],
   "notes": {
-    "writer_ownership": "CLI owns: enabled, kind, agent, schedule, review.state (accepted/aborted transitions only), review.accepted_run_id, next_due_at (initial and scheduled-run accept advance). Daemon owns: review.state (scheduled/running/awaiting transitions), review.run_id, last_run_at, enabled (false flip after oneshot run). Ad-hoc standing runs preserve next_due_at.",
+    "writer_ownership": "CLI owns: enabled, kind, agent, schedule, review.state (scheduled/accepted transitions), review.accepted_run_id, next_due_at (initial and scheduled-run accept advance). Daemon/workers own: review.state=awaiting at run completion, review.run_id, last_run_at, enabled (false flip after oneshot run). Ad-hoc standing runs preserve next_due_at.",
+    "derived_states": "due and running are snapshot/view states derived from next_due_at and live worker state. They are not persisted review.state values.",
+    "legacy_review_aliases": "Older fibers may carry review.state=review or in_review for awaiting. Readers should normalize them when possible; new writers must use awaiting.",
     "schema_tz_migration": "Pre-CLI standing roles used schedule.timezone. Migration renames to schedule.tz. The Elixir daemon reads tz after migration.",
     "kind_migration": "Pre-CLI standing roles used shuttle.mode instead of shuttle.kind. Migration renames to kind."
   }

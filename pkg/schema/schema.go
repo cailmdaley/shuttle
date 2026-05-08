@@ -143,8 +143,10 @@ func (b *Block) UnmarshalJSON(data []byte) error {
 // ValidKinds enumerates the allowed kind values.
 var ValidKinds = []string{"oneshot", "standing"}
 
-// ValidReviewStates enumerates the allowed review.state values.
-var ValidReviewStates = []string{"scheduled", "running", "awaiting", "accepted"}
+// ValidReviewStates enumerates canonical persisted review.state values.
+// Runtime states such as "due" and "running" are derived by the daemon
+// snapshot and must not be written to frontmatter.
+var ValidReviewStates = []string{"scheduled", "awaiting", "accepted"}
 
 // ---- Validation ------------------------------------------------------------
 

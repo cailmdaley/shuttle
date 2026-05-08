@@ -18,6 +18,11 @@ defmodule Shuttle.StandingRole do
     validation_errors: []
   ]
 
+  @canonical_review_states ~w(scheduled awaiting accepted)
+  @awaiting_review_states ~w(awaiting review in_review)
+  @scheduleable_review_states ~w(scheduled accepted)
+  @legacy_review_states ~w(review in_review)
+
   @type t :: %__MODULE__{
           fiber_id: String.t(),
           mode: String.t() | nil,
@@ -54,7 +59,7 @@ defmodule Shuttle.StandingRole do
 
     cond do
       running? -> "running"
-      review_state in ["awaiting", "review", "in_review"] -> "review"
+      review_state in @awaiting_review_states -> "review"
       review_state == "accepted" -> "accepted"
       due?(role, now) -> "due"
       true -> "scheduled"
@@ -66,7 +71,7 @@ defmodule Shuttle.StandingRole do
         %__MODULE__{next_due_at: %DateTime{} = next_due_at, review: review} = role,
         %DateTime{} = now
       ) do
-    valid?(role) and (review["state"] || "scheduled") in ["scheduled", "accepted", "due"] and
+    valid?(role) and (review["state"] || "scheduled") in @scheduleable_review_states and
       DateTime.compare(next_due_at, now) != :gt
   end
 
@@ -124,7 +129,7 @@ defmodule Shuttle.StandingRole do
   defp validate_review_state(%__MODULE__{review: review}) do
     state = review["state"] || "scheduled"
 
-    if state in ["scheduled", "accepted", "awaiting", "review", "in_review", "due"] do
+    if state in @canonical_review_states or state in @legacy_review_states do
       nil
     else
       "unsupported review state #{inspect(state)}"
@@ -135,10 +140,10 @@ defmodule Shuttle.StandingRole do
     state = review["state"] || "scheduled"
 
     cond do
-      state in ["scheduled", "accepted", "due"] and is_nil(next_due_at) ->
+      state in @scheduleable_review_states and is_nil(next_due_at) ->
         "scheduleable state #{state} requires next_due_at"
 
-      state in ["awaiting", "review", "in_review"] and not is_nil(next_due_at) and
+      state in @awaiting_review_states and not is_nil(next_due_at) and
           not ad_hoc_run_id?(string(review["run_id"])) ->
         "review state #{state} must clear next_due_at"
 
@@ -159,7 +164,7 @@ defmodule Shuttle.StandingRole do
       state == "accepted" and accepted_run_id != run_id ->
         "accepted_run_id must match run_id in accepted review state"
 
-      state in ["awaiting", "review", "in_review"] and (is_nil(run_id) or run_id == "") ->
+      state in @awaiting_review_states and (is_nil(run_id) or run_id == "") ->
         "review state requires run_id"
 
       true ->
