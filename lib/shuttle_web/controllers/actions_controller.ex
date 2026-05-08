@@ -120,9 +120,8 @@ defmodule ShuttleWeb.ActionsController do
   defp fetch_fiber(fiber_id) do
     FeltStores.configured_hosts()
     |> Enum.find_value(fn host ->
-      with true <- exact_fiber_exists?(host, fiber_id),
-           {:ok, output} <- run_felt(host, ["show", fiber_id, "--json"]),
-           {:ok, fiber} <- Jason.decode(output) do
+      with {:ok, path} <- exact_fiber_path(host, fiber_id),
+           {:ok, fiber} <- read_fiber_frontmatter(path, fiber_id) do
         {:ok, fiber}
       else
         _ -> nil
@@ -134,15 +133,40 @@ defmodule ShuttleWeb.ActionsController do
     end
   end
 
-  defp exact_fiber_exists?(host, fiber_id) do
+  defp exact_fiber_path(host, fiber_id) do
     segments = String.split(fiber_id, "/")
     basename = List.last(segments)
     felt_dir = Path.join(host, ".felt")
     bare_path = Path.join(felt_dir, "#{basename}.md")
     dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
 
-    (not String.contains?(fiber_id, "/") and File.exists?(bare_path)) or File.exists?(dir_path)
+    cond do
+      not String.contains?(fiber_id, "/") and File.exists?(bare_path) -> {:ok, bare_path}
+      File.exists?(dir_path) -> {:ok, dir_path}
+      true -> {:error, :not_found}
+    end
   end
+
+  defp read_fiber_frontmatter(path, fiber_id) do
+    with {:ok, text} <- File.read(path),
+         {:ok, frontmatter} <- split_frontmatter(text),
+         {:ok, fiber} <- YamlElixir.read_from_string(frontmatter) do
+      {:ok, Map.put(fiber || %{}, "id", fiber_id)}
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :invalid_frontmatter}
+    end
+  end
+
+  defp split_frontmatter("---\n" <> rest) do
+    case :binary.split(rest, "\n---", [:global]) do
+      [frontmatter, _body] -> {:ok, frontmatter}
+      [frontmatter, _separator_tail | _] -> {:ok, frontmatter}
+      _ -> {:error, :missing_frontmatter}
+    end
+  end
+
+  defp split_frontmatter(_), do: {:error, :missing_frontmatter}
 
   defp running?(fiber_id) do
     case System.cmd("tmux", ["has-session", "-t", "=" <> Dispatcher.session_name(fiber_id)],
@@ -153,15 +177,6 @@ defmodule ShuttleWeb.ActionsController do
     end
   rescue
     _ -> false
-  end
-
-  defp run_felt(host, args) do
-    case System.cmd("felt", ["-C", host | args], stderr_to_stdout: true) do
-      {output, 0} -> {:ok, output}
-      {output, _} -> {:error, output}
-    end
-  rescue
-    e in ErlangError -> {:error, Exception.message(e)}
   end
 
   defp invoke_action(fiber_id, "pause"), do: run(["pause", fiber_id])
