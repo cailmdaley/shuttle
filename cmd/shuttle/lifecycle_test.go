@@ -531,6 +531,63 @@ Standing role body.
 	}
 }
 
+// TestAcceptCmd_ClearsSessionUUID verifies that accept clears the session
+// block, so any subsequent dispatch (next cron tick, manual ad-hoc, kanban
+// drag) starts a fresh worker rather than resuming the just-accepted run's
+// transcript. Resuming would land the worker in a transcript whose last
+// turn was "Run accepted. Exiting" — they'd idle ("nothing new on the
+// fiber") instead of running fresh. After accept, the cycle has rolled over.
+func TestAcceptCmd_ClearsSessionUUID(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "daily-report", `---
+name: Daily report
+status: active
+outcome: digest
+shuttle:
+  enabled: true
+  kind: standing
+  schedule:
+    expr: "0 9 * * 1-5"
+    tz: Europe/Paris
+  review:
+    state: awaiting
+    run_id: "20260508T070000+0000"
+  session:
+    id: 11111111-2222-3333-4444-555555555555
+    agent: claude-opus
+    dispatched_at: 2026-05-08T07:00:00Z
+---
+
+Standing role body.
+`)
+
+	cmd := newAcceptCmd()
+	cmd.SetArgs([]string{"daily-report"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	text := string(raw)
+
+	// State must have advanced.
+	if !strings.Contains(text, "state: scheduled") {
+		t.Fatalf("expected review.state: scheduled:\n%s", text)
+	}
+	// The session uuid must not survive — it's the trigger for stale-resume.
+	if strings.Contains(text, "11111111-2222-3333-4444-555555555555") {
+		t.Fatalf("session UUID survived accept; next dispatch may resume stale transcript:\n%s", text)
+	}
+	if strings.Contains(text, "session:") {
+		t.Fatalf("session block survived accept:\n%s", text)
+	}
+}
+
 // TestAcceptCmd_KeepOutcomeFlag_PreservesOutcome verifies that --keep-outcome
 // preserves the outcome field across accept (escape hatch for the rare case
 // where the digest should survive into the next dispatch).

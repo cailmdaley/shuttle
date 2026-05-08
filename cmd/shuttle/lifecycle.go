@@ -396,6 +396,18 @@ Appends a felt history event recording the acceptance.`,
 			f.Block.NextDueAt = next
 			f.Block.Enabled = true // ensure re-enabled after review
 
+			// Clear the session block. The run we just accepted is finalized;
+			// the session UUID was a handle for resuming THAT run, and any
+			// subsequent dispatch (next cron tick, manual ad-hoc, kanban drag)
+			// is a NEW run that should start fresh. Leaving session.id set
+			// would let check_resume_intent/3 latch onto a stale UUID if a
+			// prior review-comment carried `resume_mode: previous`, landing
+			// the worker in a transcript whose last assistant turn was
+			// "Run accepted. Exiting" — they'd idle ("nothing new on the
+			// fiber") instead of running fresh. After accept, the cycle has
+			// rolled over.
+			f.Block.Session = nil
+
 			// Clear outcome unless --keep-outcome. The accepted digest's signal
 			// lives in the felt history event below; outcome is the live-state
 			// surface and should be empty so the next worker writes fresh into it.
