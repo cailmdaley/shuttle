@@ -118,7 +118,10 @@ defmodule Shuttle.Dispatcher do
          ) do
       [event | _] ->
         resume_mode = get_in(event, ["payload", "resume_mode"])
-        session_id = get_in(fiber, ["shuttle", "session", "id"])
+
+        session_id =
+          get_in(fiber, ["shuttle", "session", "id"]) ||
+            latest_history_session_id(fiber_id, felt_store: felt_store)
 
         if resume_mode == "previous" and is_binary(session_id) and session_id != "" do
           {:previous, session_id}
@@ -372,6 +375,26 @@ defmodule Shuttle.Dispatcher do
         []
     end
   end
+
+  defp latest_history_session_id(fiber_id, opts) do
+    fiber_id
+    |> query_history(["--last", "20", "--json"], opts)
+    |> Enum.find_value(fn event ->
+      event
+      |> get_in(["payload", "text"])
+      |> extract_session_id()
+    end)
+  end
+
+  defp extract_session_id(text) when is_binary(text) do
+    case Regex.run(~r/(?:^|\s)session=([A-Za-z0-9._:-]+)/, text) do
+      [_, "<unknown>"] -> nil
+      [_, session_id] -> session_id
+      _ -> nil
+    end
+  end
+
+  defp extract_session_id(_), do: nil
 
   # Indent every line of `text` by `prefix`. Used to inset event summaries
   # under the box header so multi-line directives stay visually grouped.

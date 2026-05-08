@@ -320,6 +320,45 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert script =~ "Fiber: tests/kanban-resume"
   end
 
+  test "kanban resume uses worker-exit history session when frontmatter session was cleared", %{
+    host: host
+  } do
+    write_fiber(host, "tests/kanban-history-resume", """
+    ---
+    name: Kanban history resume fiber
+    status: active
+    tags:
+      - constitution
+    shuttle:
+      enabled: true
+      kind: oneshot
+      agent: codex
+    ---
+    A codex fiber whose live session block has been cleared.
+    """)
+
+    append_worker_exit(host, "tests/kanban-history-resume",
+      agent: "codex",
+      session: "40740310-2345-4e33-a1e4-7950db41ce10"
+    )
+
+    append_review_comment(host, "tests/kanban-history-resume",
+      summary: "Continue from history",
+      resume_mode: "previous"
+    )
+
+    assert {:ok, _} =
+             Dispatcher.dispatch("tests/kanban-history-resume",
+               runner: IntegrationRunner,
+               felt_store: host
+             )
+
+    script = read_run_script()
+    assert script =~ "codex"
+    assert script =~ "resume '40740310-2345-4e33-a1e4-7950db41ce10'"
+    assert script =~ "Shuttle resumed your previous session"
+  end
+
   # Resume mode requested but no session UUID: falls back to fresh cleanly.
   test "resume mode requested but no session UUID falls back to fresh", %{host: host} do
     write_fiber(host, "tests/resume-no-uuid", """
@@ -530,6 +569,19 @@ defmodule Shuttle.DispatchIntegrationTest do
         if(resume_mode, do: ["--field", "resume_mode=#{resume_mode}"], else: [])
 
     {out, code} = System.cmd("felt", args, stderr_to_stdout: true)
+    if code != 0, do: raise("felt history append failed (#{code}): #{out}")
+  end
+
+  defp append_worker_exit(host, id, opts) do
+    agent = Keyword.fetch!(opts, :agent)
+    session = Keyword.fetch!(opts, :session)
+    summary = "worker exited (:normal_exit); agent=#{agent} session=#{session}"
+
+    {out, code} =
+      System.cmd("felt", ["-C", host, "history", "append", id, "-m", summary],
+        stderr_to_stdout: true
+      )
+
     if code != 0, do: raise("felt history append failed (#{code}): #{out}")
   end
 

@@ -1824,7 +1824,7 @@ defmodule Shuttle.Poller do
         if StandingRole.standing?(role) do
           now = DateTime.utc_now()
 
-          if Keyword.get(opts, :ad_hoc, false) or Keyword.get(opts, :force, false) do
+          if Keyword.get(opts, :ad_hoc, false) do
             {:standing_run, StandingRole.ad_hoc_run_id(now), :ad_hoc}
           else
             {:standing_run, StandingRole.next_run_id(role, now)}

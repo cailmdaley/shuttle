@@ -471,7 +471,7 @@ defmodule Shuttle.PollerTest do
              Poller.snapshot(poller).standing_roles
   end
 
-  test "direct dispatch creates an ad-hoc standing run before the schedule is due" do
+  test "direct ad-hoc dispatch creates an ad-hoc standing run before the schedule is due" do
     fiber_id = "tests/standing-force-now"
     fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
     MockRunner.set_fiber(fiber_id, fiber)
@@ -500,7 +500,7 @@ defmodule Shuttle.PollerTest do
       )
 
     assert {:error, :not_eligible} = Poller.dispatch_fiber(poller, fiber_id, [])
-    assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, force: true)
+    assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, force: true, ad_hoc: true)
     assert session == Dispatcher.session_name(fiber_id)
 
     assert [%{fiber_id: ^fiber_id, state: "running", run_id: run_id}] =
@@ -521,6 +521,43 @@ defmodule Shuttle.PollerTest do
       |> length()
 
     assert new_session_count == 1
+  end
+
+  test "forced non-ad-hoc standing dispatch keeps scheduled run context for resume" do
+    fiber_id = "tests/standing-force-scheduled"
+    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
+    MockRunner.set_fiber(fiber_id, fiber)
+
+    MockRunner.set_shuttle(
+      fiber_id,
+      """
+      enabled: true
+      kind: standing
+      agent: claude-sonnet
+      schedule:
+        expr: "0 9 * * 1-5"
+        tz: Europe/Paris
+      review:
+        state: scheduled
+      next_due_at: "2999-01-01T09:00:00+01:00"
+      """
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_standing_force_scheduled,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    assert {:ok, _session} = Poller.dispatch_fiber(poller, fiber_id, force: true)
+
+    assert [%{fiber_id: ^fiber_id, state: "running", run_id: run_id}] =
+             Poller.snapshot(poller).eligible
+
+    refute String.starts_with?(run_id, "adhoc-")
+    assert String.starts_with?(run_id, "29990101T080000")
   end
 
   test "poller dispatches a due standing role with run context and does not hot-loop after exit" do
