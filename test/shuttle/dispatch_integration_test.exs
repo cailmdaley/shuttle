@@ -4,7 +4,7 @@ defmodule Shuttle.DispatchIntegrationTest do
   alias Shuttle.Dispatcher
 
   # ── Integration Runner ─────────────────────────────────────────────────────
-  # Passes `felt` commands to the real felt CLI (with -C felt_host).
+  # Passes `felt` commands to the real felt CLI (with -C felt_store).
   # Intercepts `tmux` calls with an in-memory session set.
   # Named Agent so it can be injected as a module reference into Dispatcher.
 
@@ -15,20 +15,19 @@ defmodule Shuttle.DispatchIntegrationTest do
 
     def start_link(_ \\ []) do
       Agent.start_link(
-        fn -> %{felt_host: "", commands: [], tmux_sessions: MapSet.new()} end,
+        fn -> %{felt_store: "", commands: [], tmux_sessions: MapSet.new()} end,
         name: __MODULE__
       )
     end
 
-    def reset(felt_host) do
+    def reset(felt_store) do
       Agent.update(__MODULE__, fn _ ->
-        %{felt_host: felt_host, commands: [], tmux_sessions: MapSet.new()}
+        %{felt_store: felt_store, commands: [], tmux_sessions: MapSet.new()}
       end)
     end
 
     def add_tmux_session(session),
-      do:
-        Agent.update(__MODULE__, &%{&1 | tmux_sessions: MapSet.put(&1.tmux_sessions, session)})
+      do: Agent.update(__MODULE__, &%{&1 | tmux_sessions: MapSet.put(&1.tmux_sessions, session)})
 
     def remove_tmux_session(session),
       do:
@@ -39,15 +38,15 @@ defmodule Shuttle.DispatchIntegrationTest do
 
     @impl true
     def cmd("felt", args, opts) do
-      felt_host = Agent.get(__MODULE__, & &1.felt_host)
+      felt_store = Agent.get(__MODULE__, & &1.felt_store)
 
       Agent.update(__MODULE__, fn s ->
         %{s | commands: s.commands ++ [{"felt", args}]}
       end)
 
-      # Always use -C felt_host so the real felt finds our temp directory,
+      # Always use -C felt_store so the real felt finds our temp directory,
       # regardless of working directory. Drop :cd — redundant when -C is set.
-      System.cmd("felt", ["-C", felt_host | args], Keyword.drop(opts, [:cd]))
+      System.cmd("felt", ["-C", felt_store | args], Keyword.drop(opts, [:cd]))
     end
 
     def cmd("tmux", ["has-session", "-t", session], _opts) do
@@ -84,7 +83,7 @@ defmodule Shuttle.DispatchIntegrationTest do
 
   setup do
     start_supervised!(IntegrationRunner)
-    host = mk_tmp_felt_host()
+    host = mk_tmp_felt_store()
     IntegrationRunner.reset(host)
     on_exit(fn -> File.rm_rf!(host) end)
     {:ok, host: host}
@@ -113,7 +112,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert {:ok, "shuttle-tests/fresh-oneshot"} =
              Dispatcher.dispatch("tests/fresh-oneshot",
                runner: IntegrationRunner,
-               felt_host: host
+               felt_store: host
              )
 
     script = read_run_script()
@@ -150,7 +149,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert {:error, :closed} =
              Dispatcher.dispatch("tests/closed-fiber",
                runner: IntegrationRunner,
-               felt_host: host
+               felt_store: host
              )
 
     # No tmux invocation.
@@ -179,7 +178,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert {:error, :already_running} =
              Dispatcher.dispatch("tests/running-fiber",
                runner: IntegrationRunner,
-               felt_host: host
+               felt_store: host
              )
   end
 
@@ -188,7 +187,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert {:error, :not_found} =
              Dispatcher.dispatch("tests/does-not-exist",
                runner: IntegrationRunner,
-               felt_host: host
+               felt_store: host
              )
   end
 
@@ -228,7 +227,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert {:ok, _} =
              Dispatcher.dispatch("tests/cli-resume-no-event",
                runner: IntegrationRunner,
-               felt_host: host
+               felt_store: host
              )
 
     script = read_run_script()
@@ -268,7 +267,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert {:ok, _} =
              Dispatcher.dispatch("tests/cli-resume-fixed",
                runner: IntegrationRunner,
-               felt_host: host
+               felt_store: host
              )
 
     script = read_run_script()
@@ -308,7 +307,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert {:ok, _} =
              Dispatcher.dispatch("tests/kanban-resume",
                runner: IntegrationRunner,
-               felt_host: host
+               felt_store: host
              )
 
     script = read_run_script()
@@ -346,7 +345,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert {:ok, _} =
              Dispatcher.dispatch("tests/resume-no-uuid",
                runner: IntegrationRunner,
-               felt_host: host
+               felt_store: host
              )
 
     script = read_run_script()
@@ -384,7 +383,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert {:ok, _} =
              Dispatcher.dispatch("tests/resume-mode-fresh",
                runner: IntegrationRunner,
-               felt_host: host
+               felt_store: host
              )
 
     script = read_run_script()
@@ -420,7 +419,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert {:ok, _} =
              Dispatcher.dispatch("tests/standing-dispatch",
                runner: IntegrationRunner,
-               felt_host: host,
+               felt_store: host,
                prompt_context: {:standing_run, "run-2026-05-07"}
              )
 
@@ -462,7 +461,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert {:ok, _} =
              Dispatcher.dispatch("tests/user-message",
                runner: IntegrationRunner,
-               felt_host: host
+               felt_store: host
              )
 
     script = read_run_script()
@@ -491,7 +490,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert {:ok, _} =
              Dispatcher.dispatch("tests/no-review-comment",
                runner: IntegrationRunner,
-               felt_host: host
+               felt_store: host
              )
 
     script = read_run_script()
@@ -502,7 +501,7 @@ defmodule Shuttle.DispatchIntegrationTest do
 
   # Mirror of Go lifecycle_test.go's withTempHost: creates a temp directory
   # with a .felt/ subdirectory so `felt -C <host> show <id>` can find fibers.
-  defp mk_tmp_felt_host do
+  defp mk_tmp_felt_store do
     host =
       Path.join(System.tmp_dir!(), "shuttle-inttest-#{System.unique_integer([:positive])}")
 
@@ -522,7 +521,7 @@ defmodule Shuttle.DispatchIntegrationTest do
 
   # Appends a review-comment event to the fiber's felt history so that
   # check_resume_intent/3 and render_user_message_block/2 can read it.
-  defp append_review_comment(host, id, opts \\ []) do
+  defp append_review_comment(host, id, opts) do
     summary = Keyword.get(opts, :summary, "Requeued")
     resume_mode = Keyword.get(opts, :resume_mode)
 

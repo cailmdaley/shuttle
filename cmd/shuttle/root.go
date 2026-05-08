@@ -72,12 +72,12 @@ func loadAgents() *schema.AgentRegistry {
 func resolveFiber(idOrQuery string) (string, string, string) {
 	host := feltHostFlag
 	if host == "" {
-		defaultHost, err := schema.FeltHost()
+		defaultStore, err := schema.FeltStore()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "shuttle: %v\n", err)
 			os.Exit(1)
 		}
-		host = defaultHost
+		host = defaultStore
 	}
 
 	ref, err := schema.ResolveFiberInHost(host, idOrQuery)

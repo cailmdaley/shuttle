@@ -100,13 +100,13 @@ shuttle-ctl migrate --dry-run                 # preview eligibility migration
 ## How dispatch works
 
 - **Poller** (`lib/shuttle/poller.ex`) owns the tick. It walks each
-  configured felt host, pulls candidate metadata via `felt ls --json` and
+  configured felt store, pulls candidate metadata via `felt ls --json` and
   per-fiber detail via `felt show -j`, and considers a fiber eligible iff
   `shuttle.enabled: true` AND `status in ["open", "active"]` AND not
   already running AND deps satisfied.
-- **Configured hosts** come from `LOOM_HOMES` (comma-separated env var) →
-  persisted `~/.shuttle/felt_hosts.json` → `LOOM_HOME` → `~/loom`.
-  `POST /api/v1/felt-hosts` rewrites the persisted file.
+- **Configured stores** come from `LOOM_HOMES` (comma-separated env var) →
+  persisted `~/.shuttle/felt_stores.json` → `LOOM_HOME` → `~/loom`.
+  `POST /api/v1/felt-stores` rewrites the persisted file.
 - **Dispatcher** (`lib/shuttle/dispatcher.ex`) resolves the agent via
   `Shuttle.Agents.resolve_by_name/1` against the embedded registry, spawns
   `shuttle-<fiber-id>` tmux session.

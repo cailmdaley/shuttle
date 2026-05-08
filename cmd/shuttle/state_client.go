@@ -43,7 +43,7 @@ func daemonURL() string {
 // surface them later without changing the wire format.
 type SnapshotEntry struct {
 	FiberID        string `json:"fiber_id"`
-	FeltHost       string `json:"felt_host,omitempty"`
+	FeltStore      string `json:"felt_store,omitempty"`
 	TmuxSession    string `json:"tmux_session,omitempty"`
 	Agent          string `json:"agent,omitempty"`
 	State          string `json:"state,omitempty"`
@@ -80,7 +80,7 @@ type RetryEntry struct {
 type Snapshot struct {
 	PollAt        int64               `json:"poll_at,omitempty"`
 	Host          string              `json:"host,omitempty"`
-	FeltHosts     []string            `json:"felt_hosts,omitempty"`
+	FeltStores    []string            `json:"felt_stores,omitempty"`
 	Eligible      []SnapshotEntry     `json:"eligible,omitempty"`
 	Retrying      []RetryEntry        `json:"retrying,omitempty"`
 	StandingRoles []StandingRoleEntry `json:"standing_roles,omitempty"`

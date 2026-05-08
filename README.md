@@ -71,11 +71,11 @@ Add `~/go/bin` (or wherever `$(GOPATH)/bin` points) to your `PATH` so `shuttle-c
 Shuttle defaults to `LOOM_HOME` or `~/loom` as the felt store. Override with:
 
 ```bash
-# Environment variable (takes precedence, comma-separated for multiple hosts):
+# Environment variable (takes precedence, comma-separated for multiple stores):
 export LOOM_HOMES=~/loom,~/other-project
 
 # Persistent registration (written through the HTTP API, survives restarts):
-# POST /api/v1/felt-hosts with {"felt_hosts": ["/absolute/path/to/host"]}
+# POST /api/v1/felt-stores with {"felt_stores": ["/absolute/path/to/store"]}
 ```
 
 ## Running

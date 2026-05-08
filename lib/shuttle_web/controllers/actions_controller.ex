@@ -5,12 +5,12 @@ defmodule ShuttleWeb.ActionsController do
 
   use Phoenix.Controller, formats: [:json]
 
-  @timeout_ms 15_000
+  alias Shuttle.{Actions, Dispatcher, FeltStores}
 
   def show(conn, %{"fiber_id" => parts}) do
     fiber_id = Path.join(parts)
 
-    case Shuttle.Poller.actions_for(Shuttle.Poller, fiber_id, [], @timeout_ms) do
+    case actions_for(fiber_id) do
       {:ok, actions} ->
         json(conn, %{fiber_id: fiber_id, actions: actions})
 
@@ -20,7 +20,7 @@ defmodule ShuttleWeb.ActionsController do
   end
 
   def resolve(conn, %{"fiber_id" => fiber_id, "target" => target}) do
-    case Shuttle.Poller.resolve_action(Shuttle.Poller, fiber_id, target, [], @timeout_ms) do
+    case resolve_action(fiber_id, target) do
       {:ok, action} ->
         json(conn, %{fiber_id: fiber_id, target: target, action: action})
 
@@ -88,11 +88,11 @@ defmodule ShuttleWeb.ActionsController do
   end
 
   defp validate_action(action) do
-    if Shuttle.Actions.known_action?(action), do: :ok, else: {:error, :unknown_action}
+    if Actions.known_action?(action), do: :ok, else: {:error, :unknown_action}
   end
 
   defp validate_available(fiber_id, action) do
-    case Shuttle.Poller.actions_for(Shuttle.Poller, fiber_id, [], @timeout_ms) do
+    case actions_for(fiber_id) do
       {:ok, actions} ->
         if Enum.any?(actions, &(Map.get(&1, :id) == action || Map.get(&1, "id") == action)) do
           :ok
@@ -103,6 +103,65 @@ defmodule ShuttleWeb.ActionsController do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp actions_for(fiber_id) do
+    with {:ok, fiber} <- fetch_fiber(fiber_id) do
+      {:ok, Actions.actions_for(fiber, running?(fiber_id))}
+    end
+  end
+
+  defp resolve_action(fiber_id, target) do
+    with {:ok, fiber} <- fetch_fiber(fiber_id) do
+      Actions.resolve_transition(fiber, target, running?(fiber_id))
+    end
+  end
+
+  defp fetch_fiber(fiber_id) do
+    FeltStores.configured_hosts()
+    |> Enum.find_value(fn host ->
+      with true <- exact_fiber_exists?(host, fiber_id),
+           {:ok, output} <- run_felt(host, ["show", fiber_id, "--json"]),
+           {:ok, fiber} <- Jason.decode(output) do
+        {:ok, fiber}
+      else
+        _ -> nil
+      end
+    end)
+    |> case do
+      nil -> {:error, :not_found}
+      result -> result
+    end
+  end
+
+  defp exact_fiber_exists?(host, fiber_id) do
+    segments = String.split(fiber_id, "/")
+    basename = List.last(segments)
+    felt_dir = Path.join(host, ".felt")
+    bare_path = Path.join(felt_dir, "#{basename}.md")
+    dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
+
+    (not String.contains?(fiber_id, "/") and File.exists?(bare_path)) or File.exists?(dir_path)
+  end
+
+  defp running?(fiber_id) do
+    case System.cmd("tmux", ["has-session", "-t", "=" <> Dispatcher.session_name(fiber_id)],
+           stderr_to_stdout: true
+         ) do
+      {_, 0} -> true
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
+  defp run_felt(host, args) do
+    case System.cmd("felt", ["-C", host | args], stderr_to_stdout: true) do
+      {output, 0} -> {:ok, output}
+      {output, _} -> {:error, output}
+    end
+  rescue
+    e in ErlangError -> {:error, Exception.message(e)}
   end
 
   defp invoke_action(fiber_id, "pause"), do: run(["pause", fiber_id])

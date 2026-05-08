@@ -33,12 +33,12 @@ defmodule Shuttle.Dispatcher do
     * `:runner` — module implementing `Shuttle.Runner` behavior for test injection.
       Defaults to `Shuttle.Runner.Default`.
     * `:work_dir` — working directory for the tmux session. Defaults to `File.cwd!()`.
-    * `:felt_host` — directory containing the `.felt/` index this dispatch
-      should read fibers and history from. Defaults to `default_felt_host/0`.
-      The Poller passes its configured `state.felt_host` here so each shuttle
+    * `:felt_store` — directory containing the `.felt/` index this dispatch
+      should read fibers and history from. Defaults to `default_felt_store/0`.
+      The Poller passes its configured `state.felt_store` here so each shuttle
       instance is consistent within itself; running multiple shuttle instances
-      against different felt hosts (e.g. one for `~/loom`, another for a
-      standalone project root) is the supported way to span felt hosts.
+      against different felt stores (e.g. one for `~/loom`, another for a
+      standalone project root) is the supported way to span felt stores.
     * `:prompt_context` — `:constitution` (default) or `:standing_run`.
   """
   @spec dispatch(String.t(), keyword()) :: dispatch_result()
@@ -46,9 +46,9 @@ defmodule Shuttle.Dispatcher do
     runner = Keyword.get(opts, :runner, Shuttle.Runner.Default)
     work_dir = Keyword.get(opts, :work_dir, File.cwd!())
     prompt_context = Keyword.get(opts, :prompt_context, :constitution)
-    felt_host = Keyword.get(opts, :felt_host, default_felt_host())
+    felt_store = Keyword.get(opts, :felt_store, default_felt_store())
 
-    with {:ok, fiber} <- fetch_fiber(fiber_id, runner, felt_host: felt_host),
+    with {:ok, fiber} <- fetch_fiber(fiber_id, runner, felt_store: felt_store),
          :ok <- check_not_closed(fiber),
          :ok <- check_not_running(fiber_id, runner),
          {:ok, agent} <- resolve_agent(fiber),
@@ -61,10 +61,10 @@ defmodule Shuttle.Dispatcher do
         Logger.info("Human-worker dispatch for #{fiber_id} — no tmux session spawned")
         {:ok, :human_no_op}
       else
-        resume_intent = resolve_resume_intent(prompt_context, fiber_id, fiber, felt_host)
+        resume_intent = resolve_resume_intent(prompt_context, fiber_id, fiber, felt_store)
 
         create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent,
-          felt_host: felt_host
+          felt_store: felt_store
         )
       end
     end
@@ -83,13 +83,13 @@ defmodule Shuttle.Dispatcher do
   """
   @spec resolve_resume_intent(any(), String.t(), map(), String.t() | nil) ::
           :fresh | {:previous, String.t()}
-  def resolve_resume_intent(prompt_context, fiber_id, fiber, felt_host) do
+  def resolve_resume_intent(prompt_context, fiber_id, fiber, felt_store) do
     case prompt_context do
       {:standing_run, _, :ad_hoc} ->
         :fresh
 
       _ ->
-        opts = if is_nil(felt_host), do: [], else: [felt_host: felt_host]
+        opts = if is_nil(felt_store), do: [], else: [felt_store: felt_store]
         check_resume_intent(fiber_id, fiber, opts)
     end
   end
@@ -111,10 +111,10 @@ defmodule Shuttle.Dispatcher do
   @spec check_resume_intent(String.t(), map(), keyword()) ::
           :fresh | {:previous, String.t()}
   def check_resume_intent(fiber_id, fiber, opts \\ []) do
-    felt_host = Keyword.get(opts, :felt_host, default_felt_host())
+    felt_store = Keyword.get(opts, :felt_store, default_felt_store())
 
     case query_history(fiber_id, ["--kind", "review-comment", "--last", "1", "--json"],
-           felt_host: felt_host
+           felt_store: felt_store
          ) do
       [event | _] ->
         resume_mode = get_in(event, ["payload", "resume_mode"])
@@ -132,14 +132,14 @@ defmodule Shuttle.Dispatcher do
   end
 
   @doc """
-  Returns shuttle's default felt host.
+  Returns shuttle's default felt store.
 
-  Mirrors `Shuttle.FeltHosts.configured_hosts/0` and keeps `Dispatcher`
+  Mirrors `Shuttle.FeltStores.configured_hosts/0` and keeps `Dispatcher`
   working standalone (e.g. via the CLI) without a running Poller.
   """
-  @spec default_felt_host() :: String.t()
-  def default_felt_host do
-    Shuttle.FeltHosts.configured_hosts()
+  @spec default_felt_store() :: String.t()
+  def default_felt_store do
+    Shuttle.FeltStores.configured_hosts()
     |> List.first()
     |> Kernel.||(System.user_home() <> "/loom")
   end
@@ -180,10 +180,10 @@ defmodule Shuttle.Dispatcher do
 
   ## Options
 
-    * `:felt_host` — directory containing the `.felt/` index to query.
-      Defaults to `default_felt_host/0`. The Poller threads its
-      configured `state.felt_host` here so each shuttle instance reads
-      from the felt host it's responsible for.
+    * `:felt_store` — directory containing the `.felt/` index to query.
+      Defaults to `default_felt_store/0`. The Poller threads its
+      configured `state.felt_store` here so each shuttle instance reads
+      from the felt store it's responsible for.
   """
   @spec render_prompt(String.t(), keyword()) :: String.t()
   def render_prompt(fiber_id, opts \\ []) do
@@ -209,8 +209,8 @@ defmodule Shuttle.Dispatcher do
   user intent — see `render_user_message_block/2`), the From User block
   is suppressed and the worker just gets the framing sentence.
 
-  Pass `felt_host:` to control which `.felt/` index is queried; defaults
-  to `default_felt_host/0`.
+  Pass `felt_store:` to control which `.felt/` index is queried; defaults
+  to `default_felt_store/0`.
   """
   @spec render_resume_prompt(String.t(), keyword()) :: String.t()
   def render_resume_prompt(fiber_id, opts \\ []) do
@@ -234,7 +234,7 @@ defmodule Shuttle.Dispatcher do
   worker reads it alongside the editorial chain and decides whether
   it's been addressed already.
 
-  Pass `felt_host:` to control which `.felt/` index is queried.
+  Pass `felt_store:` to control which `.felt/` index is queried.
   """
   @spec render_user_message_block(String.t(), keyword()) :: String.t()
   def render_user_message_block(fiber_id, opts \\ []) do
@@ -270,7 +270,7 @@ defmodule Shuttle.Dispatcher do
   `kill $PPID` instruction in the constitution: the worker completes
   the initial task, then waits for the human to take over.
 
-  Pass `felt_host:` to control which `.felt/` index is queried.
+  Pass `felt_store:` to control which `.felt/` index is queried.
   """
   @spec render_interactive_prelude(String.t(), keyword()) :: String.t()
   def render_interactive_prelude(fiber_id, opts \\ []) do
@@ -354,12 +354,12 @@ defmodule Shuttle.Dispatcher do
 
   # Shared `felt history` JSON query with graceful fallback to []. Used by
   # both the directive block (filters on --kind review-comment) and the
-  # handoff block (default editorial filter). `felt_host:` opt selects the
-  # `.felt/` index to query — defaults to `default_felt_host/0` so callers
+  # handoff block (default editorial filter). `felt_store:` opt selects the
+  # `.felt/` index to query — defaults to `default_felt_store/0` so callers
   # without a configured host (e.g. CLI smoke tests) still work.
   defp query_history(fiber_id, extra_args, opts) do
-    felt_host = Keyword.get(opts, :felt_host, default_felt_host())
-    args = ["-C", felt_host, "history", fiber_id] ++ extra_args
+    felt_store = Keyword.get(opts, :felt_store, default_felt_store())
+    args = ["-C", felt_store, "history", fiber_id] ++ extra_args
 
     case System.cmd("felt", args, stderr_to_stdout: true) do
       {output, 0} ->
@@ -422,7 +422,7 @@ defmodule Shuttle.Dispatcher do
   # duplicating either here risks drift between the prompt's snapshot and
   # felt's view.
   defp compose_prompt(header, fiber_id, opts) do
-    felt_opts = [felt_host: Keyword.get(opts, :felt_host, default_felt_host())]
+    felt_opts = [felt_store: Keyword.get(opts, :felt_store, default_felt_store())]
 
     # Order: header, interactive prelude (when set), user message block.
     # The prelude sits before the From User block so the worker reads
@@ -454,13 +454,13 @@ defmodule Shuttle.Dispatcher do
 
   # First tries the runner's default cwd (so tests / one-off CLI invocations
   # in a project's working directory still resolve the fiber against that
-  # project's `.felt/`). Falls back to the configured `felt_host` so the
+  # project's `.felt/`). Falls back to the configured `felt_store` so the
   # daemon path always lands in the right index regardless of where the BEAM
-  # process happens to be running. The default `felt_host` is
-  # `default_felt_host/0` (~/loom) — pass `:felt_host` explicitly to point at
+  # process happens to be running. The default `felt_store` is
+  # `default_felt_store/0` (~/loom) — pass `:felt_store` explicitly to point at
   # a different root.
   defp fetch_fiber(fiber_id, runner, opts) do
-    felt_host = Keyword.get(opts, :felt_host, default_felt_host())
+    felt_store = Keyword.get(opts, :felt_store, default_felt_store())
 
     case run_felt(runner, ["show", fiber_id, "--json"]) do
       {:ok, output} ->
@@ -470,7 +470,7 @@ defmodule Shuttle.Dispatcher do
         end
 
       {:error, _} ->
-        case run_felt(runner, ["show", fiber_id, "--json"], cd: felt_host) do
+        case run_felt(runner, ["show", fiber_id, "--json"], cd: felt_store) do
           {:ok, output} ->
             case Jason.decode(output) do
               {:ok, fiber} -> {:ok, fiber}
@@ -530,7 +530,7 @@ defmodule Shuttle.Dispatcher do
   # `resume_intent` is `:fresh | {:previous, session_id}` from check_resume_intent/3.
   defp create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent, opts) do
     session = session_name(fiber_id)
-    felt_host = Keyword.get(opts, :felt_host, default_felt_host())
+    felt_store = Keyword.get(opts, :felt_store, default_felt_store())
 
     case resume_intent do
       {:previous, session_id} ->
@@ -569,7 +569,7 @@ defmodule Shuttle.Dispatcher do
         case spawn_tmux(session, work_dir, run_script, runner) do
           {:ok, _} = result ->
             # Store the session UUID so "Resume previous" is available next time.
-            store_session_id(fiber_id, agent.id, session_uuid, runner, felt_host)
+            store_session_id(fiber_id, agent.id, session_uuid, runner, felt_store)
             result
 
           error ->
@@ -626,7 +626,7 @@ defmodule Shuttle.Dispatcher do
   # - Claude: UUID was pre-specified; write synchronously.
   # - Codex/Pi: capture UUID from session file asynchronously with backoff.
   # - None: agent doesn't support session IDs; skip.
-  defp store_session_id(fiber_id, agent_id, {:claude, uuid}, _runner, felt_host) do
+  defp store_session_id(fiber_id, agent_id, {:claude, uuid}, _runner, felt_store) do
     # Fire-and-forget: storing the UUID is best-effort; blocking dispatch on a
     # shuttle-ctl call would delay WorkerWatcher startup and cause flaky tests
     # (the watcher init checks the session, but the session can be removed by
@@ -634,7 +634,7 @@ defmodule Shuttle.Dispatcher do
     Task.start(fn ->
       case System.cmd(
              "shuttle-ctl",
-             ["--host", felt_host, "session-set", fiber_id, uuid, "--agent", agent_id],
+             ["--host", felt_store, "session-set", fiber_id, uuid, "--agent", agent_id],
              stderr_to_stdout: true
            ) do
         {_, 0} ->
@@ -648,7 +648,7 @@ defmodule Shuttle.Dispatcher do
     end)
   end
 
-  defp store_session_id(fiber_id, agent_id, {:capture, cli, work_dir}, _runner, felt_host) do
+  defp store_session_id(fiber_id, agent_id, {:capture, cli, work_dir}, _runner, felt_store) do
     # Fire-and-forget: capture the session UUID from the harness's JSONL file
     # in a background task. The race window (50 ms × 20 attempts = ~1 s) is
     # short enough that the kanban card will show "Resume previous" by the
@@ -658,7 +658,7 @@ defmodule Shuttle.Dispatcher do
         {:ok, uuid} ->
           case System.cmd(
                  "shuttle-ctl",
-                 ["--host", felt_host, "session-set", fiber_id, uuid, "--agent", agent_id],
+                 ["--host", felt_store, "session-set", fiber_id, uuid, "--agent", agent_id],
                  stderr_to_stdout: true
                ) do
             {_, 0} ->
@@ -680,7 +680,7 @@ defmodule Shuttle.Dispatcher do
     end)
   end
 
-  defp store_session_id(_fiber_id, _agent_id, :none, _runner, _felt_host), do: :ok
+  defp store_session_id(_fiber_id, _agent_id, :none, _runner, _felt_store), do: :ok
 
   # Poll for the session UUID written by codex/pi to their respective session
   # JSONL files. Tries `attempts` times with 50 ms between each.

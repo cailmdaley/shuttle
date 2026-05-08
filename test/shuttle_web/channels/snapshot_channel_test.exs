@@ -200,7 +200,7 @@ defmodule ShuttleWeb.SnapshotChannelTest do
       Poller.start_link(
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     # Trigger dispatch
@@ -225,7 +225,7 @@ defmodule ShuttleWeb.SnapshotChannelTest do
       Poller.start_link(
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     # Connect and join

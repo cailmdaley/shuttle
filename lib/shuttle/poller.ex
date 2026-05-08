@@ -13,13 +13,13 @@ defmodule Shuttle.Poller do
 
   ## Multi-host support
 
-  The Poller manages one or more felt hosts on the same machine. Configure via:
+  The Poller manages one or more felt stores on the same machine. Configure via:
 
-      config :shuttle, felt_hosts: ["~/loom", "~/other-project"]
+      config :shuttle, felt_stores: ["~/loom", "~/other-project"]
       # or env var (comma-separated, takes precedence over the persisted file):
       LOOM_HOMES=~/loom,~/other-project
       # or persisted registration written through the HTTP API:
-      ~/.shuttle/felt_hosts.json
+      ~/.shuttle/felt_stores.json
 
   Single-host setups (the common case) are unchanged: when no explicit hosts
   are configured, Shuttle falls back to `[LOOM_HOME || ~/loom]`.
@@ -70,21 +70,16 @@ defmodule Shuttle.Poller do
       :next_poll_due_at_ms,
       :tick_timer_ref,
       :tick_token,
-      # List of felt host directories, in resolution-priority order.
-      :felt_hosts,
+      # List of felt store directories, in resolution-priority order.
+      :felt_stores,
       # Machine identity used by shuttle.host dispatch affinity.
       :own_host_id,
-      # When true, felt_hosts is re-read from env + persisted registration on
-      # each poll cycle. Set true when :felt_hosts opt isn't passed to
+      # When true, felt_stores is re-read from env + persisted registration on
+      # each poll cycle. Set true when :felt_stores opt isn't passed to
       # start_link; false when the caller passed an explicit list (tests,
       # manual overrides — respect them).
-      :auto_discover_felt_hosts,
+      :auto_discover_felt_stores,
       :runner,
-      # Module exposing running_fibers/0 and origin_for_running/1 — used
-      # by the dispatch deferral check. Defaults to Shuttle.RemoteRegistry;
-      # tests pass a stub or `nil` (deferral becomes a no-op when the
-      # module is missing or the registry isn't running).
-      :remote_registry,
       poll_check_in_progress: false,
       running: %{},
       claimed: MapSet.new(),
@@ -93,16 +88,10 @@ defmodule Shuttle.Poller do
       reservations: %{},
       completed_standing_runs: MapSet.new(),
       standing_roles: [],
-      # %{fiber_id => felt_host} — populated by discover_candidates/1 on each
+      # %{fiber_id => felt_store} — populated by discover_candidates/1 on each
       # poll cycle and by host_for_fiber/2 on demand. Entries are never evicted
       # automatically; call bust_fiber_host_cache/1 when a fiber moves hosts.
-      fiber_host_cache: %{},
-      # %{fiber_id => %{origin: name, recorded_at: DateTime}} — fibers a
-      # fresh remote snapshot claims as running. Populated each poll
-      # cycle (and refreshed on per-call dispatch) so that no two
-      # daemons dispatch the same fiber when loom git-sync surfaces it
-      # on multiple hosts. Surfaced in build_snapshot/1 under `blocked`.
-      deferred: %{}
+      fiber_host_cache: %{}
     ]
   end
 
@@ -218,7 +207,7 @@ defmodule Shuttle.Poller do
   end
 
   @doc """
-  Returns `{:ok, felt_host}` for the first configured host that contains
+  Returns `{:ok, felt_store}` for the first configured host that contains
   `fiber_id`, or `{:error, :not_found}` if the fiber isn't in any host.
 
   The result is cached in the Poller's state for the daemon's lifetime.
@@ -235,7 +224,7 @@ defmodule Shuttle.Poller do
   end
 
   @doc """
-  Evicts the cached felt-host resolution for `fiber_id`. The daemon
+  Evicts the cached felt-store resolution for `fiber_id`. The daemon
   re-resolves on the next access. Use after a fiber moves between hosts.
   """
   @spec bust_fiber_host_cache(String.t()) :: :ok
@@ -252,14 +241,13 @@ defmodule Shuttle.Poller do
   def init(opts) do
     now_ms = System.monotonic_time(:millisecond)
 
-    {felt_hosts, auto_discover} =
-      case Keyword.fetch(opts, :felt_hosts) do
+    {felt_stores, auto_discover} =
+      case Keyword.fetch(opts, :felt_stores) do
         {:ok, hosts} -> {hosts, false}
-        :error -> {default_felt_hosts(), true}
+        :error -> {default_felt_stores(), true}
       end
 
     runner = Keyword.get(opts, :runner, Shuttle.Runner.Default)
-    remote_registry = Keyword.get(opts, :remote_registry, Shuttle.RemoteRegistry)
     own_host_id = Keyword.get(opts, :own_host_id, Application.get_env(:shuttle, :host, "local"))
 
     # Use the registered name (atom) when available so cross-process sends
@@ -286,14 +274,13 @@ defmodule Shuttle.Poller do
       next_poll_due_at_ms: now_ms,
       tick_timer_ref: nil,
       tick_token: nil,
-      felt_hosts: felt_hosts,
+      felt_stores: felt_stores,
       own_host_id: to_string(own_host_id || "local"),
-      auto_discover_felt_hosts: auto_discover,
-      runner: runner,
-      remote_registry: remote_registry
+      auto_discover_felt_stores: auto_discover,
+      runner: runner
     }
 
-    Logger.info("configured felt hosts: #{inspect(felt_hosts)}")
+    Logger.info("configured felt stores: #{inspect(felt_stores)}")
 
     # Adopt existing tmux sessions on startup
     state = adopt_orphans(state)
@@ -421,11 +408,6 @@ defmodule Shuttle.Poller do
       already_running_session?(state, session) ->
         {:reply, {:error, :already_running}, state}
 
-      MapSet.member?(running_fibers_safe(state.remote_registry), fiber_id) ->
-        origin = origin_for_running_safe(state.remote_registry, fiber_id) || "remote"
-        Logger.info("API dispatch deferring #{fiber_id} to #{origin}")
-        {:reply, {:error, {:deferred_to, origin}}, state}
-
       true ->
         case fetch_fiber_full(fiber_id, state) do
           {:ok, fiber} ->
@@ -476,17 +458,6 @@ defmodule Shuttle.Poller do
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}
-    end
-  end
-
-  # Detects fibers that opted out of agent dispatch by setting
-  # `shuttle.agent: human`. Used by the API dispatch path to short-circuit
-  # with a friendly success and by the poller-side eligibility filter to
-  # skip human-worker fibers in the auto-dispatch loop.
-  defp human_worker?(fiber) do
-    case get_in(fiber, ["shuttle", "agent"]) do
-      "human" -> true
-      _ -> false
     end
   end
 
@@ -574,6 +545,17 @@ defmodule Shuttle.Poller do
     {:reply, :ok, %{state | fiber_host_cache: Map.delete(state.fiber_host_cache, fiber_id)}}
   end
 
+  # Detects fibers that opted out of agent dispatch by setting
+  # `shuttle.agent: human`. Used by the API dispatch path to short-circuit
+  # with a friendly success and by the poller-side eligibility filter to
+  # skip human-worker fibers in the auto-dispatch loop.
+  defp human_worker?(fiber) do
+    case get_in(fiber, ["shuttle", "agent"]) do
+      "human" -> true
+      _ -> false
+    end
+  end
+
   # ── Snapshot ──
 
   @spec build_snapshot(State.t()) :: map()
@@ -585,7 +567,7 @@ defmodule Shuttle.Poller do
       Enum.map(state.running, fn {fiber_id, meta} ->
         %{
           fiber_id: fiber_id,
-          felt_host: Map.get(state.fiber_host_cache, fiber_id),
+          felt_store: Map.get(state.fiber_host_cache, fiber_id),
           tmux_session: meta.session,
           agent: meta.agent_id,
           state: Map.get(meta, :state, "running"),
@@ -606,22 +588,12 @@ defmodule Shuttle.Poller do
         }
       end)
 
-    blocked =
-      Enum.map(state.deferred, fn {fiber_id, info} ->
-        %{
-          fiber_id: fiber_id,
-          reason: "deferred to #{info.origin}",
-          origin: info.origin,
-          recorded_at: DateTime.to_unix(info.recorded_at, :millisecond)
-        }
-      end)
-
     %{
       poll_at: now_ms,
       host: hostname(),
-      felt_hosts: state.felt_hosts,
+      felt_stores: state.felt_stores,
       eligible: eligible,
-      blocked: blocked,
+      blocked: [],
       orphans: [],
       retrying: retrying,
       standing_roles: standing_role_snapshots(state.standing_roles, state.running, now),
@@ -639,7 +611,7 @@ defmodule Shuttle.Poller do
   # ── Dispatch ──
 
   defp maybe_dispatch(%State{} = state) do
-    state = state |> refresh_felt_hosts() |> reconcile()
+    state = state |> refresh_felt_stores() |> reconcile()
 
     with {:ok, candidates, new_host_map} <- discover_candidates(state),
          true <- available_slots(state) > 0 do
@@ -652,10 +624,7 @@ defmodule Shuttle.Poller do
           standing_roles: standing_roles_from_candidates(candidates)
       }
 
-      eligible = candidates |> filter_eligible(state) |> sort_candidates()
-      {deferred, dispatchable} = partition_deferred(eligible, state)
-
-      state = record_deferred(state, deferred, eligible)
+      dispatchable = candidates |> filter_eligible(state) |> sort_candidates()
 
       Enum.reduce(dispatchable, state, fn fiber, state_acc ->
         if available_slots(state_acc) > 0 do
@@ -698,93 +667,13 @@ defmodule Shuttle.Poller do
     }
   end
 
-  # Splits eligible candidates into (deferred, dispatchable). Deferred
-  # entries carry the origin claiming the fiber as running; the rest go
-  # to the dispatch reduce. See "deferral logic only runs on the
-  # laptop" in [[constitution-shuttle-remote-dispatch]] — when the
-  # registry has no fresh remote snapshots (the common case on remote
-  # hosts), partition_deferred/2 is a near-no-op.
-  defp partition_deferred(candidates, %State{remote_registry: registry}) do
-    case running_fibers_safe(registry) do
-      empty when map_size(empty) == 0 and is_map(empty) ->
-        {[], candidates}
-
-      running_set ->
-        Enum.reduce(candidates, {[], []}, fn fiber, {def_acc, dis_acc} ->
-          fiber_id = Map.get(fiber, "id", "")
-
-          if MapSet.member?(running_set, fiber_id) do
-            origin = origin_for_running_safe(registry, fiber_id) || "remote"
-            Logger.info("Poller deferring #{fiber_id} to #{origin}")
-            {[{fiber, origin} | def_acc], dis_acc}
-          else
-            {def_acc, [fiber | dis_acc]}
-          end
-        end)
-        |> then(fn {def_acc, dis_acc} -> {Enum.reverse(def_acc), Enum.reverse(dis_acc)} end)
-    end
-  end
-
-  # Records the per-cycle deferred map. We replace rather than merge so
-  # that yesterday's deferrals (where the remote may have since
-  # finished or gone stale) don't linger in `blocked`. `_eligible` is
-  # accepted for symmetry with future filtering needs.
-  defp record_deferred(%State{} = state, deferred_pairs, _eligible) do
-    now = DateTime.utc_now()
-
-    deferred_map =
-      Map.new(deferred_pairs, fn {fiber, origin} ->
-        fiber_id = Map.get(fiber, "id", "")
-        {fiber_id, %{origin: origin, recorded_at: now}}
-      end)
-
-    %{state | deferred: deferred_map}
-  end
-
-  # Wraps RemoteRegistry calls so the Poller still works in isolation
-  # (tests, daemons started with start_remote_registry: false). When the
-  # registry isn't running, `running_fibers/0` returns an empty MapSet
-  # (no deferral) — fail-open is the safe default for a coordination
-  # primitive: we'd rather risk a (rare) duplicate than lose dispatch.
-  defp running_fibers_safe(nil), do: MapSet.new()
-
-  defp running_fibers_safe(registry) when is_atom(registry) do
-    if function_exported?(registry, :running_fibers, 0) do
-      try do
-        registry.running_fibers()
-      catch
-        _, _ -> MapSet.new()
-      end
-    else
-      MapSet.new()
-    end
-  end
-
-  defp running_fibers_safe(_), do: MapSet.new()
-
-  defp origin_for_running_safe(nil, _fiber_id), do: nil
-
-  defp origin_for_running_safe(registry, fiber_id) when is_atom(registry) do
-    if function_exported?(registry, :origin_for_running, 1) do
-      try do
-        registry.origin_for_running(fiber_id)
-      catch
-        _, _ -> nil
-      end
-    else
-      nil
-    end
-  end
-
-  defp origin_for_running_safe(_, _), do: nil
-
   # Discovers candidate fibers by walking <host>/.felt/ for files that carry a
   # shuttle: frontmatter block. No tag predicate — the block is the source of
   # truth, matching the same shuttle-block contract every other surface reads.
   #
   # Returns {:ok, fibers, host_map} where:
   #   fibers   — [%{"id" => id, "status" => status}] across all hosts
-  #   host_map — %{fiber_id => felt_host} for host resolution
+  #   host_map — %{fiber_id => felt_store} for host resolution
   #
   # ## Symlink discipline
   #
@@ -796,7 +685,7 @@ defmodule Shuttle.Poller do
   #    as `task-board` (project view) and `work/project-a/task-board`
   #    (loom view).
   #
-  # 2. A project-canonical felt host (lightcone) whose own `.felt/` is a
+  # 2. A project-canonical felt store (lightcone) whose own `.felt/` is a
   #    real directory, with loom symlinking *into* it at
   #    `~/loom/.felt/ai-futures/lightcone -> ~/lightcone/.felt`. The same
   #    fiber is reachable as `lightcone-ui/...` (lightcone view) and
@@ -829,7 +718,7 @@ defmodule Shuttle.Poller do
   # the same inode and both pass the symlink filter.
   defp discover_candidates(state) do
     {all_fibers, host_map} =
-      Enum.reduce(state.felt_hosts, {[], %{}}, fn host, {acc_fibers, acc_map} ->
+      Enum.reduce(state.felt_stores, {[], %{}}, fn host, {acc_fibers, acc_map} ->
         owned_ids = owned_fiber_ids(host)
 
         case list_shuttle_fibers(host, owned_ids, state) do
@@ -1234,7 +1123,7 @@ defmodule Shuttle.Poller do
     end
   end
 
-  # Resolves which configured felt host owns `fiber_id`.
+  # Resolves which configured felt store owns `fiber_id`.
   #
   # Resolution order:
   # 1. State cache (fast; populated by discover_candidates/1 each poll cycle)
@@ -1255,7 +1144,7 @@ defmodule Shuttle.Poller do
 
       nil ->
         found =
-          Enum.find_value(state.felt_hosts, fn host ->
+          Enum.find_value(state.felt_stores, fn host ->
             canonical_host = canonical_host_path(host)
 
             with {:ok, path} <- exact_fiber_path(host, fiber_id),
@@ -1319,7 +1208,7 @@ defmodule Shuttle.Poller do
     fallback_host =
       case host_for_fiber(fiber_id, state) do
         {:ok, h} -> h
-        {:error, _} -> hd(state.felt_hosts)
+        {:error, _} -> hd(state.felt_stores)
       end
 
     with {:ok, shuttle} <- fetch_shuttle_block(fiber_id, state),
@@ -1374,10 +1263,10 @@ defmodule Shuttle.Poller do
   defp do_dispatch_fiber(%State{} = state, fiber, opts \\ []) do
     fiber_id = Map.get(fiber, "id", "")
 
-    felt_host =
+    felt_store =
       case host_for_fiber(fiber_id, state) do
         {:ok, h} -> h
-        {:error, _} -> hd(state.felt_hosts)
+        {:error, _} -> hd(state.felt_stores)
       end
 
     prompt_context = dispatch_prompt_context(fiber, state, opts)
@@ -1387,7 +1276,7 @@ defmodule Shuttle.Poller do
            runner: state.runner,
            work_dir: fiber_work_dir(fiber_id, state),
            prompt_context: prompt_context,
-           felt_host: felt_host
+           felt_store: felt_store
          ) do
       {:ok, :human_no_op} ->
         # Human-worker fibers don't need a watcher or running-state entry —
@@ -1797,8 +1686,8 @@ defmodule Shuttle.Poller do
       end
 
     case host_for_fiber(fiber_id, state) do
-      {:ok, felt_host} ->
-        args = ["-C", felt_host, "history", "append", fiber_id, "--summary", summary]
+      {:ok, felt_store} ->
+        args = ["-C", felt_store, "history", "append", fiber_id, "--summary", summary]
 
         try do
           case System.cmd("felt", args, stderr_to_stdout: true) do
@@ -1819,7 +1708,7 @@ defmodule Shuttle.Poller do
 
       {:error, _} ->
         Logger.debug(
-          "log_worker_exit: no felt host found for #{fiber_id}; skipping history event"
+          "log_worker_exit: no felt store found for #{fiber_id}; skipping history event"
         )
     end
   end
@@ -1890,7 +1779,7 @@ defmodule Shuttle.Poller do
     host =
       case host_for_fiber(fiber_id, state) do
         {:ok, h} -> h
-        {:error, _} -> hd(state.felt_hosts)
+        {:error, _} -> hd(state.felt_stores)
       end
 
     case run_felt(host, state.runner, ["show", fiber_id, "--json"]) do
@@ -2053,32 +1942,32 @@ defmodule Shuttle.Poller do
     end
   end
 
-  # Returns the configured felt hosts list.
+  # Returns the configured felt stores list.
   #
-  # Resolution order lives in `Shuttle.FeltHosts`: `LOOM_HOMES` → persisted
-  # `~/.shuttle/felt_hosts.json` → `LOOM_HOME` → `~/loom`.
+  # Resolution order lives in `Shuttle.FeltStores`: `LOOM_HOMES` → persisted
+  # `~/.shuttle/felt_stores.json` → `LOOM_HOME` → `~/loom`.
   #
-  # This is the default-fallback only; explicit :felt_hosts opts in start_link
+  # This is the default-fallback only; explicit :felt_stores opts in start_link
   # take precedence via init/1 (and disable the per-poll refresh in that case).
-  defp default_felt_hosts do
-    Shuttle.FeltHosts.configured_hosts()
+  defp default_felt_stores do
+    Shuttle.FeltStores.configured_hosts()
   end
 
-  # Re-reads the configured host list and updates state.felt_hosts if the list
+  # Re-reads the configured host list and updates state.felt_stores if the list
   # changed. Called from discover_candidates/1 each poll cycle so persisted
   # host registration or env changes are picked up without a daemon restart.
-  # No-op when the caller passed an explicit :felt_hosts opt
-  # (state.auto_discover_felt_hosts == false).
-  defp refresh_felt_hosts(%{auto_discover_felt_hosts: false} = state), do: state
+  # No-op when the caller passed an explicit :felt_stores opt
+  # (state.auto_discover_felt_stores == false).
+  defp refresh_felt_stores(%{auto_discover_felt_stores: false} = state), do: state
 
-  defp refresh_felt_hosts(%{felt_hosts: current} = state) do
-    fresh = default_felt_hosts()
+  defp refresh_felt_stores(%{felt_stores: current} = state) do
+    fresh = default_felt_stores()
 
     if fresh == current do
       state
     else
-      Logger.info("felt_hosts updated from env/config: #{inspect(current)} → #{inspect(fresh)}")
-      %{state | felt_hosts: fresh}
+      Logger.info("felt_stores updated from env/config: #{inspect(current)} → #{inspect(fresh)}")
+      %{state | felt_stores: fresh}
     end
   end
 

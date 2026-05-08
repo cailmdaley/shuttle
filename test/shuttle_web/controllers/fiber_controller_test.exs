@@ -6,23 +6,28 @@ defmodule ShuttleWeb.FiberControllerTest do
   @endpoint ShuttleWeb.Endpoint
 
   setup do
-    tmp = Path.join(System.tmp_dir!(), "shuttle-fiber-controller-#{System.unique_integer([:positive])}")
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "shuttle-fiber-controller-#{System.unique_integer([:positive])}"
+      )
+
     File.mkdir_p!(tmp)
 
     old_loom_home = System.get_env("LOOM_HOME")
     old_loom_homes = System.get_env("LOOM_HOMES")
-    old_felt_hosts_file = System.get_env("SHUTTLE_FELT_HOSTS_FILE")
+    old_felt_stores_file = System.get_env("SHUTTLE_FELT_STORES_FILE")
     old_host = Application.get_env(:shuttle, :host)
 
     System.put_env("LOOM_HOME", tmp)
     System.delete_env("LOOM_HOMES")
-    System.put_env("SHUTTLE_FELT_HOSTS_FILE", Path.join(tmp, "felt_hosts.json"))
+    System.put_env("SHUTTLE_FELT_STORES_FILE", Path.join(tmp, "felt_stores.json"))
     Application.put_env(:shuttle, :host, "local")
 
     on_exit(fn ->
       restore_env("LOOM_HOME", old_loom_home)
       restore_env("LOOM_HOMES", old_loom_homes)
-      restore_env("SHUTTLE_FELT_HOSTS_FILE", old_felt_hosts_file)
+      restore_env("SHUTTLE_FELT_STORES_FILE", old_felt_stores_file)
 
       if old_host == nil do
         Application.delete_env(:shuttle, :host)
@@ -85,6 +90,7 @@ defmodule ShuttleWeb.FiberControllerTest do
       )
 
     assert conn.status == 400
+
     assert %{"error" => "shuttle.project_dir is required when enabled=true"} =
              Jason.decode!(conn.resp_body)
   end

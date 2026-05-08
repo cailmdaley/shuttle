@@ -68,7 +68,7 @@ Other flags:
 			return runStatusCrossHost()
 		}
 
-		// Resolve which felt hosts to scan. An explicit -C flag pins the read
+		// Resolve which felt stores to scan. An explicit -C flag pins the read
 		// to that single host (useful for "what does this checkout see"); the
 		// default scans every host the daemon polls so status reflects the
 		// dispatcher's actual surface.
@@ -76,7 +76,7 @@ Other flags:
 		if feltHostFlag != "" {
 			hosts = []string{feltHostFlag}
 		} else {
-			discovered, err := schema.FeltHosts()
+			discovered, err := schema.FeltStores()
 			if err != nil {
 				return err
 			}
@@ -204,7 +204,7 @@ type shuttleEntry struct {
 // daemon's per-host best-effort scan.
 func listShuttleFibersAcrossHosts(hosts []string) ([]shuttleEntry, error) {
 	if len(hosts) == 0 {
-		return nil, fmt.Errorf("no felt hosts configured")
+		return nil, fmt.Errorf("no felt stores configured")
 	}
 	merged := make([]shuttleEntry, 0)
 	seen := map[string]bool{}

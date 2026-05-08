@@ -2,14 +2,14 @@ defmodule ShuttleWeb.FiberHostController do
   @moduledoc """
   Agent-API endpoint: GET /api/v1/fiber/host?id=<fiber_id>
 
-  Resolves the felt host for a fiber. Since fiber IDs contain slashes, the
+  Resolves the felt store for a fiber. Since fiber IDs contain slashes, the
   fiber ID is passed as a query parameter rather than a path segment.
 
   Used by external callers so they can route their own felt operations to the
   right index without re-implementing resolution.
 
   Returns:
-    200  %{fiber_id: string, felt_host: string, resolved_at: iso8601}
+    200  %{fiber_id: string, felt_store: string, resolved_at: iso8601}
     404  %{error: string, fiber_id: string}  — not found in any configured host
     400  %{error: string}                    — missing id parameter
   """
@@ -21,7 +21,7 @@ defmodule ShuttleWeb.FiberHostController do
       {:ok, host} ->
         json(conn, %{
           fiber_id: fiber_id,
-          felt_host: host,
+          felt_store: host,
           resolved_at: DateTime.to_iso8601(DateTime.utc_now())
         })
 
@@ -29,7 +29,7 @@ defmodule ShuttleWeb.FiberHostController do
         conn
         |> put_status(404)
         |> json(%{
-          error: "fiber not found in any configured felt host",
+          error: "fiber not found in any configured felt store",
           fiber_id: fiber_id
         })
     end

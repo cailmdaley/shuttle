@@ -1,11 +1,11 @@
-defmodule Shuttle.FeltHosts do
+defmodule Shuttle.FeltStores do
   @moduledoc """
-  Reads and persists Shuttle's configured felt-host list.
+  Reads and persists Shuttle's configured felt-store list.
 
   Resolution order:
 
     1. `LOOM_HOMES` (comma-separated)
-    2. persisted `~/.shuttle/felt_hosts.json`
+    2. persisted `~/.shuttle/felt_stores.json`
     3. `LOOM_HOME`
     4. `~/loom`
 
@@ -13,15 +13,17 @@ defmodule Shuttle.FeltHosts do
   list deletes the file so the default single-host fallback remains `~/loom`.
   """
 
-  @config_env "SHUTTLE_FELT_HOSTS_FILE"
-  @default_config_path "~/.shuttle/felt_hosts.json"
+  @config_env "SHUTTLE_FELT_STORES_FILE"
+  @default_config_path "~/.shuttle/felt_stores.json"
 
   @type host_list :: [String.t()]
 
   @spec configured_hosts() :: host_list()
   def configured_hosts do
     case env_hosts() do
-      [_ | _] = hosts -> hosts
+      [_ | _] = hosts ->
+        hosts
+
       [] ->
         case registered_hosts() do
           [_ | _] = hosts -> hosts
@@ -38,7 +40,7 @@ defmodule Shuttle.FeltHosts do
          {:ok, content} <- File.read(path),
          {:ok, decoded} <- Jason.decode(content) do
       case decoded do
-        %{"felt_hosts" => hosts} when is_list(hosts) -> normalize(hosts)
+        %{"felt_stores" => hosts} when is_list(hosts) -> normalize(hosts)
         hosts when is_list(hosts) -> normalize(hosts)
         _ -> []
       end
@@ -64,7 +66,7 @@ defmodule Shuttle.FeltHosts do
         _ ->
           File.mkdir_p!(Path.dirname(path))
           tmp = path <> ".tmp"
-          payload = Jason.encode!(%{version: 1, felt_hosts: normalized}, pretty: true) <> "\n"
+          payload = Jason.encode!(%{version: 1, felt_stores: normalized}, pretty: true) <> "\n"
           File.write!(tmp, payload)
           File.rename!(tmp, path)
           {:ok, normalized}

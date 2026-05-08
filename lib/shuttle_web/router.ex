@@ -28,7 +28,7 @@ defmodule ShuttleWeb.Router do
     get("/agents", AgentsController, :show)
     post("/fiber/create", FiberController, :create)
     get("/fiber/host", FiberHostController, :show)
-    post("/felt-hosts", FeltHostsController, :create)
+    post("/felt-stores", FeltStoresController, :create)
     post("/cache/bust", CacheBustController, :create)
   end
 end

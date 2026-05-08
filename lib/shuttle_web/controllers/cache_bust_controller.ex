@@ -2,7 +2,7 @@ defmodule ShuttleWeb.CacheBustController do
   @moduledoc """
   Agent-API endpoint: POST /api/v1/cache/bust
 
-  Evicts a fiber's resolved felt-host from the Poller's cache. Use after
+  Evicts a fiber's resolved felt-store from the Poller's cache. Use after
   a fiber moves between configured hosts.
 
   Request body: %{"fiber_id" => string}

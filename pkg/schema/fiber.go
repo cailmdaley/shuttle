@@ -9,8 +9,8 @@ import (
 	"strings"
 )
 
-// FiberRef is the canonical (felt-host, fiber-id, md-path) triple for a fiber.
-// Host and ID are derived from the nearest real `.felt/` store, so symlinked
+// FiberRef is the canonical (felt-store, fiber-id, md-path) triple for a fiber.
+// Felt store and ID are derived from the nearest real `.felt/` store, so symlinked
 // project views canonicalize back to Shuttle's actual dispatch identity.
 type FiberRef struct {
 	Host string
@@ -18,15 +18,15 @@ type FiberRef struct {
 	Path string
 }
 
-// FeltHost returns Shuttle's default felt host (single).
+// FeltStore returns Shuttle's default felt store (single).
 // Resolution order:
 //  1. LOOM_HOME env var
 //  2. ~/loom (the standard loom location)
 //
-// Use this when one host is enough — e.g. addressing a fiber by id or running
+// Use this when one store is enough — e.g. addressing a fiber by id or running
 // a -C-style felt invocation with a single root. For surfaces that need to see
-// every fiber the daemon would dispatch, use FeltHosts (plural).
-func FeltHost() (string, error) {
+// every fiber the daemon would dispatch, use FeltStores (plural).
+func FeltStore() (string, error) {
 	if loom := os.Getenv("LOOM_HOME"); loom != "" {
 		return expandUserPath(loom)
 	}
@@ -37,29 +37,29 @@ func FeltHost() (string, error) {
 	return filepath.Join(home, "loom"), nil
 }
 
-// FeltHosts returns every felt host the dispatcher considers. Mirrors
-// Shuttle.FeltHosts.configured_hosts/0 (lib/shuttle/felt_hosts.ex) so the Go
+// FeltStores returns every felt store the dispatcher considers. Mirrors
+// Shuttle.FeltStores.configured_hosts/0 (lib/shuttle/felt_stores.ex) so the Go
 // CLI sees the same surface the Elixir poller does:
 //
 //  1. LOOM_HOMES env var (comma-separated; non-empty wins)
-//  2. ~/.shuttle/felt_hosts.json (or $SHUTTLE_FELT_HOSTS_FILE) when present
-//  3. Single host from FeltHost() (LOOM_HOME, then ~/loom)
+//  2. ~/.shuttle/felt_stores.json (or $SHUTTLE_FELT_STORES_FILE) when present
+//  3. Single host from FeltStore() (LOOM_HOME, then ~/loom)
 //
 // Without this, surfaces like `shuttle status` only ever read the single
-// default host and silently miss everything pinned in the registry — which is
-// the whole reason a multi-host registry exists.
-func FeltHosts() ([]string, error) {
+// default store and silently miss everything pinned in the registry — which is
+// the whole reason a multi-store registry exists.
+func FeltStores() ([]string, error) {
 	if envHosts := loomHomesEnv(); len(envHosts) > 0 {
 		return envHosts, nil
 	}
-	if registered, err := registeredFeltHosts(); err == nil && len(registered) > 0 {
+	if registered, err := registeredFeltStores(); err == nil && len(registered) > 0 {
 		return registered, nil
 	}
-	host, err := FeltHost()
+	store, err := FeltStore()
 	if err != nil {
 		return nil, err
 	}
-	return []string{host}, nil
+	return []string{store}, nil
 }
 
 // loomHomesEnv parses LOOM_HOMES into the same shape as the Elixir reader.
@@ -68,15 +68,15 @@ func loomHomesEnv() []string {
 	if raw == "" {
 		return nil
 	}
-	return normalizeFeltHosts(strings.Split(raw, ","))
+	return normalizeFeltStores(strings.Split(raw, ","))
 }
 
-// registeredFeltHosts reads the persisted ~/.shuttle/felt_hosts.json file (or
-// $SHUTTLE_FELT_HOSTS_FILE override) and returns its normalized host list.
+// registeredFeltStores reads the persisted ~/.shuttle/felt_stores.json file (or
+// $SHUTTLE_FELT_STORES_FILE override) and returns its normalized store list.
 // Missing file or empty list returns an empty slice with no error — callers
 // fall back to the single default.
-func registeredFeltHosts() ([]string, error) {
-	path, err := feltHostsRegistryPath()
+func registeredFeltStores() ([]string, error) {
+	path, err := feltStoresRegistryPath()
 	if err != nil {
 		return nil, err
 	}
@@ -89,35 +89,35 @@ func registeredFeltHosts() ([]string, error) {
 	}
 
 	// Tolerate both wrapping shapes the Elixir writer accepts:
-	//   {"version": 1, "felt_hosts": [...]}  ← canonical
+	//   {"version": 1, "felt_stores": [...]}  ← canonical
 	//   [...]                                 ← bare list
 	var wrapped struct {
-		FeltHosts []string `json:"felt_hosts"`
+		FeltStores []string `json:"felt_stores"`
 	}
-	if err := json.Unmarshal(content, &wrapped); err == nil && wrapped.FeltHosts != nil {
-		return normalizeFeltHosts(wrapped.FeltHosts), nil
+	if err := json.Unmarshal(content, &wrapped); err == nil && wrapped.FeltStores != nil {
+		return normalizeFeltStores(wrapped.FeltStores), nil
 	}
 	var bare []string
 	if err := json.Unmarshal(content, &bare); err == nil {
-		return normalizeFeltHosts(bare), nil
+		return normalizeFeltStores(bare), nil
 	}
 	return nil, fmt.Errorf("parsing %s: unexpected shape", path)
 }
 
-func feltHostsRegistryPath() (string, error) {
-	if env := os.Getenv("SHUTTLE_FELT_HOSTS_FILE"); env != "" {
+func feltStoresRegistryPath() (string, error) {
+	if env := os.Getenv("SHUTTLE_FELT_STORES_FILE"); env != "" {
 		return expandUserPath(env)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolving home directory: %w", err)
 	}
-	return filepath.Join(home, ".shuttle", "felt_hosts.json"), nil
+	return filepath.Join(home, ".shuttle", "felt_stores.json"), nil
 }
 
-// normalizeFeltHosts mirrors Shuttle.FeltHosts.normalize/1: trim, drop empty,
+// normalizeFeltStores mirrors Shuttle.FeltStores.normalize/1: trim, drop empty,
 // expand `~`, deduplicate while preserving first-seen order.
-func normalizeFeltHosts(hosts []string) []string {
+func normalizeFeltStores(hosts []string) []string {
 	seen := make(map[string]bool, len(hosts))
 	out := make([]string, 0, len(hosts))
 	for _, h := range hosts {
@@ -139,21 +139,21 @@ func normalizeFeltHosts(hosts []string) []string {
 }
 
 // ResolveFiberPath returns the canonical absolute path of a fiber's .md file
-// under the default felt host.
+// under the default felt store.
 func ResolveFiberPath(fiberID string) (string, error) {
-	host, err := FeltHost()
+	store, err := FeltStore()
 	if err != nil {
 		return "", err
 	}
-	ref, err := ResolveFiberInHost(host, fiberID)
+	ref, err := ResolveFiberInHost(store, fiberID)
 	if err != nil {
 		return "", err
 	}
 	return ref.Path, nil
 }
 
-// ResolveFiberInHost resolves an ID/query relative to the given felt host and
-// returns the canonical felt-host / fiber-id pair plus the realpath'd md file.
+// ResolveFiberInHost resolves an ID/query relative to the given felt store and
+// returns the canonical felt-store / fiber-id pair plus the realpath'd md file.
 //
 // Exact lookup checks the bare and directory layouts directly. When neither
 // exists it falls back to `felt -C <host> ls -j <query>` so prefix/alias
@@ -161,7 +161,7 @@ func ResolveFiberPath(fiberID string) (string, error) {
 func ResolveFiberInHost(host, idOrQuery string) (*FiberRef, error) {
 	normalizedHost, err := expandUserPath(host)
 	if err != nil {
-		return nil, fmt.Errorf("resolving felt host %q: %w", host, err)
+		return nil, fmt.Errorf("resolving felt store %q: %w", host, err)
 	}
 
 	if path, ok := exactFiberPath(normalizedHost, idOrQuery); ok {
@@ -230,7 +230,7 @@ func canonicalizeFiberPath(path string) (*FiberRef, error) {
 	return &FiberRef{Host: host, ID: fiberID, Path: canonicalPath}, nil
 }
 
-// FiberRefFromPath derives the canonical felt host + fiber id from an absolute
+// FiberRefFromPath derives the canonical felt store + fiber id from an absolute
 // md path by walking up to the nearest enclosing `.felt/` directory.
 func FiberRefFromPath(mdPath string) (string, string, error) {
 	if mdPath == "" {

@@ -60,7 +60,7 @@ defmodule Shuttle.CLITest do
       Shuttle.Poller.start_link(
         runner: Shuttle.Runner.Default,
         poll_interval_ms: 600_000,
-        felt_host: "/tmp",
+        felt_store: "/tmp",
         name: Shuttle.Poller
       )
 

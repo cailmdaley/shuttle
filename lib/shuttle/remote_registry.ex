@@ -6,10 +6,6 @@ defmodule Shuttle.RemoteRegistry do
 
   The laptop's local Shuttle daemon uses this registry to:
 
-    * **Defer dispatch** for fibers a fresh remote snapshot already
-      lists as running. The deferral check reads
-      `running_fibers/0` (an `O(1)` `MapSet` lookup).
-
     * **Composite snapshot** — `Shuttle.Web.StateController` returns
       the local snapshot plus per-origin remote snapshots so the
       kanban frontend has cross-host visibility.
@@ -22,8 +18,7 @@ defmodule Shuttle.RemoteRegistry do
   Snapshot pull stays fire-and-forget HTTP polling: the remote daemon
   doesn't know it's being polled, no persistent connections, no auth
   state. Failures only mark the origin as stale or recovering; the
-  registry never crashes and the deferral safety valve still lifts
-  after `stale_multiplier × poll_interval_ms`.
+  registry never crashes.
 
   ## Configuration
 
@@ -165,47 +160,6 @@ defmodule Shuttle.RemoteRegistry do
   end
 
   @doc """
-  Returns the union of `fiber_id`s currently running across all
-  *fresh* remote snapshots. Stale snapshots are excluded — that's the
-  safety valve so a permanently-disconnected remote doesn't
-  permanently block local dispatch.
-
-  Used by `Shuttle.Poller` for the deferral check; an `O(1)`
-  `MapSet.member?/2` keeps the dispatch path cheap.
-
-  When the registry isn't running (test fixtures, no remotes
-  configured), returns an empty `MapSet`.
-  """
-  @spec running_fibers() :: MapSet.t()
-  def running_fibers, do: running_fibers(__MODULE__)
-
-  @spec running_fibers(GenServer.server()) :: MapSet.t()
-  def running_fibers(server) do
-    if registry_alive?(server) do
-      GenServer.call(server, :running_fibers, @registry_read_timeout_ms)
-    else
-      MapSet.new()
-    end
-  end
-
-  @doc """
-  Returns the origin (remote name) that claims `fiber_id` as running,
-  or `nil` when no fresh remote claims it. Used by the Poller to log
-  `deferring to <origin>` and to populate `blocked` snapshot entries.
-  """
-  @spec origin_for_running(String.t()) :: String.t() | nil
-  def origin_for_running(fiber_id), do: origin_for_running(__MODULE__, fiber_id)
-
-  @spec origin_for_running(GenServer.server(), String.t()) :: String.t() | nil
-  def origin_for_running(server, fiber_id) do
-    if registry_alive?(server) do
-      GenServer.call(server, {:origin_for_running, fiber_id}, @registry_read_timeout_ms)
-    else
-      nil
-    end
-  end
-
-  @doc """
   Forces a synchronous poll cycle. Returns when every remote has
   been handled once. Used by tests to deterministically drive the
   registry.
@@ -288,14 +242,6 @@ defmodule Shuttle.RemoteRegistry do
 
   def handle_call({:snapshot, name}, _from, state) do
     {:reply, build_one_view(state, name), state}
-  end
-
-  def handle_call(:running_fibers, _from, state) do
-    {:reply, build_running_fibers(state), state}
-  end
-
-  def handle_call({:origin_for_running, fiber_id}, _from, state) do
-    {:reply, find_origin(state, fiber_id), state}
   end
 
   def handle_call(:poll_now, _from, state) do
@@ -821,41 +767,6 @@ defmodule Shuttle.RemoteRegistry do
       last_action: recovery.last_action,
       next_retry_at: recovery.next_retry_at
     }
-  end
-
-  defp build_running_fibers(%State{} = state) do
-    now = DateTime.utc_now()
-
-    state.snapshots
-    |> Enum.reduce(MapSet.new(), fn {_name, entry}, acc ->
-      if not Remote.stale?(entry.remote, entry.last_polled_at, now) and is_map(entry.snapshot) do
-        ids = running_ids_in_snapshot(entry.snapshot)
-        Enum.reduce(ids, acc, &MapSet.put(&2, &1))
-      else
-        acc
-      end
-    end)
-  end
-
-  defp find_origin(%State{} = state, fiber_id) do
-    now = DateTime.utc_now()
-
-    Enum.find_value(state.snapshots, fn {name, entry} ->
-      if not Remote.stale?(entry.remote, entry.last_polled_at, now) and is_map(entry.snapshot) do
-        if MapSet.member?(running_ids_in_snapshot(entry.snapshot), fiber_id), do: name
-      end
-    end)
-  end
-
-  # The remote daemon's snapshot lists active workers under "eligible" (a
-  # somewhat-confusing legacy name; see Poller.build_snapshot/1 — the field
-  # carries currently-running workers, not eligibility candidates).
-  defp running_ids_in_snapshot(snapshot) do
-    snapshot
-    |> Map.get("eligible", [])
-    |> Enum.map(&Map.get(&1, "fiber_id", ""))
-    |> Enum.reject(&(&1 == ""))
-    |> MapSet.new()
   end
 
   # ── Tick scheduling ──

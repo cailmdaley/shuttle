@@ -251,7 +251,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_1,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     # Trigger a poll cycle manually
@@ -284,7 +284,7 @@ defmodule Shuttle.PollerTest do
         runner: MockRunner,
         own_host_id: "local",
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -310,7 +310,7 @@ defmodule Shuttle.PollerTest do
         runner: MockRunner,
         own_host_id: "candide",
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -336,7 +336,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_projected_listing,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -367,7 +367,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_slow_felt_snapshot,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -395,7 +395,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_2,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -420,7 +420,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_3,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -457,7 +457,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_standing_sleeping,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -496,7 +496,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_standing_force_now,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     assert {:error, :not_eligible} = Poller.dispatch_fiber(poller, fiber_id, [])
@@ -548,7 +548,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_standing_due,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -606,7 +606,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_standing_stale,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -669,7 +669,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_standing_snapshot_states,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -696,7 +696,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_4,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -720,7 +720,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_untracked,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -746,7 +746,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_5,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -770,7 +770,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_6,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -798,7 +798,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_7,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     # Dispatch
@@ -840,7 +840,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_8,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     # Dispatch
@@ -868,7 +868,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_9,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     Process.sleep(100)
@@ -898,7 +898,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_project_dir,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -916,7 +916,7 @@ defmodule Shuttle.PollerTest do
     File.rm_rf(Path.join(System.tmp_dir!(), "shuttle-test-proj-*"))
   end
 
-  test "poller falls back to felt_host when shuttle.project_dir does not exist" do
+  test "poller falls back to felt_store when shuttle.project_dir does not exist" do
     fiber = make_fiber("tests/missing-project-dir")
     MockRunner.set_fiber("tests/missing-project-dir", fiber)
 
@@ -931,7 +931,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_missing_project_dir,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -942,7 +942,7 @@ defmodule Shuttle.PollerTest do
         cmd == "tmux" and hd(args) == "new-session"
       end)
 
-    # work_dir should fall back to the felt host
+    # work_dir should fall back to the felt store
     assert Enum.at(args, 5) == "/tmp"
   end
 
@@ -957,7 +957,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_10,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     Process.sleep(100)
@@ -980,7 +980,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_untagged_shuttle,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     send(poller, {:tick, Poller.snapshot(poller) |> Map.get(:tick_token)})
@@ -1007,7 +1007,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_slow_dispatch,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
+        felt_stores: ["/tmp"]
       )
 
     started_at_ms = System.monotonic_time(:millisecond)
@@ -1022,7 +1022,7 @@ defmodule Shuttle.PollerTest do
 
   # ── Multi-host tests ──
   #
-  # These tests exercise the multi-felt-host path directly against the file
+  # These tests exercise the multi-felt-store path directly against the file
   # system; they bypass MockRunner's in-memory fiber store and write real
   # .felt/ directories instead. They use `resolve_fiber_host/2` (the public
   # GenServer call) to verify host_for_fiber resolution without depending on
@@ -1064,7 +1064,7 @@ defmodule Shuttle.PollerTest do
         name: :test_multi_host_resolve_a,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: [host_a, host_b]
+        felt_stores: [host_a, host_b]
       )
 
     assert {:ok, ^host_a} = Poller.resolve_fiber_host(poller, "tests/fiber-in-a")
@@ -1092,7 +1092,7 @@ defmodule Shuttle.PollerTest do
         name: :test_multi_host_resolve_b,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: [host_a, host_b]
+        felt_stores: [host_a, host_b]
       )
 
     assert {:ok, ^host_b} = Poller.resolve_fiber_host(poller, "tests/fiber-in-b")
@@ -1114,7 +1114,7 @@ defmodule Shuttle.PollerTest do
         name: :test_multi_host_not_found,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: [host_a]
+        felt_stores: [host_a]
       )
 
     assert {:error, :not_found} = Poller.resolve_fiber_host(poller, "tests/no-such-fiber")
@@ -1144,7 +1144,7 @@ defmodule Shuttle.PollerTest do
         name: :test_multi_host_collision,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: [host_a, host_b]
+        felt_stores: [host_a, host_b]
       )
 
     # host_a is first-configured → wins
@@ -1173,7 +1173,7 @@ defmodule Shuttle.PollerTest do
         name: :test_multi_host_bust,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: [host_a, host_b]
+        felt_stores: [host_a, host_b]
       )
 
     # Initially resolves to host_a
@@ -1236,7 +1236,7 @@ defmodule Shuttle.PollerTest do
         name: :test_subdir_symlink_skip,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: [host_a, host_b]
+        felt_stores: [host_a, host_b]
       )
 
     # The fiber should resolve to host_b (canonical), not host_a (symlink view).
@@ -1289,7 +1289,7 @@ defmodule Shuttle.PollerTest do
         name: :test_symlinked_felt_skipped,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: [loom, project]
+        felt_stores: [loom, project]
       )
 
     # The fiber resolves to loom (canonical), not project (symlinked .felt).
@@ -1335,7 +1335,7 @@ defmodule Shuttle.PollerTest do
         name: :test_symlinked_felt_cache_bust,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: [loom, project]
+        felt_stores: [loom, project]
       )
 
     :ok = Poller.bust_fiber_host_cache(poller, "ai-futures/portolan/kanban-modal")
@@ -1348,44 +1348,44 @@ defmodule Shuttle.PollerTest do
     )
   end
 
-  test "snapshot includes felt_hosts list" do
+  test "snapshot includes felt_stores list" do
     {:ok, poller} =
       Poller.start_link(
         name: :test_multi_host_snap,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp/host-one", "/tmp/host-two"]
+        felt_stores: ["/tmp/host-one", "/tmp/host-two"]
       )
 
     snap = Poller.snapshot(poller)
-    assert snap.felt_hosts == ["/tmp/host-one", "/tmp/host-two"]
+    assert snap.felt_stores == ["/tmp/host-one", "/tmp/host-two"]
   end
 
   test "poller reads configured hosts from persisted registration" do
     config_path =
       Path.join(
         System.tmp_dir!(),
-        "shuttle-felt-hosts-poller-#{System.unique_integer([:positive])}.json"
+        "shuttle-felt-stores-poller-#{System.unique_integer([:positive])}.json"
       )
 
-    original_file = System.get_env("SHUTTLE_FELT_HOSTS_FILE")
+    original_file = System.get_env("SHUTTLE_FELT_STORES_FILE")
     original_homes = System.get_env("LOOM_HOMES")
 
-    System.put_env("SHUTTLE_FELT_HOSTS_FILE", config_path)
+    System.put_env("SHUTTLE_FELT_STORES_FILE", config_path)
     System.delete_env("LOOM_HOMES")
     File.mkdir_p!(Path.dirname(config_path))
 
     File.write!(
       config_path,
-      Jason.encode!(%{"version" => 1, "felt_hosts" => ["/tmp/host-a", "/tmp/host-b"]})
+      Jason.encode!(%{"version" => 1, "felt_stores" => ["/tmp/host-a", "/tmp/host-b"]})
     )
 
     on_exit(fn ->
       File.rm(config_path)
 
       case original_file do
-        nil -> System.delete_env("SHUTTLE_FELT_HOSTS_FILE")
-        value -> System.put_env("SHUTTLE_FELT_HOSTS_FILE", value)
+        nil -> System.delete_env("SHUTTLE_FELT_STORES_FILE")
+        value -> System.put_env("SHUTTLE_FELT_STORES_FILE", value)
       end
 
       case original_homes do
@@ -1396,35 +1396,35 @@ defmodule Shuttle.PollerTest do
 
     {:ok, poller} =
       Poller.start_link(
-        name: :test_registered_felt_hosts,
+        name: :test_registered_felt_stores,
         runner: MockRunner,
         poll_interval_ms: 60_000
       )
 
-    assert Poller.snapshot(poller).felt_hosts == ["/tmp/host-a", "/tmp/host-b"]
+    assert Poller.snapshot(poller).felt_stores == ["/tmp/host-a", "/tmp/host-b"]
   end
 
   test "poller refreshes configured hosts when the persisted registration changes" do
     config_path =
       Path.join(
         System.tmp_dir!(),
-        "shuttle-felt-hosts-refresh-#{System.unique_integer([:positive])}.json"
+        "shuttle-felt-stores-refresh-#{System.unique_integer([:positive])}.json"
       )
 
-    original_file = System.get_env("SHUTTLE_FELT_HOSTS_FILE")
+    original_file = System.get_env("SHUTTLE_FELT_STORES_FILE")
     original_homes = System.get_env("LOOM_HOMES")
 
-    System.put_env("SHUTTLE_FELT_HOSTS_FILE", config_path)
+    System.put_env("SHUTTLE_FELT_STORES_FILE", config_path)
     System.delete_env("LOOM_HOMES")
     File.mkdir_p!(Path.dirname(config_path))
-    File.write!(config_path, Jason.encode!(%{"version" => 1, "felt_hosts" => ["/tmp/host-a"]}))
+    File.write!(config_path, Jason.encode!(%{"version" => 1, "felt_stores" => ["/tmp/host-a"]}))
 
     on_exit(fn ->
       File.rm(config_path)
 
       case original_file do
-        nil -> System.delete_env("SHUTTLE_FELT_HOSTS_FILE")
-        value -> System.put_env("SHUTTLE_FELT_HOSTS_FILE", value)
+        nil -> System.delete_env("SHUTTLE_FELT_STORES_FILE")
+        value -> System.put_env("SHUTTLE_FELT_STORES_FILE", value)
       end
 
       case original_homes do
@@ -1435,156 +1435,17 @@ defmodule Shuttle.PollerTest do
 
     {:ok, poller} =
       Poller.start_link(
-        name: :test_refresh_registered_felt_hosts,
+        name: :test_refresh_registered_felt_stores,
         runner: MockRunner,
         poll_interval_ms: 60_000
       )
 
-    assert Poller.snapshot(poller).felt_hosts == ["/tmp/host-a"]
+    assert Poller.snapshot(poller).felt_stores == ["/tmp/host-a"]
 
-    File.write!(config_path, Jason.encode!(%{"version" => 1, "felt_hosts" => ["/tmp/host-c"]}))
+    File.write!(config_path, Jason.encode!(%{"version" => 1, "felt_stores" => ["/tmp/host-c"]}))
     send(poller, :run_poll_cycle)
     Process.sleep(50)
 
-    assert Poller.snapshot(poller).felt_hosts == ["/tmp/host-c"]
-  end
-
-  # ── Remote dispatch deferral ──
-  #
-  # The Poller consults a registry module (default Shuttle.RemoteRegistry,
-  # overridable via :remote_registry opt) before dispatching. If a fresh
-  # remote snapshot lists the fiber as running, local dispatch defers — the
-  # fiber appears in `blocked` instead of dispatching, and no tmux session
-  # is created. Tests inject a stub registry that exposes the same shape
-  # (running_fibers/0, origin_for_running/1) without spinning up the real
-  # GenServer.
-
-  defmodule MockRegistry do
-    use Agent
-
-    def start_link(_ \\ []) do
-      Agent.start_link(fn -> %{running: MapSet.new(), origins: %{}} end, name: __MODULE__)
-    end
-
-    def reset, do: Agent.update(__MODULE__, fn _ -> %{running: MapSet.new(), origins: %{}} end)
-
-    def claim(fiber_id, origin) do
-      Agent.update(__MODULE__, fn s ->
-        %{
-          running: MapSet.put(s.running, fiber_id),
-          origins: Map.put(s.origins, fiber_id, origin)
-        }
-      end)
-    end
-
-    def running_fibers do
-      if Process.whereis(__MODULE__),
-        do: Agent.get(__MODULE__, & &1.running),
-        else: MapSet.new()
-    end
-
-    def origin_for_running(fiber_id) do
-      if Process.whereis(__MODULE__),
-        do: Agent.get(__MODULE__, &Map.get(&1.origins, fiber_id)),
-        else: nil
-    end
-  end
-
-  test "poller defers dispatch when a fresh remote claims the fiber as running" do
-    start_supervised!(MockRegistry)
-    MockRegistry.reset()
-
-    fiber = make_fiber("tests/deferred-fiber")
-    MockRunner.set_fiber("tests/deferred-fiber", fiber)
-    MockRunner.set_shuttle("tests/deferred-fiber", @oneshot_shuttle)
-
-    # Candide claims this fiber.
-    MockRegistry.claim("tests/deferred-fiber", "candide")
-
-    {:ok, poller} =
-      Poller.start_link(
-        name: :test_poller_deferral,
-        runner: MockRunner,
-        remote_registry: MockRegistry,
-        poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
-      )
-
-    send(poller, :run_poll_cycle)
-    Process.sleep(50)
-
-    # No tmux session created.
-    refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
-             cmd == "tmux" and hd(args) == "new-session"
-           end)
-
-    # The deferred fiber is surfaced in `blocked` for kanban visibility,
-    # with the origin annotated.
-    snap = Poller.snapshot(poller)
-    blocked = Enum.find(snap.blocked, &(&1.fiber_id == "tests/deferred-fiber"))
-    assert blocked != nil
-    assert blocked.origin == "candide"
-    assert blocked.reason =~ "deferred to candide"
-
-    # The fiber is NOT in `running` and not in `claimed`.
-    assert snap.eligible == []
-    assert snap.claimed_count == 0
-  end
-
-  test "poller dispatches normally when no remote claims the fiber" do
-    start_supervised!(MockRegistry)
-    MockRegistry.reset()
-
-    fiber = make_fiber("tests/not-deferred")
-    MockRunner.set_fiber("tests/not-deferred", fiber)
-    MockRunner.set_shuttle("tests/not-deferred", @oneshot_shuttle)
-
-    # Registry has someone *else* running, not our fiber.
-    MockRegistry.claim("tests/someone-else", "candide")
-
-    {:ok, poller} =
-      Poller.start_link(
-        name: :test_poller_no_deferral,
-        runner: MockRunner,
-        remote_registry: MockRegistry,
-        poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
-      )
-
-    send(poller, :run_poll_cycle)
-
-    assert wait_until(fn ->
-             Enum.any?(MockRunner.commands(), fn {cmd, args} ->
-               cmd == "tmux" and hd(args) == "new-session"
-             end)
-           end)
-
-    snap = Poller.snapshot(poller)
-    assert length(snap.eligible) == 1
-    # Other deferrals (for fibers we own) don't pollute our snapshot.
-    refute Enum.any?(snap.blocked, &(&1.fiber_id == "tests/not-deferred"))
-  end
-
-  test "poller does not defer when remote_registry is nil (graceful fallback)" do
-    fiber = make_fiber("tests/no-registry")
-    MockRunner.set_fiber("tests/no-registry", fiber)
-    MockRunner.set_shuttle("tests/no-registry", @oneshot_shuttle)
-
-    {:ok, poller} =
-      Poller.start_link(
-        name: :test_poller_nil_registry,
-        runner: MockRunner,
-        remote_registry: nil,
-        poll_interval_ms: 60_000,
-        felt_hosts: ["/tmp"]
-      )
-
-    send(poller, :run_poll_cycle)
-
-    assert wait_until(fn ->
-             Enum.any?(MockRunner.commands(), fn {cmd, args} ->
-               cmd == "tmux" and hd(args) == "new-session"
-             end)
-           end)
+    assert Poller.snapshot(poller).felt_stores == ["/tmp/host-c"]
   end
 end

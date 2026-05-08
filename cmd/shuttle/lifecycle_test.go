@@ -96,7 +96,7 @@ Body text.
 	}
 }
 
-// withTempHost creates a temp felt host, sets LOOM_HOME, and returns a cleanup func.
+// withTempHost creates a temp felt store, sets LOOM_HOME, and returns a cleanup func.
 func withTempHost(t *testing.T) (host string, cleanup func()) {
 	t.Helper()
 	host = t.TempDir()

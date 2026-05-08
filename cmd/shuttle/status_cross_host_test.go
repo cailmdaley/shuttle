@@ -19,7 +19,7 @@ import (
 const sampleCompositeJSON = `{
   "local": {
     "host": "dapmcw68",
-    "felt_hosts": ["/tmp/example-loom"],
+    "felt_stores": ["/tmp/example-loom"],
     "eligible": [
       {
         "fiber_id": "ai-futures/shuttle/constitution-shuttle-remote-dispatch",

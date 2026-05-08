@@ -187,50 +187,6 @@ defmodule Shuttle.RemoteRegistryTest do
       assert candide.last_error == nil
       assert get_in(candide, [:snapshot, "host"]) == "candide"
     end
-
-    test "running_fibers/0 returns the union of running across fresh remotes" do
-      MockClient.set(
-        "http://localhost:4001/api/v1/state",
-        {:ok, snapshot_with_running(["work/a", "work/b"])}
-      )
-
-      {:ok, _pid} =
-        RemoteRegistry.start_link(
-          name: :reg_running,
-          remotes: [candide_remote()],
-          client: MockClient,
-          auto_poll: false,
-          tick_interval_ms: 60_000
-        )
-
-      :ok = RemoteRegistry.poll_now(:reg_running)
-
-      running = RemoteRegistry.running_fibers(:reg_running)
-      assert MapSet.member?(running, "work/a")
-      assert MapSet.member?(running, "work/b")
-      refute MapSet.member?(running, "work/c")
-    end
-
-    test "origin_for_running/1 returns the remote name claiming a fiber" do
-      MockClient.set(
-        "http://localhost:4001/api/v1/state",
-        {:ok, snapshot_with_running(["work/foo"])}
-      )
-
-      {:ok, _pid} =
-        RemoteRegistry.start_link(
-          name: :reg_origin,
-          remotes: [candide_remote()],
-          client: MockClient,
-          auto_poll: false,
-          tick_interval_ms: 60_000
-        )
-
-      :ok = RemoteRegistry.poll_now(:reg_origin)
-
-      assert RemoteRegistry.origin_for_running(:reg_origin, "work/foo") == "candide"
-      assert RemoteRegistry.origin_for_running(:reg_origin, "work/missing") == nil
-    end
   end
 
   # ── Failure paths ──
@@ -256,8 +212,6 @@ defmodule Shuttle.RemoteRegistryTest do
       candide = RemoteRegistry.snapshot(:reg_502, "candide")
       assert candide.stale
       assert candide.last_error == {:http_status, 502}
-      # No fiber claims when the remote has nothing to report.
-      assert RemoteRegistry.running_fibers(:reg_502) == MapSet.new()
     end
 
     test "connection error marks the remote stale" do
@@ -328,15 +282,11 @@ defmodule Shuttle.RemoteRegistryTest do
 
       # Right after polling, fresh + running.
       refute RemoteRegistry.snapshot(:reg_stale, "candide").stale
-      assert MapSet.member?(RemoteRegistry.running_fibers(:reg_stale), "work/temp")
 
-      # After 2 × poll_interval, the snapshot is stale and running_fibers
-      # drops it (the safety valve so a permanently disconnected remote
-      # doesn't permanently block local dispatch).
+      # After 2 × poll_interval, the snapshot is stale for composite views.
       Process.sleep(120)
 
       assert RemoteRegistry.snapshot(:reg_stale, "candide").stale
-      refute MapSet.member?(RemoteRegistry.running_fibers(:reg_stale), "work/temp")
     end
   end
 
@@ -464,32 +414,12 @@ defmodule Shuttle.RemoteRegistryTest do
     end
   end
 
-  # ── No remotes configured ──
-
-  describe "no remotes" do
-    test "running_fibers/0 returns empty MapSet" do
-      {:ok, _pid} =
-        RemoteRegistry.start_link(
-          name: :reg_empty,
-          remotes: [],
-          client: MockClient,
-          auto_poll: false,
-          tick_interval_ms: 60_000
-        )
-
-      assert RemoteRegistry.running_fibers(:reg_empty) == MapSet.new()
-      assert RemoteRegistry.snapshots(:reg_empty) == %{}
-    end
-  end
-
   # ── Module fallback when registry isn't running ──
 
   describe "graceful absence" do
-    test "running_fibers/0 returns empty MapSet when registry is not started" do
+    test "snapshot/2 returns nil when registry is not started" do
       # Use a name we know isn't registered.
-      assert RemoteRegistry.running_fibers(:reg_does_not_exist) == MapSet.new()
       assert RemoteRegistry.snapshot(:reg_does_not_exist, "candide") == nil
-      assert RemoteRegistry.origin_for_running(:reg_does_not_exist, "x") == nil
     end
   end
 end

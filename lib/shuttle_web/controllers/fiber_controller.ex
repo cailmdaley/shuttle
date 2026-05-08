@@ -8,7 +8,7 @@ defmodule ShuttleWeb.FiberController do
 
   use Phoenix.Controller, formats: [:json]
 
-  alias Shuttle.FeltHosts
+  alias Shuttle.FeltStores
 
   def create(conn, params) do
     with {:ok, fiber_id} <- required_string(params, "id"),
@@ -58,7 +58,8 @@ defmodule ShuttleWeb.FiberController do
         {:ok, %{frontmatter | "shuttle" => shuttle}}
 
       other ->
-        {:error, "shuttle.host #{inspect(other)} does not match this daemon host #{inspect(own_host)}"}
+        {:error,
+         "shuttle.host #{inspect(other)} does not match this daemon host #{inspect(own_host)}"}
     end
   end
 
@@ -96,10 +97,17 @@ defmodule ShuttleWeb.FiberController do
     segments = String.split(fiber_id, "/")
 
     cond do
-      fiber_id == "" -> {:error, "id is required"}
-      String.starts_with?(fiber_id, "/") -> {:error, "id must be relative"}
-      Enum.any?(segments, &(&1 in ["", ".", ".."])) -> {:error, "id contains an invalid path segment"}
-      true -> :ok
+      fiber_id == "" ->
+        {:error, "id is required"}
+
+      String.starts_with?(fiber_id, "/") ->
+        {:error, "id must be relative"}
+
+      Enum.any?(segments, &(&1 in ["", ".", ".."])) ->
+        {:error, "id contains an invalid path segment"}
+
+      true ->
+        :ok
     end
   end
 
@@ -121,7 +129,7 @@ defmodule ShuttleWeb.FiberController do
   end
 
   defp felt_root do
-    FeltHosts.configured_hosts()
+    FeltStores.configured_hosts()
     |> List.first()
   end
 

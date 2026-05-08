@@ -197,7 +197,7 @@ defmodule ShuttleWeb.APIControllerTest do
     MockRunner.reset()
 
     start_supervised!(
-      {Poller, runner: MockRunner, poll_interval_ms: 600_000, felt_hosts: ["/tmp"]}
+      {Poller, runner: MockRunner, poll_interval_ms: 600_000, felt_stores: ["/tmp"]}
     )
 
     Process.sleep(50)

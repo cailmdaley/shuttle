@@ -15,7 +15,7 @@ var migrateDryRun bool
 var migrateCmd = &cobra.Command{
 	Use:   "migrate",
 	Short: "Add shuttle: blocks to currently-eligible constitution fibers",
-	Long: `Walks each configured felt host and adds shuttle.enabled=true / shuttle.kind=oneshot to every
+	Long: `Walks each configured felt store and adds shuttle.enabled=true / shuttle.kind=oneshot to every
 fiber that has the 'constitution' tag and not the 'draft' tag — the pre-CLI
 eligibility predicate. After migration the daemon switches to reading
 shuttle.enabled instead of tag predicates.
@@ -36,7 +36,7 @@ For existing standing roles (shuttle.mode=standing), the script:
 The eligibility cutover (daemon + kanban) is a separate step coordinated
 by the operator after verifying migration output.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		host, err := schema.FeltHost()
+		host, err := schema.FeltStore()
 		if err != nil {
 			return err
 		}
