@@ -138,7 +138,7 @@ func (b *Block) UnmarshalJSON(data []byte) error {
 var ValidKinds = []string{"oneshot", "standing"}
 
 // ValidReviewStates enumerates the allowed review.state values.
-var ValidReviewStates = []string{"scheduled", "running", "awaiting", "accepted", "aborted"}
+var ValidReviewStates = []string{"scheduled", "running", "awaiting", "accepted"}
 
 // ---- Validation ------------------------------------------------------------
 

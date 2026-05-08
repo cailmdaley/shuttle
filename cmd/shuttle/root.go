@@ -33,14 +33,16 @@ Write verbs (offline, validate-before-write):
   set-model    Change the agent for a fiber
   uninstall    Remove the shuttle: block from a fiber
 
-Read + abort verbs:
+Read verbs:
   status       One-line-per-fiber status overview
   ps           Live tmux worker sessions only
   snapshot     Print the selected daemon's state snapshot
   dispatch     Ask the selected daemon to dispatch a fiber now
   session-name Print the canonical tmux session name for a fiber
   attach       Attach to a running worker's tmux session
-  abort        Kill a worker's tmux session
+
+To stop a running worker, use 'shuttle pause <fiber>' — it disables
+dispatch and kills the live worker (use --no-kill to preserve the worker).
 
 The CLI edits local shuttle: frontmatter directly. With --origin <name>,
 HTTP-backed verbs route to the selected daemon over its configured tunnel so

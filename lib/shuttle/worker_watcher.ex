@@ -133,7 +133,22 @@ defmodule Shuttle.WorkerWatcher do
   end
 
   defp notify_poller(state, reason) do
-    send(state.poller, {:worker_exited, state.fiber_id, reason, session_alive?(state)})
+    # state.poller is the Poller's registered name (atom) in production —
+    # `send/2` resolves it at delivery time, so this survives a Poller
+    # supervisor restart. When unresolved (crash-loop window, or test
+    # tearing the poller down), `send/2` raises ArgumentError; we trap and
+    # log so the watcher's exit notification isn't silently dropped.
+    # See [[ai-futures/shuttle/finding-ghost-workers-stuck-running]].
+    try do
+      send(state.poller, {:worker_exited, state.fiber_id, reason, session_alive?(state)})
+    rescue
+      ArgumentError ->
+        Logger.error(
+          "WorkerWatcher could not deliver :worker_exited for #{state.fiber_id}: " <>
+            "poller #{inspect(state.poller)} not registered. " <>
+            "state.running may ghost until next dispatch reconcile."
+        )
+    end
   end
 
   defp session_alive?(state) do

@@ -53,6 +53,15 @@ defmodule Shuttle.Poller do
   defmodule State do
     @moduledoc false
     defstruct [
+      # Stable reference for cross-process messaging (e.g. WorkerWatcher →
+      # Poller exit notifications). Captured from the Poller's registered
+      # name in init/1, falling back to self()'s pid if unnamed (test
+      # scenarios). Watchers store this as `:poller` and `send/2` resolves
+      # the registered atom at delivery time, which survives a Poller
+      # supervisor restart — pids do not (the old pid is dead, sends are
+      # silently dropped, and `state.running` ghosts forever). See
+      # [[ai-futures/shuttle/finding-ghost-workers-stuck-running]].
+      :self_ref,
       :poll_interval_ms,
       :max_concurrent_workers,
       :heartbeat_interval_ms,
@@ -219,7 +228,19 @@ defmodule Shuttle.Poller do
     runner = Keyword.get(opts, :runner, Shuttle.Runner.Default)
     remote_registry = Keyword.get(opts, :remote_registry, Shuttle.RemoteRegistry)
 
+    # Use the registered name (atom) when available so cross-process sends
+    # survive a supervisor restart of this Poller. Process.info/2 returns
+    # `{:registered_name, atom}` for named processes and `{:registered_name, []}`
+    # for unnamed ones (typical in tests started without a `name:` opt; we fall
+    # back to self() pid so behavior is unchanged in that case).
+    self_ref =
+      case Process.info(self(), :registered_name) do
+        {:registered_name, name} when is_atom(name) -> name
+        _ -> self()
+      end
+
     state = %State{
+      self_ref: self_ref,
       poll_interval_ms: Keyword.get(opts, :poll_interval_ms, @default_poll_interval_ms),
       max_concurrent_workers:
         Keyword.get(opts, :max_concurrent_workers, @default_max_concurrent_workers),
@@ -1313,7 +1334,7 @@ defmodule Shuttle.Poller do
         watcher_opts = [
           fiber_id: fiber_id,
           session: session,
-          poller: self(),
+          poller: state.self_ref,
           runner: state.runner,
           heartbeat_interval_ms: state.heartbeat_interval_ms
         ]
@@ -1436,7 +1457,7 @@ defmodule Shuttle.Poller do
           watcher_opts = [
             fiber_id: fiber_id,
             session: session,
-            poller: self(),
+            poller: state.self_ref,
             runner: state.runner,
             heartbeat_interval_ms: state.heartbeat_interval_ms
           ]

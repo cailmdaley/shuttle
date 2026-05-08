@@ -244,4 +244,69 @@ defmodule Shuttle.WorkerWatcherTest do
     assert_receive {:worker_exited, "tests/recover", :normal_exit, false}, 200
     refute Process.alive?(watcher)
   end
+
+  # Regression: WorkerWatcher used to capture self() (a pid) at start time
+  # via Poller.start_watcher's `poller: self()` opt. If the Poller's
+  # supervisor restarted that process, the watcher's stored pid went stale,
+  # `send/2` to a dead pid was silently dropped, and `state.running` ghosted
+  # forever. The fix in Poller.init/1 captures the registered name (atom)
+  # into State.self_ref and passes that as `:poller`; `send/2` resolves the
+  # atom at delivery time. A corollary: when the registered name has no live
+  # process (test teardown, crash-loop window), `send/2` raises ArgumentError
+  # — the watcher must trap+log, not crash.
+  # See [[ai-futures/shuttle/finding-ghost-workers-stuck-running]].
+  test "watcher accepts a registered atom as :poller and delivers via name" do
+    session = Dispatcher.session_name("tests/named-poller")
+    MockRunner.add_session(session)
+
+    # Register the test process under a unique name so send/2 can resolve it
+    # by atom — mirroring how production passes Shuttle.Poller (the registered
+    # name of the running daemon) rather than its pid.
+    name = :"watcher_named_poller_#{System.unique_integer([:positive])}"
+    Process.register(self(), name)
+
+    {:ok, watcher} =
+      WorkerWatcher.start_link(
+        fiber_id: "tests/named-poller",
+        session: session,
+        poller: name,
+        runner: MockRunner,
+        heartbeat_interval_ms: 50
+      )
+
+    MockRunner.remove_session(session)
+    Process.sleep(200)
+
+    assert_receive {:worker_exited, "tests/named-poller", :normal_exit, false}, 200
+    refute Process.alive?(watcher)
+  end
+
+  test "watcher logs and continues when registered :poller name has no live process" do
+    session = Dispatcher.session_name("tests/dead-poller")
+    MockRunner.add_session(session)
+
+    # Use an atom that is NOT registered to any process. send/2 to an
+    # unregistered name raises ArgumentError; the watcher must trap and log.
+    dead_name = :"unregistered_poller_#{System.unique_integer([:positive])}"
+
+    {:ok, watcher} =
+      WorkerWatcher.start_link(
+        fiber_id: "tests/dead-poller",
+        session: session,
+        poller: dead_name,
+        runner: MockRunner,
+        heartbeat_interval_ms: 50
+      )
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        MockRunner.remove_session(session)
+        Process.sleep(200)
+      end)
+
+    assert log =~ "could not deliver :worker_exited"
+    assert log =~ "tests/dead-poller"
+    # Watcher still stops normally; the failure is bounded to the send.
+    refute Process.alive?(watcher)
+  end
 end

@@ -321,8 +321,6 @@ func computeState(b *schema.Block, running bool) string {
 		switch b.Review.State {
 		case "awaiting":
 			return "awaiting-review"
-		case "aborted":
-			return "aborted"
 		case "accepted":
 			return "accepted"
 		}
