@@ -14,14 +14,16 @@ import (
 )
 
 type tunnelSpec struct {
-	Name      string
-	LocalPort int
+	Name        string
+	LocalPort   int
+	HoldCommand string
 }
 
 type tunnelTemplateData struct {
 	Label       string
 	SSHHost     string
 	LocalPort   int
+	HoldCommand string
 	AutoSSHPath string
 	SSHAuthSock string
 	LogPath     string
@@ -29,7 +31,7 @@ type tunnelTemplateData struct {
 }
 
 var defaultTunnelSpecs = map[string]tunnelSpec{
-	"candide": {Name: "candide", LocalPort: 4001},
+	"candide": {Name: "candide", LocalPort: 4001, HoldCommand: "sleep 2147483647"},
 	"cineca":  {Name: "cineca", LocalPort: 4002},
 }
 
@@ -111,6 +113,7 @@ func installTunnels(requested []string) error {
 			Label:       label,
 			SSHHost:     spec.Name,
 			LocalPort:   spec.LocalPort,
+			HoldCommand: spec.HoldCommand,
 			AutoSSHPath: autosshPath,
 			SSHAuthSock: os.Getenv("SSH_AUTH_SOCK"),
 			LogPath:     logPath,

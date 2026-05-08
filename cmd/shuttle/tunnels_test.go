@@ -18,8 +18,14 @@ func TestResolveTunnelSpecs_DefaultsAllSorted(t *testing.T) {
 	if specs[0].Name != "candide" || specs[0].LocalPort != 4001 {
 		t.Fatalf("unexpected first spec: %+v", specs[0])
 	}
+	if specs[0].HoldCommand != "sleep 2147483647" {
+		t.Fatalf("expected candide hold command, got %+v", specs[0])
+	}
 	if specs[1].Name != "cineca" || specs[1].LocalPort != 4002 {
 		t.Fatalf("unexpected second spec: %+v", specs[1])
+	}
+	if specs[1].HoldCommand != "" {
+		t.Fatalf("expected cineca to use bare tunnel mode, got %+v", specs[1])
 	}
 }
 
@@ -60,6 +66,7 @@ func TestInstallTunnels_WriteOnlyWritesPlist(t *testing.T) {
 		"<string>-S</string>",
 		"<string>none</string>",
 		"4001:localhost:4000",
+		"sleep 2147483647",
 		"ControlMaster=no",
 		"ExitOnForwardFailure=yes",
 		"IdentityAgent=" + filepath.Join(tmp, "agent.sock"),
@@ -70,5 +77,8 @@ func TestInstallTunnels_WriteOnlyWritesPlist(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("plist missing %q\n%s", want, text)
 		}
+	}
+	if strings.Contains(text, "<string>-N</string>") {
+		t.Fatalf("candide plist should use command-mode tunnel, got -N\n%s", text)
 	}
 }

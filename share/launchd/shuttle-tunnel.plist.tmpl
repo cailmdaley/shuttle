@@ -8,7 +8,9 @@
   <key>ProgramArguments</key>
   <array>
     <string>{{ .AutoSSHPath }}</string>
+    {{- if not .HoldCommand }}
     <string>-N</string>
+    {{- end }}
     <string>-M</string>
     <string>0</string>
     <string>-S</string>
@@ -28,6 +30,9 @@
     <string>-L</string>
     <string>{{ .LocalPort }}:localhost:4000</string>
     <string>{{ .SSHHost }}</string>
+    {{- if .HoldCommand }}
+    <string>{{ .HoldCommand }}</string>
+    {{- end }}
   </array>
 
   <key>EnvironmentVariables</key>
