@@ -9,9 +9,10 @@ import (
 )
 
 var (
-	repeatSchedule string
-	repeatTZ       string
-	repeatModel    string
+	repeatSchedule   string
+	repeatTZ         string
+	repeatModel      string
+	repeatProjectDir string
 )
 
 var repeatCmd = &cobra.Command{
@@ -24,7 +25,7 @@ Example: --schedule "0 9 * * 1-5" runs at 09:00 on weekdays.
 
 The --tz flag must be an IANA timezone name (e.g. Europe/Paris, UTC).
 
-  shuttle repeat <fiber> --schedule "0 9 * * 1-5" --tz Europe/Paris
+  shuttle repeat <fiber> --schedule "0 9 * * 1-5" --tz Europe/Paris --project-dir "$PWD"
 
 The shuttle: block is validated before any file is touched.
 The running daemon picks it up on its next poll.`,
@@ -32,20 +33,26 @@ The running daemon picks it up on its next poll.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if !usingLocalOrigin() {
 			return postRemoteLifecycle("repeat", map[string]any{
-				"fiber":    args[0],
-				"schedule": repeatSchedule,
-				"tz":       repeatTZ,
-				"model":    repeatModel,
+				"fiber":       args[0],
+				"schedule":    repeatSchedule,
+				"tz":          repeatTZ,
+				"model":       repeatModel,
+				"project_dir": repeatProjectDir,
 			})
 		}
 
 		agents := loadAgents()
 		path, _, _ := resolveFiber(args[0])
 		f := readFiber(path)
+		projectDir, err := resolveProjectDirFlag(repeatProjectDir)
+		if err != nil {
+			return err
+		}
 
 		block := &schema.Block{
-			Enabled: true,
-			Kind:    "standing",
+			Enabled:    true,
+			Kind:       "standing",
+			ProjectDir: projectDir,
 			Schedule: &schema.Schedule{
 				Expr: repeatSchedule,
 				TZ:   repeatTZ,
@@ -96,6 +103,7 @@ The running daemon picks it up on its next poll.`,
 		if block.Agent != "" {
 			fmt.Printf("  agent:    %s\n", block.Agent)
 		}
+		fmt.Printf("  project_dir: %s\n", block.ProjectDir)
 		fmt.Printf("  next due: %s\n", next.Format(time.RFC3339))
 		if statusChanged {
 			if statusBefore == "" {
@@ -112,6 +120,7 @@ func init() {
 	repeatCmd.Flags().StringVarP(&repeatSchedule, "schedule", "s", "", "Cron expression (5-field standard syntax) — required")
 	repeatCmd.Flags().StringVarP(&repeatTZ, "tz", "z", "UTC", "IANA timezone name (default: UTC)")
 	repeatCmd.Flags().StringVarP(&repeatModel, "model", "m", "", "Agent ID (default: registry default)")
+	repeatCmd.Flags().StringVar(&repeatProjectDir, "project-dir", "", "Worker cwd on the target host (required)")
 	_ = repeatCmd.MarkFlagRequired("schedule")
 	rootCmd.AddCommand(repeatCmd)
 }

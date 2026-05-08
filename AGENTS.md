@@ -59,8 +59,8 @@ shuttle-ctl status --remote <name>            # single remote
 shuttle-ctl status --origin candide           # direct origin spelling for remote daemon routing
 shuttle-ctl ps                                # live tmux workers only
 shuttle-ctl ps --origin candide               # live workers on a selected daemon
-shuttle-ctl install <fiber> [-m <agent-id>] [--disabled] [--origin candide]
-shuttle-ctl repeat <fiber> --schedule "0 9 * * 1-5" --tz Europe/Paris
+shuttle-ctl install <fiber> --project-dir "$PWD" [-m <agent-id>] [--disabled] [--origin candide]
+shuttle-ctl repeat <fiber> --schedule "0 9 * * 1-5" --tz Europe/Paris --project-dir "$PWD"
 shuttle-ctl pause <fiber>                       # disable + kill live worker; --no-kill preserves it
 shuttle-ctl resume / accept <fiber>
 shuttle-ctl set-model <fiber> <agent-id>
@@ -85,6 +85,12 @@ shuttle-ctl migrate --dry-run                 # preview eligibility migration
 - **`shuttle.agent` field drives agent selection.** The `shuttle:` block's
   `agent:` field resolves against the registry. Default agent is
   `claude-sonnet`.
+- **`shuttle.host` field drives daemon affinity.** Absent or empty means
+  `local`; each daemon only dispatches fibers whose `host:` matches its
+  configured `config :shuttle, :host`.
+- **`shuttle.project_dir` is required for enabled installs.** `shuttle-ctl
+  install` and `repeat` require `--project-dir`; workers start there instead
+  of falling back to the felt store.
 - **shuttle-ctl is the agent-facing CLI.** Local write verbs validate before
   write and work offline. With `--origin <name>`, lifecycle verbs are sent to
   that daemon over the configured tunnel so the selected host edits its own

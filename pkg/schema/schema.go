@@ -181,6 +181,10 @@ func Validate(b *Block, agents *AgentRegistry) ValidationErrors {
 		add("kind", fmt.Sprintf("must be one of %v, got %q", ValidKinds, b.Kind))
 	}
 
+	if b.Enabled && strings.TrimSpace(b.ProjectDir) == "" {
+		add("project_dir", "required when enabled=true")
+	}
+
 	if b.Agent != "" && agents != nil {
 		if _, ok := agents.Find(b.Agent); !ok {
 			ids := agents.IDs()

@@ -14,7 +14,7 @@ import (
 // ---- Validation tests -------------------------------------------------------
 
 func TestValidate_ValidOneshot(t *testing.T) {
-	b := &Block{Enabled: true, Kind: "oneshot"}
+	b := &Block{Enabled: true, Kind: "oneshot", ProjectDir: "/tmp/project"}
 	if errs := Validate(b, nil); len(errs) != 0 {
 		t.Fatalf("expected no errors, got: %v", errs)
 	}
@@ -22,21 +22,34 @@ func TestValidate_ValidOneshot(t *testing.T) {
 
 func TestValidate_ValidStanding(t *testing.T) {
 	b := &Block{
-		Enabled:  true,
-		Kind:     "standing",
-		Schedule: &Schedule{Expr: "0 9 * * 1-5", TZ: "Europe/Paris"},
-		Review:   &Review{State: "scheduled"},
+		Enabled:    true,
+		Kind:       "standing",
+		ProjectDir: "/tmp/project",
+		Schedule:   &Schedule{Expr: "0 9 * * 1-5", TZ: "Europe/Paris"},
+		Review:     &Review{State: "scheduled"},
 	}
 	if errs := Validate(b, nil); len(errs) != 0 {
 		t.Fatalf("expected no errors, got: %v", errs)
 	}
 }
 
+func TestValidate_EnabledRequiresProjectDir(t *testing.T) {
+	b := &Block{Enabled: true, Kind: "oneshot"}
+	errs := Validate(b, nil)
+	if len(errs) == 0 {
+		t.Fatal("expected project_dir validation error")
+	}
+	if errs[0].Field != "project_dir" {
+		t.Fatalf("expected field=project_dir, got %q", errs[0].Field)
+	}
+}
+
 func TestValidate_BadCron(t *testing.T) {
 	b := &Block{
-		Enabled:  true,
-		Kind:     "standing",
-		Schedule: &Schedule{Expr: "0 25 * * *", TZ: "UTC"},
+		Enabled:    true,
+		Kind:       "standing",
+		ProjectDir: "/tmp/project",
+		Schedule:   &Schedule{Expr: "0 25 * * *", TZ: "UTC"},
 	}
 	errs := Validate(b, nil)
 	if len(errs) == 0 {
@@ -49,9 +62,10 @@ func TestValidate_BadCron(t *testing.T) {
 
 func TestValidate_BadTimezone(t *testing.T) {
 	b := &Block{
-		Enabled:  true,
-		Kind:     "standing",
-		Schedule: &Schedule{Expr: "0 9 * * *", TZ: "Atlantis/Bermuda"},
+		Enabled:    true,
+		Kind:       "standing",
+		ProjectDir: "/tmp/project",
+		Schedule:   &Schedule{Expr: "0 9 * * *", TZ: "Atlantis/Bermuda"},
 	}
 	errs := Validate(b, nil)
 	if len(errs) == 0 {
@@ -63,7 +77,7 @@ func TestValidate_BadTimezone(t *testing.T) {
 }
 
 func TestValidate_MissingScheduleForStanding(t *testing.T) {
-	b := &Block{Enabled: true, Kind: "standing"}
+	b := &Block{Enabled: true, Kind: "standing", ProjectDir: "/tmp/project"}
 	errs := Validate(b, nil)
 	if len(errs) == 0 {
 		t.Fatal("expected error: schedule required for standing")
@@ -387,7 +401,7 @@ func TestValidate_UnknownAgent(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(dir, "agents.json"), []byte(agentJSON), 0644)
 	agents, _ := LoadAgentRegistryFromFile(filepath.Join(dir, "agents.json"))
 
-	b := &Block{Enabled: true, Kind: "oneshot", Agent: "unknown-agent"}
+	b := &Block{Enabled: true, Kind: "oneshot", ProjectDir: "/tmp/project", Agent: "unknown-agent"}
 	errs := Validate(b, agents)
 	if len(errs) == 0 {
 		t.Fatal("expected validation error for unknown agent")

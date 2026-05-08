@@ -74,12 +74,24 @@
     }
   },
   "additionalProperties": false,
-  "if": {
-    "properties": { "kind": { "const": "standing" } }
-  },
-  "then": {
-    "required": ["schedule"]
-  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "kind": { "const": "standing" } }
+      },
+      "then": {
+        "required": ["schedule"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "enabled": { "const": true } }
+      },
+      "then": {
+        "required": ["project_dir"]
+      }
+    }
+  ],
   "notes": {
     "writer_ownership": "CLI owns: enabled, kind, agent, schedule, review.state (accepted/aborted transitions only), review.accepted_run_id, next_due_at (initial and scheduled-run accept advance). Daemon owns: review.state (scheduled/running/awaiting transitions), review.run_id, last_run_at, enabled (false flip after oneshot run). Ad-hoc standing runs preserve next_due_at.",
     "schema_tz_migration": "Pre-CLI standing roles used schedule.timezone. Migration renames to schedule.tz. The Elixir daemon reads tz after migration.",

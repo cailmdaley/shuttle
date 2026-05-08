@@ -128,6 +128,69 @@ func writeFiber(t *testing.T, host, slug, content string) string {
 	return path
 }
 
+func TestInstallCmd_EnabledRequiresProjectDir(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "install-me", `---
+name: Install me
+status: open
+---
+
+Body.
+`)
+
+	cmd := newInstallCmd()
+	cmd.SetArgs([]string{"install-me"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected install without --project-dir to fail")
+	}
+	if !strings.Contains(err.Error(), "project_dir is required") {
+		t.Fatalf("expected project_dir error, got %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	if strings.Contains(string(raw), "shuttle:") {
+		t.Fatalf("install failure should not write shuttle block:\n%s", string(raw))
+	}
+}
+
+func TestInstallCmd_WritesProjectDir(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	projectDir := t.TempDir()
+	path := writeFiber(t, host, "install-with-project", `---
+name: Install with project
+status: open
+---
+
+Body.
+`)
+
+	cmd := newInstallCmd()
+	cmd.SetArgs([]string{"install-with-project", "--project-dir", projectDir})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "project_dir: "+projectDir) {
+		t.Fatalf("project_dir not written:\n%s", text)
+	}
+	if !strings.Contains(text, "enabled: true") {
+		t.Fatalf("enabled block not written:\n%s", text)
+	}
+}
+
 func withStubbedTmux(t *testing.T, sessions map[string]bool) (killed *[]string) {
 	t.Helper()
 	originalExists := tmuxSessionExists

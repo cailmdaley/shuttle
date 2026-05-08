@@ -108,6 +108,8 @@ tags:
 shuttle:
   enabled: true
   kind: oneshot
+  host: local
+  project_dir: /path/to/project
   agent: claude-sonnet
 ---
 
@@ -117,13 +119,13 @@ Describe desired state here. Shuttle dispatches a worker; the worker reads
 this file, does the work, updates outcome:, and exits.
 ```
 
-Install via `shuttle-ctl install <fiber-id>` or write the block directly.
+Install via `shuttle-ctl install <fiber-id> --project-dir "$PWD"` or write the block directly.
 
 ## Lifecycle Verbs
 
 ```bash
-shuttle-ctl install  <fiber> [-m <agent>] [--disabled]  # oneshot; --disabled = draft
-shuttle-ctl repeat   <fiber> --schedule "0 9 * * 1-5" --tz Europe/Paris  # standing
+shuttle-ctl install  <fiber> --project-dir "$PWD" [-m <agent>] [--disabled]  # oneshot
+shuttle-ctl repeat   <fiber> --schedule "0 9 * * 1-5" --tz Europe/Paris --project-dir "$PWD"
 shuttle-ctl pause    <fiber>      # enabled=false → drafts; kills live worker unless --no-kill
 shuttle-ctl resume   <fiber>      # enabled=true → in-flight
 shuttle-ctl accept   <fiber>      # standing: advance next_due_at after review
@@ -145,6 +147,8 @@ A standing role is a recurring responsibility — a constitution with a cron sch
 shuttle:
   enabled: true
   kind: standing
+  host: local
+  project_dir: /path/to/project
   agent: claude-sonnet
   schedule:
     expr: "0 9 * * 1-5"
