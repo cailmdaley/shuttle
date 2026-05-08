@@ -592,7 +592,10 @@ defmodule Shuttle.Dispatcher do
         case spawn_tmux(session, work_dir, run_script, runner) do
           {:ok, _} = result ->
             # Store the session UUID so "Resume previous" is available next time.
-            store_session_id(fiber_id, agent.id, session_uuid, runner, felt_store)
+            if Keyword.get(opts, :store_session_id, true) do
+              store_session_id(fiber_id, agent.id, session_uuid, runner, felt_store)
+            end
+
             result
 
           error ->
@@ -649,15 +652,15 @@ defmodule Shuttle.Dispatcher do
   # - Claude: UUID was pre-specified; write synchronously.
   # - Codex/Pi: capture UUID from session file asynchronously with backoff.
   # - None: agent doesn't support session IDs; skip.
-  defp store_session_id(fiber_id, agent_id, {:claude, uuid}, _runner, felt_store) do
+  defp store_session_id(fiber_id, agent_id, {:claude, uuid}, runner, felt_store) do
     # Fire-and-forget: storing the UUID is best-effort; blocking dispatch on a
     # shuttle-ctl call would delay WorkerWatcher startup and cause flaky tests
     # (the watcher init checks the session, but the session can be removed by
     # other actors while we wait for shuttle-ctl to finish).
     Task.start(fn ->
-      case System.cmd(
+      case runner.cmd(
              "shuttle-ctl",
-             ["--host", felt_store, "session-set", fiber_id, uuid, "--agent", agent_id],
+             ["--felt-store", felt_store, "session-set", fiber_id, uuid, "--agent", agent_id],
              stderr_to_stdout: true
            ) do
         {_, 0} ->
@@ -671,7 +674,7 @@ defmodule Shuttle.Dispatcher do
     end)
   end
 
-  defp store_session_id(fiber_id, agent_id, {:capture, cli, work_dir}, _runner, felt_store) do
+  defp store_session_id(fiber_id, agent_id, {:capture, cli, work_dir}, runner, felt_store) do
     # Fire-and-forget: capture the session UUID from the harness's JSONL file
     # in a background task. The race window (50 ms × 20 attempts = ~1 s) is
     # short enough that the kanban card will show "Resume previous" by the
@@ -679,9 +682,9 @@ defmodule Shuttle.Dispatcher do
     Task.start(fn ->
       case capture_session_uuid(cli, work_dir, 20) do
         {:ok, uuid} ->
-          case System.cmd(
+          case runner.cmd(
                  "shuttle-ctl",
-                 ["--host", felt_store, "session-set", fiber_id, uuid, "--agent", agent_id],
+                 ["--felt-store", felt_store, "session-set", fiber_id, uuid, "--agent", agent_id],
                  stderr_to_stdout: true
                ) do
             {_, 0} ->

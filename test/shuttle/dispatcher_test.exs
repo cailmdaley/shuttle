@@ -216,7 +216,7 @@ defmodule Shuttle.DispatcherTest do
   end
 
   test "dispatch resolves pi agent from bare tag" do
-    result = Dispatcher.dispatch("tests/pi-tagged", runner: MockRunner)
+    result = Dispatcher.dispatch("tests/pi-tagged", runner: MockRunner, store_session_id: false)
     assert {:ok, session} = result
     assert session == Dispatcher.session_name("tests/pi-tagged")
 
