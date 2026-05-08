@@ -5,7 +5,7 @@ defmodule ShuttleWeb.ActionsController do
 
   use Phoenix.Controller, formats: [:json]
 
-  @timeout_ms 1_500
+  @timeout_ms 15_000
 
   def show(conn, %{"fiber_id" => parts}) do
     fiber_id = Path.join(parts)
