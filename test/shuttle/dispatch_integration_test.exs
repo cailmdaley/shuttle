@@ -359,6 +359,74 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert script =~ "Shuttle resumed your previous session"
   end
 
+  test "resume previous dispatch reaches each harness-specific resume command", %{host: host} do
+    matrix = [
+      {"claude-sonnet", "claude-session-111", ["claude", "--resume 'claude-session-111'", "<<<"],
+       ["codex resume", "pi "]},
+      {"codex", "codex-session-222",
+       ["codex", "resume 'codex-session-222'", "Shuttle resumed your previous session"],
+       ["--resume", "--session"]},
+      {"pi-kimi", "pi-session-333", ["pi", "--session 'pi-session-333'"],
+       ["--resume", "Shuttle resumed your previous session"]}
+    ]
+
+    for {agent, session_id, expected, forbidden} <- matrix do
+      IntegrationRunner.reset(host)
+      id = "tests/resume-matrix/#{agent}"
+
+      write_resume_fiber(host, id,
+        agent: agent,
+        frontmatter_session: session_id
+      )
+
+      append_review_comment(host, id,
+        summary: "Resume the previous #{agent} worker",
+        resume_mode: "previous"
+      )
+
+      assert {:ok, _} =
+               Dispatcher.dispatch(id,
+                 runner: IntegrationRunner,
+                 felt_store: host
+               )
+
+      script = read_run_script()
+      for needle <- expected, do: assert(script =~ needle)
+      for needle <- forbidden, do: refute(script =~ needle)
+    end
+  end
+
+  test "resume previous can recover the session id from worker-exit history for every harness", %{
+    host: host
+  } do
+    matrix = [
+      {"claude-sonnet", "claude-history-session", "--resume 'claude-history-session'"},
+      {"codex", "codex-history-session", "resume 'codex-history-session'"},
+      {"pi-kimi", "pi-history-session", "--session 'pi-history-session'"}
+    ]
+
+    for {agent, session_id, resume_fragment} <- matrix do
+      IntegrationRunner.reset(host)
+      id = "tests/history-resume-matrix/#{agent}"
+
+      write_resume_fiber(host, id, agent: agent)
+      append_worker_exit(host, id, agent: agent, session: session_id)
+
+      append_review_comment(host, id,
+        summary: "Resume from history for #{agent}",
+        resume_mode: "previous"
+      )
+
+      assert {:ok, _} =
+               Dispatcher.dispatch(id,
+                 runner: IntegrationRunner,
+                 felt_store: host
+               )
+
+      assert read_run_script() =~ resume_fragment
+    end
+  end
+
   # Resume mode requested but no session UUID: falls back to fresh cleanly.
   test "resume mode requested but no session UUID falls back to fresh", %{host: host} do
     write_fiber(host, "tests/resume-no-uuid", """
@@ -556,6 +624,38 @@ defmodule Shuttle.DispatchIntegrationTest do
     dir = Path.join([host, ".felt"] ++ parts)
     File.mkdir_p!(dir)
     File.write!(Path.join(dir, "#{basename}.md"), String.trim(content) <> "\n")
+  end
+
+  defp write_resume_fiber(host, id, opts) do
+    agent = Keyword.fetch!(opts, :agent)
+    frontmatter_session = Keyword.get(opts, :frontmatter_session)
+
+    session_block =
+      if frontmatter_session do
+        """
+          session:
+            agent: #{agent}
+            dispatched_at: "2026-05-01T09:00:00Z"
+            id: #{frontmatter_session}
+        """
+      else
+        ""
+      end
+
+    write_fiber(host, id, """
+    ---
+    name: Resume matrix #{agent}
+    status: active
+    tags:
+      - constitution
+    shuttle:
+      enabled: true
+      kind: oneshot
+      agent: #{agent}
+    #{session_block}
+    ---
+    A fiber used by the resume matrix.
+    """)
   end
 
   # Appends a review-comment event to the fiber's felt history so that
