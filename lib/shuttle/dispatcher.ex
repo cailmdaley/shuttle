@@ -61,12 +61,36 @@ defmodule Shuttle.Dispatcher do
         Logger.info("Human-worker dispatch for #{fiber_id} — no tmux session spawned")
         {:ok, :human_no_op}
       else
-        resume_intent = check_resume_intent(fiber_id, fiber, felt_host: felt_host)
+        resume_intent = resolve_resume_intent(prompt_context, fiber_id, fiber, felt_host)
 
         create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent,
           felt_host: felt_host
         )
       end
+    end
+  end
+
+  @doc """
+  Decides whether this dispatch should resume a prior worker session or start
+  fresh, based on the prompt context.
+
+  - Ad-hoc standing-role dispatches always start fresh. Resuming would land
+    the worker in a transcript whose last assistant turn was "Run accepted.
+    Exiting" — they'd idle ("nothing new on the fiber") instead of doing the
+    new run.
+  - All other contexts defer to `check_resume_intent/3`, which reads the
+    most recent review-comment from felt history and honors its `resume_mode`.
+  """
+  @spec resolve_resume_intent(any(), String.t(), map(), String.t() | nil) ::
+          :fresh | {:previous, String.t()}
+  def resolve_resume_intent(prompt_context, fiber_id, fiber, felt_host) do
+    case prompt_context do
+      {:standing_run, _, :ad_hoc} ->
+        :fresh
+
+      _ ->
+        opts = if is_nil(felt_host), do: [], else: [felt_host: felt_host]
+        check_resume_intent(fiber_id, fiber, opts)
     end
   end
 

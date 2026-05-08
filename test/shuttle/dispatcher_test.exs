@@ -438,6 +438,46 @@ defmodule Shuttle.DispatcherTest do
     assert prompt =~ "Run:   adhoc-1770000000000"
   end
 
+  test "resolve_resume_intent forces :fresh for ad-hoc dispatch even with stored session" do
+    # An ad-hoc run is "do this responsibility right now" work. The prior
+    # session's transcript may have wrapped on a "Run accepted. Exiting"
+    # turn — resuming there leads to an idle worker that says "nothing new
+    # on the fiber" instead of running the responsibility afresh. The
+    # ad-hoc branch must short-circuit to :fresh regardless of any stored
+    # session UUID or review-comment resume_mode the fiber's history carries.
+    fiber_with_session = %{
+      "shuttle" => %{
+        "session" => %{"id" => "11111111-2222-3333-4444-555555555555"}
+      }
+    }
+
+    assert Dispatcher.resolve_resume_intent(
+             {:standing_run, "adhoc-1770000000000", :ad_hoc},
+             "tests/haiku",
+             fiber_with_session,
+             nil
+           ) == :fresh
+  end
+
+  test "resolve_resume_intent defers to check_resume_intent for non-ad-hoc dispatches" do
+    # The delegation boundary: anything other than {:standing_run, _, :ad_hoc}
+    # takes the existing review-comment-driven path. With no felt history in
+    # the test env, check_resume_intent returns :fresh as the safe default —
+    # but it's the path being taken that matters, not the value.
+    fiber = %{}
+
+    # Scheduled standing run: defer
+    assert Dispatcher.resolve_resume_intent(
+             {:standing_run, "20260508T070000+0000"},
+             "tests/haiku",
+             fiber,
+             nil
+           ) == :fresh
+
+    # Plain constitution dispatch: defer
+    assert Dispatcher.resolve_resume_intent(:constitution, "tests/haiku", fiber, nil) == :fresh
+  end
+
   test "render_resume_prompt names the fiber and defers to the existing transcript" do
     # No felt history available in test env (no .felt index) — context
     # blocks suppress to empty; the framing block still renders.
