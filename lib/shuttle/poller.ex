@@ -1519,6 +1519,14 @@ defmodule Shuttle.Poller do
         # Re-read fiber to determine next action
         case fetch_fiber_full(fiber_id, state) do
           {:ok, fiber} ->
+            # Auto-log the worker exit to felt history with the session UUID,
+            # so users can browse history and find sessions to reattach or
+            # diagnose. Best-effort: failure to write history doesn't block
+            # the exit-handling state machine. Captured every exit path
+            # (clean kill, crash, abort, ghost cleanup) since we always
+            # come through here when the daemon notices the session ended.
+            log_worker_exit(fiber_id, fiber, meta, reason, state)
+
             status = Map.get(fiber, "status", "")
 
             cond do
@@ -1690,6 +1698,57 @@ defmodule Shuttle.Poller do
       | running: Map.delete(state.running, fiber_id),
         claimed: MapSet.delete(state.claimed, fiber_id)
     }
+  end
+
+  # Append a felt history event noting the worker exit, including the
+  # Claude/codex session UUID so it's archivally findable. Best-effort:
+  # if felt isn't available or the index is busy, swallow the error and
+  # log; the daemon's state machine must not be blocked on history writes.
+  #
+  # Surface for the user: `felt history <fiber-id>` lists every run with
+  # its session UUID, agent, and reason. From there they can reattach
+  # (`claude --resume <uuid>` directly) or shape a refinement via
+  # `shuttle-ctl resume`.
+  defp log_worker_exit(fiber_id, fiber, meta, reason, state) do
+    session_uuid =
+      case get_in(fiber, ["shuttle", "session", "id"]) do
+        uuid when is_binary(uuid) and uuid != "" -> uuid
+        _ -> nil
+      end
+
+    agent_id = Map.get(meta, :agent_id, "unknown")
+
+    summary =
+      if session_uuid do
+        "worker exited (#{inspect(reason)}); agent=#{agent_id} session=#{session_uuid}"
+      else
+        "worker exited (#{inspect(reason)}); agent=#{agent_id} session=<unknown>"
+      end
+
+    case host_for_fiber(fiber_id, state) do
+      {:ok, felt_host} ->
+        args = ["-C", felt_host, "history", "append", fiber_id, "--summary", summary]
+
+        try do
+          case System.cmd("felt", args, stderr_to_stdout: true) do
+            {_, 0} ->
+              :ok
+
+            {output, code} ->
+              Logger.warning(
+                "log_worker_exit: felt history append exited #{code} for #{fiber_id}: #{String.trim(output)}"
+              )
+          end
+        rescue
+          e ->
+            Logger.warning(
+              "log_worker_exit: felt history append raised for #{fiber_id}: #{inspect(e)}"
+            )
+        end
+
+      {:error, _} ->
+        Logger.debug("log_worker_exit: no felt host found for #{fiber_id}; skipping history event")
+    end
   end
 
   defp reconcile_waiters(%State{waiters: waiters} = state) when map_size(waiters) == 0, do: state

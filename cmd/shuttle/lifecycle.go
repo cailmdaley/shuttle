@@ -145,14 +145,15 @@ closed fiber back into active work.`,
 			}
 
 			// File a review-comment so the dispatcher's check_resume_intent/3
-			// can detect resume intent. Without this event the dispatcher always
-			// takes the fresh path — shuttle.session.id alone is insufficient
-			// because check_resume_intent reads only the latest review-comment.
-			// Mirror what the kanban's "Resume previous" button does.
+			// can detect resume intent. The summary is intentionally empty:
+			// render_user_message_block/2 in the dispatcher suppresses the
+			// "From User" prompt block when the latest review-comment has
+			// empty text, so we keep `resume_mode: previous` in the payload
+			// without surfacing meaningless machinery (a stale session uuid)
+			// as a directive in the worker's prompt.
 			if f.Block.Session != nil && f.Block.Session.ID != "" {
 				sessionID := f.Block.Session.ID
-				summary := "resumed via shuttle-ctl; session " + sessionID + " available for reattach"
-				_ = appendFeltHistoryReviewComment(host, fiberID, summary, "previous")
+				_ = appendFeltHistoryReviewComment(host, fiberID, "", "previous")
 				fmt.Printf("  resume_mode: previous (session %s)\n", sessionID)
 			}
 			return nil
