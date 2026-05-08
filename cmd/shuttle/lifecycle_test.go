@@ -594,6 +594,56 @@ Standing role body.
 	}
 }
 
+func TestAcceptCmd_ReactivatesClosedStandingRole(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "daily-report", `---
+name: Daily report
+status: closed
+tempered: true
+closed-at: 2026-05-08T10:00:00Z
+outcome: stale digest
+shuttle:
+  enabled: true
+  kind: standing
+  schedule:
+    expr: "0 9 * * 1-5"
+    tz: Europe/Paris
+  review:
+    state: awaiting
+    run_id: "20260508T070000+0000"
+---
+
+Standing role body.
+`)
+
+	cmd := newAcceptCmd()
+	cmd.SetArgs([]string{"daily-report"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	text := string(raw)
+
+	if !strings.Contains(text, "status: active") {
+		t.Fatalf("accept should reactivate standing roles:\n%s", text)
+	}
+	if strings.Contains(text, "tempered:") {
+		t.Fatalf("accept should clear tempered marker:\n%s", text)
+	}
+	if strings.Contains(text, "closed-at:") {
+		t.Fatalf("accept should clear closed-at marker:\n%s", text)
+	}
+	if !strings.Contains(text, "state: scheduled") {
+		t.Fatalf("expected review.state: scheduled:\n%s", text)
+	}
+}
+
 // TestAcceptCmd_ClearsSessionUUID verifies that accept clears the session
 // block, so any subsequent dispatch (next cron tick, manual ad-hoc, kanban
 // drag) starts a fresh worker rather than resuming the just-accepted run's

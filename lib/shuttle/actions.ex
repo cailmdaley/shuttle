@@ -44,10 +44,14 @@ defmodule Shuttle.Actions do
 
   defp action_ids(fiber, running?) do
     shuttle = shuttle(fiber)
+    status = Map.get(fiber, "status")
 
     cond do
       running? ->
         [:pause]
+
+      status == "closed" ->
+        [:reopen, :close_tempered, :close_composted]
 
       standing?(shuttle) and review_state(shuttle) == "awaiting" ->
         [:accept_run, :continue_run_fresh] ++
@@ -58,9 +62,6 @@ defmodule Shuttle.Actions do
 
       standing?(shuttle) ->
         [:reopen]
-
-      Map.get(fiber, "status") == "closed" ->
-        [:reopen, :close_tempered, :close_composted]
 
       enabled?(shuttle) ->
         [:pause, :close_awaiting_review, :close_tempered, :close_composted]
@@ -79,8 +80,12 @@ defmodule Shuttle.Actions do
 
   defp action_for_target(fiber, target, _running?) do
     shuttle = shuttle(fiber)
+    status = Map.get(fiber, "status")
 
     cond do
+      status == "closed" and target == "inFlight" ->
+        :reopen
+
       standing?(shuttle) and review_state(shuttle) == "awaiting" and
           target in ["inFlight", "tempered"] ->
         :accept_run

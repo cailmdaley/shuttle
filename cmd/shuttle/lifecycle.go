@@ -381,6 +381,9 @@ Appends a felt history event recording the acceptance.`,
 			}
 			f.Block.NextDueAt = next
 			f.Block.Enabled = true // ensure re-enabled after review
+			f.SetStatus("active")
+			f.SetTempered(nil)
+			f.ClearClosedAt()
 
 			// Clear the session block. The run we just accepted is finalized;
 			// the session UUID was a handle for resuming THAT run, and any

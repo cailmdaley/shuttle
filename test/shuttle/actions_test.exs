@@ -20,6 +20,17 @@ defmodule Shuttle.ActionsTest do
              Actions.resolve_transition(fiber, "inFlight")
   end
 
+  test "closed standing-role must reopen before dispatching" do
+    fiber = %{standing("scheduled") | "status" => "closed"}
+
+    actions = Actions.actions_for(fiber)
+    assert Enum.any?(actions, &(&1.id == "reopen"))
+    refute Enum.any?(actions, &(&1.id == "dispatch-ad-hoc"))
+
+    assert {:ok, %{id: "reopen", invocation: %{verb: "reopen"}}} =
+             Actions.resolve_transition(fiber, "inFlight")
+  end
+
   test "oneshot transition vocabulary stays lifecycle-shaped" do
     fiber = %{
       "id" => "work/thing",
