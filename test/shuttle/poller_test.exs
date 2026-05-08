@@ -20,6 +20,7 @@ defmodule Shuttle.PollerTest do
             fibers: %{},
             shuttle: %{},
             felt_ls: [],
+            felt_ls_delay_ms: 0,
             new_session_delay_ms: 0
           }
         end,
@@ -38,6 +39,7 @@ defmodule Shuttle.PollerTest do
           fibers: %{},
           shuttle: %{},
           felt_ls: [],
+          felt_ls_delay_ms: 0,
           new_session_delay_ms: 0
         }
       end)
@@ -88,6 +90,9 @@ defmodule Shuttle.PollerTest do
     # mock's felt ls handler which other code paths may call.
     def set_felt_ls(fibers), do: Agent.update(__MODULE__, &%{&1 | felt_ls: fibers})
 
+    def set_felt_ls_delay(ms),
+      do: Agent.update(__MODULE__, &Map.put(&1, :felt_ls_delay_ms, ms))
+
     def add_tmux_session(session),
       do: Agent.update(__MODULE__, &%{&1 | tmux_sessions: MapSet.put(&1.tmux_sessions, session)})
 
@@ -110,6 +115,9 @@ defmodule Shuttle.PollerTest do
 
       cond do
         command == "felt" and String.contains?(full_args, "ls") ->
+          delay_ms = Agent.get(__MODULE__, &Map.get(&1, :felt_ls_delay_ms, 0))
+          if delay_ms > 0, do: Process.sleep(delay_ms)
+
           show_all =
             case Enum.find_index(args, &(&1 in ["-s", "--status"])) do
               nil -> false
@@ -256,9 +264,72 @@ defmodule Shuttle.PollerTest do
            end)
 
     # Check snapshot shows running worker
+    assert wait_until(fn ->
+             length(Poller.snapshot(poller).eligible) == 1
+           end)
+
     snap = Poller.snapshot(poller)
     assert length(snap.eligible) == 1
     assert hd(snap.eligible).fiber_id == "tests/haiku-dispatch"
+  end
+
+  test "poller uses projected felt listing for shuttle discovery" do
+    fiber = make_fiber("tests/projected-discovery")
+    MockRunner.set_fiber("tests/projected-discovery", fiber)
+    MockRunner.set_shuttle("tests/projected-discovery", @oneshot_shuttle)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_projected_listing,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_hosts: ["/tmp"]
+      )
+
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+               cmd == "felt" and
+                 args == [
+                   "ls",
+                   "--json",
+                   "--has-field",
+                   "shuttle",
+                   "--json-field",
+                   "id,status,created_at,shuttle,depends_on,tempered"
+                 ]
+             end)
+           end)
+  end
+
+  test "snapshot remains responsive while poll cycle is reading felt" do
+    fiber = make_fiber("tests/slow-felt-read")
+    MockRunner.set_fiber("tests/slow-felt-read", fiber)
+    MockRunner.set_shuttle("tests/slow-felt-read", @oneshot_shuttle)
+    MockRunner.set_felt_ls_delay(1_000)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_slow_felt_snapshot,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_hosts: ["/tmp"]
+      )
+
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+               cmd == "felt" and Enum.take(args, 2) == ["ls", "--json"]
+             end)
+           end)
+
+    started_at_ms = System.monotonic_time(:millisecond)
+    snap = Poller.snapshot(poller, 100)
+
+    assert is_map(snap)
+    assert System.monotonic_time(:millisecond) - started_at_ms < 100
   end
 
   test "poller skips closed fibers" do
@@ -534,6 +605,12 @@ defmodule Shuttle.PollerTest do
         felt_hosts: ["/tmp"]
       )
 
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             length(Poller.snapshot(poller).standing_roles) == 2
+           end)
+
     roles = Poller.snapshot(poller).standing_roles
     assert Enum.find(roles, &(&1.fiber_id == "tests/standing-review")).state == "review"
     assert Enum.find(roles, &(&1.fiber_id == "tests/standing-accepted")).state == "accepted"
@@ -591,7 +668,7 @@ defmodule Shuttle.PollerTest do
 
   test "poller dispatches when dependencies are tempered" do
     dep = make_fiber("tests/dep", %{"tempered" => true})
-    fiber = make_fiber("tests/dependent", %{"depends_on" => ["tests/dep"]})
+    fiber = make_fiber("tests/dependent", %{"depends_on" => [%{"id" => "tests/dep"}]})
 
     MockRunner.set_fiber("tests/dependent", fiber)
     MockRunner.set_fiber("tests/dep", dep)

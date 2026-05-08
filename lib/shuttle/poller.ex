@@ -48,6 +48,7 @@ defmodule Shuttle.Poller do
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   @default_max_retry_backoff_ms 300_000
+  @felt_shuttle_projection_fields "id,status,created_at,shuttle,depends_on,tempered"
 
   defmodule State do
     @moduledoc false
@@ -80,6 +81,7 @@ defmodule Shuttle.Poller do
       waiters: %{},
       reservations: %{},
       completed_standing_runs: MapSet.new(),
+      standing_roles: [],
       # %{fiber_id => felt_host} — populated by discover_candidates/1 on each
       # poll cycle and by host_for_fiber/2 on demand. Entries are never evicted
       # automatically; call bust_fiber_host_cache/1 when a fiber moves hosts.
@@ -250,8 +252,7 @@ defmodule Shuttle.Poller do
       when is_reference(tick_token) do
     state = %{
       state
-      | poll_check_in_progress: true,
-        next_poll_due_at_ms: nil,
+      | next_poll_due_at_ms: nil,
         tick_timer_ref: nil,
         tick_token: nil
     }
@@ -262,9 +263,38 @@ defmodule Shuttle.Poller do
 
   def handle_info({:tick, _}, state), do: {:noreply, state}
 
+  def handle_info(:run_poll_cycle, %{poll_check_in_progress: true} = state), do: {:noreply, state}
+
   def handle_info(:run_poll_cycle, state) do
-    state = maybe_dispatch(state)
-    state = schedule_tick(state, state.poll_interval_ms)
+    parent = self()
+
+    {:ok, _pid} =
+      Task.start_link(fn ->
+        send(parent, {:poll_cycle_complete, run_poll_cycle_safely(state)})
+      end)
+
+    {:noreply, %{state | poll_check_in_progress: true}}
+  end
+
+  def handle_info({:poll_cycle_complete, {:ok, poll_state}}, state) do
+    state =
+      state
+      |> merge_poll_cycle_state(poll_state)
+      |> Map.put(:poll_check_in_progress, false)
+      |> schedule_tick(state.poll_interval_ms)
+
+    broadcast_snapshot(state)
+    {:noreply, state}
+  end
+
+  def handle_info({:poll_cycle_complete, {:error, reason}}, state) do
+    Logger.error("Poll cycle failed: #{reason}")
+
+    state =
+      state
+      |> Map.put(:poll_check_in_progress, false)
+      |> schedule_tick(state.poll_interval_ms)
+
     broadcast_snapshot(state)
     {:noreply, state}
   end
@@ -516,7 +546,7 @@ defmodule Shuttle.Poller do
       blocked: blocked,
       orphans: [],
       retrying: retrying,
-      standing_roles: standing_role_snapshots(state, now),
+      standing_roles: standing_role_snapshots(state.standing_roles, state.running, now),
       claimed_count: MapSet.size(state.claimed),
       max_concurrent: state.max_concurrent_workers
     }
@@ -538,7 +568,11 @@ defmodule Shuttle.Poller do
       # Merge newly resolved host entries into the cache. Existing entries
       # are not evicted — earlier-configured hosts win for ID collisions,
       # and cache entries are stable for the daemon's lifetime.
-      state = %{state | fiber_host_cache: Map.merge(new_host_map, state.fiber_host_cache)}
+      state = %{
+        state
+        | fiber_host_cache: Map.merge(new_host_map, state.fiber_host_cache),
+          standing_roles: standing_roles_from_candidates(candidates)
+      }
 
       eligible = candidates |> filter_eligible(state) |> sort_candidates()
       {deferred, dispatchable} = partition_deferred(eligible, state)
@@ -560,6 +594,30 @@ defmodule Shuttle.Poller do
       false ->
         state
     end
+  end
+
+  defp run_poll_cycle_safely(%State{} = state) do
+    {:ok, maybe_dispatch(state)}
+  rescue
+    error ->
+      {:error, Exception.format(:error, error, __STACKTRACE__)}
+  catch
+    kind, reason ->
+      {:error, Exception.format(kind, reason, __STACKTRACE__)}
+  end
+
+  defp merge_poll_cycle_state(%State{} = current, %State{} = poll_state) do
+    %{
+      poll_state
+      | running: Map.merge(poll_state.running, current.running),
+        claimed: MapSet.union(poll_state.claimed, current.claimed),
+        retry_queue: Map.merge(poll_state.retry_queue, current.retry_queue),
+        waiters: current.waiters,
+        reservations: current.reservations,
+        completed_standing_runs:
+          MapSet.union(poll_state.completed_standing_runs, current.completed_standing_runs),
+        standing_roles: poll_state.standing_roles
+    }
   end
 
   # Splits eligible candidates into (deferred, dispatchable). Deferred
@@ -683,9 +741,10 @@ defmodule Shuttle.Poller do
   #   loom symlinking into a project-canonical host).
   #
   # Once we know which IDs are physically rooted in a host, felt becomes the
-  # sole reader: `list_shuttle_fibers/3` shells out once per host to
-  # `felt ls --json`, then filters that JSON payload down to the owned IDs
-  # that actually carry a `shuttle:` block.
+  # sole reader: `list_shuttle_fibers/3` shells out once per host to a narrow
+  # `felt ls --json --has-field shuttle --json-field ...` projection, then
+  # filters that JSON payload down to the owned IDs that actually carry a
+  # `shuttle:` block.
   #
   # The `file_identity` MapSet below is belt-and-suspenders for esoteric
   # cases (hard links, etc.) where two physically-distinct paths point at
@@ -761,7 +820,7 @@ defmodule Shuttle.Poller do
     if MapSet.size(owned_ids) == 0 do
       {:ok, []}
     else
-      case run_felt(host, state.runner, ["ls", "--json"]) do
+      case run_felt_ls_for_shuttle(host, state) do
         {:ok, output} ->
           with {:ok, fibers} when is_list(fibers) <- Jason.decode(output) do
             kept =
@@ -778,6 +837,29 @@ defmodule Shuttle.Poller do
         {:error, reason} ->
           {:error, reason}
       end
+    end
+  end
+
+  defp run_felt_ls_for_shuttle(host, state) do
+    projected_args = [
+      "ls",
+      "--json",
+      "--has-field",
+      "shuttle",
+      "--json-field",
+      @felt_shuttle_projection_fields
+    ]
+
+    case run_felt(host, state.runner, projected_args) do
+      {:ok, output} ->
+        {:ok, output}
+
+      {:error, reason} ->
+        Logger.warning(
+          "projected felt ls failed for #{host}; falling back to legacy broad listing: #{inspect(reason)}"
+        )
+
+        run_felt(host, state.runner, ["ls", "--json"])
     end
   end
 
@@ -1038,6 +1120,27 @@ defmodule Shuttle.Poller do
     end
   end
 
+  defp standing_roles_from_candidates(candidates) do
+    Enum.flat_map(candidates, fn fiber ->
+      case standing_role_from_fiber(fiber) do
+        {:ok, role} ->
+          if StandingRole.standing?(role), do: [role], else: []
+
+        {:error, _} ->
+          []
+      end
+    end)
+  end
+
+  defp standing_role_from_fiber(fiber) do
+    fiber_id = Map.get(fiber, "id", "")
+
+    case Map.get(fiber, "shuttle") do
+      shuttle when is_map(shuttle) -> StandingRole.from_map(fiber_id, shuttle)
+      _ -> {:error, :no_shuttle_block}
+    end
+  end
+
   # Resolves which configured felt host owns `fiber_id`.
   #
   # Resolution order:
@@ -1144,10 +1247,16 @@ defmodule Shuttle.Poller do
         if deps == [] or is_nil(deps) do
           true
         else
-          Enum.all?(deps, fn dep_id ->
-            case fetch_fiber_full(dep_id, state) do
-              {:ok, dep} -> Map.get(dep, "tempered", false) == true
-              {:error, _} -> false
+          Enum.all?(deps, fn dep ->
+            case dep_id(dep) do
+              nil ->
+                false
+
+              dep_id ->
+                case fetch_fiber_full(dep_id, state) do
+                  {:ok, dep} -> Map.get(dep, "tempered", false) == true
+                  {:error, _} -> false
+                end
             end
           end)
         end
@@ -1156,6 +1265,11 @@ defmodule Shuttle.Poller do
         false
     end
   end
+
+  defp dep_id(dep) when is_binary(dep), do: dep
+  defp dep_id(%{"id" => id}) when is_binary(id), do: id
+  defp dep_id(%{id: id}) when is_binary(id), do: id
+  defp dep_id(_), do: nil
 
   defp sort_candidates(candidates) do
     Enum.sort_by(candidates, fn fiber ->
@@ -1698,26 +1812,10 @@ defmodule Shuttle.Poller do
     MapSet.member?(state.completed_standing_runs, {fiber_id, run_id})
   end
 
-  defp standing_role_snapshots(state, now) do
-    with {:ok, candidates, _host_map} <- discover_candidates(state) do
-      candidates
-      |> Enum.filter(fn fiber ->
-        standing_role?(fiber, state)
-      end)
-      |> Enum.flat_map(fn fiber ->
-        fiber_id = Map.get(fiber, "id", "")
-
-        case fetch_standing_role(fiber_id, state) do
-          {:ok, role} ->
-            [StandingRole.to_snapshot(role, now, Map.has_key?(state.running, fiber_id))]
-
-          {:error, _} ->
-            []
-        end
-      end)
-    else
-      _ -> []
-    end
+  defp standing_role_snapshots(roles, running, now) do
+    Enum.map(roles, fn role ->
+      StandingRole.to_snapshot(role, now, Map.has_key?(running, role.fiber_id))
+    end)
   end
 
   # Run a felt CLI command against an explicit host directory.

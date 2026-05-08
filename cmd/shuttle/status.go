@@ -43,7 +43,7 @@ var statusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "One-line-per-fiber status overview",
 	Long: `Prints one line per fiber that has a shuttle: block.
-Sources: felt ls -j (for fibers with shuttle: blocks) + tmux ls (for live sessions).
+Sources: projected felt ls -j (for fibers with shuttle: blocks) + tmux ls (for live sessions).
 
 Columns: fiber_id  kind  state  agent  next_due_at
 
@@ -240,10 +240,13 @@ func listShuttleFibersAcrossHosts(hosts []string) ([]shuttleEntry, error) {
 	return merged, nil
 }
 
-// listShuttleFibers reads every fiber through `felt ls -s all --json` and
-// keeps the entries that carry a shuttle block.
+// listShuttleFibers reads a narrow projected felt listing and keeps the entries
+// that carry a shuttle block.
 func listShuttleFibers(host string) ([]shuttleEntry, error) {
-	out, err := exec.Command("felt", "-C", host, "ls", "-s", "all", "--json").Output()
+	out, err := projectedShuttleFiberListing(host)
+	if err != nil {
+		out, err = exec.Command("felt", "-C", host, "ls", "-s", "all", "--json").Output()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("felt ls: %w", err)
 	}
@@ -277,6 +280,18 @@ func listShuttleFibers(host string) ([]shuttleEntry, error) {
 		entries = append(entries, shuttleEntry{FiberID: ref.ID, Block: &block})
 	}
 	return entries, nil
+}
+
+func projectedShuttleFiberListing(host string) ([]byte, error) {
+	return exec.Command(
+		"felt",
+		"-C", host,
+		"ls",
+		"-s", "all",
+		"--json",
+		"--has-field", "shuttle",
+		"--json-field", "id,shuttle",
+	).Output()
 }
 
 // liveTmuxSessions returns a set of tmux session names that start with "shuttle-".
