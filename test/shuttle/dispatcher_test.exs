@@ -280,53 +280,6 @@ defmodule Shuttle.DispatcherTest do
     assert agent.model == "deepseek/deepseek-v4-flash"
   end
 
-  test "agent resolution reads application config" do
-    previous = Application.get_env(:shuttle, :agents)
-
-    try do
-      Application.put_env(:shuttle, :agents, [
-        [
-          id: "local-codex",
-          cli: "codex",
-          wrapper: "codex-nightly",
-          aliases: ["codex"],
-          default: true
-        ]
-      ])
-
-      assert [%{id: "local-codex", wrapper: "codex-nightly"}] = Agents.list()
-      assert {:ok, agent} = Agents.resolve(["constitution", "codex"])
-      assert agent.id == "local-codex"
-      assert agent.wrapper == "codex-nightly"
-    after
-      if previous do
-        Application.put_env(:shuttle, :agents, previous)
-      else
-        Application.delete_env(:shuttle, :agents)
-      end
-    end
-  end
-
-  test "agent resolution falls back to first configured agent when no default is set" do
-    previous = Application.get_env(:shuttle, :agents)
-
-    try do
-      Application.put_env(:shuttle, :agents, [
-        [id: "first", cli: "first", wrapper: "first"],
-        [id: "second", cli: "second", wrapper: "second"]
-      ])
-
-      assert {:ok, agent} = Agents.resolve(["constitution"])
-      assert agent.id == "first"
-    after
-      if previous do
-        Application.put_env(:shuttle, :agents, previous)
-      else
-        Application.delete_env(:shuttle, :agents)
-      end
-    end
-  end
-
   test "build_command for claude uses here-string" do
     agent = Enum.find(Agents.list(), &(&1.id == "claude-sonnet"))
     refute is_nil(agent), "expected claude-sonnet agent in defaults"
@@ -342,6 +295,16 @@ defmodule Shuttle.DispatcherTest do
     assert cmd =~ "codex"
     refute cmd =~ "<<<"
     assert cmd =~ "'hello world'"
+  end
+
+  test "build_command for codex spark selects the spark model" do
+    agent = Enum.find(Agents.list(), &(&1.id == "codex-spark"))
+    refute is_nil(agent), "expected codex-spark agent in defaults"
+    cmd = Agents.build_command(agent, "hello world")
+    assert cmd =~ "codex"
+    assert cmd =~ "--model 'gpt-5.3-codex-spark'"
+    assert cmd =~ "'hello world'"
+    refute cmd =~ "<<<"
   end
 
   test "build_command for pi includes provider and model" do

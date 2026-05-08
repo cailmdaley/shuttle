@@ -42,6 +42,15 @@ var embeddedAgentJSON = []byte(`[
     "default": false
   },
   {
+    "id": "codex-spark",
+    "cli": "codex",
+    "wrapper": "codex",
+    "model": "gpt-5.3-codex-spark",
+    "extra_flags": "--dangerously-bypass-approvals-and-sandbox",
+    "aliases": ["gpt-5.3-codex-spark"],
+    "default": false
+  },
+  {
     "id": "pi-sonnet",
     "cli": "pi",
     "wrapper": "pi",

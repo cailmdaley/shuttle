@@ -2,9 +2,8 @@ defmodule Shuttle.Agents do
   @moduledoc """
   Agent configuration loading and tag resolution.
 
-  Agents are configured through `config :shuttle, :agents`. The built-in
-  records are the fallback so tests and local escripts still have a complete
-  default surface when no config file has been loaded.
+  Agents are loaded from `share/agents.json` at compile time. That JSON file
+  is the single source of truth shared with the Go CLI.
   """
 
   @type agent_record :: %{
@@ -28,9 +27,7 @@ defmodule Shuttle.Agents do
   """
   @spec list() :: [agent_record()]
   def list do
-    :shuttle
-    |> Application.get_env(:agents, @embedded_agents)
-    |> normalize_agents()
+    normalize_agents(@embedded_agents)
   end
 
   @doc """

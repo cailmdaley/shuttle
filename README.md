@@ -165,7 +165,7 @@ The worker exits with `review.state: awaiting`; `shuttle-ctl accept <fiber>` adv
 
 Agents live in `share/agents.json` — the single source of truth for both the Elixir daemon and the Go CLI (embedded at compile time). Edit the JSON, then `make restart` to pick up changes.
 
-Built-in agents: `claude-sonnet`, `claude-opus`, `codex`, and several `pi-*` variants (for [pi](https://github.com/mariozechner/pi)). Add your own by following the same shape.
+Built-in agents: `claude-sonnet`, `claude-opus`, `codex`, `codex-spark`, and several `pi-*` variants (for [pi](https://github.com/mariozechner/pi)). Add your own by following the same shape.
 
 ## Remote Dispatch
 
