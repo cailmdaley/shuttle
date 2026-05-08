@@ -35,7 +35,7 @@ defmodule Shuttle.Poller do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias Shuttle.{Dispatcher, StandingRole, WorkerWatcher}
+  alias Shuttle.{Actions, Dispatcher, StandingRole, WorkerWatcher}
 
   @pubsub_topic "shuttle:snapshot"
 
@@ -144,6 +144,37 @@ defmodule Shuttle.Poller do
           {:ok, String.t()} | {:error, atom()}
   def dispatch_fiber(server, fiber_id, opts) do
     GenServer.call(server, {:dispatch, fiber_id, opts}, @dispatch_call_timeout_ms)
+  end
+
+  @spec actions_for(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  def actions_for(fiber_id, opts \\ []), do: actions_for(__MODULE__, fiber_id, opts)
+
+  @spec actions_for(GenServer.server(), String.t(), keyword()) ::
+          {:ok, [map()]} | {:error, term()}
+  def actions_for(server, fiber_id, opts) do
+    GenServer.call(server, {:actions, fiber_id, opts}, @dispatch_call_timeout_ms)
+  end
+
+  @spec actions_for(GenServer.server(), String.t(), keyword(), non_neg_integer()) ::
+          {:ok, [map()]} | {:error, term()}
+  def actions_for(server, fiber_id, opts, timeout_ms) do
+    GenServer.call(server, {:actions, fiber_id, opts}, timeout_ms)
+  end
+
+  @spec resolve_action(String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def resolve_action(fiber_id, target, opts \\ []),
+    do: resolve_action(__MODULE__, fiber_id, target, opts)
+
+  @spec resolve_action(GenServer.server(), String.t(), String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def resolve_action(server, fiber_id, target, opts) do
+    GenServer.call(server, {:resolve_action, fiber_id, target, opts}, @dispatch_call_timeout_ms)
+  end
+
+  @spec resolve_action(GenServer.server(), String.t(), String.t(), keyword(), non_neg_integer()) ::
+          {:ok, map()} | {:error, term()}
+  def resolve_action(server, fiber_id, target, opts, timeout_ms) do
+    GenServer.call(server, {:resolve_action, fiber_id, target, opts}, timeout_ms)
   end
 
   @spec wait_for_tempered(String.t(), non_neg_integer(), keyword()) ::
@@ -423,6 +454,28 @@ defmodule Shuttle.Poller do
           {:error, reason} ->
             {:reply, {:error, reason}, state}
         end
+    end
+  end
+
+  def handle_call({:actions, fiber_id, opts}, _from, state) do
+    case fetch_fiber_full(fiber_id, state) do
+      {:ok, fiber} ->
+        running? = Keyword.get(opts, :running, Map.has_key?(state.running, fiber_id))
+        {:reply, {:ok, Actions.actions_for(fiber, running?)}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:resolve_action, fiber_id, target, opts}, _from, state) do
+    case fetch_fiber_full(fiber_id, state) do
+      {:ok, fiber} ->
+        running? = Keyword.get(opts, :running, Map.has_key?(state.running, fiber_id))
+        {:reply, Actions.resolve_transition(fiber, target, running?), state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
     end
   end
 

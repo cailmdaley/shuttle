@@ -16,6 +16,8 @@ defmodule ShuttleWeb.Router do
 
     get("/workers/*fiber_id", WorkerController, :show)
     post("/dispatch", DispatchController, :create)
+    get("/actions/*fiber_id", ActionsController, :show)
+    post("/actions/resolve", ActionsController, :resolve)
     post("/wait", WaitController, :create)
     post("/reserve", ReserveController, :create)
     get("/state", StateController, :show)
