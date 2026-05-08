@@ -3,8 +3,8 @@ defmodule ShuttleWeb.OriginsController do
   Agent-API endpoint for daemon origin resolution.
 
   `GET /api/v1/origins` exposes the local daemon plus the configured
-  `:remotes` list. The Go CLI uses this as the single source of truth
-  for `--origin <name>` URL routing.
+  `:remotes` list. Portolan uses this as the daemon routing table for
+  cross-host create and lifecycle requests.
   """
 
   use Phoenix.Controller, formats: [:json]

@@ -2,11 +2,10 @@ defmodule ShuttleWeb.LifecycleController do
   @moduledoc """
   Agent-API endpoint for daemon-local shuttle lifecycle mutations.
 
-  Remote `shuttle --origin <name> ...` calls land here on the selected
-  daemon. The endpoint delegates to the existing shuttle-ctl Go CLI without an
-  origin flag, so the validated offline frontmatter writer remains the
-  single implementation of install/pause/resume/repeat/accept/set-model/
-  uninstall.
+  Cross-host lifecycle requests from Portolan land here on the selected
+  daemon. The endpoint delegates to the existing shuttle-ctl Go CLI, so the
+  validated offline frontmatter writer remains the single implementation of
+  install/pause/resume/repeat/accept/set-model/uninstall.
   """
 
   use Phoenix.Controller, formats: [:json]
