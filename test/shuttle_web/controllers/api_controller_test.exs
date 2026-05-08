@@ -226,6 +226,18 @@ defmodule ShuttleWeb.APIControllerTest do
     )
   end
 
+  defp with_actions_host do
+    previous = System.get_env("LOOM_HOMES")
+    System.put_env("LOOM_HOMES", "/tmp")
+
+    on_exit(fn ->
+      case previous do
+        nil -> System.delete_env("LOOM_HOMES")
+        value -> System.put_env("LOOM_HOMES", value)
+      end
+    end)
+  end
+
   # ── GET /api/v1/workers/:fiber_id ──
 
   test "returns running worker info" do
@@ -357,6 +369,54 @@ defmodule ShuttleWeb.APIControllerTest do
     assert conn.status == 400
     body = Jason.decode!(conn.resp_body)
     assert body["error"] == "fiber_id is required"
+  end
+
+  # ── Shuttle actions ──
+
+  @tag :capture_log
+  test "actions resolve returns the canonical lifecycle action from local frontmatter" do
+    with_actions_host()
+
+    MockRunner.set_shuttle(
+      "tests/action-awaiting",
+      "enabled: true\nkind: standing\nreview:\n  state: awaiting\n",
+      "active"
+    )
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/actions/resolve",
+        Jason.encode!(%{fiber_id: "tests/action-awaiting", target: "tempered"})
+      )
+
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+    assert body["fiber_id"] == "tests/action-awaiting"
+    assert body["target"] == "tempered"
+    assert body["action"]["id"] == "accept-run"
+
+    refute Enum.any?(MockRunner.commands(), fn {command, args} ->
+             command == "felt" and "show" in args
+           end)
+  end
+
+  @tag :capture_log
+  test "actions invoke rejects unavailable action ids before mutating" do
+    with_actions_host()
+    MockRunner.set_shuttle("tests/action-oneshot", @oneshot_shuttle)
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/actions/invoke",
+        Jason.encode!(%{fiber_id: "tests/action-oneshot", action: "accept-run"})
+      )
+
+    assert conn.status == 409
+    body = Jason.decode!(conn.resp_body)
+    assert body["error"] == "action_not_available"
+    assert body["invoked"] == false
   end
 
   # ── POST /api/v1/wait ──
