@@ -14,14 +14,10 @@ import (
 
 var snapshotCmd = &cobra.Command{
 	Use:   "snapshot",
-	Short: "Print the selected daemon's state snapshot",
+	Short: "Print the local daemon's state snapshot",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		baseURL, err := resolveOriginURL(normalizedOrigin())
-		if err != nil {
-			return err
-		}
-		body, err := getDaemon(baseURL + "/api/v1/state")
+		body, err := getDaemon(daemonURL() + "/api/v1/state")
 		if err != nil {
 			return err
 		}
@@ -35,19 +31,15 @@ var snapshotCmd = &cobra.Command{
 
 var dispatchCmd = &cobra.Command{
 	Use:   "dispatch <fiber>",
-	Short: "Ask the selected daemon to dispatch a fiber now",
+	Short: "Ask the local daemon to dispatch a fiber now",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		baseURL, err := resolveOriginURL(normalizedOrigin())
-		if err != nil {
-			return err
-		}
 		adHoc, _ := cmd.Flags().GetBool("ad-hoc")
 		payload, _ := json.Marshal(map[string]any{
 			"fiber_id": args[0],
 			"ad_hoc":   adHoc,
 		})
-		body, err := postDaemon(baseURL+"/api/v1/dispatch", payload)
+		body, err := postDaemon(daemonURL()+"/api/v1/dispatch", payload)
 		if err != nil {
 			return err
 		}

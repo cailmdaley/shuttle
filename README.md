@@ -66,9 +66,9 @@ make cli
 
 Add `~/go/bin` (or wherever `$(GOPATH)/bin` points) to your `PATH` so `shuttle-ctl` is available.
 
-### Configure a felt host
+### Configure a felt store
 
-Shuttle defaults to `LOOM_HOME` or `~/loom` as the felt host. Override with:
+Shuttle defaults to `LOOM_HOME` or `~/loom` as the felt store. Override with:
 
 ```bash
 # Environment variable (takes precedence, comma-separated for multiple hosts):

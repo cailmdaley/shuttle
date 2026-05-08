@@ -56,16 +56,14 @@ bin/shuttle dispatch <fiber-id>               # one-shot dispatch
 shuttle-ctl status                            # all fibers with shuttle: blocks
 shuttle-ctl status --all                      # local + every configured remote
 shuttle-ctl status --remote <name>            # single remote
-shuttle-ctl status --origin candide           # direct origin spelling for remote daemon routing
 shuttle-ctl ps                                # live tmux workers only
-shuttle-ctl ps --origin candide               # live workers on a selected daemon
-shuttle-ctl install <fiber> --project-dir "$PWD" [-m <agent-id>] [--disabled] [--origin candide]
+shuttle-ctl install <fiber> --project-dir "$PWD" [-m <agent-id>] [--disabled]
 shuttle-ctl repeat <fiber> --schedule "0 9 * * 1-5" --tz Europe/Paris --project-dir "$PWD"
 shuttle-ctl pause <fiber>                       # disable + kill live worker; --no-kill preserves it
 shuttle-ctl resume / accept <fiber>
 shuttle-ctl set-model <fiber> <agent-id>
-shuttle-ctl dispatch <fiber> --origin candide
-shuttle-ctl snapshot --origin candide
+shuttle-ctl dispatch <fiber>
+shuttle-ctl snapshot
 shuttle-ctl abort / attach <fiber>
 shuttle-ctl migrate --dry-run                 # preview eligibility migration
 ```
@@ -92,9 +90,9 @@ shuttle-ctl migrate --dry-run                 # preview eligibility migration
   install` and `repeat` require `--project-dir`; workers start there instead
   of falling back to the felt store.
 - **shuttle-ctl is the agent-facing CLI.** Local write verbs validate before
-  write and work offline. With `--origin <name>`, lifecycle verbs are sent to
-  that daemon over the configured tunnel so the selected host edits its own
-  local fiber store. `bin/shuttle` handles daemon lifecycle and dispatch.
+  write and work offline. Cross-host writes belong to Portolan's kanban/API
+  surface, not to `shuttle-ctl`. `bin/shuttle` handles daemon lifecycle and
+  dispatch.
 - **No tag predicate for dispatch.** The `shuttle:` block's `enabled: true`
   field is the dispatch signal. Tags are free-form qualitative noticings;
   only `idea` is load-bearing for Portolan's kanban column placement.

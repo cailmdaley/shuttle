@@ -11,7 +11,6 @@ import (
 var (
 	jsonOutput   bool
 	feltHostFlag string
-	originFlag   string
 )
 
 var rootCmd = &cobra.Command{
@@ -36,28 +35,26 @@ Write verbs (offline, validate-before-write):
 Read verbs:
   status       One-line-per-fiber status overview
   ps           Live tmux worker sessions only
-  snapshot     Print the selected daemon's state snapshot
-  dispatch     Ask the selected daemon to dispatch a fiber now
+  snapshot     Print the local daemon's state snapshot
+  dispatch     Ask the local daemon to dispatch a fiber now
   session-name Print the canonical tmux session name for a fiber
   attach       Attach to a running worker's tmux session
 
 To stop a running worker, use 'shuttle pause <fiber>' — it disables
 dispatch and kills the live worker (use --no-kill to preserve the worker).
 
-The CLI edits local shuttle: frontmatter directly. With --origin <name>,
-HTTP-backed verbs route to the selected daemon over its configured tunnel so
-that host edits or dispatches its own local fiber store. All write verbs
-validate input before touching any file.
+The CLI edits local shuttle: frontmatter directly. Cross-host writes belong to
+the kanban/backend HTTP surface, not to agent-facing shuttle-ctl. All write
+verbs validate input before touching any file.
 
-Use --host <dir> to target a specific felt host when a fiber does not live
-under the default LOOM_HOME or ~/loom felt store.`,
+Use --felt-store <dir> to target a specific felt store when a fiber does not
+live under the default LOOM_HOME or ~/loom store.`,
 	CompletionOptions: cobra.CompletionOptions{HiddenDefaultCmd: true},
 }
 
 func init() {
 	rootCmd.PersistentFlags().BoolVarP(&jsonOutput, "json", "j", false, "Output in JSON format")
-	rootCmd.PersistentFlags().StringVar(&feltHostFlag, "host", "", "Felt host root (directory containing .felt/)")
-	rootCmd.PersistentFlags().StringVar(&originFlag, "origin", "local", "Daemon origin for HTTP-backed commands (local, candide, cineca)")
+	rootCmd.PersistentFlags().StringVar(&feltHostFlag, "felt-store", "", "Felt store root (directory containing .felt/)")
 }
 
 // loadAgents loads the agent registry; exits with a clear error on failure.
