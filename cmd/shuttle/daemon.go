@@ -42,7 +42,11 @@ var dispatchCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		payload, _ := json.Marshal(map[string]string{"fiber_id": args[0]})
+		adHoc, _ := cmd.Flags().GetBool("ad-hoc")
+		payload, _ := json.Marshal(map[string]any{
+			"fiber_id": args[0],
+			"ad_hoc":   adHoc,
+		})
 		body, err := postDaemon(baseURL+"/api/v1/dispatch", payload)
 		if err != nil {
 			return err
@@ -87,6 +91,7 @@ func readDaemonResponse(url string, resp *http.Response) ([]byte, error) {
 }
 
 func init() {
+	dispatchCmd.Flags().Bool("ad-hoc", false, "For standing roles, dispatch an ad-hoc run without consuming the scheduled occurrence")
 	rootCmd.AddCommand(snapshotCmd)
 	rootCmd.AddCommand(dispatchCmd)
 }

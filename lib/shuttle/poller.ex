@@ -383,7 +383,7 @@ defmodule Shuttle.Poller do
                 {:reply, {:ok, "human"}, state}
 
               dispatch_eligible?(fiber, state, opts) ->
-                new_state = do_dispatch_fiber(state, fiber)
+                new_state = do_dispatch_fiber(state, fiber, opts)
 
                 if Map.has_key?(new_state.running, fiber_id) do
                   {:reply, {:ok, session}, new_state}
@@ -1095,7 +1095,8 @@ defmodule Shuttle.Poller do
   end
 
   defp dispatch_eligible?(fiber, state, opts) do
-    if Keyword.get(opts, :force, false) and force_dispatchable_standing_role?(fiber, state) do
+    if (Keyword.get(opts, :force, false) or Keyword.get(opts, :ad_hoc, false)) and
+         force_dispatchable_standing_role?(fiber, state) do
       dependencies_satisfied?(Map.get(fiber, "id", ""), state)
     else
       eligible?(fiber, state)
@@ -1278,7 +1279,7 @@ defmodule Shuttle.Poller do
     end)
   end
 
-  defp do_dispatch_fiber(%State{} = state, fiber) do
+  defp do_dispatch_fiber(%State{} = state, fiber, opts \\ []) do
     fiber_id = Map.get(fiber, "id", "")
 
     felt_host =
@@ -1287,7 +1288,7 @@ defmodule Shuttle.Poller do
         {:error, _} -> hd(state.felt_hosts)
       end
 
-    prompt_context = dispatch_prompt_context(fiber, state)
+    prompt_context = dispatch_prompt_context(fiber, state, opts)
 
     case Dispatcher.dispatch(
            fiber_id,
@@ -1773,13 +1774,19 @@ defmodule Shuttle.Poller do
     end
   end
 
-  defp dispatch_prompt_context(fiber, state) do
+  defp dispatch_prompt_context(fiber, state, opts) do
     fiber_id = Map.get(fiber, "id", "")
 
     case fetch_standing_role(fiber_id, state) do
       {:ok, role} ->
         if StandingRole.standing?(role) do
-          {:standing_run, StandingRole.next_run_id(role, DateTime.utc_now())}
+          now = DateTime.utc_now()
+
+          if Keyword.get(opts, :ad_hoc, false) or Keyword.get(opts, :force, false) do
+            {:standing_run, StandingRole.ad_hoc_run_id(now), :ad_hoc}
+          else
+            {:standing_run, StandingRole.next_run_id(role, now)}
+          end
         else
           :constitution
         end
@@ -1790,6 +1797,10 @@ defmodule Shuttle.Poller do
   end
 
   defp running_prompt_metadata({:standing_run, run_id}), do: %{state: "running", run_id: run_id}
+
+  defp running_prompt_metadata({:standing_run, run_id, :ad_hoc}),
+    do: %{state: "running", run_id: run_id, run_kind: "ad_hoc"}
+
   defp running_prompt_metadata(_), do: %{}
 
   defp fetch_standing_role(fiber_id, state) do

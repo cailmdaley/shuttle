@@ -372,9 +372,17 @@ defmodule Shuttle.Dispatcher do
   """
   @spec render_standing_run_prompt(String.t(), String.t(), keyword()) :: String.t()
   def render_standing_run_prompt(fiber_id, run_id, opts \\ []) do
-    header = """
-    The orchestration system Shuttle dispatched you for a scheduled run of this standing role. Standing roles are recurring responsibilities — this dispatch is one due occurrence, not a new fiber. The `shuttle` and `felt` skills carry the practice — activate them next; the skill's "Standing Roles" section covers the awaiting-review handoff at run completion.
+    ad_hoc? = Keyword.get(opts, :ad_hoc, false)
 
+    orientation =
+      if ad_hoc? do
+        "The orchestration system Shuttle dispatched you for an ad-hoc run of this standing role. Standing roles are recurring responsibilities; this dispatch is right-now work and must not consume or advance the scheduled occurrence. On completion, set review.state to awaiting with this ad-hoc run id and preserve next_due_at. The `shuttle` and `felt` skills carry the practice — activate them next."
+      else
+        "The orchestration system Shuttle dispatched you for a scheduled run of this standing role. Standing roles are recurring responsibilities — this dispatch is one due occurrence, not a new fiber. The `shuttle` and `felt` skills carry the practice — activate them next; the skill's \"Standing Roles\" section covers the awaiting-review handoff at run completion."
+      end
+
+    header = """
+    #{orientation}
     Fiber: #{fiber_id}
     Run:   #{run_id}
     """
@@ -782,6 +790,10 @@ defmodule Shuttle.Dispatcher do
 
   defp render_context_prompt(fiber_id, {:standing_run, run_id}, opts) do
     render_standing_run_prompt(fiber_id, run_id, opts)
+  end
+
+  defp render_context_prompt(fiber_id, {:standing_run, run_id, :ad_hoc}, opts) do
+    render_standing_run_prompt(fiber_id, run_id, Keyword.put(opts, :ad_hoc, true))
   end
 
   defp render_context_prompt(fiber_id, _, opts), do: render_prompt(fiber_id, opts)

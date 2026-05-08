@@ -418,7 +418,7 @@ defmodule Shuttle.PollerTest do
              Poller.snapshot(poller).standing_roles
   end
 
-  test "direct dispatch can force a scheduled standing role before it is due" do
+  test "direct dispatch creates an ad-hoc standing run before the schedule is due" do
     fiber_id = "tests/standing-force-now"
     fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
     MockRunner.set_fiber(fiber_id, fiber)
@@ -453,7 +453,21 @@ defmodule Shuttle.PollerTest do
     assert [%{fiber_id: ^fiber_id, state: "running", run_id: run_id}] =
              Poller.snapshot(poller).eligible
 
-    assert run_id == "29990101T080000+0000"
+    assert String.starts_with?(run_id, "adhoc-")
+
+    MockRunner.remove_tmux_session(Dispatcher.session_name(fiber_id))
+    send(poller, {:worker_exited, fiber_id, :normal_exit, false})
+    Process.sleep(50)
+
+    send(poller, :run_poll_cycle)
+    Process.sleep(50)
+
+    new_session_count =
+      MockRunner.commands()
+      |> Enum.filter(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
+      |> length()
+
+    assert new_session_count == 1
   end
 
   test "poller dispatches a due standing role with run context and does not hot-loop after exit" do

@@ -85,6 +85,15 @@ defmodule Shuttle.StandingRole do
     Calendar.strftime(now, "%Y%m%dT%H%M%S%z")
   end
 
+  @spec ad_hoc_run_id(DateTime.t()) :: String.t()
+  def ad_hoc_run_id(%DateTime{} = now) do
+    "adhoc-#{DateTime.to_unix(now, :millisecond)}"
+  end
+
+  @spec ad_hoc_run_id?(String.t() | nil) :: boolean()
+  def ad_hoc_run_id?("adhoc-" <> _), do: true
+  def ad_hoc_run_id?(_), do: false
+
   @spec to_snapshot(t(), DateTime.t(), boolean()) :: map()
   def to_snapshot(%__MODULE__{} = role, now, running?) do
     %{
@@ -129,7 +138,8 @@ defmodule Shuttle.StandingRole do
       state in ["scheduled", "accepted", "due"] and is_nil(next_due_at) ->
         "scheduleable state #{state} requires next_due_at"
 
-      state in ["awaiting", "review", "in_review"] and not is_nil(next_due_at) ->
+      state in ["awaiting", "review", "in_review"] and not is_nil(next_due_at) and
+          not ad_hoc_run_id?(string(review["run_id"])) ->
         "review state #{state} must clear next_due_at"
 
       true ->

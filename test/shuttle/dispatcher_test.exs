@@ -428,6 +428,16 @@ defmodule Shuttle.DispatcherTest do
     refute prompt =~ "felt history append"
   end
 
+  test "render_standing_run_prompt distinguishes ad-hoc runs from scheduled occurrences" do
+    prompt =
+      Dispatcher.render_standing_run_prompt("tests/haiku", "adhoc-1770000000000", ad_hoc: true)
+
+    assert prompt =~ "ad-hoc run of this standing role"
+    assert prompt =~ "must not consume or advance the scheduled occurrence"
+    assert prompt =~ "preserve next_due_at"
+    assert prompt =~ "Run:   adhoc-1770000000000"
+  end
+
   test "render_resume_prompt names the fiber and defers to the existing transcript" do
     # No felt history available in test env (no .felt index) — context
     # blocks suppress to empty; the framing block still renders.

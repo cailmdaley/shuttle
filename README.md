@@ -139,7 +139,7 @@ All write verbs validate the block before touching any file. The daemon picks up
 
 ## Standing Roles
 
-A standing role is a recurring responsibility — a constitution with a cron schedule. Shuttle dispatches a run only when `next_due_at` is due and `review.state` is `scheduled` or `accepted`:
+A standing role is a recurring responsibility — a constitution with a cron schedule. Shuttle dispatches scheduled runs only when `next_due_at` is due and `review.state` is `scheduled` or `accepted`:
 
 ```yaml
 shuttle:
@@ -155,7 +155,7 @@ shuttle:
   last_run_at: null
 ```
 
-The worker exits with `review.state: awaiting`; `shuttle-ctl accept <fiber>` advances `next_due_at` to the next occurrence.
+The worker exits with `review.state: awaiting`; `shuttle-ctl accept <fiber>` advances `next_due_at` to the next occurrence. Manual standing-role dispatch uses an `adhoc-...` run id and preserves the existing `next_due_at` through accept, so an extra run does not consume the next scheduled slot.
 
 ## Agent Registry
 

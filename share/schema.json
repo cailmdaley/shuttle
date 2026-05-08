@@ -46,7 +46,7 @@
         },
         "run_id": {
           "type": ["string", "null"],
-          "description": "Current run identifier. Set by daemon when dispatching."
+          "description": "Current run identifier. Set by daemon when dispatching; ad-hoc standing runs use an adhoc- prefix."
         },
         "accepted_run_id": {
           "type": ["string", "null"],
@@ -57,7 +57,7 @@
     "next_due_at": {
       "type": ["string", "null"],
       "format": "date-time",
-      "description": "ISO 8601 datetime. Daemon-owned for standing roles after the first install; CLI sets initial value on repeat and advances on accept."
+      "description": "ISO 8601 datetime. Daemon-owned for standing roles after the first install; CLI sets initial value on repeat and advances on scheduled-run accept. Ad-hoc run accept preserves it."
     },
     "last_run_at": {
       "type": ["string", "null"],
@@ -73,7 +73,7 @@
     "required": ["schedule"]
   },
   "notes": {
-    "writer_ownership": "CLI owns: enabled, kind, agent, schedule, review.state (accepted/aborted transitions only), review.accepted_run_id, next_due_at (initial and accept advance). Daemon owns: review.state (scheduled/running/awaiting transitions), review.run_id, last_run_at, enabled (false flip after oneshot run), next_due_at (standing role advance after run).",
+    "writer_ownership": "CLI owns: enabled, kind, agent, schedule, review.state (accepted/aborted transitions only), review.accepted_run_id, next_due_at (initial and scheduled-run accept advance). Daemon owns: review.state (scheduled/running/awaiting transitions), review.run_id, last_run_at, enabled (false flip after oneshot run). Ad-hoc standing runs preserve next_due_at.",
     "schema_tz_migration": "Pre-CLI standing roles used schedule.timezone. Migration renames to schedule.tz. The Elixir daemon reads tz after migration.",
     "kind_migration": "Pre-CLI standing roles used shuttle.mode instead of shuttle.kind. Migration renames to kind."
   }

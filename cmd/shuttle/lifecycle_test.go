@@ -485,6 +485,52 @@ Standing role body.
 	}
 }
 
+func TestAcceptCmd_AdHocRunPreservesNextDueAt(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "daily-report", `---
+name: Daily report
+status: active
+outcome: ad-hoc digest
+shuttle:
+  enabled: true
+  kind: standing
+  schedule:
+    expr: "0 9 * * 1-5"
+    tz: Europe/Paris
+  review:
+    state: awaiting
+    run_id: adhoc-1770000000000
+  next_due_at: "2026-05-11T09:00:00+02:00"
+---
+
+Standing role body.
+`)
+
+	cmd := newAcceptCmd()
+	cmd.SetArgs([]string{"daily-report"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	text := string(raw)
+
+	if !strings.Contains(text, "accepted_run_id: adhoc-1770000000000") {
+		t.Fatalf("accepted_run_id not set for ad-hoc run:\n%s", text)
+	}
+	if !strings.Contains(text, "next_due_at: 2026-05-11T09:00:00+02:00") {
+		t.Fatalf("ad-hoc accept should preserve next_due_at:\n%s", text)
+	}
+	if strings.Contains(text, "ad-hoc digest") {
+		t.Fatalf("outcome digest survived accept:\n%s", text)
+	}
+}
+
 // TestAcceptCmd_KeepOutcomeFlag_PreservesOutcome verifies that --keep-outcome
 // preserves the outcome field across accept (escape hatch for the rare case
 // where the digest should survive into the next dispatch).

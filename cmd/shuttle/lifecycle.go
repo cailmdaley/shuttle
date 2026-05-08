@@ -373,14 +373,19 @@ Appends a felt history event recording the acceptance.`,
 				runID = *f.Block.Review.RunID
 			}
 
-			// Advance next_due_at from current or now.
-			from := time.Now()
-			if f.Block.NextDueAt != nil {
-				from = *f.Block.NextDueAt
-			}
-			next, err := schema.NextOccurrence(f.Block.Schedule, from)
-			if err != nil {
-				return fmt.Errorf("computing next occurrence: %w", err)
+			adHoc := strings.HasPrefix(runID, "adhoc-")
+			next := f.Block.NextDueAt
+			if !adHoc {
+				// Advance next_due_at from current or now.
+				from := time.Now()
+				if f.Block.NextDueAt != nil {
+					from = *f.Block.NextDueAt
+				}
+				computedNext, err := schema.NextOccurrence(f.Block.Schedule, from)
+				if err != nil {
+					return fmt.Errorf("computing next occurrence: %w", err)
+				}
+				next = &computedNext
 			}
 
 			f.Block.Review = &schema.Review{
@@ -388,7 +393,7 @@ Appends a felt history event recording the acceptance.`,
 				RunID:         schema.StringPtr(runID),
 				AcceptedRunID: schema.StringPtr(runID),
 			}
-			f.Block.NextDueAt = &next
+			f.Block.NextDueAt = next
 			f.Block.Enabled = true // ensure re-enabled after review
 
 			// Clear outcome unless --keep-outcome. The accepted digest's signal
@@ -403,6 +408,18 @@ Appends a felt history event recording the acceptance.`,
 			}
 
 			// Append felt history event.
+			if adHoc {
+				nextText := "unchanged"
+				if next != nil {
+					nextText = next.Format(time.RFC3339)
+				}
+				_ = appendFeltHistory(host, fiberID, fmt.Sprintf("accepted ad-hoc run %s; next due %s", runID, nextText))
+
+				fmt.Printf("accepted ad-hoc run %s for %s\n", runID, args[0])
+				fmt.Printf("  next due: %s (unchanged)\n", nextText)
+				return nil
+			}
+
 			_ = appendFeltHistory(host, fiberID, fmt.Sprintf("accepted run %s; next due %s", runID, next.Format(time.RFC3339)))
 
 			fmt.Printf("accepted run %s for %s\n", runID, args[0])

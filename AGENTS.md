@@ -107,9 +107,11 @@ shuttle-ctl migrate --dry-run                 # preview eligibility migration
   `Shuttle.Agents.resolve_by_name/1` against the embedded registry, spawns
   `shuttle-<fiber-id>` tmux session.
 - **Standing roles** — `shuttle.kind: standing` with a cron `schedule:`.
-  Dispatches only when `next_due_at` is due AND `review.state` is
-  `scheduled` or `accepted`. Worker exit flips state to `awaiting`;
-  `shuttle-ctl accept` advances `next_due_at`.
+  Scheduled runs dispatch only when `next_due_at` is due AND `review.state`
+  is `scheduled` or `accepted`. Manual dispatch is ad-hoc (`adhoc-...`
+  run id) and preserves `next_due_at`; worker exit flips state to
+  `awaiting`, and `shuttle-ctl accept` advances `next_due_at` only for
+  scheduled runs.
 
 ## Dispatch prompt structure
 
