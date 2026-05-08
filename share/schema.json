@@ -15,6 +15,14 @@
       "enum": ["oneshot", "standing"],
       "description": "Dispatch mode. oneshot: dispatched once (daemon clears enabled after run). standing: recurring per schedule."
     },
+    "host": {
+      "type": "string",
+      "description": "Machine id that owns dispatch for this fiber. Daemons default absent/empty host to local and only dispatch blocks whose host matches their configured shuttle host id."
+    },
+    "project_dir": {
+      "type": "string",
+      "description": "Absolute or tilde-prefixed working directory on the target host where the worker tmux session should start."
+    },
     "agent": {
       "type": "string",
       "description": "Agent ID from the agent registry. Defaults to the registry's default agent when absent."

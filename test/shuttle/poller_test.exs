@@ -273,6 +273,59 @@ defmodule Shuttle.PollerTest do
     assert hd(snap.eligible).fiber_id == "tests/haiku-dispatch"
   end
 
+  test "poller skips fibers targeted at a different shuttle host" do
+    fiber = make_fiber("tests/host-mismatch")
+    MockRunner.set_fiber("tests/host-mismatch", fiber)
+    MockRunner.set_shuttle("tests/host-mismatch", "enabled: true\nkind: oneshot\nhost: candide\n")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_host_mismatch,
+        runner: MockRunner,
+        own_host_id: "local",
+        poll_interval_ms: 60_000,
+        felt_hosts: ["/tmp"]
+      )
+
+    send(poller, :run_poll_cycle)
+    Process.sleep(50)
+
+    refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
+
+    snap = Poller.snapshot(poller)
+    assert snap.eligible == []
+    assert snap.claimed_count == 0
+  end
+
+  test "poller dispatches fibers targeted at its own shuttle host" do
+    fiber = make_fiber("tests/host-match")
+    MockRunner.set_fiber("tests/host-match", fiber)
+    MockRunner.set_shuttle("tests/host-match", "enabled: true\nkind: oneshot\nhost: candide\n")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_host_match,
+        runner: MockRunner,
+        own_host_id: "candide",
+        poll_interval_ms: 60_000,
+        felt_hosts: ["/tmp"]
+      )
+
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+               cmd == "tmux" and hd(args) == "new-session"
+             end)
+           end)
+
+    snap = Poller.snapshot(poller)
+    assert length(snap.eligible) == 1
+    assert hd(snap.eligible).fiber_id == "tests/host-match"
+  end
+
   test "poller uses projected felt listing for shuttle discovery" do
     fiber = make_fiber("tests/projected-discovery")
     MockRunner.set_fiber("tests/projected-discovery", fiber)

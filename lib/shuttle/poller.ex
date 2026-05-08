@@ -72,6 +72,8 @@ defmodule Shuttle.Poller do
       :tick_token,
       # List of felt host directories, in resolution-priority order.
       :felt_hosts,
+      # Machine identity used by shuttle.host dispatch affinity.
+      :own_host_id,
       # When true, felt_hosts is re-read from env + persisted registration on
       # each poll cycle. Set true when :felt_hosts opt isn't passed to
       # start_link; false when the caller passed an explicit list (tests,
@@ -227,6 +229,7 @@ defmodule Shuttle.Poller do
 
     runner = Keyword.get(opts, :runner, Shuttle.Runner.Default)
     remote_registry = Keyword.get(opts, :remote_registry, Shuttle.RemoteRegistry)
+    own_host_id = Keyword.get(opts, :own_host_id, Application.get_env(:shuttle, :host, "local"))
 
     # Use the registered name (atom) when available so cross-process sends
     # survive a supervisor restart of this Poller. Process.info/2 returns
@@ -253,6 +256,7 @@ defmodule Shuttle.Poller do
       tick_timer_ref: nil,
       tick_token: nil,
       felt_hosts: felt_hosts,
+      own_host_id: to_string(own_host_id || "local"),
       auto_discover_felt_hosts: auto_discover,
       runner: runner,
       remote_registry: remote_registry
@@ -1089,6 +1093,10 @@ defmodule Shuttle.Poller do
         Map.get(shuttle, "enabled", false) != true ->
           false
 
+        # Must target this daemon. Blocks without host: are legacy/local.
+        shuttle_host(shuttle) != state.own_host_id ->
+          false
+
         # Must be committed to active work
         status not in ["open", "active"] ->
           false
@@ -1131,6 +1139,7 @@ defmodule Shuttle.Poller do
 
     with true <- is_map(shuttle),
          true <- Map.get(shuttle, "enabled", false) == true,
+         true <- shuttle_host(shuttle) == state.own_host_id,
          true <- status in ["open", "active"],
          {:ok, role} <- fetch_standing_role(fiber_id, state),
          true <- StandingRole.standing?(role),
@@ -1141,6 +1150,15 @@ defmodule Shuttle.Poller do
       _ -> false
     end
   end
+
+  defp shuttle_host(shuttle) when is_map(shuttle) do
+    case Map.get(shuttle, "host") do
+      host when is_binary(host) and host != "" -> host
+      _ -> "local"
+    end
+  end
+
+  defp shuttle_host(_), do: "local"
 
   defp standing_roles_from_candidates(candidates) do
     Enum.flat_map(candidates, fn fiber ->
@@ -1747,7 +1765,9 @@ defmodule Shuttle.Poller do
         end
 
       {:error, _} ->
-        Logger.debug("log_worker_exit: no felt host found for #{fiber_id}; skipping history event")
+        Logger.debug(
+          "log_worker_exit: no felt host found for #{fiber_id}; skipping history event"
+        )
     end
   end
 

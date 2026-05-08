@@ -2,6 +2,7 @@ import Config
 
 config :shuttle,
   env: config_env(),
+  host: "local",
   start_poller: true,
   start_remote_registry: true,
   # Per-host snapshots from remote Shuttle daemons reachable via

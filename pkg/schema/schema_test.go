@@ -145,6 +145,20 @@ shuttle:
 Body.
 `
 
+const sampleFiberWithProjectDirAndUnknown = `---
+name: Cross Host Test
+status: active
+shuttle:
+  enabled: false
+  kind: oneshot
+  project_dir: /tmp/shuttle-project
+  elixir_only:
+    nested: value
+---
+
+Body.
+`
+
 func writeTmpFiber(t *testing.T, content string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -237,6 +251,74 @@ func TestWriteBlock_Uninstall(t *testing.T) {
 	raw, _ := os.ReadFile(path)
 	if strings.Contains(string(raw), "shuttle:") {
 		t.Fatal("shuttle: key still present after uninstall")
+	}
+}
+
+func TestWriteBlock_PreservesProjectDirAndUnknownShuttleFields(t *testing.T) {
+	path := writeTmpFiber(t, sampleFiberWithProjectDirAndUnknown)
+	f, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("ReadFiber: %v", err)
+	}
+	if f.Block == nil {
+		t.Fatal("expected shuttle block")
+	}
+
+	f.Block.Enabled = true
+	if err := f.WriteBlock(f.Block); err != nil {
+		t.Fatalf("WriteBlock: %v", err)
+	}
+
+	raw, _ := os.ReadFile(path)
+	content := string(raw)
+	for _, want := range []string{
+		"enabled: true",
+		"project_dir: /tmp/shuttle-project",
+		"elixir_only:",
+		"nested: value",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("expected rewritten fiber to contain %q; got:\n%s", want, content)
+		}
+	}
+}
+
+func TestWriteBlock_RemovesKnownFieldsWhenCleared(t *testing.T) {
+	content := `---
+name: Session Test
+status: active
+shuttle:
+  enabled: true
+  kind: oneshot
+  session:
+    id: old-session
+    dispatched_at: 2026-05-08T12:00:00Z
+  elixir_only: preserved
+---
+
+Body.
+`
+	path := writeTmpFiber(t, content)
+	f, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("ReadFiber: %v", err)
+	}
+	if f.Block == nil || f.Block.Session == nil {
+		t.Fatalf("expected session block, got %+v", f.Block)
+	}
+
+	f.Block.Session = nil
+	if err := f.WriteBlock(f.Block); err != nil {
+		t.Fatalf("WriteBlock: %v", err)
+	}
+
+	raw, _ := os.ReadFile(path)
+	rewritten := string(raw)
+	if strings.Contains(rewritten, "session:") {
+		t.Fatalf("known cleared session field was preserved; got:\n%s", rewritten)
+	}
+	if !strings.Contains(rewritten, "elixir_only: preserved") {
+		t.Fatalf("unknown field was not preserved; got:\n%s", rewritten)
 	}
 }
 

@@ -201,6 +201,7 @@ func (f *FiberFile) WriteBlock(block *Block) error {
 		if err != nil {
 			return fmt.Errorf("encoding shuttle block: %w", err)
 		}
+		blockNode = mergeUnknownShuttleFields(findMappingValue(mappingNode, "shuttle"), blockNode)
 		setMappingValue(mappingNode, "shuttle", blockNode)
 	}
 
@@ -339,6 +340,67 @@ func removeMappingKey(mapping *yaml.Node, key string) {
 			return
 		}
 	}
+}
+
+var knownShuttleKeys = map[string]bool{
+	"enabled":     true,
+	"kind":        true,
+	"mode":        true, // legacy alias; rewritten to kind on the next save
+	"host":        true,
+	"project_dir": true,
+	"agent":       true,
+	"schedule":    true,
+	"review":      true,
+	"session":     true,
+	"next_due_at": true,
+	"last_run_at": true,
+}
+
+// mergeUnknownShuttleFields preserves forward-compatible shuttle: keys when a
+// typed Go lifecycle rewrite updates the block. Elixir is currently the wider
+// schema reader/writer, so replacing the whole mapping would silently erase
+// fields the Go struct does not yet know.
+func mergeUnknownShuttleFields(existing, encoded *yaml.Node) *yaml.Node {
+	if existing == nil || existing.Kind != yaml.MappingNode || encoded == nil || encoded.Kind != yaml.MappingNode {
+		return encoded
+	}
+
+	for i := 0; i+1 < len(existing.Content); i += 2 {
+		keyNode := existing.Content[i]
+		valueNode := existing.Content[i+1]
+		if keyNode == nil || knownShuttleKeys[keyNode.Value] || mappingHasKey(encoded, keyNode.Value) {
+			continue
+		}
+		encoded.Content = append(encoded.Content, cloneYAMLNode(keyNode), cloneYAMLNode(valueNode))
+	}
+
+	return encoded
+}
+
+func mappingHasKey(mapping *yaml.Node, key string) bool {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			return true
+		}
+	}
+	return false
+}
+
+func cloneYAMLNode(node *yaml.Node) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	clone := *node
+	if len(node.Content) > 0 {
+		clone.Content = make([]*yaml.Node, len(node.Content))
+		for i, child := range node.Content {
+			clone.Content[i] = cloneYAMLNode(child)
+		}
+	}
+	return &clone
 }
 
 // encodeNode marshals v into a *yaml.Node suitable for splicing into a mapping.
