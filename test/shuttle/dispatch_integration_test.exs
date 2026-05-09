@@ -427,8 +427,11 @@ defmodule Shuttle.DispatchIntegrationTest do
     end
   end
 
-  # Resume mode requested but no session UUID: falls back to fresh cleanly.
-  test "resume mode requested but no session UUID falls back to fresh", %{host: host} do
+  # Resume mode requested but no session UUID: fail loudly. "New session" is
+  # the explicit fresh path; Resume should never silently dispatch fresh.
+  test "resume mode requested but no session UUID errors instead of dispatching fresh", %{
+    host: host
+  } do
     write_fiber(host, "tests/resume-no-uuid", """
     ---
     name: Resume no UUID
@@ -449,16 +452,11 @@ defmodule Shuttle.DispatchIntegrationTest do
       resume_mode: "previous"
     )
 
-    assert {:ok, _} =
+    assert {:error, :missing_session_id} =
              Dispatcher.dispatch("tests/resume-no-uuid",
                runner: IntegrationRunner,
                felt_store: host
              )
-
-    script = read_run_script()
-    # Falls back to fresh: no --resume, no dismiss block.
-    refute script =~ "--resume"
-    refute script =~ "send-keys"
   end
 
   # review-comment with resume_mode=fresh explicitly requests a new session

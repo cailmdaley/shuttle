@@ -22,6 +22,7 @@ defmodule Shuttle.Dispatcher do
           | {:error, :not_found}
           | {:error, :closed}
           | {:error, :already_running}
+          | {:error, :missing_session_id}
           | {:error, String.t()}
 
   @doc """
@@ -61,11 +62,15 @@ defmodule Shuttle.Dispatcher do
         Logger.info("Human-worker dispatch for #{fiber_id} — no tmux session spawned")
         {:ok, :human_no_op}
       else
-        resume_intent = resolve_resume_intent(prompt_context, fiber_id, fiber, felt_store)
+        case resolve_resume_intent(prompt_context, fiber_id, fiber, felt_store) do
+          {:error, _} = error ->
+            error
 
-        create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent,
-          felt_store: felt_store
-        )
+          resume_intent ->
+            create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent,
+              felt_store: felt_store
+            )
+        end
       end
     end
   end
@@ -82,7 +87,7 @@ defmodule Shuttle.Dispatcher do
     most recent review-comment from felt history and honors its `resume_mode`.
   """
   @spec resolve_resume_intent(any(), String.t(), map(), String.t() | nil) ::
-          :fresh | {:previous, String.t()}
+          :fresh | {:previous, String.t()} | {:error, :missing_session_id}
   def resolve_resume_intent(prompt_context, fiber_id, fiber, felt_store) do
     case prompt_context do
       {:standing_run, _, :ad_hoc} ->
@@ -99,17 +104,20 @@ defmodule Shuttle.Dispatcher do
   worker session and, if so, whether a stored session UUID is available.
 
   Returns one of:
-  - `:fresh` — no resume requested, or no session UUID stored. Always the safe
-    default: the worker gets a clean slate with the full dispatch prompt.
+  - `:fresh` — no resume requested, or a fresh run was explicitly requested.
   - `{:previous, session_id}` — resume requested and session UUID available.
     The dispatcher will invoke the harness-appropriate resume command.
+  - `{:error, :missing_session_id}` — previous-session resume was requested,
+    but neither `shuttle.session.id` nor worker-exit history contains a usable
+    session id. The caller should surface this instead of silently starting
+    fresh; "New session" is the explicit fresh path.
 
   Reads the latest `--kind review-comment` event from felt history. The
   `resume_mode` field in the event payload is set at requeue time by the user
   clicking "Requeue fresh" or "Resume previous" in the Kanban UI.
   """
   @spec check_resume_intent(String.t(), map(), keyword()) ::
-          :fresh | {:previous, String.t()}
+          :fresh | {:previous, String.t()} | {:error, :missing_session_id}
   def check_resume_intent(fiber_id, fiber, opts \\ []) do
     felt_store = Keyword.get(opts, :felt_store, default_felt_store())
 
@@ -123,10 +131,15 @@ defmodule Shuttle.Dispatcher do
           get_in(fiber, ["shuttle", "session", "id"]) ||
             latest_history_session_id(fiber_id, felt_store: felt_store)
 
-        if resume_mode == "previous" and is_binary(session_id) and session_id != "" do
-          {:previous, session_id}
-        else
-          :fresh
+        case {resume_mode, session_id} do
+          {"previous", session_id} when is_binary(session_id) and session_id != "" ->
+            {:previous, session_id}
+
+          {"previous", _} ->
+            {:error, :missing_session_id}
+
+          _ ->
+            :fresh
         end
 
       _ ->
