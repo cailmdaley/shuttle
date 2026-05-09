@@ -421,13 +421,8 @@ defmodule Shuttle.Poller do
                 {:reply, {:ok, "human"}, state}
 
               dispatch_eligible?(fiber, state, opts) ->
-                new_state = do_dispatch_fiber(state, fiber, opts)
-
-                if Map.has_key?(new_state.running, fiber_id) do
-                  {:reply, {:ok, session}, new_state}
-                else
-                  {:reply, {:error, :dispatch_failed}, new_state}
-                end
+                {new_state, result} = do_dispatch_fiber(state, fiber, opts)
+                {:reply, result || {:ok, session}, new_state}
 
               true ->
                 {:reply, {:error, :not_eligible}, state}
@@ -628,7 +623,8 @@ defmodule Shuttle.Poller do
 
       Enum.reduce(dispatchable, state, fn fiber, state_acc ->
         if available_slots(state_acc) > 0 do
-          do_dispatch_fiber(state_acc, fiber)
+          {new_state, _result} = do_dispatch_fiber(state_acc, fiber)
+          new_state
         else
           state_acc
         end
@@ -1284,7 +1280,7 @@ defmodule Shuttle.Poller do
         # the kanban shows the card in inFlight (status:active, enabled:true)
         # without any tmux session to watch.
         Logger.info("Human-worker fiber #{fiber_id} accepted; no watcher started")
-        state
+        {state, {:ok, "human"}}
 
       {:ok, session} ->
         agent_name = fetch_shuttle_agent_name(fiber_id, state)
@@ -1325,23 +1321,26 @@ defmodule Shuttle.Poller do
             }
 
             broadcast_snapshot(state)
-            state
+            {state, {:ok, session}}
 
           {:error, reason} ->
             Logger.error("Failed to start watcher for #{fiber_id}: #{inspect(reason)}")
 
-            schedule_retry(state, fiber_id, 1, %{
-              error: "watcher start failed: #{inspect(reason)}"
-            })
+            state =
+              schedule_retry(state, fiber_id, 1, %{
+                error: "watcher start failed: #{inspect(reason)}"
+              })
+
+            {state, {:error, :watcher_start_failed}}
         end
 
       {:error, :already_running} ->
         # Session exists but we don't have a watcher — adopt it
-        adopt_session(state, fiber_id)
+        {adopt_session(state, fiber_id), {:error, :already_running}}
 
       {:error, reason} ->
         Logger.warning("Dispatch failed for #{fiber_id}: #{inspect(reason)}")
-        state
+        {state, {:error, reason}}
     end
   end
 
@@ -1538,7 +1537,8 @@ defmodule Shuttle.Poller do
       {:ok, fiber} ->
         state =
           if eligible?(fiber, state) do
-            do_dispatch_fiber(state, fiber)
+            {new_state, _result} = do_dispatch_fiber(state, fiber)
+            new_state
           else
             Logger.debug("Retry no longer eligible: #{fiber_id}")
             release_claim(state, fiber_id)

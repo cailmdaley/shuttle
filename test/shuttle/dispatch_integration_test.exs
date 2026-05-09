@@ -1,7 +1,7 @@
 defmodule Shuttle.DispatchIntegrationTest do
   use ExUnit.Case, async: false
 
-  alias Shuttle.Dispatcher
+  alias Shuttle.{Dispatcher, Poller}
 
   # ── Integration Runner ─────────────────────────────────────────────────────
   # Passes `felt` commands to the real felt CLI (with -C felt_store).
@@ -457,6 +457,42 @@ defmodule Shuttle.DispatchIntegrationTest do
                runner: IntegrationRunner,
                felt_store: host
              )
+  end
+
+  test "poller dispatch API preserves missing session UUID errors", %{host: host} do
+    write_fiber(host, "tests/poller-resume-no-uuid", """
+    ---
+    name: Poller resume no UUID
+    status: active
+    tags:
+      - constitution
+    shuttle:
+      enabled: true
+      kind: oneshot
+      agent: claude-sonnet
+    ---
+    No session UUID in shuttle block.
+    """)
+
+    append_review_comment(host, "tests/poller-resume-no-uuid",
+      summary: "Please resume",
+      resume_mode: "previous"
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_resume_no_uuid,
+        runner: IntegrationRunner,
+        poll_interval_ms: 600_000,
+        felt_stores: [host]
+      )
+
+    assert {:error, :missing_session_id} =
+             Poller.dispatch_fiber(poller, "tests/poller-resume-no-uuid", [])
+
+    refute Enum.any?(IntegrationRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and Enum.at(args, 0) == "new-session"
+           end)
   end
 
   # review-comment with resume_mode=fresh explicitly requests a new session

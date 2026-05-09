@@ -192,6 +192,10 @@ make clean    # rm _build and stray .beam files
 
 mix test                    # Elixir suite (110 tests)
 go test ./pkg/schema/...    # Go schema tests
+
+# Opt-in real harness smoke: opens Claude/Codex/Pi in tmux, sends no prompt,
+# captures the idle pane, then kills the smoke-owned sessions.
+SHUTTLE_REAL_HARNESS_SMOKE=1 mix test --only integration test/shuttle/real_harness_smoke_test.exs
 ```
 
 ## License
