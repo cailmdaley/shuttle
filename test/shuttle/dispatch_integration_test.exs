@@ -508,6 +508,33 @@ defmodule Shuttle.DispatchIntegrationTest do
            end)
   end
 
+  test "interactive prelude names the active-fiber handoff exception", %{host: host} do
+    write_fiber(host, "tests/interactive-handoff", """
+    ---
+    name: Interactive handoff
+    status: active
+    tags:
+      - constitution
+    shuttle:
+      enabled: true
+      kind: oneshot
+      agent: claude-sonnet
+    ---
+    A fiber dispatched for live human attachment.
+    """)
+
+    append_review_comment(host, "tests/interactive-handoff",
+      summary: "",
+      interactive: true
+    )
+
+    prelude = Dispatcher.render_interactive_prelude("tests/interactive-handoff", felt_store: host)
+
+    assert prelude =~ "Interactive Mode"
+    assert prelude =~ "leave the fiber active"
+    assert prelude =~ "close-for-review + `kill $PPID` handoff waits"
+  end
+
   # Resume mode requested but no session UUID: fail loudly. "New session" is
   # the explicit fresh path; Resume should never silently dispatch fresh.
   test "resume mode requested but no session UUID errors instead of dispatching fresh", %{
@@ -778,14 +805,23 @@ defmodule Shuttle.DispatchIntegrationTest do
   defp append_review_comment(host, id, opts) do
     summary = Keyword.get(opts, :summary, "Requeued")
     resume_mode = Keyword.get(opts, :resume_mode)
+    interactive = Keyword.get(opts, :interactive)
+
+    fields =
+      []
+      |> maybe_field("resume_mode", resume_mode)
+      |> maybe_field("interactive", interactive)
 
     args =
       ["-C", host, "history", "append", id, "--kind", "review-comment", "-m", summary] ++
-        if(resume_mode, do: ["--field", "resume_mode=#{resume_mode}"], else: [])
+        fields
 
     {out, code} = System.cmd("felt", args, stderr_to_stdout: true)
     if code != 0, do: raise("felt history append failed (#{code}): #{out}")
   end
+
+  defp maybe_field(fields, _key, nil), do: fields
+  defp maybe_field(fields, key, value), do: fields ++ ["--field", "#{key}=#{value}"]
 
   defp append_worker_exit(host, id, opts) do
     agent = Keyword.fetch!(opts, :agent)

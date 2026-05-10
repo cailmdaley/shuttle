@@ -282,9 +282,10 @@ defmodule Shuttle.Dispatcher do
   initial task — when `payload.interactive == "true"`. Otherwise returns "".
 
   The kanban's modal sets `interactive=true` when the user wants to
-  attach to the worker mid-conversation. The prelude overrides any
-  `kill $PPID` instruction in the constitution: the worker completes
-  the initial task, then waits for the human to take over.
+  attach to the worker mid-conversation. The prelude creates an exception
+  to the usual worker handoff: the worker leaves the fiber active and
+  waits for the human to take over instead of closing for review and
+  exiting.
 
   Pass `felt_store:` to control which `.felt/` index is queried.
   """
@@ -296,7 +297,7 @@ defmodule Shuttle.Dispatcher do
           render_block(
             "Interactive Mode",
             nil,
-            "A human will attach to this session shortly. Complete the initial task as the constitution describes, but do NOT exit via `kill $PPID` afterward — leave the agent alive at a clean checkpoint and wait for the human's next message."
+            "A human will attach to this session shortly. Complete the initial task as the constitution describes, then leave the fiber active and the agent alive at a clean checkpoint. In this mode, the usual close-for-review + `kill $PPID` handoff waits until the human is done with the live session."
           )
         else
           ""
