@@ -427,6 +427,87 @@ defmodule Shuttle.DispatchIntegrationTest do
     end
   end
 
+  test "codex session capture ignores newer non-worker session in same cwd", %{host: host} do
+    session_dir = Path.join(host, "codex-sessions")
+    File.mkdir_p!(session_dir)
+
+    previous_dir = System.get_env("SHUTTLE_CODEX_SESSIONS_DIR")
+    System.put_env("SHUTTLE_CODEX_SESSIONS_DIR", session_dir)
+
+    on_exit(fn ->
+      if previous_dir do
+        System.put_env("SHUTTLE_CODEX_SESSIONS_DIR", previous_dir)
+      else
+        System.delete_env("SHUTTLE_CODEX_SESSIONS_DIR")
+      end
+    end)
+
+    work_dir = File.cwd!()
+    timestamp = DateTime.utc_now() |> DateTime.add(30, :second) |> DateTime.to_iso8601()
+
+    write_codex_session(
+      session_dir,
+      "rollout-2999-01-01T00-00-01-zzzz-newer-wrong.jsonl",
+      "wrong-human-session",
+      work_dir,
+      timestamp,
+      "Fiber: tests/some-other-fiber"
+    )
+
+    write_codex_session(
+      session_dir,
+      "rollout-2999-01-01T00-00-00-aaaa-worker.jsonl",
+      "right-worker-session",
+      work_dir,
+      timestamp,
+      "Fiber: tests/codex-capture"
+    )
+
+    write_fiber(host, "tests/codex-capture", """
+    ---
+    name: Codex capture test
+    status: active
+    tags:
+      - constitution
+    shuttle:
+      enabled: true
+      kind: oneshot
+      agent: codex
+    ---
+    A codex fiber whose session UUID should be captured from its own transcript.
+    """)
+
+    assert {:ok, "shuttle-tests/codex-capture"} =
+             Dispatcher.dispatch("tests/codex-capture",
+               runner: IntegrationRunner,
+               felt_store: host,
+               work_dir: work_dir
+             )
+
+    assert eventually(fn ->
+             Enum.any?(IntegrationRunner.commands(), fn
+               {"shuttle-ctl", args} ->
+                 args == [
+                   "--felt-store",
+                   host,
+                   "session-set",
+                   "tests/codex-capture",
+                   "right-worker-session",
+                   "--agent",
+                   "codex"
+                 ]
+
+               _ ->
+                 false
+             end)
+           end)
+
+    refute Enum.any?(IntegrationRunner.commands(), fn
+             {"shuttle-ctl", args} -> "wrong-human-session" in args
+             _ -> false
+           end)
+  end
+
   # Resume mode requested but no session UUID: fail loudly. "New session" is
   # the explicit fresh path; Resume should never silently dispatch fresh.
   test "resume mode requested but no session UUID errors instead of dispatching fresh", %{
@@ -718,6 +799,45 @@ defmodule Shuttle.DispatchIntegrationTest do
 
     if code != 0, do: raise("felt history append failed (#{code}): #{out}")
   end
+
+  defp write_codex_session(session_dir, filename, uuid, cwd, timestamp, prompt) do
+    session_meta =
+      Jason.encode!(%{
+        "timestamp" => timestamp,
+        "type" => "session_meta",
+        "payload" => %{
+          "id" => uuid,
+          "timestamp" => timestamp,
+          "cwd" => cwd
+        }
+      })
+
+    user_turn =
+      Jason.encode!(%{
+        "timestamp" => timestamp,
+        "type" => "response_item",
+        "payload" => %{
+          "type" => "message",
+          "role" => "user",
+          "content" => [%{"type" => "input_text", "text" => prompt}]
+        }
+      })
+
+    File.write!(Path.join(session_dir, filename), session_meta <> "\n" <> user_turn <> "\n")
+  end
+
+  defp eventually(fun, attempts \\ 40)
+
+  defp eventually(fun, attempts) when attempts > 0 do
+    if fun.() do
+      true
+    else
+      Process.sleep(50)
+      eventually(fun, attempts - 1)
+    end
+  end
+
+  defp eventually(_fun, 0), do: false
 
   # Finds the tmux new-session command recorded by IntegrationRunner and reads
   # the run-script tempfile that was passed to `bash -l`. The script contains

@@ -632,7 +632,7 @@ defmodule Shuttle.Dispatcher do
       cli when cli in ["codex", "pi"] ->
         command = Agents.build_command(agent, prompt)
         work_dir = Keyword.get(opts, :work_dir, File.cwd!())
-        {command, {:capture, cli, work_dir}}
+        {command, {:capture, cli, work_dir, fiber_id, DateTime.utc_now()}}
 
       _ ->
         command = Agents.build_command(agent, prompt)
@@ -687,13 +687,19 @@ defmodule Shuttle.Dispatcher do
     end)
   end
 
-  defp store_session_id(fiber_id, agent_id, {:capture, cli, work_dir}, runner, felt_store) do
+  defp store_session_id(
+         fiber_id,
+         agent_id,
+         {:capture, cli, work_dir, capture_fiber_id, dispatched_after},
+         runner,
+         felt_store
+       ) do
     # Fire-and-forget: capture the session UUID from the harness's JSONL file
     # in a background task. The race window (50 ms × 20 attempts = ~1 s) is
     # short enough that the kanban card will show "Resume previous" by the
     # next manual refresh.
     Task.start(fn ->
-      case capture_session_uuid(cli, work_dir, 20) do
+      case capture_session_uuid(cli, work_dir, capture_fiber_id, dispatched_after, 100) do
         {:ok, uuid} ->
           case runner.cmd(
                  "shuttle-ctl",
@@ -730,38 +736,41 @@ defmodule Shuttle.Dispatcher do
   #   pi:    ~/.pi/agent/sessions/<encoded-cwd>/<iso>_<uuid>.jsonl
   #          First line: {"type":"session","id":"<uuid>","cwd":"..."}
   #
-  # Both harnesses use UUIDv7 filenames (lexicographically = chronologically
-  # ordered), so sorting names and taking the last gives the freshest session.
-  defp capture_session_uuid(_cli, _work_dir, 0) do
+  # Codex stores all sessions in one date directory, so cwd alone is not a
+  # unique worker identity: the human can be driving an interactive Codex
+  # thread from the same project while Shuttle dispatches a worker. Require
+  # the transcript to be new enough for this dispatch and to contain Shuttle's
+  # fiber prompt before accepting its UUID.
+  defp capture_session_uuid(_cli, _work_dir, _fiber_id, _dispatched_after, 0) do
     {:error, "timed out waiting for session file"}
   end
 
-  defp capture_session_uuid(cli, work_dir, attempts) do
+  defp capture_session_uuid(cli, work_dir, fiber_id, dispatched_after, attempts) do
     :timer.sleep(50)
 
-    case find_session_file(cli, work_dir) do
+    case find_session_file(cli, work_dir, fiber_id, dispatched_after) do
       {:ok, path} ->
         read_uuid_from_jsonl(cli, path, work_dir)
 
       {:error, _} ->
-        capture_session_uuid(cli, work_dir, attempts - 1)
+        capture_session_uuid(cli, work_dir, fiber_id, dispatched_after, attempts - 1)
     end
   end
 
-  defp find_session_file("codex", _work_dir) do
-    home = System.user_home!()
-    date = Date.utc_today()
-
-    dir =
-      Path.join([home, ".codex", "sessions", "#{date.year}", pad2(date.month), pad2(date.day)])
+  defp find_session_file("codex", work_dir, fiber_id, dispatched_after) do
+    dir = codex_sessions_dir()
 
     case File.ls(dir) do
       {:ok, files} ->
-        rollout_files = Enum.filter(files, &String.starts_with?(&1, "rollout-"))
+        paths =
+          files
+          |> Enum.filter(&String.starts_with?(&1, "rollout-"))
+          |> Enum.sort(:desc)
+          |> Enum.map(&Path.join(dir, &1))
 
-        case Enum.sort(rollout_files) |> List.last() do
+        case Enum.find(paths, &codex_session_matches?(&1, work_dir, fiber_id, dispatched_after)) do
           nil -> {:error, :not_found}
-          file -> {:ok, Path.join(dir, file)}
+          path -> {:ok, path}
         end
 
       {:error, reason} ->
@@ -769,7 +778,7 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
-  defp find_session_file("pi", work_dir) do
+  defp find_session_file("pi", work_dir, _fiber_id, _dispatched_after) do
     home = System.user_home!()
     # Pi's encoded-cwd: absolute path with "/" replaced by "-", bracketed by "--".
     # e.g. /home/user/loom → --home-user-loom--
@@ -790,7 +799,37 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
-  defp find_session_file(_cli, _work_dir), do: {:error, :unsupported}
+  defp find_session_file(_cli, _work_dir, _fiber_id, _dispatched_after),
+    do: {:error, :unsupported}
+
+  defp codex_sessions_dir do
+    case System.get_env("SHUTTLE_CODEX_SESSIONS_DIR") do
+      dir when is_binary(dir) and dir != "" ->
+        dir
+
+      _ ->
+        home = System.user_home!()
+        date = Date.utc_today()
+        Path.join([home, ".codex", "sessions", "#{date.year}", pad2(date.month), pad2(date.day)])
+    end
+  end
+
+  defp codex_session_matches?(path, work_dir, fiber_id, dispatched_after) do
+    with {:ok, content} <- File.read(path),
+         [first_line | _] <- String.split(content, "\n", parts: 2),
+         {:ok, event} <- Jason.decode(first_line),
+         "session_meta" <- Map.get(event, "type"),
+         payload when is_map(payload) <- Map.get(event, "payload"),
+         cwd when is_binary(cwd) <- Map.get(payload, "cwd"),
+         timestamp when is_binary(timestamp) <- Map.get(payload, "timestamp"),
+         {:ok, started_at, _} <- DateTime.from_iso8601(timestamp) do
+      Path.expand(cwd) == Path.expand(work_dir) and
+        DateTime.compare(started_at, DateTime.add(dispatched_after, -5, :second)) != :lt and
+        String.contains?(content, "Fiber: #{fiber_id}")
+    else
+      _ -> false
+    end
+  end
 
   defp read_uuid_from_jsonl("codex", path, work_dir) do
     with {:ok, content} <- File.read(path),
