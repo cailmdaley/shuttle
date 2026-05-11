@@ -237,6 +237,37 @@ defmodule Shuttle.PollerTest do
     end
   end
 
+  defp new_session_scripts do
+    MockRunner.commands()
+    |> Enum.filter(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
+    |> Enum.map(fn {_cmd, args} -> List.last(args) end)
+  end
+
+  defp append_review_comment(id, opts) do
+    resume_mode = Keyword.fetch!(opts, :resume_mode)
+
+    {out, code} =
+      System.cmd(
+        "felt",
+        [
+          "-C",
+          "/tmp",
+          "history",
+          "append",
+          id,
+          "--kind",
+          "review-comment",
+          "-m",
+          "",
+          "--field",
+          "resume_mode=#{resume_mode}"
+        ],
+        stderr_to_stdout: true
+      )
+
+    if code != 0, do: raise("felt history append failed (#{code}): #{out}")
+  end
+
   # ── Tests ──
 
   test "poller discovers and dispatches eligible fibers" do
@@ -863,6 +894,49 @@ defmodule Shuttle.PollerTest do
       |> length()
 
     assert new_session_count == 2
+  end
+
+  test "poller continuation retries start fresh even after resume-previous review comment" do
+    fiber_id = "tests/continuation-fresh-despite-review-comment"
+
+    fiber = make_fiber(fiber_id)
+    MockRunner.set_fiber(fiber_id, fiber)
+
+    MockRunner.set_shuttle(
+      fiber_id,
+      """
+      enabled: true
+      kind: oneshot
+      agent: claude-sonnet
+      session:
+        id: old-session-id
+      """
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_continuation_forces_fresh,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn -> length(new_session_scripts()) == 1 end)
+
+    append_review_comment(fiber_id, resume_mode: "previous")
+
+    MockRunner.remove_tmux_session(Dispatcher.session_name(fiber_id))
+    send(poller, {:worker_exited, fiber_id, :normal_exit, false})
+
+    assert wait_until(fn -> length(new_session_scripts()) == 2 end, 80)
+
+    second_script = new_session_scripts() |> List.last() |> File.read!()
+
+    assert second_script =~ "Fiber: #{fiber_id}"
+    refute second_script =~ "--resume"
+    refute second_script =~ "old-session-id"
   end
 
   test "poller releases claim when worker exits and fiber is closed" do

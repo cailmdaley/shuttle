@@ -41,6 +41,10 @@ defmodule Shuttle.Dispatcher do
       against different felt stores (e.g. one for `~/loom`, another for a
       standalone project root) is the supported way to span felt stores.
     * `:prompt_context` — `:constitution` (default) or `:standing_run`.
+    * `:force_fresh` — when true, ignore any prior resume intent and start a
+      new session. Used for autonomous continuation loops; explicit
+      human-triggered "Resume previous" remains the only path that reuses a
+      transcript.
   """
   @spec dispatch(String.t(), keyword()) :: dispatch_result()
   def dispatch(fiber_id, opts \\ []) do
@@ -62,7 +66,14 @@ defmodule Shuttle.Dispatcher do
         Logger.info("Human-worker dispatch for #{fiber_id} — no tmux session spawned")
         {:ok, :human_no_op}
       else
-        case resolve_resume_intent(prompt_context, fiber_id, fiber, felt_store) do
+        resume_intent =
+          if Keyword.get(opts, :force_fresh, false) do
+            :fresh
+          else
+            resolve_resume_intent(prompt_context, fiber_id, fiber, felt_store)
+          end
+
+        case resume_intent do
           {:error, _} = error ->
             error
 

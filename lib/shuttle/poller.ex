@@ -1304,7 +1304,8 @@ defmodule Shuttle.Poller do
            runner: state.runner,
            work_dir: fiber_work_dir(fiber_id, state),
            prompt_context: prompt_context,
-           felt_store: felt_store
+           felt_store: felt_store,
+           force_fresh: Keyword.get(opts, :force_fresh, false)
          ) do
       {:ok, :human_no_op} ->
         # Human-worker fibers don't need a watcher or running-state entry —
@@ -1596,14 +1597,21 @@ defmodule Shuttle.Poller do
     end
   end
 
-  defp handle_retry(%State{} = state, fiber_id, _retry) do
+  defp handle_retry(%State{} = state, fiber_id, retry) do
     state = release_claim(state, fiber_id)
 
     case fetch_fiber_full(fiber_id, state) do
       {:ok, fiber} ->
         state =
           if eligible?(fiber, state) do
-            {new_state, _result} = do_dispatch_fiber(state, fiber)
+            opts =
+              if Map.get(retry, :delay_type) == :continuation do
+                [force_fresh: true]
+              else
+                []
+              end
+
+            {new_state, _result} = do_dispatch_fiber(state, fiber, opts)
             new_state
           else
             Logger.debug("Retry no longer eligible: #{fiber_id}")
