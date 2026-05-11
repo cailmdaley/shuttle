@@ -88,6 +88,7 @@ defmodule Shuttle.Poller do
       reservations: %{},
       completed_standing_runs: MapSet.new(),
       standing_roles: [],
+      orphans: [],
       # %{fiber_id => felt_store} — populated by discover_candidates/1 on each
       # poll cycle and by host_for_fiber/2 on demand. Entries are never evicted
       # automatically; call bust_fiber_host_cache/1 when a fiber moves hosts.
@@ -589,7 +590,7 @@ defmodule Shuttle.Poller do
       felt_stores: state.felt_stores,
       eligible: eligible,
       blocked: [],
-      orphans: [],
+      orphans: state.orphans,
       retrying: retrying,
       standing_roles: standing_role_snapshots(state.standing_roles, state.running, now),
       claimed_count: MapSet.size(state.claimed),
@@ -650,17 +651,48 @@ defmodule Shuttle.Poller do
   end
 
   defp merge_poll_cycle_state(%State{} = current, %State{} = poll_state) do
+    running = merge_running_state(current.running, poll_state.running, poll_state.orphans)
+
+    retry_queue =
+      poll_state.retry_queue
+      |> Map.merge(current.retry_queue)
+      |> Map.drop(Map.keys(running))
+
     %{
       poll_state
-      | running: Map.merge(poll_state.running, current.running),
-        claimed: MapSet.union(poll_state.claimed, current.claimed),
-        retry_queue: Map.merge(poll_state.retry_queue, current.retry_queue),
+      | running: running,
+        claimed: claimed_from(running, retry_queue),
+        retry_queue: retry_queue,
         waiters: current.waiters,
         reservations: current.reservations,
         completed_standing_runs:
           MapSet.union(poll_state.completed_standing_runs, current.completed_standing_runs),
-        standing_roles: poll_state.standing_roles
+        standing_roles: poll_state.standing_roles,
+        orphans: poll_state.orphans
     }
+  end
+
+  defp merge_running_state(current_running, poll_running, poll_orphans) do
+    stale_sessions =
+      MapSet.new(
+        Enum.map(poll_orphans, fn orphan ->
+          {Map.get(orphan, :fiber_id), Map.get(orphan, :tmux_session)}
+        end)
+      )
+
+    current_running
+    |> Enum.reject(fn {fiber_id, meta} ->
+      MapSet.member?(stale_sessions, {fiber_id, Map.get(meta, :session)})
+    end)
+    |> Map.new()
+    |> then(&Map.merge(poll_running, &1))
+  end
+
+  defp claimed_from(running, retry_queue) do
+    running
+    |> Map.keys()
+    |> Enum.concat(Map.keys(retry_queue))
+    |> MapSet.new()
   end
 
   # Discovers candidate fibers by walking <host>/.felt/ for files that carry a
@@ -1347,7 +1379,9 @@ defmodule Shuttle.Poller do
   # ── Reconciliation ──
 
   defp reconcile(%State{} = state) do
+    state = %{state | orphans: []}
     state = reconcile_fiber_closures(state)
+    state = reconcile_missing_running_sessions(state)
     state = reconcile_orphaned_sessions(state)
     state = reconcile_waiters(state)
     state = clean_expired_reservations(state)
@@ -1388,6 +1422,38 @@ defmodule Shuttle.Poller do
         adopt_session(state_acc, session_to_fiber_id(session))
       end
     end)
+  end
+
+  defp reconcile_missing_running_sessions(%State{running: running} = state)
+       when map_size(running) == 0 do
+    state
+  end
+
+  defp reconcile_missing_running_sessions(%State{} = state) do
+    Enum.reduce(state.running, state, fn {fiber_id, %{session: session} = meta}, state_acc ->
+      if already_running_session?(state_acc, session) do
+        state_acc
+      else
+        Logger.info("Detected missing worker session: #{fiber_id} session=#{session}")
+        stop_watcher(meta)
+
+        state_acc
+        |> record_orphaned_running_worker(fiber_id, meta)
+        |> remove_running(fiber_id)
+      end
+    end)
+  end
+
+  defp record_orphaned_running_worker(%State{} = state, fiber_id, meta) do
+    orphan = %{
+      fiber_id: fiber_id,
+      tmux_session: Map.get(meta, :session),
+      agent: Map.get(meta, :agent_id),
+      reason: "missing_tmux_session",
+      detected_at: DateTime.utc_now() |> DateTime.to_unix(:millisecond)
+    }
+
+    %{state | orphans: [orphan | state.orphans]}
   end
 
   defp adopt_orphans(%State{} = state) do

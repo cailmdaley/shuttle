@@ -915,6 +915,52 @@ defmodule Shuttle.PollerTest do
     assert hd(snap.eligible).fiber_id == "tests/orphan"
   end
 
+  test "poller clears stale running state when the tmux session disappears" do
+    fiber_id = "tests/missing-running-session"
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_missing_running_session,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    fiber = make_fiber(fiber_id)
+    MockRunner.set_fiber(fiber_id, fiber)
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+
+    assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, [])
+    assert session == Dispatcher.session_name(fiber_id)
+
+    MockRunner.remove_tmux_session(session)
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             snap = Poller.snapshot(poller)
+
+             Enum.any?(snap.orphans, &(&1.fiber_id == fiber_id)) and
+               Enum.any?(snap.eligible, &(&1.fiber_id == fiber_id))
+           end)
+
+    snap = Poller.snapshot(poller)
+
+    assert [
+             %{
+               fiber_id: ^fiber_id,
+               tmux_session: ^session,
+               reason: "missing_tmux_session"
+             }
+             | _
+           ] = snap.orphans
+
+    new_session_count =
+      MockRunner.commands()
+      |> Enum.count(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
+
+    assert new_session_count >= 2
+  end
+
   test "poller uses shuttle.project_dir as work_dir when it exists" do
     project_dir =
       Path.join(System.tmp_dir!(), "shuttle-test-proj-#{System.unique_integer([:positive])}")
