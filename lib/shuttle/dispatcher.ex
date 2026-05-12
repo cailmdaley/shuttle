@@ -196,10 +196,11 @@ defmodule Shuttle.Dispatcher do
   prompt where causal attention sees it first conditions the worker's
   reading of everything that follows.
 
-  Operational instructions (read the constitution, exit before half-full,
-  append an editorial event, `kill $PPID`) deliberately don't appear
-  here — they're encoded in the `shuttle` skill the worker activates
-  next. The prompt's job is orientation, not duplicating practice.
+  The exit contract appears directly in the prompt, even though the full
+  practice lives in the `shuttle` skill. Resumed sessions otherwise arrive
+  with a lighter prompt and can mistake Shuttle work for ordinary chat
+  completion; keeping `kill $PPID` in the causal foreground preserves the
+  dispatcher contract across fresh and resumed runs.
 
   On felt failure (binary missing, no history yet) the From User block
   falls back to empty — dispatch continues rather than failing, and
@@ -226,10 +227,11 @@ defmodule Shuttle.Dispatcher do
   @doc """
   Renders the prompt injected into a *resumed* worker session.
 
-  Mirrors the fresh dispatch prompt's From User block so the resumed
-  worker sees the same intent signal at the top of context. The framing
-  paragraph is shorter — skills, conventions, and the constitution are
-  already in the resumed transcript, so repeating them is noise.
+  Mirrors the fresh dispatch prompt's From User block and exit contract so
+  the resumed worker sees the same intent and termination signals at the
+  top of context. The framing paragraph is shorter — skills, conventions,
+  and the constitution are already in the resumed transcript, so repeating
+  them is noise.
 
   When the latest review-comment has an empty summary (the kanban writes
   one on every requeue/resume click to keep `resume_mode` aligned with
@@ -463,26 +465,35 @@ defmodule Shuttle.Dispatcher do
   end
 
   # Shared composition for all top-level prompts: a per-prompt orientation
-  # header plus the optional From User block. The shape is documented in
-  # CLAUDE.md under "Dispatch prompt structure". Outcome and last-session
-  # are deliberately not inlined — the shuttle skill prescribes that the
-  # worker reads them via `felt show` / `felt history` on arrival, and
-  # duplicating either here risks drift between the prompt's snapshot and
-  # felt's view.
+  # header, the mandatory exit contract, and optional context blocks. The
+  # shape is documented in CLAUDE.md under "Dispatch prompt structure".
+  # Outcome and last-session are deliberately not inlined — the shuttle
+  # skill prescribes that the worker reads them via `felt show` /
+  # `felt history` on arrival, and duplicating either here risks drift
+  # between the prompt's snapshot and felt's view.
   defp compose_prompt(header, fiber_id, opts) do
     felt_opts = [felt_store: Keyword.get(opts, :felt_store, default_felt_store())]
 
-    # Order: header, interactive prelude (when set), user message block.
-    # The prelude sits before the From User block so the worker reads
-    # the "stay alive" instruction before parsing the directive itself.
+    # Order: header, exit contract, interactive exception (when set), user
+    # message block. The exit contract is always present; the prelude is an
+    # explicit exception that tells the worker to stay alive.
     [
       String.trim(header),
+      render_exit_contract(),
       render_interactive_prelude(fiber_id, felt_opts),
       render_user_message_block(fiber_id, felt_opts)
     ]
     |> Enum.reject(&(&1 == ""))
     |> Enum.join("\n\n")
     |> String.trim()
+  end
+
+  defp render_exit_contract do
+    render_block(
+      "Exit Contract",
+      nil,
+      "This is an autonomous Shuttle worker unless an Interactive Mode block explicitly says otherwise. After you update outcome/history, file findings, and commit at a clean checkpoint, your final action must be `kill $PPID`. Do not substitute a normal chat final response for worker exit; the handoff belongs in the fiber."
+    )
   end
 
   @doc """

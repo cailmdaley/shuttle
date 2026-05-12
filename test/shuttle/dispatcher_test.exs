@@ -146,7 +146,7 @@ defmodule Shuttle.DispatcherTest do
 
   # ── Tests ──
 
-  test "render_prompt opens with orientation, names the fiber, defers practice to skills" do
+  test "render_prompt opens with orientation, names the fiber, and carries exit contract" do
     # No felt index for tests/haiku → all three context blocks render empty;
     # this test exercises the orientation header.
     prompt = Dispatcher.render_prompt("tests/haiku")
@@ -160,10 +160,12 @@ defmodule Shuttle.DispatcherTest do
     # Fiber identity on its own line for grep-ability.
     assert prompt =~ "Fiber: tests/haiku"
 
-    # Operational instructions live in the shuttle skill now, not in the
-    # prompt. The prompt's job is orientation; duplicating practice in both
-    # places means drift between them.
-    refute prompt =~ "kill $PPID"
+    # The full practice still lives in the shuttle skill, but the exit
+    # contract must be prompt-local so resumed workers do not treat Shuttle
+    # work like ordinary chat completion.
+    assert prompt =~ "Exit Contract"
+    assert prompt =~ "kill $PPID"
+    assert prompt =~ "Do not substitute a normal chat final response"
     refute prompt =~ "felt history append"
     refute prompt =~ "Exit before context is half-full"
   end
@@ -385,8 +387,10 @@ defmodule Shuttle.DispatcherTest do
     assert prompt =~ "Run:"
     assert prompt =~ "run-2026-05-06"
 
-    # Operational instructions belong to the shuttle skill, not the prompt
-    refute prompt =~ "kill $PPID"
+    # The run-specific frontmatter handoff remains in the skill; the generic
+    # autonomous-worker exit contract is prompt-local.
+    assert prompt =~ "Exit Contract"
+    assert prompt =~ "kill $PPID"
     refute prompt =~ "review.state: awaiting"
     refute prompt =~ "felt history append"
   end
@@ -441,7 +445,7 @@ defmodule Shuttle.DispatcherTest do
     assert Dispatcher.resolve_resume_intent(:constitution, "tests/haiku", fiber, nil) == :fresh
   end
 
-  test "render_resume_prompt names the fiber and defers to the existing transcript" do
+  test "render_resume_prompt names the fiber and repeats the exit contract" do
     # No felt history available in test env (no .felt index) — context
     # blocks suppress to empty; the framing block still renders.
     prompt = Dispatcher.render_resume_prompt("tests/haiku")
@@ -449,11 +453,13 @@ defmodule Shuttle.DispatcherTest do
     assert prompt =~ "Shuttle resumed your previous session"
     assert prompt =~ "Fiber: tests/haiku"
     assert prompt =~ "already loaded in your transcript"
+    assert prompt =~ "Exit Contract"
+    assert prompt =~ "kill $PPID"
+    assert prompt =~ "Do not substitute a normal chat final response"
 
     # Resume prompt deliberately omits the fresh-dispatch orientation —
     # skills, conventions, and the constitution are already in scope.
     refute prompt =~ "The orchestration system Shuttle dispatched you"
-    refute prompt =~ "kill $PPID"
   end
 
   # ── Resume-warning dismiss in run script ──
