@@ -162,7 +162,7 @@ defmodule Shuttle.PollerTest do
           session = Enum.at(args, 2)
           sessions = Agent.get(__MODULE__, & &1.tmux_sessions)
 
-          if MapSet.member?(sessions, session) do
+          if tmux_session_exists?(sessions, session) do
             {"", 0}
           else
             {"can't find session", 1}
@@ -196,6 +196,12 @@ defmodule Shuttle.PollerTest do
       args
       |> Enum.reject(&(&1 in ["show", "--json", "--field", "shuttle"]))
       |> List.first("")
+    end
+
+    defp tmux_session_exists?(sessions, "=" <> session), do: MapSet.member?(sessions, session)
+
+    defp tmux_session_exists?(sessions, session) do
+      Enum.any?(sessions, &(&1 == session or String.starts_with?(&1, session <> "/")))
     end
   end
 
@@ -1033,6 +1039,33 @@ defmodule Shuttle.PollerTest do
       |> Enum.count(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
 
     assert new_session_count >= 2
+  end
+
+  test "poller clears stale parent running state when only a child session exists" do
+    fiber_id = "tests/prefix-parent"
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_prefix_parent,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    fiber = make_fiber(fiber_id)
+    MockRunner.set_fiber(fiber_id, fiber)
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+
+    assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, [])
+    MockRunner.remove_tmux_session(session)
+    MockRunner.add_tmux_session(session <> "/child")
+
+    assert {:ok, ^session} = Poller.dispatch_fiber(poller, fiber_id, [])
+
+    assert Enum.any?(MockRunner.commands(), fn
+             {"tmux", ["has-session", "-t", target]} -> target == "=" <> session
+             _ -> false
+           end)
   end
 
   test "poller uses shuttle.project_dir as work_dir when it exists" do

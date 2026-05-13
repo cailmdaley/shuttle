@@ -27,7 +27,7 @@ defmodule Shuttle.WorkerWatcherTest do
     def cmd("tmux", ["has-session", "-t", session], _opts) do
       sessions = Agent.get(__MODULE__, & &1.sessions)
 
-      if MapSet.member?(sessions, session) do
+      if tmux_session_exists?(sessions, session) do
         {"", 0}
       else
         {"can't find session", 1}
@@ -35,6 +35,12 @@ defmodule Shuttle.WorkerWatcherTest do
     end
 
     def cmd(_, _, _), do: {"", 0}
+
+    defp tmux_session_exists?(sessions, "=" <> session), do: MapSet.member?(sessions, session)
+
+    defp tmux_session_exists?(sessions, session) do
+      Enum.any?(sessions, &(&1 == session or String.starts_with?(&1, session <> "/")))
+    end
   end
 
   # ── Flakey Runner ──
@@ -77,7 +83,7 @@ defmodule Shuttle.WorkerWatcherTest do
             # Transient failure: return non-zero even if the session is alive.
             {{"transient tmux error", 1}, %{state | inject_failures: state.inject_failures - 1}}
 
-          MapSet.member?(state.sessions, session) ->
+          tmux_session_exists?(state.sessions, session) ->
             {{"", 0}, state}
 
           true ->
@@ -87,6 +93,12 @@ defmodule Shuttle.WorkerWatcherTest do
     end
 
     def cmd(_, _, _), do: {"", 0}
+
+    defp tmux_session_exists?(sessions, "=" <> session), do: MapSet.member?(sessions, session)
+
+    defp tmux_session_exists?(sessions, session) do
+      Enum.any?(sessions, &(&1 == session or String.starts_with?(&1, session <> "/")))
+    end
   end
 
   # ── Setup ──

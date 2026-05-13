@@ -136,7 +136,7 @@ defmodule ShuttleWeb.SnapshotChannelTest do
           session = Enum.at(args, 2)
           sessions = Agent.get(__MODULE__, & &1.tmux_sessions)
 
-          if MapSet.member?(sessions, session) do
+          if tmux_session_exists?(sessions, session) do
             {"", 0}
           else
             {"can't find session", 1}
@@ -166,6 +166,12 @@ defmodule ShuttleWeb.SnapshotChannelTest do
       args
       |> Enum.reject(&(&1 in ["show", "--json", "--field", "shuttle"]))
       |> List.first("")
+    end
+
+    defp tmux_session_exists?(sessions, "=" <> session), do: MapSet.member?(sessions, session)
+
+    defp tmux_session_exists?(sessions, session) do
+      Enum.any?(sessions, &(&1 == session or String.starts_with?(&1, session <> "/")))
     end
   end
 

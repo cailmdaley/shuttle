@@ -83,7 +83,7 @@ defmodule Shuttle.DispatcherTest do
         command == "tmux" and hd(args) == "has-session" ->
           session = Enum.at(args, 2)
 
-          if MapSet.member?(tmux_sessions(), session) do
+          if tmux_session_exists?(tmux_sessions(), session) do
             {"", 0}
           else
             {"can't find session", 1}
@@ -97,6 +97,12 @@ defmodule Shuttle.DispatcherTest do
         true ->
           {"", 0}
       end
+    end
+
+    defp tmux_session_exists?(sessions, "=" <> session), do: MapSet.member?(sessions, session)
+
+    defp tmux_session_exists?(sessions, session) do
+      Enum.any?(sessions, &(&1 == session or String.starts_with?(&1, session <> "/")))
     end
 
     defp handle_felt(args) do
@@ -215,6 +221,18 @@ defmodule Shuttle.DispatcherTest do
 
     result = Dispatcher.dispatch("tests/haiku", runner: MockRunner)
     assert {:error, :already_running} = result
+  end
+
+  test "dispatch does not treat child fiber session as already-running parent" do
+    MockRunner.add_tmux_session(Dispatcher.session_name("tests/haiku/child"))
+
+    result = Dispatcher.dispatch("tests/haiku", runner: MockRunner)
+    assert {:ok, "shuttle-tests/haiku"} = result
+
+    assert Enum.any?(MockRunner.commands(), fn
+             {"tmux", ["has-session", "-t", "=shuttle-tests/haiku"]} -> true
+             _ -> false
+           end)
   end
 
   test "dispatch resolves pi agent from bare tag" do

@@ -54,7 +54,10 @@ defmodule Shuttle.WorkerWatcher do
     poller = Keyword.fetch!(opts, :poller)
     runner = Keyword.get(opts, :runner, Shuttle.Runner.Default)
     heartbeat_interval = Keyword.get(opts, :heartbeat_interval_ms, @default_heartbeat_interval_ms)
-    max_consecutive_failures = Keyword.get(opts, :max_consecutive_failures, @default_max_consecutive_failures)
+
+    max_consecutive_failures =
+      Keyword.get(opts, :max_consecutive_failures, @default_max_consecutive_failures)
+
     token_budget = Keyword.get(opts, :token_budget)
 
     now = DateTime.utc_now()
@@ -93,7 +96,12 @@ defmodule Shuttle.WorkerWatcher do
         ref = Process.send_after(self(), :heartbeat, state.heartbeat_interval_ms)
 
         {:noreply,
-         %{state | heartbeat_timer_ref: ref, last_activity_at: DateTime.utc_now(), consecutive_failures: 0}}
+         %{
+           state
+           | heartbeat_timer_ref: ref,
+             last_activity_at: DateTime.utc_now(),
+             consecutive_failures: 0
+         }}
 
       :dead ->
         failures = state.consecutive_failures + 1
@@ -126,7 +134,9 @@ defmodule Shuttle.WorkerWatcher do
   # ── Internal ──
 
   defp check_session(state) do
-    case state.runner.cmd("tmux", ["has-session", "-t", state.session], stderr_to_stdout: true) do
+    case state.runner.cmd("tmux", ["has-session", "-t", exact_tmux_target(state.session)],
+           stderr_to_stdout: true
+         ) do
       {_, 0} -> :alive
       {_, _} -> :dead
     end
@@ -152,9 +162,13 @@ defmodule Shuttle.WorkerWatcher do
   end
 
   defp session_alive?(state) do
-    case state.runner.cmd("tmux", ["has-session", "-t", state.session], stderr_to_stdout: true) do
+    case state.runner.cmd("tmux", ["has-session", "-t", exact_tmux_target(state.session)],
+           stderr_to_stdout: true
+         ) do
       {_, 0} -> true
       {_, _} -> false
     end
   end
+
+  defp exact_tmux_target(session), do: "=" <> session
 end

@@ -55,7 +55,7 @@ defmodule Shuttle.DispatchIntegrationTest do
       end)
 
       sessions = Agent.get(__MODULE__, & &1.tmux_sessions)
-      if MapSet.member?(sessions, session), do: {"", 0}, else: {"can't find session", 1}
+      if tmux_session_exists?(sessions, session), do: {"", 0}, else: {"can't find session", 1}
     end
 
     def cmd("tmux", ["new-session" | _] = args, _opts) do
@@ -76,6 +76,12 @@ defmodule Shuttle.DispatchIntegrationTest do
     def cmd(cmd, args, _opts) do
       Agent.update(__MODULE__, fn s -> %{s | commands: s.commands ++ [{cmd, args}]} end)
       {"", 0}
+    end
+
+    defp tmux_session_exists?(sessions, "=" <> session), do: MapSet.member?(sessions, session)
+
+    defp tmux_session_exists?(sessions, session) do
+      Enum.any?(sessions, &(&1 == session or String.starts_with?(&1, session <> "/")))
     end
   end
 

@@ -1693,11 +1693,15 @@ defmodule Shuttle.Poller do
   # ── Helpers ──
 
   defp already_running_session?(%State{} = state, session) do
-    case state.runner.cmd("tmux", ["has-session", "-t", session], stderr_to_stdout: true) do
+    case state.runner.cmd("tmux", ["has-session", "-t", exact_tmux_target(session)],
+           stderr_to_stdout: true
+         ) do
       {_, 0} -> true
       {_, _} -> false
     end
   end
+
+  defp exact_tmux_target(session), do: "=" <> session
 
   defp available_slots(%State{} = state) do
     max(state.max_concurrent_workers - map_size(state.running), 0)

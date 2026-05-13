@@ -331,6 +331,6 @@ func TmuxSessionName(fiberID string) string {
 
 // TmuxSessionExists checks whether a tmux session with the given name exists.
 func TmuxSessionExists(sessionName string) bool {
-	cmd := exec.Command("tmux", "has-session", "-t", sessionName)
+	cmd := exec.Command("tmux", "has-session", "-t", "="+sessionName)
 	return cmd.Run() == nil
 }

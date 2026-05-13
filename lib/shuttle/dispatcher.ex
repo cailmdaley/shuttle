@@ -555,11 +555,15 @@ defmodule Shuttle.Dispatcher do
   defp check_not_running(fiber_id, runner) do
     session = session_name(fiber_id)
 
-    case runner.cmd("tmux", ["has-session", "-t", session], stderr_to_stdout: true) do
+    case runner.cmd("tmux", ["has-session", "-t", exact_tmux_target(session)],
+           stderr_to_stdout: true
+         ) do
       {_, 0} -> {:error, :already_running}
       {_, _} -> :ok
     end
   end
+
+  defp exact_tmux_target(session), do: "=" <> session
 
   defp resolve_agent(fiber) do
     # Prefer the post-migration shuttle.agent field when present; fall back
