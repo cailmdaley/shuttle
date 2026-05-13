@@ -67,7 +67,7 @@ defmodule Shuttle.Actions do
         [:pause, :close_awaiting_review, :close_tempered, :close_composted]
 
       true ->
-        [:reopen]
+        [:reopen, :close_awaiting_review, :close_tempered, :close_composted]
     end
   end
 

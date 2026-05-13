@@ -42,6 +42,23 @@ defmodule Shuttle.ActionsTest do
              Actions.resolve_transition(fiber, "tempered")
   end
 
+  test "paused oneshot drafts can be closed directly into review or verdicts" do
+    fiber = %{
+      "id" => "work/draft",
+      "status" => "open",
+      "shuttle" => %{"enabled" => false, "kind" => "oneshot"}
+    }
+
+    actions = Actions.actions_for(fiber)
+    assert Enum.any?(actions, &(&1.id == "reopen"))
+    assert Enum.any?(actions, &(&1.id == "close-awaiting-review"))
+    assert Enum.any?(actions, &(&1.id == "close-tempered"))
+    assert Enum.any?(actions, &(&1.id == "close-composted"))
+
+    assert {:ok, %{id: "close-tempered", invocation: %{verb: "close", tempered: true}}} =
+             Actions.resolve_transition(fiber, "tempered")
+  end
+
   test "running oneshots can still be closed into review or verdict columns" do
     fiber = %{
       "id" => "work/running",
