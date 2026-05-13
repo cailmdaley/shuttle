@@ -48,7 +48,7 @@ defmodule Shuttle.Actions do
 
     cond do
       running? ->
-        [:pause]
+        [:pause, :close_awaiting_review, :close_tempered, :close_composted]
 
       status == "closed" ->
         [:reopen, :close_tempered, :close_composted]

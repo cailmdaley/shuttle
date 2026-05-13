@@ -42,6 +42,21 @@ defmodule Shuttle.ActionsTest do
              Actions.resolve_transition(fiber, "tempered")
   end
 
+  test "running oneshots can still be closed into review or verdict columns" do
+    fiber = %{
+      "id" => "work/running",
+      "status" => "active",
+      "shuttle" => %{"enabled" => true, "kind" => "oneshot"}
+    }
+
+    actions = Actions.actions_for(fiber, true)
+    assert Enum.any?(actions, &(&1.id == "pause"))
+    assert Enum.any?(actions, &(&1.id == "close-awaiting-review"))
+    assert Enum.any?(actions, &(&1.id == "close-tempered"))
+    assert Enum.any?(actions, &(&1.id == "close-composted"))
+    refute Enum.any?(actions, &(&1.id == "reopen"))
+  end
+
   test "actions list exposes continue previous only when a session id exists" do
     without_session = standing("awaiting")
     with_session = put_in(without_session, ["shuttle", "session"], %{"id" => "session-1"})
