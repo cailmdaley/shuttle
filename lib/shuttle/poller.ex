@@ -92,7 +92,15 @@ defmodule Shuttle.Poller do
       # %{fiber_id => felt_store} — populated by discover_candidates/1 on each
       # poll cycle and by host_for_fiber/2 on demand. Entries are never evicted
       # automatically; call bust_fiber_host_cache/1 when a fiber moves hosts.
-      fiber_host_cache: %{}
+      fiber_host_cache: %{},
+      # %{fiber_id => %{reason: term, attempted_at: DateTime.t, attempts:
+      # pos_integer}} — fibers the dispatcher rejected with an error other
+      # than :already_running. Surfaced in the snapshot's `blocked` list so
+      # the kanban shows *why* a fiber isn't progressing instead of leaving
+      # the poll-cycle warning to scroll unread in the daemon log. Entries
+      # clear on successful dispatch or when the fiber's eligibility changes
+      # (frontmatter edit, pause, close).
+      dispatch_failures: %{}
     ]
   end
 
@@ -249,7 +257,7 @@ defmodule Shuttle.Poller do
       end
 
     runner = Keyword.get(opts, :runner, Shuttle.Runner.Default)
-    own_host_id = Keyword.get(opts, :own_host_id, Application.get_env(:shuttle, :host, "local"))
+    own_host_id = Keyword.get(opts, :own_host_id, resolve_own_host_id())
 
     # Use the registered name (atom) when available so cross-process sends
     # survive a supervisor restart of this Poller. Process.info/2 returns
@@ -584,12 +592,26 @@ defmodule Shuttle.Poller do
         }
       end)
 
+    blocked =
+      Enum.map(state.dispatch_failures, fn {fiber_id, entry} ->
+        %{
+          fiber_id: fiber_id,
+          reason: format_block_reason(entry.reason),
+          attempts: entry.attempts,
+          attempted_at: DateTime.to_unix(entry.attempted_at, :millisecond),
+          first_attempted_at: DateTime.to_unix(entry.first_attempted_at, :millisecond)
+        }
+      end)
+
     %{
       poll_at: now_ms,
-      host: hostname(),
+      # Reflect the dispatch-filter identity, not just :inet.gethostname().
+      # When SHUTTLE_HOST is set this matches the host operators read in logs
+      # and use to author `shuttle.host:` pins on fibers.
+      host: state.own_host_id,
       felt_stores: state.felt_stores,
       eligible: eligible,
-      blocked: [],
+      blocked: blocked,
       orphans: state.orphans,
       retrying: retrying,
       standing_roles: standing_role_snapshots(state.standing_roles, state.running, now),
@@ -597,6 +619,13 @@ defmodule Shuttle.Poller do
       max_concurrent: state.max_concurrent_workers
     }
   end
+
+  # Stringifies dispatch-failure reasons for the snapshot. Atoms become their
+  # name (':missing_session_id' is more useful in the UI than the raw atom);
+  # strings pass through; everything else falls back to inspect/1.
+  defp format_block_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp format_block_reason(reason) when is_binary(reason), do: reason
+  defp format_block_reason(reason), do: inspect(reason)
 
   defp broadcast_snapshot(state) do
     snap = build_snapshot(state)
@@ -617,7 +646,8 @@ defmodule Shuttle.Poller do
       state = %{
         state
         | fiber_host_cache: Map.merge(new_host_map, state.fiber_host_cache),
-          standing_roles: standing_roles_from_candidates(candidates)
+          standing_roles: standing_roles_from_candidates(candidates),
+          dispatch_failures: evict_stale_dispatch_failures(state.dispatch_failures, candidates)
       }
 
       dispatchable = candidates |> filter_eligible(state) |> sort_candidates()
@@ -638,6 +668,22 @@ defmodule Shuttle.Poller do
       false ->
         state
     end
+  end
+
+  # Drops dispatch_failures entries for fibers shuttle no longer intends to
+  # dispatch — closed, paused (status not in {open, active}), shuttle block
+  # removed, or absent from the felt store entirely. Without this, the
+  # `blocked` snapshot would carry stale entries the user has no remaining
+  # handle on. Active fibers with persistent failures keep their entry
+  # across cycles so the kanban can show the failure count.
+  defp evict_stale_dispatch_failures(failures, candidates) do
+    active_ids =
+      candidates
+      |> Enum.filter(fn fiber -> Map.get(fiber, "status") in ["open", "active"] end)
+      |> Enum.map(&Map.get(&1, "id", ""))
+      |> MapSet.new()
+
+    Map.filter(failures, fn {fiber_id, _entry} -> MapSet.member?(active_ids, fiber_id) end)
   end
 
   defp run_poll_cycle_safely(%State{} = state) do
@@ -668,7 +714,13 @@ defmodule Shuttle.Poller do
         completed_standing_runs:
           MapSet.union(poll_state.completed_standing_runs, current.completed_standing_runs),
         standing_roles: poll_state.standing_roles,
-        orphans: poll_state.orphans
+        orphans: poll_state.orphans,
+        # Carry the poll cycle's view. Sync :dispatch calls that ran in
+        # parallel with the poll Task lose their dispatch_failures updates;
+        # they'll re-record on the next attempt. The alternative — merging
+        # both — keeps stale entries when the poll evicts a fiber that just
+        # finished a sync dispatch from outside.
+        dispatch_failures: poll_state.dispatch_failures
     }
   end
 
@@ -1130,6 +1182,35 @@ defmodule Shuttle.Poller do
 
   defp shuttle_host(_), do: "local"
 
+  # Resolves the daemon's `own_host_id` — the identity it advertises for the
+  # `shuttle.host` dispatch filter. Precedence:
+  #
+  #   1. `SHUTTLE_HOST` env var, if set and non-empty. Operators override here
+  #      when they want a friendly name distinct from `:inet.gethostname()`
+  #      (e.g. `SHUTTLE_HOST=mac` instead of `dapmcw68`, or `candide` instead
+  #      of `c03`).
+  #   2. `Application.get_env(:shuttle, :host)` — pinned by `config/test.exs`
+  #      so tests get a predictable identity. `config/config.exs` deliberately
+  #      doesn't set this any more.
+  #   3. `:inet.gethostname()` — short OS hostname. Two separately-deployed
+  #      daemons get distinct ids automatically; no per-machine config needed.
+  #   4. "local" — last-resort fallback (gethostname can in principle fail).
+  defp resolve_own_host_id do
+    cond do
+      (env = System.get_env("SHUTTLE_HOST")) && env != "" ->
+        env
+
+      (configured = Application.get_env(:shuttle, :host)) && configured not in [nil, ""] ->
+        to_string(configured)
+
+      true ->
+        case :inet.gethostname() do
+          {:ok, name} when name != [] -> to_string(name)
+          _ -> "local"
+        end
+    end
+  end
+
   defp standing_roles_from_candidates(candidates) do
     Enum.flat_map(candidates, fn fiber ->
       case standing_role_from_fiber(fiber) do
@@ -1350,7 +1431,8 @@ defmodule Shuttle.Poller do
             state = %{
               state
               | running: running,
-                claimed: MapSet.put(state.claimed, fiber_id)
+                claimed: MapSet.put(state.claimed, fiber_id),
+                dispatch_failures: Map.delete(state.dispatch_failures, fiber_id)
             }
 
             broadcast_snapshot(state)
@@ -1364,17 +1446,40 @@ defmodule Shuttle.Poller do
                 error: "watcher start failed: #{inspect(reason)}"
               })
 
+            state = record_dispatch_failure(state, fiber_id, :watcher_start_failed)
             {state, {:error, :watcher_start_failed}}
         end
 
       {:error, :already_running} ->
         # Session exists but we don't have a watcher — adopt it
-        {adopt_session(state, fiber_id), {:error, :already_running}}
+        state = adopt_session(state, fiber_id)
+        state = %{state | dispatch_failures: Map.delete(state.dispatch_failures, fiber_id)}
+        {state, {:error, :already_running}}
 
       {:error, reason} ->
         Logger.warning("Dispatch failed for #{fiber_id}: #{inspect(reason)}")
+        state = record_dispatch_failure(state, fiber_id, reason)
         {state, {:error, reason}}
     end
+  end
+
+  # Records (or refreshes the attempt count on) a dispatch failure. The map
+  # entry is surfaced in `build_snapshot/1` under `blocked` so the kanban can
+  # show why a fiber is stuck — replacing the silent-warning-log failure mode
+  # where a `:missing_session_id` block could persist for days unnoticed.
+  defp record_dispatch_failure(%State{} = state, fiber_id, reason) do
+    now = DateTime.utc_now()
+
+    entry =
+      case Map.get(state.dispatch_failures, fiber_id) do
+        %{reason: ^reason, attempts: n} = e ->
+          %{e | attempts: n + 1, attempted_at: now}
+
+        _ ->
+          %{reason: reason, attempts: 1, attempted_at: now, first_attempted_at: now}
+      end
+
+    %{state | dispatch_failures: Map.put(state.dispatch_failures, fiber_id, entry)}
   end
 
   # ── Reconciliation ──
@@ -2066,13 +2171,6 @@ defmodule Shuttle.Poller do
   end
 
   defp runtime_seconds(_, _), do: 0
-
-  defp hostname do
-    case :inet.gethostname() do
-      {:ok, name} -> to_string(name)
-      _ -> "unknown"
-    end
-  end
 
   # Returns the configured felt stores list.
   #

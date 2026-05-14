@@ -363,6 +363,53 @@ defmodule Shuttle.PollerTest do
     assert hd(snap.eligible).fiber_id == "tests/host-match"
   end
 
+  # The Poller defaults `own_host_id` from a precedence chain:
+  # SHUTTLE_HOST env var → :shuttle, :host app config (unless "local") →
+  # :inet.gethostname() → "local". Explicit `own_host_id:` opts always win;
+  # these tests cover the fallback chain that drives production daemons.
+  test "poller resolves own_host_id from SHUTTLE_HOST env var when set" do
+    System.put_env("SHUTTLE_HOST", "candide")
+
+    try do
+      {:ok, poller} =
+        Poller.start_link(
+          name: :test_poller_env_host,
+          runner: MockRunner,
+          poll_interval_ms: 60_000,
+          felt_stores: ["/tmp"]
+        )
+
+      assert Poller.snapshot(poller).host == "candide"
+    after
+      System.delete_env("SHUTTLE_HOST")
+    end
+  end
+
+  test "poller falls back to :inet.gethostname when env + config absent" do
+    # config/test.exs pins `:shuttle, :host` to "local" so tests are
+    # deterministic. To exercise the gethostname fallback, temporarily clear
+    # both the env var and the app config.
+    System.delete_env("SHUTTLE_HOST")
+    prev_host = Application.get_env(:shuttle, :host)
+    Application.delete_env(:shuttle, :host)
+    {:ok, hostname} = :inet.gethostname()
+    expected = to_string(hostname)
+
+    try do
+      {:ok, poller} =
+        Poller.start_link(
+          name: :test_poller_gethostname,
+          runner: MockRunner,
+          poll_interval_ms: 60_000,
+          felt_stores: ["/tmp"]
+        )
+
+      assert Poller.snapshot(poller).host == expected
+    after
+      if prev_host, do: Application.put_env(:shuttle, :host, prev_host)
+    end
+  end
+
   test "poller uses projected felt listing for shuttle discovery" do
     fiber = make_fiber("tests/projected-discovery")
     MockRunner.set_fiber("tests/projected-discovery", fiber)

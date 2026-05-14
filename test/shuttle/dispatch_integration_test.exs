@@ -573,6 +573,98 @@ defmodule Shuttle.DispatchIntegrationTest do
              )
   end
 
+  # Scheduled standing-run dispatches scope the review-comment lookup to the
+  # current run window — events older than the run window's start time are
+  # ignored. Without this, a stale `resume_mode: "previous"` from days ago
+  # blocks every subsequent scheduled run with :missing_session_id.
+  # (Real-world example: loom/email/morning-post stuck 2026-05-09 → 2026-05-14
+  # with no surfaced signal; the warning log fired every 30s for 5 days.)
+  test "scheduled standing-run ignores review-comment older than the run window", %{host: host} do
+    write_fiber(host, "tests/standing-stale-resume", """
+    ---
+    name: Standing stale resume
+    status: active
+    tags:
+      - constitution
+    shuttle:
+      enabled: true
+      kind: standing
+      agent: claude-sonnet
+      schedule:
+        expr: 0 9 * * 1-5
+        tz: Europe/Paris
+      review:
+        state: scheduled
+      next_due_at: 2026-05-14T09:00:00+02:00
+    ---
+    Standing role with a stale resume directive.
+    """)
+
+    # Review-comment filed *now* (in the test's wall clock); resume_mode says
+    # previous but there's no session id. Without scoping this would block.
+    append_review_comment(host, "tests/standing-stale-resume",
+      summary: "Resume previous",
+      resume_mode: "previous"
+    )
+
+    # Pretend the current run window starts well in the future — the just-
+    # appended review-comment is "older" than the window, so it shouldn't
+    # apply. Dispatcher should take :fresh.
+    future_run_id = "29990101T090000+0000"
+
+    assert {:ok, _} =
+             Dispatcher.dispatch("tests/standing-stale-resume",
+               runner: IntegrationRunner,
+               felt_store: host,
+               prompt_context: {:standing_run, future_run_id}
+             )
+
+    script = read_run_script()
+    # Fresh path: no --resume flag, no dismiss block.
+    refute script =~ "--resume"
+    refute script =~ "send-keys"
+  end
+
+  # Inverse of the above: when the review-comment falls *within* the current
+  # run window, the existing fail-loud-on-missing-session contract still holds.
+  test "scheduled standing-run honors review-comment inside the run window", %{host: host} do
+    write_fiber(host, "tests/standing-fresh-resume", """
+    ---
+    name: Standing fresh resume
+    status: active
+    tags:
+      - constitution
+    shuttle:
+      enabled: true
+      kind: standing
+      agent: claude-sonnet
+      schedule:
+        expr: 0 9 * * 1-5
+        tz: Europe/Paris
+      review:
+        state: scheduled
+      next_due_at: 2020-01-01T09:00:00+00:00
+    ---
+    Standing role with an in-window resume directive but no session id.
+    """)
+
+    append_review_comment(host, "tests/standing-fresh-resume",
+      summary: "Resume previous",
+      resume_mode: "previous"
+    )
+
+    # Past run_id: review-comment occurred after the window opened, so the
+    # directive applies. No session id → fail loud per the existing contract.
+    past_run_id = "20200101T090000+0000"
+
+    assert {:error, :missing_session_id} =
+             Dispatcher.dispatch("tests/standing-fresh-resume",
+               runner: IntegrationRunner,
+               felt_store: host,
+               prompt_context: {:standing_run, past_run_id}
+             )
+  end
+
   test "poller dispatch API preserves missing session UUID errors", %{host: host} do
     write_fiber(host, "tests/poller-resume-no-uuid", """
     ---
@@ -607,6 +699,68 @@ defmodule Shuttle.DispatchIntegrationTest do
     refute Enum.any?(IntegrationRunner.commands(), fn {cmd, args} ->
              cmd == "tmux" and Enum.at(args, 0) == "new-session"
            end)
+
+    # The dispatch failure surfaces in the snapshot's `blocked` list so the
+    # kanban shows *why* the fiber isn't progressing. Before this, the only
+    # signal was a warning log that scrolled by once every 30s.
+    snap = Poller.snapshot(poller)
+
+    assert [%{fiber_id: "tests/poller-resume-no-uuid", reason: "missing_session_id"} = entry] =
+             snap.blocked
+
+    assert entry.attempts == 1
+    assert is_integer(entry.attempted_at)
+    assert is_integer(entry.first_attempted_at)
+  end
+
+  # The poll cycle evicts dispatch_failures entries when the underlying fiber
+  # is no longer discoverable (closed, paused, or had its shuttle block
+  # removed). Without eviction, the snapshot would carry stale "blocked"
+  # entries the user has no remaining handle on.
+  test "blocked entry clears when fiber is closed", %{host: host} do
+    write_fiber(host, "tests/blocked-then-closed", """
+    ---
+    name: Blocked then closed
+    status: active
+    tags:
+      - constitution
+    shuttle:
+      enabled: true
+      kind: oneshot
+      agent: claude-sonnet
+    ---
+    No session UUID; dispatch will block.
+    """)
+
+    append_review_comment(host, "tests/blocked-then-closed",
+      summary: "Please resume",
+      resume_mode: "previous"
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_blocked_then_closed,
+        runner: IntegrationRunner,
+        poll_interval_ms: 600_000,
+        felt_stores: [host]
+      )
+
+    assert {:error, :missing_session_id} =
+             Poller.dispatch_fiber(poller, "tests/blocked-then-closed", [])
+
+    assert [%{fiber_id: "tests/blocked-then-closed"}] = Poller.snapshot(poller).blocked
+
+    # Close the fiber. The next poll cycle's candidate set no longer
+    # contains it, so the dispatch-failure entry should evict.
+    {_out, 0} =
+      System.cmd("felt", ["-C", host, "edit", "tests/blocked-then-closed", "--status", "closed"],
+        stderr_to_stdout: true
+      )
+
+    send(poller, :run_poll_cycle)
+
+    assert eventually(fn -> Poller.snapshot(poller).blocked == [] end),
+           "expected blocked entry to evict after fiber closed"
   end
 
   # review-comment with resume_mode=fresh explicitly requests a new session

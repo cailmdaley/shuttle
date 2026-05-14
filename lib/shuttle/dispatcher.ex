@@ -94,6 +94,11 @@ defmodule Shuttle.Dispatcher do
     the worker in a transcript whose last assistant turn was "Run accepted.
     Exiting" — they'd idle ("nothing new on the fiber") instead of doing the
     new run.
+  - Scheduled standing-role dispatches scope the review-comment lookup to the
+    current run window (events at or after the run_id timestamp). A stale
+    `resume_mode: "previous"` from a prior run would otherwise gate every
+    future scheduled dispatch with `:missing_session_id` (see
+    `loom/email/morning-post` blocked for 5 days, 2026-05-09 → 2026-05-14).
   - All other contexts defer to `check_resume_intent/3`, which reads the
     most recent review-comment from felt history and honors its `resume_mode`.
   """
@@ -105,10 +110,45 @@ defmodule Shuttle.Dispatcher do
         :fresh
 
       _ ->
-        opts = if is_nil(felt_store), do: [], else: [felt_store: felt_store]
+        opts =
+          [since: run_window_start(prompt_context)]
+          |> then(fn o -> if is_nil(felt_store), do: o, else: [{:felt_store, felt_store} | o] end)
+
         check_resume_intent(fiber_id, fiber, opts)
     end
   end
+
+  # Standing-run prompt contexts carry the run_id (a YYYYMMDDTHHMMSS+ZZZZ
+  # timestamp string). Parse it back into a DateTime — used to scope the
+  # review-comment lookup to events from the current run window so stale
+  # directives from older runs can't silently gate the dispatcher.
+  defp run_window_start({:standing_run, run_id}) when is_binary(run_id),
+    do: parse_run_id(run_id)
+
+  defp run_window_start({:standing_run, run_id, _}) when is_binary(run_id),
+    do: parse_run_id(run_id)
+
+  defp run_window_start(_), do: nil
+
+  defp parse_run_id(run_id) when is_binary(run_id) do
+    case Regex.run(
+           ~r/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})([+-])(\d{2})(\d{2})$/,
+           run_id
+         ) do
+      [_, y, mo, d, h, mi, s, sign, tzh, tzm] ->
+        case DateTime.from_iso8601(
+               "#{y}-#{mo}-#{d}T#{h}:#{mi}:#{s}#{sign}#{tzh}:#{tzm}"
+             ) do
+          {:ok, dt, _offset} -> dt
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp parse_run_id(_), do: nil
 
   @doc """
   Checks whether the most recent review-comment requests resume of the previous
@@ -126,13 +166,27 @@ defmodule Shuttle.Dispatcher do
   Reads the latest `--kind review-comment` event from felt history. The
   `resume_mode` field in the event payload is set at requeue time by the user
   clicking "Requeue fresh" or "Resume previous" in the Kanban UI.
+
+  Options:
+    * `:since` — `DateTime` lower bound passed through to `felt history
+      --since`. Used by scheduled standing-run dispatches to ignore
+      directives that pre-date the current run window. When unset (oneshots,
+      ad-hoc dispatches), the latest review-comment of all time applies.
   """
   @spec check_resume_intent(String.t(), map(), keyword()) ::
           :fresh | {:previous, String.t()} | {:error, :missing_session_id}
   def check_resume_intent(fiber_id, fiber, opts \\ []) do
     felt_store = Keyword.get(opts, :felt_store, default_felt_store())
 
-    case query_history(fiber_id, ["--kind", "review-comment", "--last", "1", "--json"],
+    since_args =
+      case Keyword.get(opts, :since) do
+        %DateTime{} = dt -> ["--since", DateTime.to_iso8601(dt)]
+        _ -> []
+      end
+
+    case query_history(
+           fiber_id,
+           ["--kind", "review-comment", "--last", "1", "--json"] ++ since_args,
            felt_store: felt_store
          ) do
       [event | _] ->

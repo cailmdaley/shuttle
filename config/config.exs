@@ -2,7 +2,11 @@ import Config
 
 config :shuttle,
   env: config_env(),
-  host: "local",
+  # `:host` is intentionally left unset here. Per-daemon identity resolves at
+  # runtime in `Shuttle.Poller.resolve_own_host_id/0`: SHUTTLE_HOST env var →
+  # explicit app config (e.g. config/test.exs) → :inet.gethostname() →
+  # "local". The historical literal "local" default was a no-op filter that
+  # let remote and local daemons fight over the same fibers.
   start_poller: true,
   start_remote_registry: true,
   # Per-host snapshots from remote Shuttle daemons reachable via
