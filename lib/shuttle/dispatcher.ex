@@ -499,17 +499,30 @@ defmodule Shuttle.Dispatcher do
   @doc """
   tmux session name for a fiber ID.
 
-  tmux on macOS and Linux accepts `/` in session names; preserving the
-  literal fiber ID makes `tmux attach -t shuttle-<id>` work without
-  transformation, and keeps the kanban's `listShuttleSessions` probe
-  aligned with the Elixir Shuttle's naming.
+  Uses the fiber leaf so tmux/kitty titles stay legible from the left edge
+  when truncated.
   """
   @spec session_name(String.t()) :: String.t()
   def session_name(fiber_id) do
-    "shuttle-" <> fiber_id
+    fiber_leaf(fiber_id) <> "-shuttle"
+  end
+
+  @doc """
+  Returns true when a tmux session name belongs to a Shuttle worker.
+  """
+  @spec shuttle_session?(String.t()) :: boolean()
+  def shuttle_session?(session_name) do
+    String.ends_with?(session_name, "-shuttle")
   end
 
   # ── Internal ──
+
+  defp fiber_leaf(fiber_id) do
+    case String.trim_trailing(fiber_id, "/") do
+      "" -> ""
+      trimmed -> trimmed |> String.split("/") |> List.last()
+    end
+  end
 
   # First tries the runner's default cwd (so tests / one-off CLI invocations
   # in a project's working directory still resolve the fiber against that

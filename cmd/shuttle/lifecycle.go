@@ -16,7 +16,7 @@ func newPauseCmd() *cobra.Command {
 		Use:   "pause <fiber>",
 		Short: "Pause dispatch, kill any live worker, and park a fiber in drafts",
 		Long: `Sets shuttle.enabled = false while preserving the schedule, then kills the
-canonical worker tmux session (shuttle-<fiber-id>) if one is running. When the fiber
+canonical worker tmux session (<leaf>-shuttle) if one is running. When the fiber
 is currently closed, pause also reopens it to status: active and clears
 closed-at / tempered so the card lands in Drafts rather than Awaiting review.
 Open fibers keep their existing status (typically open).

@@ -321,12 +321,27 @@ func expandUserPath(path string) (string, error) {
 	return filepath.Clean(abs), nil
 }
 
+func fiberLeaf(fiberID string) string {
+	fiberID = strings.TrimRight(fiberID, "/")
+	if fiberID == "" {
+		return ""
+	}
+	if idx := strings.LastIndexByte(fiberID, '/'); idx >= 0 {
+		return fiberID[idx+1:]
+	}
+	return fiberID
+}
+
 // TmuxSessionName returns the canonical tmux session name for a fiber ID.
 func TmuxSessionName(fiberID string) string {
-	// Preserve the full fiber ID so every surface (Elixir dispatcher, Go CLI,
-	// portolan UI, manual tmux attach) agrees on the same worker session name.
-	// tmux accepts `/` in session names on macOS and Linux.
-	return "shuttle-" + fiberID
+	// Shuttle workers use the fiber leaf so tmux/kitty titles stay legible from
+	// the left edge when truncated.
+	return fiberLeaf(fiberID) + "-shuttle"
+}
+
+// IsTmuxSessionName reports whether a tmux session name belongs to Shuttle.
+func IsTmuxSessionName(sessionName string) bool {
+	return strings.HasSuffix(sessionName, "-shuttle")
 }
 
 // TmuxSessionExists checks whether a tmux session with the given name exists.

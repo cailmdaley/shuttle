@@ -23,7 +23,7 @@ const sampleCompositeJSON = `{
     "eligible": [
       {
         "fiber_id": "ai-futures/shuttle/constitution-shuttle-remote-dispatch",
-        "tmux_session": "shuttle-ai-futures/shuttle/constitution-shuttle-remote-dispatch",
+        "tmux_session": "constitution-shuttle-remote-dispatch-shuttle",
         "agent": "claude-opus",
         "state": "running",
         "started_at": 1778010188803,
@@ -48,7 +48,7 @@ const sampleCompositeJSON = `{
         "eligible": [
           {
             "fiber_id": "tests/smoke-remote-haiku",
-            "tmux_session": "shuttle-tests/smoke-remote-haiku",
+            "tmux_session": "smoke-remote-haiku-shuttle",
             "agent": "claude-sonnet",
             "state": "running",
             "started_at": 1778010100000,
@@ -76,7 +76,7 @@ const sampleCompositeJSON = `{
 func TestCompositeRows_All(t *testing.T) {
 	c := &CompositeState{
 		Local: &Snapshot{
-			Eligible: []SnapshotEntry{{FiberID: "local/a", Agent: "claude-opus", State: "running", TmuxSession: "shuttle-local/a"}},
+			Eligible: []SnapshotEntry{{FiberID: "local/a", Agent: "claude-opus", State: "running", TmuxSession: "a-shuttle"}},
 			StandingRoles: []StandingRoleEntry{
 				{FiberID: "local/standing", State: "scheduled", Review: map[string]any{"state": "scheduled"}},
 			},

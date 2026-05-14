@@ -862,7 +862,7 @@ defmodule Shuttle.PollerTest do
   test "poller schedules retry when worker exits and fiber still active" do
     # Uses "tests/haiku-retry" to avoid session collisions — this test leaves two
     # WorkerWatcher processes alive (initial + retry) that would interfere with
-    # subsequent tests using the same session name "shuttle-tests/haiku".
+    # subsequent tests using the same session name "haiku-shuttle".
     fiber = make_fiber("tests/haiku-retry")
     MockRunner.set_fiber("tests/haiku-retry", fiber)
     MockRunner.set_shuttle("tests/haiku-retry", @oneshot_shuttle)
@@ -976,8 +976,7 @@ defmodule Shuttle.PollerTest do
   end
 
   test "poller adopts orphan tmux sessions on startup" do
-    fiber = make_fiber("tests/orphan")
-    MockRunner.set_fiber("tests/orphan", fiber)
+    MockRunner.set_shuttle("tests/orphan", @oneshot_shuttle)
     MockRunner.add_tmux_session(Dispatcher.session_name("tests/orphan"))
 
     {:ok, poller} =
@@ -1138,8 +1137,18 @@ defmodule Shuttle.PollerTest do
 
   test "poller adopts orphan sessions with literal hyphenated fiber ids" do
     fiber_id = "ai-futures/shuttle/constitution-shuttle-standalone"
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
     fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "codex"]})
-    MockRunner.set_fiber(fiber_id, fiber)
+
+    MockRunner.set_fiber(
+      fiber_id,
+      Map.put(fiber, "shuttle", %{
+        "enabled" => true,
+        "kind" => "oneshot",
+        "agent" => "claude-sonnet"
+      })
+    )
+
     MockRunner.add_tmux_session(Dispatcher.session_name(fiber_id))
 
     {:ok, poller} =
@@ -1153,7 +1162,8 @@ defmodule Shuttle.PollerTest do
     Process.sleep(100)
 
     snap = Poller.snapshot(poller)
-    assert [%{fiber_id: ^fiber_id, tmux_session: "shuttle-" <> ^fiber_id}] = snap.eligible
+    assert [%{fiber_id: ^fiber_id, tmux_session: session}] = snap.eligible
+    assert session == Dispatcher.session_name(fiber_id)
   end
 
   # Regression: a fiber with a shuttle: block but *no* constitution tag must be

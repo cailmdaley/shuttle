@@ -195,7 +195,9 @@ defmodule Shuttle.CLI do
     IO.puts("")
 
     case tmux_shuttle_sessions() do
-      [] -> IO.puts("No running workers.")
+      [] ->
+        IO.puts("No running workers.")
+
       sessions ->
         IO.puts("Active shuttle sessions (#{length(sessions)}):")
         Enum.each(sessions, fn s -> IO.puts("  • #{s}") end)
@@ -217,7 +219,7 @@ defmodule Shuttle.CLI do
     IO.puts(Jason.encode!(fallback))
   end
 
-  # List shuttle- tmux sessions without starting the OTP application.
+  # List Shuttle tmux sessions without starting the OTP application.
   # Returns [] when tmux is not running or there are no matching sessions.
   defp tmux_shuttle_sessions do
     case System.cmd("tmux", ["ls", "-F", "\#{session_name}"], stderr_to_stdout: true) do
@@ -225,7 +227,7 @@ defmodule Shuttle.CLI do
         output
         |> String.split("\n")
         |> Enum.map(&String.trim/1)
-        |> Enum.filter(&String.starts_with?(&1, "shuttle-"))
+        |> Enum.filter(&Dispatcher.shuttle_session?/1)
 
       {_, _} ->
         []

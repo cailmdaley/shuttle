@@ -19,7 +19,7 @@ var killTmuxSession = func(session string) error {
 var attachCmd = &cobra.Command{
 	Use:   "attach <fiber>",
 	Short: "Attach to a running worker's tmux session",
-	Long: `Convenience wrapper for: tmux attach -t shuttle-<fiber-id>
+	Long: `Convenience wrapper for: tmux attach -t <leaf>-shuttle
 
 Resolves the fiber ID to Shuttle's canonical tmux session name and executes
 tmux attach. Exits with a clear error if no session exists.`,

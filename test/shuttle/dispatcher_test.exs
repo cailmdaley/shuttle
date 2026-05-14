@@ -194,14 +194,14 @@ defmodule Shuttle.DispatcherTest do
     refute prompt =~ "Last session"
   end
 
-  test "session_name preserves slashes" do
-    assert Dispatcher.session_name("tests/haiku") == "shuttle-tests/haiku"
-    assert Dispatcher.session_name("a/b/c") == "shuttle-a/b/c"
+  test "session_name uses fiber leaf plus shuttle suffix" do
+    assert Dispatcher.session_name("tests/haiku") == "haiku-shuttle"
+    assert Dispatcher.session_name("a/b/c") == "c-shuttle"
   end
 
   test "dispatch creates tmux session for eligible fiber" do
     result = Dispatcher.dispatch("tests/haiku", runner: MockRunner)
-    assert {:ok, "shuttle-tests/haiku"} = result
+    assert {:ok, "haiku-shuttle"} = result
 
     commands = MockRunner.commands()
 
@@ -227,10 +227,10 @@ defmodule Shuttle.DispatcherTest do
     MockRunner.add_tmux_session(Dispatcher.session_name("tests/haiku/child"))
 
     result = Dispatcher.dispatch("tests/haiku", runner: MockRunner)
-    assert {:ok, "shuttle-tests/haiku"} = result
+    assert {:ok, "haiku-shuttle"} = result
 
     assert Enum.any?(MockRunner.commands(), fn
-             {"tmux", ["has-session", "-t", "=shuttle-tests/haiku"]} -> true
+             {"tmux", ["has-session", "-t", "=haiku-shuttle"]} -> true
              _ -> false
            end)
   end
@@ -251,7 +251,7 @@ defmodule Shuttle.DispatcherTest do
 
   test "dispatch resolves agent from shuttle.agent block when present" do
     assert {:ok, _session} = Dispatcher.dispatch("tests/shuttle-agent-block", runner: MockRunner)
-    script = read_run_script_for("shuttle-tests/shuttle-agent-block")
+    script = read_run_script_for(Dispatcher.session_name("tests/shuttle-agent-block"))
     assert script =~ "agent=claude-opus"
     refute script =~ "agent=claude-sonnet"
   end
@@ -260,7 +260,7 @@ defmodule Shuttle.DispatcherTest do
     assert {:ok, _session} =
              Dispatcher.dispatch("tests/shuttle-agent-overrides-tag", runner: MockRunner)
 
-    script = read_run_script_for("shuttle-tests/shuttle-agent-overrides-tag")
+    script = read_run_script_for(Dispatcher.session_name("tests/shuttle-agent-overrides-tag"))
     assert script =~ "agent=claude-opus"
     refute script =~ "agent=pi-deepseek-flash"
   end
@@ -486,11 +486,11 @@ defmodule Shuttle.DispatcherTest do
     script =
       Dispatcher.build_run_script("tests/haiku", "claude --resume 'abc'", "claude-sonnet",
         dismiss_resume_warning: true,
-        session: "shuttle-tests/haiku"
+        session: "haiku-shuttle"
       )
 
     assert script =~ "sleep 2"
-    assert script =~ "tmux send-keys -t 'shuttle-tests/haiku' Enter"
+    assert script =~ "tmux send-keys -t 'haiku-shuttle' Enter"
     # The dismiss block runs in the background (suffixed with `&`) so it
     # doesn't block the harness command itself.
     assert script =~ ") &"
@@ -500,7 +500,7 @@ defmodule Shuttle.DispatcherTest do
     script =
       Dispatcher.build_run_script("tests/haiku", "claude --resume 'abc'", "claude-sonnet",
         dismiss_resume_warning: false,
-        session: "shuttle-tests/haiku"
+        session: "haiku-shuttle"
       )
 
     refute script =~ "send-keys"

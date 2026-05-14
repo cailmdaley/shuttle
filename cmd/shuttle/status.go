@@ -57,9 +57,9 @@ port; the CLI just renders that response. Rows from a remote include an
 flagged with "[stale]" in the state column.
 
 Other flags:
-  --include-orphans  include live shuttle-* tmux sessions that no longer
-                     have a shuttle: block (rare; useful for reconciling
-                     after manual cleanup).
+  --include-orphans  include live Shuttle tmux sessions that no longer
+                     map cleanly to a shuttle: block (rare; useful for
+                     reconciling after manual cleanup).
   --json             emit an array of objects instead.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// Cross-host paths route through the local daemon; --remote and
@@ -68,19 +68,9 @@ Other flags:
 			return runStatusCrossHost()
 		}
 
-		// Resolve which felt stores to scan. An explicit -C flag pins the read
-		// to that single host (useful for "what does this checkout see"); the
-		// default scans every host the daemon polls so status reflects the
-		// dispatcher's actual surface.
-		var hosts []string
-		if feltHostFlag != "" {
-			hosts = []string{feltHostFlag}
-		} else {
-			discovered, err := schema.FeltStores()
-			if err != nil {
-				return err
-			}
-			hosts = discovered
+		hosts, err := statusHosts()
+		if err != nil {
+			return err
 		}
 
 		// Read fibers through felt's JSON surface across every host; shuttle
@@ -95,6 +85,7 @@ Other flags:
 
 		// List live tmux sessions.
 		liveSessions := liveTmuxSessions()
+		sessionOwners := sessionOwnerMap(shuttleFibers)
 
 		// Build status rows.
 		rows := make([]FiberStatus, 0, len(shuttleFibers))
@@ -102,8 +93,10 @@ Other flags:
 
 		for _, entry := range shuttleFibers {
 			session := schema.TmuxSessionName(entry.FiberID)
-			live := liveSessions[session]
-			seenSessions[session] = true
+			live := liveSessions[session] && sessionOwners[session] == entry.FiberID
+			if live {
+				seenSessions[session] = true
+			}
 
 			state := computeState(entry.Block, live)
 
@@ -133,7 +126,7 @@ Other flags:
 			for session := range liveSessions {
 				if !seenSessions[session] {
 					rows = append(rows, FiberStatus{
-						FiberID: strings.TrimPrefix(session, "shuttle-"),
+						FiberID: session,
 						State:   "running",
 						Running: true,
 						Session: session,
@@ -158,7 +151,7 @@ Other flags:
 var psCmd = &cobra.Command{
 	Use:   "ps",
 	Short: "Live tmux worker sessions",
-	Long:  "Prints one line per live shuttle-* tmux session.",
+	Long:  "Prints one line per live Shuttle tmux session.",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		live := liveTmuxSessions()
 		if len(live) == 0 {
@@ -166,18 +159,30 @@ var psCmd = &cobra.Command{
 			return nil
 		}
 
+		hosts, err := statusHosts()
+		if err != nil {
+			return err
+		}
+		owners := map[string]string{}
+		if shuttleFibers, err := listShuttleFibersAcrossHosts(hosts); err == nil {
+			owners = sessionOwnerMap(shuttleFibers)
+		}
+
 		type row struct{ session, fiberID string }
 		rows := make([]row, 0, len(live))
 		for session := range live {
-			fiberID := strings.TrimPrefix(session, "shuttle-")
-			rows = append(rows, row{session, fiberID})
+			rows = append(rows, row{session: session, fiberID: owners[session]})
 		}
 		sort.Slice(rows, func(i, j int) bool { return rows[i].session < rows[j].session })
 
 		if jsonOutput {
 			out := make([]map[string]string, len(rows))
 			for i, r := range rows {
-				out[i] = map[string]string{"session": r.session, "fiber_id": r.fiberID}
+				row := map[string]string{"session": r.session}
+				if r.fiberID != "" {
+					row["fiber_id"] = r.fiberID
+				}
+				out[i] = row
 			}
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
@@ -185,7 +190,11 @@ var psCmd = &cobra.Command{
 		}
 
 		for _, r := range rows {
-			fmt.Printf("%-40s  %s\n", r.session, r.fiberID)
+			if r.fiberID != "" {
+				fmt.Printf("%-40s  %s\n", r.session, r.fiberID)
+			} else {
+				fmt.Println(r.session)
+			}
 		}
 		return nil
 	},
@@ -195,6 +204,7 @@ var psCmd = &cobra.Command{
 
 type shuttleEntry struct {
 	FiberID string
+	Status  string
 	Block   *schema.Block
 }
 
@@ -247,6 +257,7 @@ func listShuttleFibers(host string) ([]shuttleEntry, error) {
 
 	var raw []struct {
 		FiberID string          `json:"id"`
+		Status  string          `json:"status"`
 		Shuttle json.RawMessage `json:"shuttle"`
 	}
 	if err := json.Unmarshal(out, &raw); err != nil {
@@ -271,7 +282,7 @@ func listShuttleFibers(host string) ([]shuttleEntry, error) {
 			continue
 		}
 		seen[ref.ID] = true
-		entries = append(entries, shuttleEntry{FiberID: ref.ID, Block: &block})
+		entries = append(entries, shuttleEntry{FiberID: ref.ID, Status: fiber.Status, Block: &block})
 	}
 	return entries, nil
 }
@@ -284,11 +295,38 @@ func projectedShuttleFiberListing(host string) ([]byte, error) {
 		"-s", "all",
 		"--json",
 		"--has-field", "shuttle",
-		"--json-field", "id,shuttle",
+		"--json-field", "id,status,shuttle",
 	).Output()
 }
 
-// liveTmuxSessions returns a set of tmux session names that start with "shuttle-".
+func statusHosts() ([]string, error) {
+	if feltHostFlag != "" {
+		return []string{feltHostFlag}, nil
+	}
+	return schema.FeltStores()
+}
+
+func sessionOwnerMap(entries []shuttleEntry) map[string]string {
+	owners := map[string]string{}
+	collisions := map[string]bool{}
+	for _, entry := range entries {
+		if entry.Status == "closed" {
+			continue
+		}
+		session := schema.TmuxSessionName(entry.FiberID)
+		if existing, ok := owners[session]; ok && existing != entry.FiberID {
+			delete(owners, session)
+			collisions[session] = true
+			continue
+		}
+		if !collisions[session] {
+			owners[session] = entry.FiberID
+		}
+	}
+	return owners
+}
+
+// liveTmuxSessions returns a set of live Shuttle tmux session names.
 func liveTmuxSessions() map[string]bool {
 	out, err := exec.Command("tmux", "ls", "-F", "#{session_name}").Output()
 	if err != nil {
@@ -297,7 +335,7 @@ func liveTmuxSessions() map[string]bool {
 	result := map[string]bool{}
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "shuttle-") {
+		if schema.IsTmuxSessionName(line) {
 			result[line] = true
 		}
 	}
@@ -359,7 +397,7 @@ func truncate(s string, n int) string {
 
 func init() {
 	statusCmd.Flags().BoolVar(&statusIncludeOrphans, "include-orphans", false,
-		"Include live shuttle-* tmux sessions with no matching shuttle block")
+		"Include live Shuttle tmux sessions with no matching shuttle block")
 	statusCmd.Flags().BoolVar(&statusAll, "all", false,
 		"Show local plus all configured remotes (queries daemon /api/v1/state/composite)")
 	statusCmd.Flags().StringVar(&statusRemote, "remote", "",

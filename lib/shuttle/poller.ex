@@ -1412,17 +1412,21 @@ defmodule Shuttle.Poller do
   end
 
   defp reconcile_orphaned_sessions(%State{} = state) do
-    # Find tmux sessions that exist but have no watcher
+    # Find tmux sessions that exist but have no watcher.
     {:ok, sessions} = list_shuttle_sessions(state)
     running_sessions = Enum.map(state.running, fn {_, meta} -> meta.session end) |> MapSet.new()
 
-    Enum.reduce(sessions, state, fn session, state_acc ->
-      if MapSet.member?(running_sessions, session) do
-        state_acc
-      else
-        adopt_session(state_acc, session_to_fiber_id(session))
-      end
-    end)
+    orphan_sessions = Enum.reject(sessions, &MapSet.member?(running_sessions, &1))
+
+    if orphan_sessions == [] do
+      state
+    else
+      lookup = candidate_session_lookup(state)
+
+      Enum.reduce(orphan_sessions, state, fn session, state_acc ->
+        adopt_known_orphan_session(state_acc, lookup, session)
+      end)
+    end
   end
 
   defp reconcile_missing_running_sessions(%State{running: running} = state)
@@ -1459,15 +1463,10 @@ defmodule Shuttle.Poller do
 
   defp adopt_orphans(%State{} = state) do
     {:ok, sessions} = list_shuttle_sessions(state)
+    lookup = candidate_session_lookup(state)
 
     Enum.reduce(sessions, state, fn session, state_acc ->
-      fiber_id = session_to_fiber_id(session)
-
-      if Map.has_key?(state_acc.running, fiber_id) do
-        state_acc
-      else
-        adopt_session(state_acc, fiber_id)
-      end
+      adopt_known_orphan_session(state_acc, lookup, session)
     end)
   end
 
@@ -1960,6 +1959,67 @@ defmodule Shuttle.Poller do
     end
   end
 
+  defp candidate_session_lookup(%State{} = state) do
+    {:ok, candidates, _host_map} = discover_candidates(state)
+
+    candidates
+    |> Enum.reduce(%{}, fn fiber, acc ->
+      case {Map.get(fiber, "id"), Map.get(fiber, "status")} do
+        {fiber_id, status} when is_binary(fiber_id) and fiber_id != "" ->
+          session = Dispatcher.session_name(fiber_id)
+          bucket = if(status == "closed", do: :closed, else: :open)
+
+          Map.update(acc, session, %{open: MapSet.new(), closed: MapSet.new()}, fn grouped ->
+            Map.update!(grouped, bucket, &MapSet.put(&1, fiber_id))
+          end)
+
+        _ ->
+          acc
+      end
+    end)
+    |> Enum.into(%{}, fn {session, grouped} ->
+      open_ids = Map.get(grouped, :open, MapSet.new()) |> MapSet.to_list()
+      closed_ids = Map.get(grouped, :closed, MapSet.new()) |> MapSet.to_list()
+
+      value =
+        cond do
+          length(open_ids) == 1 -> {:adopt, hd(open_ids)}
+          length(open_ids) > 1 -> :ambiguous
+          length(closed_ids) == 1 -> {:kill_closed, hd(closed_ids)}
+          length(closed_ids) > 1 -> :ambiguous
+          true -> nil
+        end
+
+      {session, value}
+    end)
+    |> Enum.reject(fn {_session, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp adopt_known_orphan_session(%State{} = state, lookup, session) do
+    case Map.get(lookup, session) do
+      {:adopt, fiber_id} ->
+        if Map.has_key?(state.running, fiber_id) do
+          state
+        else
+          adopt_session(state, fiber_id)
+        end
+
+      {:kill_closed, fiber_id} ->
+        Logger.info("Killing stale session for closed fiber: #{fiber_id} session=#{session}")
+        _ = state.runner.cmd("tmux", ["kill-session", "-t", session], stderr_to_stdout: true)
+        state
+
+      :ambiguous ->
+        Logger.warning("Skipping orphan session with ambiguous leaf-only name: #{session}")
+        state
+
+      nil ->
+        Logger.debug("Skipping orphan session with no matching fiber: #{session}")
+        state
+    end
+  end
+
   defp list_shuttle_sessions(state) do
     case state.runner.cmd("tmux", ["ls", "-F", "\#{session_name}"], stderr_to_stdout: true) do
       {output, 0} ->
@@ -1967,7 +2027,7 @@ defmodule Shuttle.Poller do
           output
           |> String.split("\n")
           |> Enum.map(&String.trim/1)
-          |> Enum.filter(&String.starts_with?(&1, "shuttle-"))
+          |> Enum.filter(&Dispatcher.shuttle_session?/1)
 
         {:ok, sessions}
 
@@ -1976,12 +2036,6 @@ defmodule Shuttle.Poller do
         {:ok, []}
     end
   end
-
-  defp session_to_fiber_id("shuttle-" <> rest) do
-    rest
-  end
-
-  defp session_to_fiber_id(other), do: other
 
   defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
     if is_reference(state.tick_timer_ref) do

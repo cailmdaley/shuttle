@@ -108,11 +108,11 @@ func TestNextOccurrence(t *testing.T) {
 	}
 }
 
-func TestTmuxSessionNamePreservesFullFiberID(t *testing.T) {
+func TestTmuxSessionNameUsesFiberLeafAndSuffix(t *testing.T) {
 	cases := map[string]string{
-		"tests/haiku":              "shuttle-tests/haiku",
-		"ai-futures/foo/bar":       "shuttle-ai-futures/foo/bar",
-		"constitution-single-name": "shuttle-constitution-single-name",
+		"tests/haiku":              "haiku-shuttle",
+		"ai-futures/foo/bar":       "bar-shuttle",
+		"constitution-single-name": "constitution-single-name-shuttle",
 	}
 
 	for fiberID, want := range cases {

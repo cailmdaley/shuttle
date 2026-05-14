@@ -115,7 +115,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     A fresh oneshot fiber.
     """)
 
-    assert {:ok, "shuttle-tests/fresh-oneshot"} =
+    assert {:ok, "fresh-oneshot-shuttle"} =
              Dispatcher.dispatch("tests/fresh-oneshot",
                runner: IntegrationRunner,
                felt_store: host
@@ -483,7 +483,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     A codex fiber whose session UUID should be captured from its own transcript.
     """)
 
-    assert {:ok, "shuttle-tests/codex-capture"} =
+    assert {:ok, "codex-capture-shuttle"} =
              Dispatcher.dispatch("tests/codex-capture",
                runner: IntegrationRunner,
                felt_store: host,
