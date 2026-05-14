@@ -512,4 +512,43 @@ defmodule Shuttle.DispatcherTest do
     script = Dispatcher.build_run_script("tests/haiku", "claude <<< 'hi'", "claude-sonnet")
     refute script =~ "send-keys"
   end
+
+  # ── Wait-for-client guard before harness start ──
+
+  test "build_run_script with session waits for a non-control client before the harness" do
+    # Without this wait, the harness initializes inside the detached
+    # session's 80x24 default-size and bakes its dispatch banner into
+    # scrollback at 80 cols — the symptom that drove this gate in.
+    script =
+      Dispatcher.build_run_script("tests/haiku", "claude --resume 'abc'", "claude-sonnet",
+        session: "haiku-shuttle"
+      )
+
+    assert script =~ "tmux list-clients -t 'haiku-shuttle'"
+    # Filter out tmux's control-mode clients (Portolan's wterm preview
+    # uses `tmux -C attach -r` and would otherwise satisfy the wait
+    # without a real human terminal attached).
+    assert script =~ "client_control_mode"
+    assert script =~ "grep -qx '0'"
+    # Bounded wait: autonomous dispatches still proceed if no human
+    # attaches in time.
+    assert script =~ "WAIT_DEADLINE"
+    # The wait precedes the start banner so the banner renders at the
+    # attached client's terminal size, not at 80x24.
+    [wait_idx, banner_idx] =
+      Enum.map(["WAIT_DEADLINE", "Shuttle worker —"], fn needle ->
+        :binary.match(script, needle) |> elem(0)
+      end)
+
+    assert wait_idx < banner_idx
+  end
+
+  test "build_run_script with no session skips the wait" do
+    # spawn_tmux always passes a session, but the function defaults
+    # session to "" — guard against accidental no-session callers
+    # spinning forever on a session that doesn't exist.
+    script = Dispatcher.build_run_script("tests/haiku", "claude <<< 'hi'", "claude-sonnet")
+    refute script =~ "tmux list-clients"
+    refute script =~ "WAIT_DEADLINE"
+  end
 end

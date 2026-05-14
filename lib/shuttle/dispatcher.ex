@@ -962,11 +962,49 @@ defmodule Shuttle.Dispatcher do
         ""
       end
 
+    # Wait briefly for a real interactive tmux client (e.g. kitty's
+    # `tmux attach`) to attach before starting the harness. We spawn the
+    # tmux session detached (`tmux new-session -d ...`), which inherits
+    # the server's `default-size` (80x24 by default). If the harness
+    # starts rendering before a human-sized client attaches, its initial
+    # output — especially `claude --resume`, which emits the dispatch
+    # banner and "remote-control is active" line as soon as it loads
+    # saved state — bakes into the scrollback at 80 cols and stays there
+    # even after tmux resizes on attach (resize doesn't reflow scrollback).
+    # The user sees a tiny ~80-col-wide content area inside a much larger
+    # kitty tab. Waiting until the first non-control client attaches lets
+    # the harness initialize at the kitty terminal's real size.
+    #
+    # Control-mode clients (Portolan's `tmux -C attach -r` wterm preview)
+    # don't count — they declare a fake 200x50 and don't represent a
+    # human attach. Filter them out via `client_control_mode=0`.
+    #
+    # 30s timeout keeps autonomous dispatch unblocked: if no human
+    # attaches in time, the worker proceeds at the default-size — same
+    # behavior as before the wait was added. The Resume / New Session
+    # path from the kanban modal typically gets a kitty attach within
+    # a few seconds, well inside the budget.
+    wait_for_client_block =
+      if session != "" do
+        ~s"""
+        WAIT_DEADLINE=$(( $(date +%s) + 30 ))
+        while [ "$(date +%s)" -lt "$WAIT_DEADLINE" ]; do
+          if tmux list-clients -t '#{session}' -F '\#{client_control_mode}' 2>/dev/null | grep -qx '0'; then
+            break
+          fi
+          sleep 0.2
+        done
+        """
+      else
+        ""
+      end
+
     """
     #!/bin/bash
     set -e
     trap 'rm -f "$0"' EXIT
 
+    #{wait_for_client_block}
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "Shuttle worker — #{fiber_id} — agent=#{agent_id} — $(date '+%H:%M:%S')"
