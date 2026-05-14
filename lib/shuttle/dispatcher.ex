@@ -1033,15 +1033,18 @@ defmodule Shuttle.Dispatcher do
     # don't count — they declare a fake 200x50 and don't represent a
     # human attach. Filter them out via `client_control_mode=0`.
     #
-    # 30s timeout keeps autonomous dispatch unblocked: if no human
-    # attaches in time, the worker proceeds at the default-size — same
-    # behavior as before the wait was added. The Resume / New Session
-    # path from the kanban modal typically gets a kitty attach within
-    # a few seconds, well inside the budget.
+    # The expected client of this gate is Portolan's auto-attach in the
+    # kanban modal's dispatch-success path (`onAttachFreshTmux` → kitty
+    # `launch --type=tab tmux attach`), which lands in ~300-500ms. The
+    # 10s timeout is the safety net for the rare cases where that auto-
+    # attach can't run — kitty isn't running, the daemon was dispatched
+    # by a non-Portolan client (CLI, scheduled standing role with no
+    # human in the loop). After the timeout the harness proceeds at the
+    # default-size, same as the world before this gate existed.
     wait_for_client_block =
       if session != "" do
         ~s"""
-        WAIT_DEADLINE=$(( $(date +%s) + 30 ))
+        WAIT_DEADLINE=$(( $(date +%s) + 10 ))
         while [ "$(date +%s)" -lt "$WAIT_DEADLINE" ]; do
           if tmux list-clients -t '#{session}' -F '\#{client_control_mode}' 2>/dev/null | grep -qx '0'; then
             break
