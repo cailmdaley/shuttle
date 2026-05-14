@@ -42,8 +42,8 @@ defmodule ShuttleWeb.ActionsController do
 
   def invoke(conn, %{"fiber_id" => fiber_id, "action" => action}) do
     with :ok <- validate_action(action),
-         :ok <- validate_available(fiber_id, action),
-         :ok <- invoke_action(fiber_id, action) do
+         {:ok, host} <- validate_available(fiber_id, action),
+         :ok <- invoke_action(fiber_id, action, host) do
       json(conn, %{fiber_id: fiber_id, action: action, invoked: true})
     else
       {:error, :unknown_action} ->
@@ -93,9 +93,9 @@ defmodule ShuttleWeb.ActionsController do
 
   defp validate_available(fiber_id, action) do
     case actions_for(fiber_id) do
-      {:ok, actions} ->
+      {:ok, actions, host} ->
         if Enum.any?(actions, &(Map.get(&1, :id) == action || Map.get(&1, "id") == action)) do
-          :ok
+          {:ok, host}
         else
           {:error, :action_not_available}
         end
@@ -106,23 +106,29 @@ defmodule ShuttleWeb.ActionsController do
   end
 
   defp actions_for(fiber_id) do
-    with {:ok, fiber} <- fetch_fiber(fiber_id) do
-      {:ok, Actions.actions_for(fiber, running?(fiber_id))}
+    with {:ok, fiber, host} <- fetch_fiber(fiber_id) do
+      {:ok, Actions.actions_for(fiber, running?(fiber_id)), host}
     end
   end
 
   defp resolve_action(fiber_id, target) do
-    with {:ok, fiber} <- fetch_fiber(fiber_id) do
+    with {:ok, fiber, _host} <- fetch_fiber(fiber_id) do
       Actions.resolve_transition(fiber, target, running?(fiber_id))
     end
   end
 
+  # Returns {:ok, fiber, host} so callers can pass the right `--felt-store`
+  # to shuttle-ctl. Without that flag, the CLI walks from its own PWD looking
+  # for `.felt/` and hits a different store than the one the daemon resolved
+  # the fiber from — typical symptom is "shuttle: fiber X has no shuttle:
+  # block" for fibers whose canonical store is a project-scoped felt-store
+  # symlinked into loom (e.g. lightcone).
   defp fetch_fiber(fiber_id) do
     FeltStores.configured_hosts()
     |> Enum.find_value(fn host ->
       with {:ok, path} <- exact_fiber_path(host, fiber_id),
            {:ok, fiber} <- read_fiber_frontmatter(path, fiber_id) do
-        {:ok, fiber}
+        {:ok, fiber, host}
       else
         _ -> nil
       end
@@ -179,18 +185,20 @@ defmodule ShuttleWeb.ActionsController do
     _ -> false
   end
 
-  defp invoke_action(fiber_id, "pause"), do: run(["pause", fiber_id])
-  defp invoke_action(fiber_id, "reopen"), do: run(["reopen", fiber_id])
-  defp invoke_action(fiber_id, "accept-run"), do: run(["accept", fiber_id])
-  defp invoke_action(fiber_id, "continue-run-fresh"), do: run(["resume", fiber_id])
-  defp invoke_action(fiber_id, "continue-run-previous"), do: run(["resume", fiber_id])
-  defp invoke_action(fiber_id, "close-awaiting-review"), do: run(["close", fiber_id])
-  defp invoke_action(fiber_id, "close-tempered"), do: run(["close", fiber_id, "--tempered=true"])
+  defp invoke_action(fiber_id, "pause", host), do: run(["pause", fiber_id], host)
+  defp invoke_action(fiber_id, "reopen", host), do: run(["reopen", fiber_id], host)
+  defp invoke_action(fiber_id, "accept-run", host), do: run(["accept", fiber_id], host)
+  defp invoke_action(fiber_id, "continue-run-fresh", host), do: run(["resume", fiber_id], host)
+  defp invoke_action(fiber_id, "continue-run-previous", host), do: run(["resume", fiber_id], host)
+  defp invoke_action(fiber_id, "close-awaiting-review", host), do: run(["close", fiber_id], host)
 
-  defp invoke_action(fiber_id, "close-composted"),
-    do: run(["close", fiber_id, "--tempered=false"])
+  defp invoke_action(fiber_id, "close-tempered", host),
+    do: run(["close", fiber_id, "--tempered=true"], host)
 
-  defp invoke_action(fiber_id, "dispatch-ad-hoc") do
+  defp invoke_action(fiber_id, "close-composted", host),
+    do: run(["close", fiber_id, "--tempered=false"], host)
+
+  defp invoke_action(fiber_id, "dispatch-ad-hoc", _host) do
     case Shuttle.Poller.dispatch_fiber(Shuttle.Poller, fiber_id,
            force: true,
            ad_hoc: true
@@ -200,7 +208,15 @@ defmodule ShuttleWeb.ActionsController do
     end
   end
 
-  defp run(args) do
+  # Prepend `--felt-store <host>` so shuttle-ctl reads the same `.felt/` index
+  # the daemon resolved the fiber against. Without this, shuttle-ctl falls
+  # back to its own default discovery (PWD walk / config) which can land on a
+  # different store and report bogus "no shuttle: block" errors for fibers
+  # whose canonical store is project-scoped (e.g. lightcone).
+  defp run(args, nil), do: run_cmd(args)
+  defp run(args, host) when is_binary(host), do: run_cmd(["--felt-store", host | args])
+
+  defp run_cmd(args) do
     case System.cmd("shuttle-ctl", args, stderr_to_stdout: true) do
       {_, 0} -> :ok
       {output, status} -> {:error, {:command_error, status, output}}

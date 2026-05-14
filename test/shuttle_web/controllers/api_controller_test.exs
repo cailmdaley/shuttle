@@ -425,6 +425,64 @@ defmodule ShuttleWeb.APIControllerTest do
     assert body["invoked"] == false
   end
 
+  # Regression: the daemon used to shell out to `shuttle-ctl` without
+  # `--felt-store`, so the CLI's default discovery (PWD walk / loom default)
+  # could land on a different store than the one fetch_fiber/1 resolved the
+  # fiber against. Symptom: "shuttle: fiber X has no shuttle: block" for
+  # fibers whose canonical store is project-scoped (e.g. lightcone). Fix:
+  # thread the resolved host through invoke_action and prepend
+  # `--felt-store <host>` to every shuttle-ctl invocation.
+  @tag :capture_log
+  test "actions invoke passes --felt-store to shuttle-ctl" do
+    with_actions_host()
+    # An awaiting-review fiber so close-tempered is an available action.
+    MockRunner.set_shuttle(
+      "tests/action-felt-store",
+      "enabled: true\nkind: oneshot\nreview:\n  state: awaiting\n",
+      "closed"
+    )
+
+    # Stand up a fake shuttle-ctl on PATH that records its argv and exits 0.
+    stub_dir = Path.join(System.tmp_dir!(), "shuttle-test-stub-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(stub_dir)
+    argv_log = Path.join(stub_dir, "argv.log")
+
+    File.write!(Path.join(stub_dir, "shuttle-ctl"), """
+    #!/usr/bin/env bash
+    printf '%s\\n' "$@" >> "#{argv_log}"
+    exit 0
+    """)
+
+    File.chmod!(Path.join(stub_dir, "shuttle-ctl"), 0o755)
+
+    previous_path = System.get_env("PATH")
+    System.put_env("PATH", "#{stub_dir}:#{previous_path}")
+
+    on_exit(fn ->
+      if previous_path, do: System.put_env("PATH", previous_path), else: System.delete_env("PATH")
+      File.rm_rf!(stub_dir)
+    end)
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/actions/invoke",
+        Jason.encode!(%{fiber_id: "tests/action-felt-store", action: "close-tempered"})
+      )
+
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+    assert body["invoked"] == true
+
+    captured = argv_log |> File.read!() |> String.split("\n", trim: true)
+    # `--felt-store /tmp` must come before the verb so shuttle-ctl uses the
+    # store the daemon resolved against, not its own default discovery.
+    assert Enum.take(captured, 2) == ["--felt-store", "/tmp"]
+    assert "close" in captured
+    assert "tests/action-felt-store" in captured
+    assert "--tempered=true" in captured
+  end
+
   # ── POST /api/v1/wait ──
 
   test "wait returns monitoring for active fiber" do
