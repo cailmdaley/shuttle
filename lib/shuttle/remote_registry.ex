@@ -657,8 +657,7 @@ defmodule Shuttle.RemoteRegistry do
   defp ssh_check(%Remote{name: name}, runner) do
     script =
       [
-        ~s(SOCK="$HOME/.shuttle/tmux.sock"),
-        ~s(if tmux -S "$SOCK" has-session -t shuttle-daemon 2>/dev/null || tmux has-session -t shuttle-daemon 2>/dev/null; then echo session=present; else echo session=absent; fi),
+        ~s(if tmux has-session -t shuttle-daemon 2>/dev/null || tmux -S "$HOME/.shuttle/tmux.sock" has-session -t shuttle-daemon 2>/dev/null; then echo session=present; else echo session=absent; fi),
         ~s(if curl -sf --max-time 3 http://127.0.0.1:4000/api/v1/state >/dev/null; then echo http=healthy; else echo http=unhealthy; fi)
       ]
       |> Enum.join("; ")
@@ -680,8 +679,7 @@ defmodule Shuttle.RemoteRegistry do
   defp restart_remote(%Remote{name: name}, runner) do
     script =
       [
-        ~s(SOCK="$HOME/.shuttle/tmux.sock"),
-        ~s(tmux -S "$SOCK" kill-session -t shuttle-daemon 2>/dev/null || tmux kill-session -t shuttle-daemon 2>/dev/null || true),
+        ~s(tmux kill-session -t shuttle-daemon 2>/dev/null || tmux -S "$HOME/.shuttle/tmux.sock" kill-session -t shuttle-daemon 2>/dev/null || true),
         ~s("$HOME/.local/bin/shuttle-launch")
       ]
       |> Enum.join("; ")
