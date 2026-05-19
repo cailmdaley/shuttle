@@ -1115,8 +1115,10 @@ defmodule Shuttle.Poller do
         Map.get(shuttle, "enabled", false) != true ->
           false
 
-        # Must target this daemon. Blocks without host: are legacy/local.
-        shuttle_host(shuttle) != state.own_host_id ->
+        # Must target this daemon. Missing host: is a nil-pin (no opinion);
+        # the fiber is eligible on whatever daemon reads it. Explicit host:
+        # must equal this daemon's own_host_id exactly.
+        not host_pin_matches?(shuttle, state.own_host_id) ->
           false
 
         # Must be committed to active work
@@ -1187,7 +1189,7 @@ defmodule Shuttle.Poller do
     cond do
       not is_map(shuttle) -> false
       human_worker?(fiber) -> false
-      shuttle_host(shuttle) != state.own_host_id -> false
+      not host_pin_matches?(shuttle, state.own_host_id) -> false
       true -> true
     end
   end
@@ -1199,7 +1201,7 @@ defmodule Shuttle.Poller do
 
     with true <- is_map(shuttle),
          true <- Map.get(shuttle, "enabled", false) == true,
-         true <- shuttle_host(shuttle) == state.own_host_id,
+         true <- host_pin_matches?(shuttle, state.own_host_id),
          true <- status in ["open", "active"],
          {:ok, role} <- fetch_standing_role(fiber_id, state),
          true <- StandingRole.standing?(role),
@@ -1211,43 +1213,85 @@ defmodule Shuttle.Poller do
     end
   end
 
-  defp shuttle_host(shuttle) when is_map(shuttle) do
+  # Read a fiber's `shuttle.host` *pin*. The pin is an explicit declaration
+  # of which daemon owns this fiber's dispatch — a string equal to some
+  # daemon's `own_host_id`. Returns `nil` when the field is absent or empty.
+  #
+  # A `nil` pin means "no opinion": the fiber is eligible on whatever
+  # daemon happens to read it. An explicit pin must match exactly. The
+  # historical literal `"local"` default — synthesizing an opinion the
+  # fiber never asked for — was the source of a class of "ineligible
+  # forever" bugs and is gone.
+  defp shuttle_host_pin(shuttle) when is_map(shuttle) do
     case Map.get(shuttle, "host") do
       host when is_binary(host) and host != "" -> host
-      _ -> "local"
+      _ -> nil
     end
   end
 
-  defp shuttle_host(_), do: "local"
+  defp shuttle_host_pin(_), do: nil
 
-  # Resolves the daemon's `own_host_id` — the identity it advertises for the
-  # `shuttle.host` dispatch filter. Precedence:
-  #
-  #   1. `SHUTTLE_HOST` env var, if set and non-empty. Operators override here
-  #      when they want a friendly name distinct from `:inet.gethostname()`
-  #      (e.g. `SHUTTLE_HOST=mac` instead of `dapmcw68`, or `candide` instead
-  #      of `c03`).
-  #   2. `Application.get_env(:shuttle, :host)` — pinned by `config/test.exs`
-  #      so tests get a predictable identity. `config/config.exs` deliberately
-  #      doesn't set this any more.
-  #   3. `:inet.gethostname()` — short OS hostname. Two separately-deployed
-  #      daemons get distinct ids automatically; no per-machine config needed.
-  #   4. "local" — last-resort fallback (gethostname can in principle fail).
-  defp resolve_own_host_id do
-    cond do
-      (env = System.get_env("SHUTTLE_HOST")) && env != "" ->
+  # A fiber's host pin matches this daemon's own identity when the pin is
+  # `nil` (no opinion) or equals `own_host_id` exactly.
+  defp host_pin_matches?(shuttle, own_host_id) do
+    case shuttle_host_pin(shuttle) do
+      nil -> true
+      pin -> pin == own_host_id
+    end
+  end
+
+  @doc """
+  Resolves this daemon's `own_host_id` — the identity it advertises for the
+  `shuttle.host` dispatch filter. Public so other callers (e.g.
+  `ShuttleWeb.FiberController` when stamping a `host:` on a new fiber) share
+  the exact same resolution.
+
+  Precedence:
+
+    1. `SHUTTLE_HOST` env var, if set and non-empty. Operators override here
+       when they want a friendly name distinct from `:inet.gethostname()`
+       (e.g. `SHUTTLE_HOST=mac` instead of `dapmcw68`, or `candide` instead
+       of `c03`). Also the seam for tests / smoke harnesses that need a
+       stable identity — `config/test.exs` calls `System.put_env/2` to pin
+       a value at test boot.
+
+    2. `:inet.gethostname()` — short OS hostname. Two separately-deployed
+       daemons get distinct ids automatically; no per-machine config needed.
+
+  No `Application.get_env(:shuttle, :host)` step. An earlier iteration
+  pinned `host: "local"` in `config/test.exs` so tests had a predictable
+  identity, but the pin leaked into escripts built with `MIX_ENV=test` and
+  stamped `"local"` onto production daemons — every fiber without an
+  explicit `host:` then silently failed the dispatch filter (which used to
+  default to `"local"` too). The whole `"local"` magic is gone.
+
+  Raises if `:inet.gethostname/0` truly fails. That's a system-level
+  problem and silently degrading into a no-op filter (what the previous
+  `"local"` fallback did) made the failure invisible.
+  """
+  @spec own_host_id() :: String.t()
+  def own_host_id do
+    case System.get_env("SHUTTLE_HOST") do
+      env when is_binary(env) and env != "" ->
         env
 
-      (configured = Application.get_env(:shuttle, :host)) && configured not in [nil, ""] ->
-        to_string(configured)
-
-      true ->
+      _ ->
         case :inet.gethostname() do
-          {:ok, name} when name != [] -> to_string(name)
-          _ -> "local"
+          {:ok, name} when name != [] ->
+            to_string(name)
+
+          other ->
+            raise "Shuttle.Poller could not resolve own_host_id: " <>
+                    ":inet.gethostname/0 returned #{inspect(other)}. " <>
+                    "Set SHUTTLE_HOST=<name> in the daemon environment."
         end
     end
   end
+
+  # Internal alias used by the Poller's own startup. Kept for callsite
+  # readability — `resolve_own_host_id()` reads naturally inside the
+  # init/handle_call code.
+  defp resolve_own_host_id, do: own_host_id()
 
   defp standing_roles_from_candidates(candidates) do
     Enum.flat_map(candidates, fn fiber ->

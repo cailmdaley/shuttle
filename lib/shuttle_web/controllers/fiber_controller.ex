@@ -43,8 +43,13 @@ defmodule ShuttleWeb.FiberController do
     end
   end
 
+  # Auto-stamp `host:` on new fibers with a shuttle block. Cross-host
+  # blocks (an explicit `host:` that doesn't equal this daemon's identity)
+  # are refused — the caller is asking the wrong daemon to write a file
+  # for someone else's machine. See Shuttle.Poller.own_host_id/0 for the
+  # resolution chain.
   defp normalize_shuttle_host(%{"shuttle" => shuttle} = frontmatter) when is_map(shuttle) do
-    own_host = Application.get_env(:shuttle, :host, "local") |> to_string()
+    own_host = Shuttle.Poller.own_host_id()
     shuttle = stringify_keys(shuttle)
 
     case Map.get(shuttle, "host") do

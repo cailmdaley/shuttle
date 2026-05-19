@@ -17,23 +17,21 @@ defmodule ShuttleWeb.FiberControllerTest do
     old_loom_home = System.get_env("LOOM_HOME")
     old_loom_homes = System.get_env("LOOM_HOMES")
     old_felt_stores_file = System.get_env("SHUTTLE_FELT_STORES_FILE")
-    old_host = Application.get_env(:shuttle, :host)
+    old_shuttle_host = System.get_env("SHUTTLE_HOST")
 
     System.put_env("LOOM_HOME", tmp)
     System.delete_env("LOOM_HOMES")
     System.put_env("SHUTTLE_FELT_STORES_FILE", Path.join(tmp, "felt_stores.json"))
-    Application.put_env(:shuttle, :host, "local")
+    # Pin the daemon's identity for this test via the env var — the
+    # Application config path is gone. Test assertions read `test-host`
+    # back from the auto-stamped shuttle.host field.
+    System.put_env("SHUTTLE_HOST", "test-host")
 
     on_exit(fn ->
       restore_env("LOOM_HOME", old_loom_home)
       restore_env("LOOM_HOMES", old_loom_homes)
       restore_env("SHUTTLE_FELT_STORES_FILE", old_felt_stores_file)
-
-      if old_host == nil do
-        Application.delete_env(:shuttle, :host)
-      else
-        Application.put_env(:shuttle, :host, old_host)
-      end
+      restore_env("SHUTTLE_HOST", old_shuttle_host)
 
       File.rm_rf(tmp)
     end)
@@ -69,7 +67,7 @@ defmodule ShuttleWeb.FiberControllerTest do
             %{
               "name" => "Create me",
               "status" => "active",
-              "shuttle" => %{"host" => "local", "project_dir" => ^tmp}
+              "shuttle" => %{"host" => "test-host", "project_dir" => ^tmp}
             }} =
              path
              |> File.read!()
