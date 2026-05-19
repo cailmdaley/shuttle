@@ -45,6 +45,11 @@ defmodule Shuttle.Dispatcher do
       new session. Used for autonomous continuation loops; explicit
       human-triggered "Resume previous" remains the only path that reuses a
       transcript.
+    * `:force` — explicit manual dispatch override. When true, the dispatcher
+      stops refusing closed fibers (the Poller already relaxes eligibility
+      under force) and `resolve_resume_intent` ignores the ad-hoc
+      short-circuit so the most recent review-comment's `resume_mode` is
+      honored regardless of dispatch context.
   """
   @spec dispatch(String.t(), keyword()) :: dispatch_result()
   def dispatch(fiber_id, opts \\ []) do
@@ -52,9 +57,10 @@ defmodule Shuttle.Dispatcher do
     work_dir = Keyword.get(opts, :work_dir, File.cwd!())
     prompt_context = Keyword.get(opts, :prompt_context, :constitution)
     felt_store = Keyword.get(opts, :felt_store, default_felt_store())
+    force = Keyword.get(opts, :force, false)
 
     with {:ok, fiber} <- fetch_fiber(fiber_id, runner, felt_store: felt_store),
-         :ok <- check_not_closed(fiber),
+         :ok <- check_not_closed(fiber, force),
          :ok <- check_not_running(fiber_id, runner),
          {:ok, agent} <- resolve_agent(fiber),
          :ok <- validate_agent(agent) do
@@ -67,10 +73,12 @@ defmodule Shuttle.Dispatcher do
         {:ok, :human_no_op}
       else
         resume_intent =
-          if Keyword.get(opts, :force_fresh, false) do
-            :fresh
-          else
-            resolve_resume_intent(prompt_context, fiber_id, fiber, felt_store)
+          cond do
+            Keyword.get(opts, :force_fresh, false) ->
+              :fresh
+
+            true ->
+              resolve_resume_intent(prompt_context, fiber_id, fiber, felt_store, force: force)
           end
 
         case resume_intent do
@@ -90,10 +98,12 @@ defmodule Shuttle.Dispatcher do
   Decides whether this dispatch should resume a prior worker session or start
   fresh, based on the prompt context.
 
-  - Ad-hoc standing-role dispatches always start fresh. Resuming would land
+  - Ad-hoc standing-role dispatches default to fresh. Resuming would land
     the worker in a transcript whose last assistant turn was "Run accepted.
     Exiting" — they'd idle ("nothing new on the fiber") instead of doing the
-    new run.
+    new run. The kanban modal's manual "Resume" button overrides this by
+    passing `force: true`, which routes back through `check_resume_intent`
+    so the freshly-filed review-comment's `resume_mode` is honored.
   - Scheduled standing-role dispatches scope the review-comment lookup to the
     current run window (events at or after the run_id timestamp). A stale
     `resume_mode: "previous"` from a prior run would otherwise gate every
@@ -101,20 +111,26 @@ defmodule Shuttle.Dispatcher do
     `loom/email/morning-post` blocked for 5 days, 2026-05-09 → 2026-05-14).
   - All other contexts defer to `check_resume_intent/3`, which reads the
     most recent review-comment from felt history and honors its `resume_mode`.
+
+  Options:
+    * `:force` — when true, the ad-hoc short-circuit is skipped and the
+      latest review-comment's intent wins. Set by manual kanban dispatches.
   """
-  @spec resolve_resume_intent(any(), String.t(), map(), String.t() | nil) ::
+  @spec resolve_resume_intent(any(), String.t(), map(), String.t() | nil, keyword()) ::
           :fresh | {:previous, String.t()} | {:error, :missing_session_id}
-  def resolve_resume_intent(prompt_context, fiber_id, fiber, felt_store) do
+  def resolve_resume_intent(prompt_context, fiber_id, fiber, felt_store, opts \\ []) do
+    force? = Keyword.get(opts, :force, false)
+
     case prompt_context do
-      {:standing_run, _, :ad_hoc} ->
+      {:standing_run, _, :ad_hoc} when not force? ->
         :fresh
 
       _ ->
-        opts =
+        check_opts =
           [since: run_window_start(prompt_context)]
           |> then(fn o -> if is_nil(felt_store), do: o, else: [{:felt_store, felt_store} | o] end)
 
-        check_resume_intent(fiber_id, fiber, opts)
+        check_resume_intent(fiber_id, fiber, check_opts)
     end
   end
 
@@ -609,7 +625,13 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
-  defp check_not_closed(fiber) do
+  # Reject closed fibers by default. Manual force-dispatch (the "New session"
+  # / "Resume" buttons) explicitly opts in to dispatching against closed
+  # fibers — the closed status stays unchanged; a worker runs against the
+  # current outcome.
+  defp check_not_closed(_fiber, true), do: :ok
+
+  defp check_not_closed(fiber, _force) do
     status = Map.get(fiber, "status", "")
 
     if status == "closed" do

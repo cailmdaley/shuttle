@@ -1145,12 +1145,50 @@ defmodule Shuttle.Poller do
     end
   end
 
+  # Eligibility for an explicit dispatch call (POST /api/v1/dispatch).
+  #
+  # Three modes, in priority order:
+  #
+  #   1. `force: true` — manual human-triggered dispatch from the kanban
+  #      "New session" / "Resume" buttons. Bypasses every condition except
+  #      the ones that *can't* be overridden by intent: a shuttle block must
+  #      exist (we need an agent + project_dir to spawn), the host must
+  #      match (we can't conjure a worker on the wrong machine), and the
+  #      fiber must not be a human-worker (no machine to spawn). Status,
+  #      enabled, kind, review_state, schedule, validity, and dependencies
+  #      are all overridden. Closed, composted, disabled, not-yet-due, and
+  #      unvalidated fibers all dispatch on force.
+  #
+  #   2. `ad_hoc: true` (without `force`) — legacy manual trigger for
+  #      standing roles that bypasses the schedule but still requires the
+  #      role to be otherwise dispatchable (enabled, active, valid, in a
+  #      scheduleable review state). Kept for callers that still rely on it.
+  #
+  #   3. Default — full `eligible?` check (status, enabled, schedule,
+  #      review state, deps, validity).
   defp dispatch_eligible?(fiber, state, opts) do
-    if (Keyword.get(opts, :force, false) or Keyword.get(opts, :ad_hoc, false)) and
-         force_dispatchable_standing_role?(fiber, state) do
-      dependencies_satisfied?(Map.get(fiber, "id", ""), state)
-    else
-      eligible?(fiber, state)
+    cond do
+      Keyword.get(opts, :force, false) ->
+        force_dispatch_eligible?(fiber, state)
+
+      Keyword.get(opts, :ad_hoc, false) and force_dispatchable_standing_role?(fiber, state) ->
+        dependencies_satisfied?(Map.get(fiber, "id", ""), state)
+
+      true ->
+        eligible?(fiber, state)
+    end
+  end
+
+  # Force-dispatch predicate: only the irreducible requirements. The user
+  # explicitly clicked dispatch; honor the intent.
+  defp force_dispatch_eligible?(fiber, state) do
+    shuttle = Map.get(fiber, "shuttle")
+
+    cond do
+      not is_map(shuttle) -> false
+      human_worker?(fiber) -> false
+      shuttle_host(shuttle) != state.own_host_id -> false
+      true -> true
     end
   end
 
@@ -1386,7 +1424,8 @@ defmodule Shuttle.Poller do
            work_dir: fiber_work_dir(fiber_id, state),
            prompt_context: prompt_context,
            felt_store: felt_store,
-           force_fresh: Keyword.get(opts, :force_fresh, false)
+           force_fresh: Keyword.get(opts, :force_fresh, false),
+           force: Keyword.get(opts, :force, false)
          ) do
       {:ok, :human_no_op} ->
         # Human-worker fibers don't need a watcher or running-state entry —
