@@ -191,6 +191,169 @@ Body.
 	}
 }
 
+// TestInstallCmd_IdempotentWhenBlockExistsNoFlags covers the common authoring
+// case: the user wrote a shuttle: block by hand in the constitution markdown,
+// then runs `shuttle-ctl install <fiber>` to confirm the daemon will dispatch.
+// Pre-fix this errored ("already has a shuttle: block"); now it prints state
+// and exits 0.
+func TestInstallCmd_IdempotentWhenBlockExistsNoFlags(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "already-installed", `---
+name: Already installed
+status: open
+shuttle:
+  enabled: true
+  kind: oneshot
+  agent: codex
+  project_dir: /tmp
+---
+
+Body.
+`)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	cmd := newInstallCmd()
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stdout)
+	cmd.SetArgs([]string{"already-installed"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v (no flags should be idempotent), output:\n%s", err, stdout.String())
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("idempotent install must not rewrite the file. before:\n%s\nafter:\n%s", before, after)
+	}
+
+	out := stdout.String()
+	for _, want := range []string{"already has a shuttle: block", "agent:       codex", "Daemon will dispatch on next poll"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in output, got:\n%s", want, out)
+		}
+	}
+}
+
+// TestInstallCmd_IdempotentWhenFlagsMatch covers `install --model codex`
+// against a block that already has agent: codex — same intent, no conflict,
+// exit 0.
+func TestInstallCmd_IdempotentWhenFlagsMatch(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	writeFiber(t, host, "flags-match", `---
+name: Flags match
+status: open
+shuttle:
+  enabled: true
+  kind: oneshot
+  agent: codex
+  project_dir: /tmp
+---
+
+Body.
+`)
+
+	var stdout bytes.Buffer
+	cmd := newInstallCmd()
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stdout)
+	cmd.SetArgs([]string{"flags-match", "--model", "codex"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v (matching --model should be idempotent), output:\n%s", err, stdout.String())
+	}
+}
+
+// TestInstallCmd_ErrorsOnModelConflict covers --model differing from the
+// existing block's agent. Exit non-zero; the message points at set-model.
+func TestInstallCmd_ErrorsOnModelConflict(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	writeFiber(t, host, "model-conflict", `---
+name: Model conflict
+status: open
+shuttle:
+  enabled: true
+  kind: oneshot
+  agent: codex
+  project_dir: /tmp
+---
+
+Body.
+`)
+
+	var stdout, stderr bytes.Buffer
+	cmd := newInstallCmd()
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"model-conflict", "--model", "claude-opus"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected non-nil error on model conflict")
+	}
+
+	combined := stdout.String() + stderr.String()
+	for _, want := range []string{
+		"--model claude-opus",
+		"current agent",
+		"shuttle-ctl set-model",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("expected %q in output, got:\n%s", want, combined)
+		}
+	}
+}
+
+// TestInstallCmd_BumpsMissingStatusEvenWhenBlockExists covers the "user
+// wrote block: enabled: true but forgot status: active" case. Without this
+// fix, install would error and leave the fiber undispatchable until the
+// user discovered the missing status separately. Now install bumps it.
+func TestInstallCmd_BumpsMissingStatusEvenWhenBlockExists(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "missing-status", `---
+name: Missing status
+shuttle:
+  enabled: true
+  kind: oneshot
+  agent: codex
+  project_dir: /tmp
+---
+
+Body.
+`)
+
+	var stdout bytes.Buffer
+	cmd := newInstallCmd()
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stdout)
+	cmd.SetArgs([]string{"missing-status"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v, output:\n%s", err, stdout.String())
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	if !strings.Contains(string(raw), "status: active") {
+		t.Fatalf("expected status: active to be written; got:\n%s", string(raw))
+	}
+	if !strings.Contains(stdout.String(), "bumped to") {
+		t.Fatalf("expected user-visible note about status bump; got:\n%s", stdout.String())
+	}
+}
+
 func withStubbedTmux(t *testing.T, sessions map[string]bool) (killed *[]string) {
 	t.Helper()
 	originalExists := tmuxSessionExists

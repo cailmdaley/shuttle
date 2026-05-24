@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,6 +36,16 @@ When installing without --disabled, the felt-native status field is set to
 poller's eligibility filter requires this. Closed fibers must be reopened
 in the markdown before installing.
 
+Idempotent: if the fiber already has a shuttle: block, install reports its
+current state and exits 0 when no conflicting flags are passed — useful
+right after writing the block by hand in the constitution markdown. If a
+flag conflicts with the existing block (--model differs from the current
+agent, --disabled differs from current enabled state, --project-dir
+differs), install exits non-zero and points at the right mutation verb
+(pause / resume / set-model / uninstall). Even on the idempotent path,
+install will bump felt status to "active" if it was missing — otherwise
+the daemon would silently ignore an enabled block.
+
 Use 'shuttle repeat' for standing (recurring) roles.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -42,11 +53,13 @@ Use 'shuttle repeat' for standing (recurring) roles.`,
 			path, _, _ := resolveFiber(args[0])
 			f := readFiber(path)
 
-			// Refuse to clobber an existing block — the user should pause/resume
-			// or set-model rather than re-install. Prevents silent loss of
-			// schedule/review state on standing roles.
+			// If a block already exists, treat install as idempotent state
+			// reporting + conflict detection. The common case is "I wrote
+			// the block manually and just want to confirm the daemon will
+			// dispatch it"; the failure case is "I passed a flag that
+			// conflicts with what's already there."
 			if f.Block != nil {
-				return fmt.Errorf("fiber %s already has a shuttle: block (use pause/resume/set-model to mutate, or uninstall first)", args[0])
+				return reportExistingBlock(cmd, args[0], f, installModel, installDisabled, installProjectDir)
 			}
 
 			block := &schema.Block{
@@ -99,18 +112,18 @@ Use 'shuttle repeat' for standing (recurring) roles.`,
 			if installDisabled {
 				state = "disabled (paused)"
 			}
-			fmt.Printf("installed %s as oneshot role (%s)\n", args[0], state)
+			fmt.Fprintf(cmd.OutOrStdout(), "installed %s as oneshot role (%s)\n", args[0], state)
 			if block.Agent != "" {
-				fmt.Printf("  agent: %s\n", block.Agent)
+				fmt.Fprintf(cmd.OutOrStdout(), "  agent: %s\n", block.Agent)
 			}
 			if block.ProjectDir != "" {
-				fmt.Printf("  project_dir: %s\n", block.ProjectDir)
+				fmt.Fprintf(cmd.OutOrStdout(), "  project_dir: %s\n", block.ProjectDir)
 			}
 			if statusChanged {
 				if statusBefore == "" {
-					fmt.Println("  status: active (set; was missing)")
+					fmt.Fprintln(cmd.OutOrStdout(), "  status: active (set; was missing)")
 				} else {
-					fmt.Printf("  status: %s → active\n", statusBefore)
+					fmt.Fprintf(cmd.OutOrStdout(), "  status: %s → active\n", statusBefore)
 				}
 			}
 			return nil
@@ -120,6 +133,139 @@ Use 'shuttle repeat' for standing (recurring) roles.`,
 	cmd.Flags().StringVar(&installProjectDir, "project-dir", "", "Worker cwd on the target host (required unless --disabled)")
 	cmd.Flags().BoolVar(&installDisabled, "disabled", false, "Install with enabled=false (lands in drafts; use 'shuttle resume' to dispatch)")
 	return cmd
+}
+
+// reportExistingBlock prints the current block state for the fiber, fixes
+// missing felt status if the block is enabled, and either returns nil
+// (idempotent confirmation, no flag conflicts) or returns an error pointing
+// at the right mutation verb (a passed flag disagrees with the existing
+// block). Cobra's Flags().Changed("...") distinguishes "user took the
+// default" from "user explicitly passed the value" — only explicit
+// disagreements raise conflicts, so a plain `install <fiber>` with no
+// flags is always a pure state query.
+func reportExistingBlock(cmd *cobra.Command, fiberID string, f *schema.FiberFile, model string, disabled bool, projectDir string) error {
+	b := f.Block
+	out := cmd.OutOrStdout()
+	errOut := cmd.ErrOrStderr()
+
+	// Bump felt status if the block is enabled but status is missing —
+	// otherwise the daemon silently ignores the fiber and the user has no
+	// way to learn that without running `shuttle-ctl status` afterward.
+	// "closed" is left alone — install doesn't reopen fibers, that's a
+	// human decision.
+	statusBefore := f.Status()
+	statusChanged := false
+	if b.Enabled && statusBefore != "active" && statusBefore != "open" && statusBefore != "closed" {
+		f.SetStatus("active")
+		if err := f.WriteBlock(b); err != nil {
+			return fmt.Errorf("writing status to fiber: %w", err)
+		}
+		statusChanged = true
+	}
+	statusNow := f.Status()
+	eligible := b.Enabled && (statusNow == "active" || statusNow == "open")
+
+	// Headline + block summary.
+	headline := fmt.Sprintf("shuttle: fiber %s already has a shuttle: block (install is idempotent).", fiberID)
+	if b.Kind == "standing" {
+		headline = fmt.Sprintf("shuttle: fiber %s already has a standing-role shuttle: block.", fiberID)
+	}
+	fmt.Fprintln(out, headline)
+	fmt.Fprintln(out, "")
+	writeBlockSummary(out, b, statusNow, statusChanged, statusBefore, eligible)
+
+	// Dispatch state assessment.
+	fmt.Fprintln(out, "")
+	switch {
+	case statusNow == "closed":
+		fmt.Fprintln(out, "→ Fiber is closed — daemon will NOT dispatch. Reopen (set status: active) to make eligible.")
+	case eligible:
+		fmt.Fprintln(out, "→ Daemon will dispatch on next poll. No action needed.")
+	case b.Enabled && statusNow == "":
+		fmt.Fprintln(out, "→ Status missing — daemon will NOT dispatch. Set status: active in the markdown.")
+	case !b.Enabled:
+		fmt.Fprintf(out, "→ Block is disabled (in drafts). Use `shuttle-ctl resume %s` to dispatch.\n", fiberID)
+	}
+
+	// Conflict detection: only fire when the user explicitly passed a flag
+	// that disagrees with the existing block.
+	modelChanged := cmd.Flags().Changed("model")
+	disabledChanged := cmd.Flags().Changed("disabled")
+	projectDirChanged := cmd.Flags().Changed("project-dir")
+
+	var mismatches []string
+	if modelChanged && model != b.Agent {
+		mismatches = append(mismatches,
+			fmt.Sprintf("--model %s ≠ current agent %q  →  shuttle-ctl set-model %s %s",
+				model, b.Agent, fiberID, model))
+	}
+	if disabledChanged {
+		if disabled && b.Enabled {
+			mismatches = append(mismatches,
+				fmt.Sprintf("--disabled passed but block is enabled  →  shuttle-ctl pause %s", fiberID))
+		} else if !disabled && !b.Enabled {
+			mismatches = append(mismatches,
+				fmt.Sprintf("--disabled=false passed but block is disabled  →  shuttle-ctl resume %s", fiberID))
+		}
+	}
+	if projectDirChanged {
+		expanded, err := resolveProjectDirFlag(projectDir)
+		if err == nil && expanded != b.ProjectDir {
+			mismatches = append(mismatches,
+				fmt.Sprintf("--project-dir %s ≠ current %q  →  shuttle-ctl uninstall %s && shuttle-ctl install %s --project-dir %s",
+					expanded, b.ProjectDir, fiberID, fiberID, expanded))
+		}
+	}
+
+	if len(mismatches) > 0 {
+		fmt.Fprintln(errOut, "")
+		fmt.Fprintln(errOut, "Conflicts with current block:")
+		for _, m := range mismatches {
+			fmt.Fprintf(errOut, "  %s\n", m)
+		}
+		return fmt.Errorf("install would mutate existing block; use the verbs above")
+	}
+
+	return nil
+}
+
+// writeBlockSummary writes the human-readable "Current block:" report used
+// by reportExistingBlock.
+func writeBlockSummary(out io.Writer, b *schema.Block, statusNow string, statusChanged bool, statusBefore string, eligible bool) {
+	fmt.Fprintln(out, "Current block:")
+	fmt.Fprintf(out, "  kind:        %s\n", nonEmpty(b.Kind, "(unset)"))
+	fmt.Fprintf(out, "  enabled:     %v\n", b.Enabled)
+	if b.Agent != "" {
+		fmt.Fprintf(out, "  agent:       %s\n", b.Agent)
+	}
+	if b.ProjectDir != "" {
+		fmt.Fprintf(out, "  project_dir: %s\n", b.ProjectDir)
+	}
+	if b.Schedule != nil {
+		fmt.Fprintf(out, "  schedule:    %q tz=%s\n", b.Schedule.Expr, b.Schedule.TZ)
+	}
+
+	switch {
+	case statusNow == "":
+		fmt.Fprintln(out, "  status:      (missing — NOT eligible; set status: active in the markdown)")
+	case statusNow == "closed":
+		fmt.Fprintln(out, "  status:      closed (NOT eligible — daemon ignores closed fibers)")
+	case eligible:
+		fmt.Fprintf(out, "  status:      %s (eligible)\n", statusNow)
+	default:
+		fmt.Fprintf(out, "  status:      %s\n", statusNow)
+	}
+	if statusChanged {
+		fmt.Fprintf(out, "               (was %q — bumped to %q because block is enabled)\n",
+			nonEmpty(statusBefore, ""), statusNow)
+	}
+}
+
+func nonEmpty(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
 }
 
 func resolveProjectDirFlag(raw string) (string, error) {
