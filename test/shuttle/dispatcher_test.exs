@@ -215,6 +215,63 @@ defmodule Shuttle.DispatcherTest do
     assert {:error, :closed} = result
   end
 
+  test "dispatch with force: true on a closed fiber shells out to shuttle-ctl reopen" do
+    # The kanban Resume button on an awaitingReview / closed card flows here
+    # with force=true. Without the reopen step, the worker spawns but the
+    # YAML stays closed and Portolan's classifyFiber keeps the card pinned
+    # in its prior column — see KanbanModal.runRequeue's comment about why
+    # this side-effect is daemon-owned. The contract: force-dispatch on a
+    # not-already-clean fiber issues `shuttle-ctl reopen <fiber>` before
+    # tmux new-session fires.
+    result = Dispatcher.dispatch("tests/closed", runner: MockRunner, force: true)
+    assert {:ok, _session} = result
+
+    commands = MockRunner.commands()
+
+    reopen_call =
+      Enum.find(commands, fn
+        {"shuttle-ctl", args} -> "reopen" in args and "tests/closed" in args
+        _ -> false
+      end)
+
+    assert reopen_call != nil, "expected shuttle-ctl reopen call; got #{inspect(commands)}"
+
+    # And it must precede tmux new-session — reopen-then-spawn, not the other way.
+    reopen_index =
+      Enum.find_index(commands, fn
+        {"shuttle-ctl", args} -> "reopen" in args
+        _ -> false
+      end)
+
+    tmux_new_index =
+      Enum.find_index(commands, fn
+        {"tmux", args} -> hd(args) == "new-session"
+        _ -> false
+      end)
+
+    assert reopen_index < tmux_new_index,
+           "reopen must precede tmux new-session; commands: #{inspect(commands)}"
+  end
+
+  test "dispatch with force: true on an already-clean fiber skips the reopen shell-out" do
+    # No-op short-circuit: re-dispatching a healthy in-flight oneshot
+    # shouldn't rewrite frontmatter on every manual click.
+    result =
+      Dispatcher.dispatch("tests/shuttle-agent-block",
+        runner: MockRunner,
+        force: true,
+        store_session_id: false
+      )
+
+    assert {:ok, _session} = result
+
+    refute Enum.any?(MockRunner.commands(), fn
+             {"shuttle-ctl", args} -> "reopen" in args
+             _ -> false
+           end),
+           "expected no shuttle-ctl reopen on already-clean fiber; got #{inspect(MockRunner.commands())}"
+  end
+
   test "dispatch refuses already-running fiber" do
     # Pre-seed the tmux session
     MockRunner.add_tmux_session(Dispatcher.session_name("tests/haiku"))
