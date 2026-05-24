@@ -377,6 +377,47 @@ defmodule ShuttleWeb.APIControllerTest do
     assert body["error"] == "fiber_id is required"
   end
 
+  test "ad-hoc dispatch returns 422 for a standing role awaiting review" do
+    fiber_id = "tests/api-awaiting-refuses-adhoc"
+    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
+    MockRunner.set_fiber(fiber_id, fiber)
+
+    MockRunner.set_shuttle(
+      fiber_id,
+      """
+      enabled: true
+      kind: standing
+      agent: claude-sonnet
+      schedule:
+        expr: "0 9 * * 1-5"
+        tz: Europe/Paris
+      review:
+        state: awaiting
+        run_id: "adhoc-1778282769604"
+        completed_at: "2026-05-24T10:00:00Z"
+      next_due_at: "2999-01-01T09:00:00+01:00"
+      """
+    )
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/dispatch",
+        Jason.encode!(%{
+          "fiber_id" => fiber_id,
+          "ad_hoc" => true
+        })
+      )
+
+    assert conn.status == 422
+    body = Jason.decode!(conn.resp_body)
+    assert body["dispatched"] == false
+    assert body["reason"] == "awaiting_review"
+    assert body["run_id"] == "adhoc-1778282769604"
+    assert body["message"] =~ "shuttle-ctl accept #{fiber_id}"
+    assert body["message"] =~ "shuttle-ctl resume #{fiber_id}"
+  end
+
   # ── Shuttle actions ──
 
   @tag :capture_log
@@ -443,7 +484,9 @@ defmodule ShuttleWeb.APIControllerTest do
     )
 
     # Stand up a fake shuttle-ctl on PATH that records its argv and exits 0.
-    stub_dir = Path.join(System.tmp_dir!(), "shuttle-test-stub-#{System.unique_integer([:positive])}")
+    stub_dir =
+      Path.join(System.tmp_dir!(), "shuttle-test-stub-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(stub_dir)
     argv_log = Path.join(stub_dir, "argv.log")
 

@@ -429,6 +429,9 @@ defmodule Shuttle.Poller do
                 Logger.info("API dispatch for #{fiber_id} is human-worker; no-op")
                 {:reply, {:ok, "human"}, state}
 
+              error = awaiting_ad_hoc_dispatch_error(fiber, state, opts) ->
+                {:reply, error, state}
+
               dispatch_eligible?(fiber, state, opts) ->
                 {new_state, result} = do_dispatch_fiber(state, fiber, opts)
                 {:reply, result || {:ok, session}, new_state}
@@ -704,6 +707,7 @@ defmodule Shuttle.Poller do
     # compiler will surface the missing clause.
     {:ok, sessions} = list_shuttle_sessions(state)
     live = MapSet.new(sessions)
+
     Enum.reduce(candidates, state, fn fiber, acc ->
       maybe_resurrect_orphan(acc, fiber, live)
     end)
@@ -758,6 +762,7 @@ defmodule Shuttle.Poller do
             "session_id=#{session_id} — worker exited while daemon was down " <>
             "or unwatched; scheduling continuation retry"
         )
+
         attempt = next_retry_attempt(state, fiber_id)
 
         schedule_retry(state, fiber_id, attempt, %{
@@ -1307,6 +1312,24 @@ defmodule Shuttle.Poller do
       review_state in ["scheduled", "accepted", "due"]
     else
       _ -> false
+    end
+  end
+
+  defp awaiting_ad_hoc_dispatch_error(fiber, state, opts) do
+    if Keyword.get(opts, :ad_hoc, false) do
+      fiber_id = Map.get(fiber, "id", "")
+
+      with {:ok, role} <- fetch_standing_role(fiber_id, state),
+           true <- StandingRole.standing?(role),
+           review_state when review_state in ["awaiting", "review", "in_review"] <-
+             role.review["state"] || "scheduled" do
+        {:error,
+         {:awaiting_review, Map.get(role.review, "run_id"), Map.get(role.review, "completed_at")}}
+      else
+        _ -> false
+      end
+    else
+      false
     end
   end
 

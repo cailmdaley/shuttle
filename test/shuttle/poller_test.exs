@@ -607,6 +607,44 @@ defmodule Shuttle.PollerTest do
     assert new_session_count == 1
   end
 
+  test "direct ad-hoc dispatch refuses a standing role awaiting review" do
+    fiber_id = "tests/standing-awaiting-refuses-adhoc"
+    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
+    MockRunner.set_fiber(fiber_id, fiber)
+
+    MockRunner.set_shuttle(
+      fiber_id,
+      """
+      enabled: true
+      kind: standing
+      agent: claude-sonnet
+      schedule:
+        expr: "0 9 * * 1-5"
+        tz: Europe/Paris
+      review:
+        state: awaiting
+        run_id: "adhoc-1778282769604"
+        completed_at: "2026-05-24T10:00:00Z"
+      next_due_at: "2999-01-01T09:00:00+01:00"
+      """
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_standing_awaiting_refuses_adhoc,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    assert {:error, {:awaiting_review, "adhoc-1778282769604", "2026-05-24T10:00:00Z"}} =
+             Poller.dispatch_fiber(poller, fiber_id, force: true, ad_hoc: true)
+
+    refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
+  end
+
   test "forced non-ad-hoc standing dispatch keeps scheduled run context for resume" do
     fiber_id = "tests/standing-force-scheduled"
     fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
@@ -654,7 +692,12 @@ defmodule Shuttle.PollerTest do
     fiber_id = "tests/closed-force"
     fiber = make_fiber(fiber_id, %{"status" => "closed"})
     MockRunner.set_fiber(fiber_id, fiber)
-    MockRunner.set_shuttle(fiber_id, "enabled: true\nkind: oneshot\nagent: claude-sonnet\n", "closed")
+
+    MockRunner.set_shuttle(
+      fiber_id,
+      "enabled: true\nkind: oneshot\nagent: claude-sonnet\n",
+      "closed"
+    )
 
     {:ok, poller} =
       Poller.start_link(
@@ -1202,6 +1245,7 @@ defmodule Shuttle.PollerTest do
     # Without this, the fiber sits "in-flight but dead" forever — the upstream
     # cause of the kanban gotcha-classifier-orphaned-oneshot.
     fiber_id = "tests/orphan-dispatched-dead"
+
     dispatched_shuttle = """
     enabled: true
     kind: oneshot
@@ -1209,6 +1253,7 @@ defmodule Shuttle.PollerTest do
       id: 577af64b-644a-4733-9e6a-f60d86b6941f
       dispatched_at: 2026-05-24T10:36:35.176394Z
     """
+
     MockRunner.set_shuttle(fiber_id, dispatched_shuttle)
     # No add_tmux_session — the dispatched session has died.
 
@@ -1240,6 +1285,7 @@ defmodule Shuttle.PollerTest do
     # a "should be running now" signal. Resurrecting them would cause them to
     # bypass their schedule.
     fiber_id = "tests/standing-stale-session"
+
     standing_shuttle = """
     enabled: true
     kind: standing
@@ -1249,6 +1295,7 @@ defmodule Shuttle.PollerTest do
     review:
       state: scheduled
     """
+
     MockRunner.set_shuttle(fiber_id, standing_shuttle)
 
     {:ok, poller} =
@@ -1261,18 +1308,21 @@ defmodule Shuttle.PollerTest do
 
     Process.sleep(150)
     snap = Poller.snapshot(poller)
+
     refute Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id)),
            "standing roles must not be resurrected by the orphan reconcile pass"
   end
 
   test "poller does not resurrect a closed oneshot even with session.id set" do
     fiber_id = "tests/closed-with-session"
+
     dispatched_shuttle = """
     enabled: true
     kind: oneshot
     session:
       id: closed-uuid
     """
+
     MockRunner.set_shuttle(fiber_id, dispatched_shuttle, "closed")
 
     {:ok, poller} =
