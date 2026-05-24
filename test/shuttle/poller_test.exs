@@ -1115,7 +1115,13 @@ defmodule Shuttle.PollerTest do
 
     send(poller, :run_poll_cycle)
 
-    assert wait_until(fn -> length(new_session_scripts()) == 1 end)
+    # `session.id: old-session-id` in the fiber file makes this an "orphaned
+    # dispatch" on first poll — the daemon sees a session was once dispatched
+    # but no tmux session is alive for it. Goes through continuation retry
+    # (with force_fresh: true) rather than direct dispatch, so the first new
+    # session shows up after the @continuation_retry_delay_ms gate (~1s).
+    # 80 attempts × 25ms = 2s, comfortably covers the gate.
+    assert wait_until(fn -> length(new_session_scripts()) == 1 end, 80)
 
     append_review_comment(fiber_id, resume_mode: "previous")
 
@@ -1124,7 +1130,15 @@ defmodule Shuttle.PollerTest do
 
     assert wait_until(fn -> length(new_session_scripts()) == 2 end, 80)
 
-    second_script = new_session_scripts() |> List.last() |> File.read!()
+    [first_script | rest] = new_session_scripts()
+    second_script = rest |> List.last() |> File.read!()
+
+    # Both the orphan-resurrection retry and the post-worker-exit continuation
+    # retry must dispatch fresh — no --resume of the stale UUID baked in.
+    first_script_body = first_script |> File.read!()
+    assert first_script_body =~ "Fiber: #{fiber_id}"
+    refute first_script_body =~ "--resume"
+    refute first_script_body =~ "old-session-id"
 
     assert second_script =~ "Fiber: #{fiber_id}"
     refute second_script =~ "--resume"
@@ -1178,6 +1192,100 @@ defmodule Shuttle.PollerTest do
     snap = Poller.snapshot(poller)
     assert length(snap.eligible) == 1
     assert hd(snap.eligible).fiber_id == "tests/orphan"
+  end
+
+  test "poller resurrects orphaned oneshot when shuttle.session.id is set but tmux session is dead" do
+    # Simulates: oneshot was dispatched (so shuttle.session.id is in the fiber
+    # file), the worker exited while the daemon was down (so no worker_exited
+    # ever fired and no continuation retry was scheduled), and on next poll
+    # cycle the daemon must notice and schedule a continuation retry itself.
+    # Without this, the fiber sits "in-flight but dead" forever — the upstream
+    # cause of the kanban gotcha-classifier-orphaned-oneshot.
+    fiber_id = "tests/orphan-dispatched-dead"
+    dispatched_shuttle = """
+    enabled: true
+    kind: oneshot
+    session:
+      id: 577af64b-644a-4733-9e6a-f60d86b6941f
+      dispatched_at: 2026-05-24T10:36:35.176394Z
+    """
+    MockRunner.set_shuttle(fiber_id, dispatched_shuttle)
+    # No add_tmux_session — the dispatched session has died.
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_resurrect_orphan,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    assert wait_until(fn ->
+             snap = Poller.snapshot(poller)
+             Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id))
+           end)
+
+    snap = Poller.snapshot(poller)
+    retry = Enum.find(snap.retrying, &(&1.fiber_id == fiber_id))
+    assert retry, "expected a retry entry for the orphaned fiber"
+    # Continuation retries use a short fixed delay (@continuation_retry_delay_ms,
+    # typically ~1s) rather than the exponential failure backoff. The retry
+    # being scheduled at all is the contract — exact delay belongs to retry_delay/3.
+    assert retry.attempt == 1
+  end
+
+  test "poller does not resurrect a standing role even when its session.id is stale" do
+    # Standing roles use review.state for lifecycle, not session.id presence;
+    # an old session.id is the historical marker for the most recent run, not
+    # a "should be running now" signal. Resurrecting them would cause them to
+    # bypass their schedule.
+    fiber_id = "tests/standing-stale-session"
+    standing_shuttle = """
+    enabled: true
+    kind: standing
+    schedule: "0 9 * * *"
+    session:
+      id: standing-past-run-uuid
+    review:
+      state: scheduled
+    """
+    MockRunner.set_shuttle(fiber_id, standing_shuttle)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_standing_not_resurrected,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    Process.sleep(150)
+    snap = Poller.snapshot(poller)
+    refute Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id)),
+           "standing roles must not be resurrected by the orphan reconcile pass"
+  end
+
+  test "poller does not resurrect a closed oneshot even with session.id set" do
+    fiber_id = "tests/closed-with-session"
+    dispatched_shuttle = """
+    enabled: true
+    kind: oneshot
+    session:
+      id: closed-uuid
+    """
+    MockRunner.set_shuttle(fiber_id, dispatched_shuttle, "closed")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_closed_not_resurrected,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    Process.sleep(150)
+    snap = Poller.snapshot(poller)
+    refute Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id))
   end
 
   test "poller clears stale running state when the tmux session disappears" do

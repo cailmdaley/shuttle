@@ -638,35 +638,132 @@ defmodule Shuttle.Poller do
   defp maybe_dispatch(%State{} = state) do
     state = state |> refresh_felt_stores() |> reconcile()
 
-    with {:ok, candidates, new_host_map} <- discover_candidates(state),
-         true <- available_slots(state) > 0 do
-      # Merge newly resolved host entries into the cache. Existing entries
-      # are not evicted — earlier-configured hosts win for ID collisions,
-      # and cache entries are stable for the daemon's lifetime.
-      state = %{
-        state
-        | fiber_host_cache: Map.merge(new_host_map, state.fiber_host_cache),
-          standing_roles: standing_roles_from_candidates(candidates),
-          dispatch_failures: evict_stale_dispatch_failures(state.dispatch_failures, candidates)
-      }
+    case discover_candidates(state) do
+      {:ok, candidates, new_host_map} ->
+        # Merge newly resolved host entries into the cache. Existing entries
+        # are not evicted — earlier-configured hosts win for ID collisions,
+        # and cache entries are stable for the daemon's lifetime.
+        state = %{
+          state
+          | fiber_host_cache: Map.merge(new_host_map, state.fiber_host_cache),
+            standing_roles: standing_roles_from_candidates(candidates),
+            dispatch_failures: evict_stale_dispatch_failures(state.dispatch_failures, candidates)
+        }
 
-      dispatchable = candidates |> filter_eligible(state) |> sort_candidates()
+        # Resurrect orphaned dispatched fibers — workers whose tmux sessions
+        # exited while the daemon was down (or otherwise not watching) so the
+        # worker_exited path never fired. Runs unconditionally on slots so
+        # orphans get back into the retry queue even when the dispatch budget
+        # is exhausted; the retry timer waits for capacity.
+        state = reconcile_dispatched_dead_fibers(state, candidates)
 
-      Enum.reduce(dispatchable, state, fn fiber, state_acc ->
-        if available_slots(state_acc) > 0 do
-          {new_state, _result} = do_dispatch_fiber(state_acc, fiber)
-          new_state
+        if available_slots(state) > 0 do
+          dispatchable = candidates |> filter_eligible(state) |> sort_candidates()
+
+          Enum.reduce(dispatchable, state, fn fiber, state_acc ->
+            if available_slots(state_acc) > 0 do
+              {new_state, _result} = do_dispatch_fiber(state_acc, fiber)
+              new_state
+            else
+              state_acc
+            end
+          end)
         else
-          state_acc
+          state
         end
-      end)
-    else
+
       {:error, reason} ->
         Logger.error("Poll cycle failed: #{inspect(reason)}")
         state
+    end
+  end
 
-      false ->
+  # ── Orphan Resurrection ──
+
+  # Detect fibers that were dispatched at least once (shuttle.session.id set)
+  # but whose tmux sessions are no longer alive AND aren't being tracked by a
+  # WorkerWatcher. This happens when the worker exits while the daemon is down
+  # — `worker_watcher` never fires `worker_exited`, the continuation retry
+  # never schedules, and the fiber sits forever in a "dispatched but dead"
+  # limbo. Without this pass the human ends up with a kanban card that says
+  # in-flight for a session that ended hours ago.
+  #
+  # `adopt_orphans` (init) and `reconcile_orphaned_sessions` (per-poll) handle
+  # the *live* analog: a tmux session exists, we just aren't watching it.
+  # This pass is the *dead* analog: no tmux session, but the fiber thinks it
+  # was dispatched. Mirrors what `handle_worker_exit` would have done if the
+  # daemon had been up.
+  #
+  # Standing roles are excluded: they use `review.state` for lifecycle, not
+  # session.id presence. A standing role's session.id is the historical
+  # marker for the most recent run, not a signal that a worker should still
+  # be running now.
+  defp reconcile_dispatched_dead_fibers(%State{} = state, candidates) do
+    # list_shuttle_sessions returns {:ok, []} on tmux-server-absent today (never
+    # errors), so this match is total; if it ever grows an error tuple, the
+    # compiler will surface the missing clause.
+    {:ok, sessions} = list_shuttle_sessions(state)
+    live = MapSet.new(sessions)
+    Enum.reduce(candidates, state, fn fiber, acc ->
+      maybe_resurrect_orphan(acc, fiber, live)
+    end)
+  end
+
+  defp maybe_resurrect_orphan(%State{} = state, fiber, live_sessions) do
+    fiber_id = Map.get(fiber, "id", "")
+    shuttle = Map.get(fiber, "shuttle", %{})
+    status = Map.get(fiber, "status", "")
+    kind = Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot"))
+
+    session_id =
+      case Map.get(shuttle, "session", %{}) do
+        %{"id" => id} when is_binary(id) and id != "" -> id
+        _ -> nil
+      end
+
+    cond do
+      # Only daemons targeting this host should act. A foreign-host fiber
+      # whose remote daemon is healthy must not get poked from here.
+      not host_pin_matches?(shuttle, state.own_host_id) ->
         state
+
+      # Standing roles use review.state, not session.id, for lifecycle.
+      kind == "standing" ->
+        state
+
+      # Never dispatched — nothing to resurrect.
+      session_id == nil ->
+        state
+
+      # Closed — work is done.
+      status == "closed" ->
+        state
+
+      # Already tracking (a WorkerWatcher is alive for this fiber).
+      Map.has_key?(state.running, fiber_id) ->
+        state
+
+      # Retry already queued.
+      MapSet.member?(state.claimed, fiber_id) ->
+        state
+
+      # tmux session for this fiber is live — `adopt_orphans` /
+      # `reconcile_orphaned_sessions` will pick it up; not our problem.
+      MapSet.member?(live_sessions, Dispatcher.session_name(fiber_id)) ->
+        state
+
+      true ->
+        Logger.info(
+          "Resurrecting orphan dispatch: fiber_id=#{fiber_id} " <>
+            "session_id=#{session_id} — worker exited while daemon was down " <>
+            "or unwatched; scheduling continuation retry"
+        )
+        attempt = next_retry_attempt(state, fiber_id)
+
+        schedule_retry(state, fiber_id, attempt, %{
+          delay_type: :continuation,
+          reason: :orphan_resurrected
+        })
     end
   end
 
@@ -1825,7 +1922,13 @@ defmodule Shuttle.Poller do
       Process.cancel_timer(previous.timer_ref)
     end
 
-    timer_ref = Process.send_after(self(), {:retry, fiber_id, retry_token}, delay_ms)
+    # Target the poller via its registered name/pid, not `self()`. When
+    # `schedule_retry` runs inside the poll-cycle Task spawned by
+    # `handle_info(:run_poll_cycle, ...)`, `self()` is the Task pid; the
+    # timer would fire into a dead process and the retry would never run.
+    # `state.self_ref` is the poller's registered name (atom) or pid,
+    # captured in init/1.
+    timer_ref = Process.send_after(state.self_ref, {:retry, fiber_id, retry_token}, delay_ms)
 
     error = Map.get(metadata, :error)
     delay_type = Map.get(metadata, :delay_type, :failure)
