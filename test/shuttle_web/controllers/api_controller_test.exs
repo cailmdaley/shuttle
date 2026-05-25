@@ -886,6 +886,24 @@ defmodule ShuttleWeb.APIControllerTest do
     assert is_binary(default["id"])
   end
 
+  # ── GET /api/v1/version ──
+
+  test "version returns the daemon build-info shape" do
+    conn = get(api_conn(), "/api/v1/version")
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+
+    assert is_binary(body["git_sha"])
+    assert is_binary(body["git_short_sha"])
+    assert is_binary(body["built_at"])
+    assert body["mix_vsn"] == Shuttle.version()
+
+    if body["git_sha"] != "unknown" do
+      assert String.length(body["git_short_sha"]) == 7
+      assert String.starts_with?(body["git_sha"], body["git_short_sha"])
+    end
+  end
+
   # ── Worker Channel ──
 
   test "worker channel broadcasts exit events" do

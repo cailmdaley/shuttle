@@ -24,6 +24,7 @@ shuttle-*.tar
 
 # Shuttle daemon escript (built via `mix escript.build`)
 /bin/shuttle
+/lib/shuttle/build_info.ex
 
 # Go binaries (build with `go build` from cmd/shuttle/)
 /bin/shuttle-ctl

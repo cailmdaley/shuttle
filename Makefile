@@ -37,6 +37,7 @@ help:
 all: restart cli
 
 build:
+	mix shuttle.gen_version
 	mix escript.build
 
 # Build the Go CLI and install to $(CLI_DEST). `go install ./cmd/shuttle`
