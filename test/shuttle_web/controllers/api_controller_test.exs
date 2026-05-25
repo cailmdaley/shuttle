@@ -448,6 +448,43 @@ defmodule ShuttleWeb.APIControllerTest do
            end)
   end
 
+  # Inline-fiber mode: the caller (Portolan) already has the fiber map in
+  # memory — e.g. for a remote-origin transition where the fiber lives on a
+  # different host than the daemon can see. Skip the disk lookup and resolve
+  # purely from the supplied map.
+  @tag :capture_log
+  test "actions resolve accepts an inline fiber map and skips disk lookup" do
+    inline_fiber = %{
+      "id" => "remote/host/standing-awaiting",
+      "status" => "active",
+      "shuttle" => %{
+        "enabled" => true,
+        "kind" => "standing",
+        "review" => %{"state" => "awaiting"}
+      }
+    }
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/actions/resolve",
+        Jason.encode!(%{fiber: inline_fiber, target: "inFlight"})
+      )
+
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+    assert body["fiber_id"] == "remote/host/standing-awaiting"
+    assert body["target"] == "inFlight"
+    assert body["action"]["id"] == "accept-run"
+    assert body["action"]["invocation"]["verb"] == "accept"
+
+    # The inline path must not touch disk: no felt-store lookups, no MockRunner
+    # commands ran in the resolve path.
+    refute Enum.any?(MockRunner.commands(), fn {command, _args} ->
+             command in ["felt", "shuttle-ctl"]
+           end)
+  end
+
   @tag :capture_log
   test "actions invoke rejects unavailable action ids before mutating" do
     with_actions_host()

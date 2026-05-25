@@ -19,6 +19,21 @@ defmodule ShuttleWeb.ActionsController do
     end
   end
 
+  def resolve(conn, %{"fiber" => fiber, "target" => target}) when is_map(fiber) do
+    fiber_id = Map.get(fiber, "id")
+    running? = Map.get(fiber, "running", false) == true
+
+    case Actions.resolve_transition(fiber, target, running?) do
+      {:ok, action} ->
+        json(conn, %{fiber_id: fiber_id, target: target, action: action})
+
+      {:error, :unknown_target} ->
+        conn
+        |> put_status(400)
+        |> json(%{fiber_id: fiber_id, target: target, error: "unknown_target"})
+    end
+  end
+
   def resolve(conn, %{"fiber_id" => fiber_id, "target" => target}) do
     case resolve_action(fiber_id, target) do
       {:ok, action} ->
@@ -37,7 +52,7 @@ defmodule ShuttleWeb.ActionsController do
   end
 
   def resolve(conn, _params) do
-    conn |> put_status(400) |> json(%{error: "fiber_id and target are required"})
+    conn |> put_status(400) |> json(%{error: "fiber or fiber_id, plus target, are required"})
   end
 
   def invoke(conn, %{"fiber_id" => fiber_id, "action" => action}) do
