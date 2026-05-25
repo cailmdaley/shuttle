@@ -640,44 +640,38 @@ defmodule Shuttle.Poller do
 
   defp maybe_dispatch(%State{} = state) do
     state = state |> refresh_felt_stores() |> reconcile()
+    {:ok, candidates, new_host_map} = discover_candidates(state)
 
-    case discover_candidates(state) do
-      {:ok, candidates, new_host_map} ->
-        # Merge newly resolved host entries into the cache. Existing entries
-        # are not evicted — earlier-configured hosts win for ID collisions,
-        # and cache entries are stable for the daemon's lifetime.
-        state = %{
-          state
-          | fiber_host_cache: Map.merge(new_host_map, state.fiber_host_cache),
-            standing_roles: standing_roles_from_candidates(candidates),
-            dispatch_failures: evict_stale_dispatch_failures(state.dispatch_failures, candidates)
-        }
+    # Merge newly resolved host entries into the cache. Existing entries
+    # are not evicted — earlier-configured hosts win for ID collisions,
+    # and cache entries are stable for the daemon's lifetime.
+    state = %{
+      state
+      | fiber_host_cache: Map.merge(new_host_map, state.fiber_host_cache),
+        standing_roles: standing_roles_from_candidates(candidates),
+        dispatch_failures: evict_stale_dispatch_failures(state.dispatch_failures, candidates)
+    }
 
-        # Resurrect orphaned dispatched fibers — workers whose tmux sessions
-        # exited while the daemon was down (or otherwise not watching) so the
-        # worker_exited path never fired. Runs unconditionally on slots so
-        # orphans get back into the retry queue even when the dispatch budget
-        # is exhausted; the retry timer waits for capacity.
-        state = reconcile_dispatched_dead_fibers(state, candidates)
+    # Resurrect orphaned dispatched fibers — workers whose tmux sessions
+    # exited while the daemon was down (or otherwise not watching) so the
+    # worker_exited path never fired. Runs unconditionally on slots so
+    # orphans get back into the retry queue even when the dispatch budget
+    # is exhausted; the retry timer waits for capacity.
+    state = reconcile_dispatched_dead_fibers(state, candidates)
 
-        if available_slots(state) > 0 do
-          dispatchable = candidates |> filter_eligible(state) |> sort_candidates()
+    if available_slots(state) > 0 do
+      dispatchable = candidates |> filter_eligible(state) |> sort_candidates()
 
-          Enum.reduce(dispatchable, state, fn fiber, state_acc ->
-            if available_slots(state_acc) > 0 do
-              {new_state, _result} = do_dispatch_fiber(state_acc, fiber)
-              new_state
-            else
-              state_acc
-            end
-          end)
+      Enum.reduce(dispatchable, state, fn fiber, state_acc ->
+        if available_slots(state_acc) > 0 do
+          {new_state, _result} = do_dispatch_fiber(state_acc, fiber)
+          new_state
         else
-          state
+          state_acc
         end
-
-      {:error, reason} ->
-        Logger.error("Poll cycle failed: #{inspect(reason)}")
-        state
+      end)
+    else
+      state
     end
   end
 
