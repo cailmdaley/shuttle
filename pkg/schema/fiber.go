@@ -212,10 +212,46 @@ func resolveFiberIDViaFelt(host, query string) (string, error) {
 	if err := json.Unmarshal(out, &results); err != nil {
 		return "", fmt.Errorf("parsing felt ls output: %w", err)
 	}
-	if len(results) == 0 || results[0].ID == "" {
+	return chooseResolvedFiberID(query, results)
+}
+
+func chooseResolvedFiberID(query string, results []struct {
+	ID string `json:"id"`
+}) (string, error) {
+	if len(results) == 0 {
 		return "", fmt.Errorf("fiber %q not found", query)
 	}
-	return results[0].ID, nil
+
+	var ids []string
+	for _, result := range results {
+		if result.ID == "" {
+			continue
+		}
+		if result.ID == query {
+			return result.ID, nil
+		}
+		ids = append(ids, result.ID)
+	}
+	if len(ids) == 0 {
+		return "", fmt.Errorf("fiber %q not found", query)
+	}
+
+	var suffixMatches []string
+	for _, id := range ids {
+		if strings.HasSuffix(id, "/"+query) {
+			suffixMatches = append(suffixMatches, id)
+		}
+	}
+	if len(suffixMatches) == 1 {
+		return suffixMatches[0], nil
+	}
+	if len(suffixMatches) > 1 {
+		return "", fmt.Errorf("fiber %q is ambiguous; matches: %s", query, strings.Join(suffixMatches, ", "))
+	}
+	if len(ids) == 1 {
+		return ids[0], nil
+	}
+	return "", fmt.Errorf("fiber %q is ambiguous; matches: %s", query, strings.Join(ids, ", "))
 }
 
 func canonicalizeFiberPath(path string) (*FiberRef, error) {
