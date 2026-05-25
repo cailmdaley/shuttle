@@ -649,6 +649,19 @@ defmodule Shuttle.DispatcherTest do
     refute script =~ "send-keys"
   end
 
+  test "build_run_script can show a project-local fiber handle in the worker banner" do
+    script =
+      Dispatcher.build_run_script(
+        "ai-futures/shuttle/constitution-shuttle-ctl-ux-fixes",
+        "codex exec",
+        "codex",
+        display_fiber_id: "constitution-shuttle-ctl-ux-fixes"
+      )
+
+    assert script =~ "Shuttle worker — constitution-shuttle-ctl-ux-fixes"
+    refute script =~ "Shuttle worker — ai-futures/shuttle/constitution-shuttle-ctl-ux-fixes"
+  end
+
   # ── Wait-for-client guard before harness start ──
 
   test "build_run_script with session waits for a non-control client before the harness" do

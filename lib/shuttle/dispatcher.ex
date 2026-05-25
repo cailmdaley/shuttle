@@ -751,11 +751,12 @@ defmodule Shuttle.Dispatcher do
   defp create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent, opts) do
     session = session_name(fiber_id)
     felt_store = Keyword.get(opts, :felt_store, default_felt_store())
+    worker_fiber_id = prompt_fiber_id(fiber_id, work_dir, felt_store)
 
     prompt_opts =
       opts
       |> Keyword.put(:work_dir, work_dir)
-      |> Keyword.put(:prompt_fiber_id, prompt_fiber_id(fiber_id, work_dir, felt_store))
+      |> Keyword.put(:prompt_fiber_id, worker_fiber_id)
 
     case resume_intent do
       {:previous, session_id} ->
@@ -780,7 +781,8 @@ defmodule Shuttle.Dispatcher do
         run_script =
           build_run_script(fiber_id, command, agent.id,
             dismiss_resume_warning: agent.cli == "claude",
-            session: session
+            session: session,
+            display_fiber_id: worker_fiber_id
           )
 
         spawn_tmux(session, work_dir, run_script, runner)
@@ -791,7 +793,9 @@ defmodule Shuttle.Dispatcher do
           build_fresh_command(agent, fiber_id, prompt_context, prompt_opts)
 
         Logger.info("Dispatching #{fiber_id} via #{agent.id} → tmux session #{session}")
-        run_script = build_run_script(fiber_id, command, agent.id)
+
+        run_script =
+          build_run_script(fiber_id, command, agent.id, display_fiber_id: worker_fiber_id)
 
         case spawn_tmux(session, work_dir, run_script, runner) do
           {:ok, _} = result ->
@@ -1159,6 +1163,7 @@ defmodule Shuttle.Dispatcher do
   def build_run_script(fiber_id, command, agent_id, opts \\ []) do
     dismiss_resume_warning = Keyword.get(opts, :dismiss_resume_warning, false)
     session = Keyword.get(opts, :session, "")
+    display_fiber_id = Keyword.get(opts, :display_fiber_id, fiber_id)
 
     # When resuming claude, schedule a backgrounded tmux send-keys to
     # dismiss the interactive warning page. Runs *inside* the same tmux
@@ -1221,7 +1226,7 @@ defmodule Shuttle.Dispatcher do
     #{wait_for_client_block}
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "Shuttle worker — #{fiber_id} — agent=#{agent_id} — $(date '+%H:%M:%S')"
+    echo "Shuttle worker — #{display_fiber_id} — agent=#{agent_id} — $(date '+%H:%M:%S')"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     #{dismiss_block}#{command}
