@@ -77,7 +77,7 @@ The running daemon picks it up on its next poll.`,
 		statusBefore := f.Status()
 		statusChanged := false
 		if statusBefore == "closed" {
-			return fmt.Errorf("fiber %s has status: closed; reopen it (set status: active in the markdown) before installing", args[0])
+			return fmt.Errorf("fiber %s has status: closed; use 'shuttle reopen %s' to clear verdict fields and requeue it before installing", args[0], args[0])
 		}
 		if statusBefore != "active" && statusBefore != "open" {
 			f.SetStatus("active")

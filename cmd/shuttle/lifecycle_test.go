@@ -191,6 +191,123 @@ Body.
 	}
 }
 
+func TestInstallCmd_BumpsMissingStatusOnFreshInstall(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	projectDir := t.TempDir()
+	path := writeFiber(t, host, "fresh-missing-status", `---
+name: Fresh missing status
+---
+
+Body.
+`)
+
+	var stdout bytes.Buffer
+	cmd := newInstallCmd()
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stdout)
+	cmd.SetArgs([]string{"fresh-missing-status", "--project-dir", projectDir})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v, output:\n%s", err, stdout.String())
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "status: active") {
+		t.Fatalf("missing status should be bumped to active:\n%s", text)
+	}
+	if !strings.Contains(stdout.String(), "status: active (set; was missing)") {
+		t.Fatalf("expected status bump in output, got:\n%s", stdout.String())
+	}
+}
+
+func TestInstallCmd_DisabledFlagPositionIsIndependent(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"before-slug", []string{"--disabled", "position-before", "--model", "codex"}},
+		{"between-slug-and-model", []string{"position-between", "--disabled", "--model", "codex"}},
+		{"after-model", []string{"position-after", "--model", "codex", "--disabled"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			slug := ""
+			for _, arg := range tc.args {
+				if !strings.HasPrefix(arg, "-") && arg != "codex" {
+					slug = arg
+					break
+				}
+			}
+			path := writeFiber(t, host, slug, `---
+name: Position test
+status: open
+---
+
+Body.
+`)
+
+			cmd := newInstallCmd()
+			cmd.SetArgs(tc.args)
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read fiber: %v", err)
+			}
+			text := string(raw)
+			if !strings.Contains(text, "enabled: false") {
+				t.Fatalf("--disabled should write to requested slug %q:\n%s", slug, text)
+			}
+			if !strings.Contains(text, "agent: codex") {
+				t.Fatalf("--model should be honored for requested slug %q:\n%s", slug, text)
+			}
+		})
+	}
+}
+
+func TestInstallCmd_ClosedStatusPointsAtReopen(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	projectDir := t.TempDir()
+	path := writeFiber(t, host, "closed-install", `---
+name: Closed install
+status: closed
+---
+
+Body.
+`)
+
+	cmd := newInstallCmd()
+	cmd.SetArgs([]string{"closed-install", "--project-dir", projectDir})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected closed fiber install to fail")
+	}
+	if !strings.Contains(err.Error(), "shuttle reopen closed-install") {
+		t.Fatalf("expected reopen guidance, got %v", err)
+	}
+
+	raw, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatalf("read fiber: %v", readErr)
+	}
+	if strings.Contains(string(raw), "shuttle:") {
+		t.Fatalf("closed install failure should not write shuttle block:\n%s", string(raw))
+	}
+}
+
 // TestInstallCmd_IdempotentWhenBlockExistsNoFlags covers the common authoring
 // case: the user wrote a shuttle: block by hand in the constitution markdown,
 // then runs `shuttle-ctl install <fiber>` to confirm the daemon will dispatch.
@@ -482,6 +599,32 @@ Body.
 	}
 	if !sessions[session] {
 		t.Fatalf("expected session %q to remain running", session)
+	}
+}
+
+func TestResumeCmd_ClosedStatusPointsAtReopen(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	writeFiber(t, host, "closed-resume", `---
+name: Closed resume
+status: closed
+shuttle:
+  enabled: false
+  kind: oneshot
+---
+
+Body.
+`)
+
+	cmd := newResumeCmd()
+	cmd.SetArgs([]string{"closed-resume"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected closed fiber resume to fail")
+	}
+	if !strings.Contains(err.Error(), "shuttle reopen closed-resume") {
+		t.Fatalf("expected reopen guidance, got %v", err)
 	}
 }
 

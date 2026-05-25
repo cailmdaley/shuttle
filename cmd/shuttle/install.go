@@ -34,7 +34,8 @@ The running daemon picks it up on its next poll when enabled.
 When installing without --disabled, the felt-native status field is set to
 "active" if it was missing or any value other than "active"/"open" — the
 poller's eligibility filter requires this. Closed fibers must be reopened
-in the markdown before installing.
+before installing. Use 'shuttle reopen <fiber>' when the fiber already has a
+shuttle block, or set status: active in the markdown before a first install.
 
 Idempotent: if the fiber already has a shuttle: block, install reports its
 current state and exits 0 when no conflicting flags are passed — useful
@@ -96,7 +97,7 @@ Use 'shuttle repeat' for standing (recurring) roles.`,
 			statusChanged := false
 			if !installDisabled {
 				if statusBefore == "closed" {
-					return fmt.Errorf("fiber %s has status: closed; reopen it (set status: active in the markdown) before installing, or use --disabled to park in drafts", args[0])
+					return fmt.Errorf("fiber %s has status: closed; use 'shuttle reopen %s' when it already has a shuttle block, or set status: active before installing; use --disabled to park in drafts", args[0], args[0])
 				}
 				if statusBefore != "active" && statusBefore != "open" {
 					f.SetStatus("active")
@@ -178,7 +179,7 @@ func reportExistingBlock(cmd *cobra.Command, fiberID string, f *schema.FiberFile
 	fmt.Fprintln(out, "")
 	switch {
 	case statusNow == "closed":
-		fmt.Fprintln(out, "→ Fiber is closed — daemon will NOT dispatch. Reopen (set status: active) to make eligible.")
+		fmt.Fprintf(out, "→ Fiber is closed — daemon will NOT dispatch. Use `shuttle-ctl reopen %s` to clear verdict fields and requeue it.\n", fiberID)
 	case eligible:
 		fmt.Fprintln(out, "→ Daemon will dispatch on next poll. No action needed.")
 	case b.Enabled && statusNow == "":
