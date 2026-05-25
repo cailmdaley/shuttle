@@ -153,9 +153,7 @@ defmodule Shuttle.Dispatcher do
            run_id
          ) do
       [_, y, mo, d, h, mi, s, sign, tzh, tzm] ->
-        case DateTime.from_iso8601(
-               "#{y}-#{mo}-#{d}T#{h}:#{mi}:#{s}#{sign}#{tzh}:#{tzm}"
-             ) do
+        case DateTime.from_iso8601("#{y}-#{mo}-#{d}T#{h}:#{mi}:#{s}#{sign}#{tzh}:#{tzm}") do
           {:ok, dt, _offset} -> dt
           _ -> nil
         end
@@ -286,10 +284,12 @@ defmodule Shuttle.Dispatcher do
   """
   @spec render_prompt(String.t(), keyword()) :: String.t()
   def render_prompt(fiber_id, opts \\ []) do
+    prompt_fiber_id = Keyword.get(opts, :prompt_fiber_id, fiber_id)
+
     header = """
     The orchestration system Shuttle dispatched you on this fiber. The constitution describes what "done" looks like; drive toward it across one or more sessions. The `shuttle` and `felt` skills carry the practice — activate them next.
 
-    Fiber: #{fiber_id}
+    Fiber: #{prompt_fiber_id}
     """
 
     compose_prompt(header, fiber_id, opts)
@@ -314,10 +314,12 @@ defmodule Shuttle.Dispatcher do
   """
   @spec render_resume_prompt(String.t(), keyword()) :: String.t()
   def render_resume_prompt(fiber_id, opts \\ []) do
+    prompt_fiber_id = Keyword.get(opts, :prompt_fiber_id, fiber_id)
+
     header = """
     Shuttle resumed your previous session on this fiber. Skills and conventions are already loaded in your transcript from the original dispatch; pick up from the last clean checkpoint, or address the message below if one's there.
 
-    Fiber: #{fiber_id}
+    Fiber: #{prompt_fiber_id}
     """
 
     compose_prompt(header, fiber_id, opts)
@@ -518,6 +520,7 @@ defmodule Shuttle.Dispatcher do
   @spec render_standing_run_prompt(String.t(), String.t(), keyword()) :: String.t()
   def render_standing_run_prompt(fiber_id, run_id, opts \\ []) do
     ad_hoc? = Keyword.get(opts, :ad_hoc, false)
+    prompt_fiber_id = Keyword.get(opts, :prompt_fiber_id, fiber_id)
 
     orientation =
       if ad_hoc? do
@@ -528,11 +531,25 @@ defmodule Shuttle.Dispatcher do
 
     header = """
     #{orientation}
-    Fiber: #{fiber_id}
+    Fiber: #{prompt_fiber_id}
     Run:   #{run_id}
     """
 
     compose_prompt(header, fiber_id, opts)
+  end
+
+  @doc false
+  @spec prompt_fiber_id(String.t(), String.t(), String.t()) :: String.t()
+  def prompt_fiber_id(fiber_id, work_dir, felt_store) do
+    with {:ok, project_felt} <- realpath(Path.join(work_dir, ".felt")),
+         {:ok, fiber_path} <- exact_fiber_path(felt_store, fiber_id),
+         {:ok, real_fiber_path} <- realpath(fiber_path),
+         true <- path_inside?(real_fiber_path, project_felt),
+         {:ok, local_id} <- fiber_id_from_project_path(real_fiber_path, project_felt) do
+      local_id
+    else
+      _ -> fiber_id
+    end
   end
 
   # Shared composition for all top-level prompts: a per-prompt orientation
@@ -667,9 +684,7 @@ defmodule Shuttle.Dispatcher do
              stderr_to_stdout: true
            ) do
         {output, 0} ->
-          Logger.info(
-            "Force-dispatch reopened #{fiber_id}: #{String.trim(output)}"
-          )
+          Logger.info("Force-dispatch reopened #{fiber_id}: #{String.trim(output)}")
 
           :ok
 
@@ -737,6 +752,11 @@ defmodule Shuttle.Dispatcher do
     session = session_name(fiber_id)
     felt_store = Keyword.get(opts, :felt_store, default_felt_store())
 
+    prompt_opts =
+      opts
+      |> Keyword.put(:work_dir, work_dir)
+      |> Keyword.put(:prompt_fiber_id, prompt_fiber_id(fiber_id, work_dir, felt_store))
+
     case resume_intent do
       {:previous, session_id} ->
         # Resume mode: invoke the harness-appropriate resume command and
@@ -748,7 +768,7 @@ defmodule Shuttle.Dispatcher do
           "Resuming #{fiber_id} session #{session_id} via #{agent.id} → tmux #{session}"
         )
 
-        resume_prompt = render_resume_prompt(fiber_id, opts)
+        resume_prompt = render_resume_prompt(fiber_id, prompt_opts)
         command = Agents.build_resume_command(agent, session_id, resume_prompt)
 
         # claude --resume shows an interactive "you're about to use a
@@ -767,7 +787,9 @@ defmodule Shuttle.Dispatcher do
 
       :fresh ->
         # Fresh mode: build the full dispatch prompt.
-        {command, session_uuid} = build_fresh_command(agent, fiber_id, prompt_context, opts)
+        {command, session_uuid} =
+          build_fresh_command(agent, fiber_id, prompt_context, prompt_opts)
+
         Logger.info("Dispatching #{fiber_id} via #{agent.id} → tmux session #{session}")
         run_script = build_run_script(fiber_id, command, agent.id)
 
@@ -791,6 +813,7 @@ defmodule Shuttle.Dispatcher do
   # dispatch normally and capture the UUID asynchronously after spawn.
   defp build_fresh_command(agent, fiber_id, prompt_context, opts) do
     prompt = render_context_prompt(fiber_id, prompt_context, opts)
+    prompt_fiber_id = Keyword.get(opts, :prompt_fiber_id, fiber_id)
 
     case agent.cli do
       "claude" ->
@@ -801,7 +824,7 @@ defmodule Shuttle.Dispatcher do
       cli when cli in ["codex", "pi"] ->
         command = Agents.build_command(agent, prompt)
         work_dir = Keyword.get(opts, :work_dir, File.cwd!())
-        {command, {:capture, cli, work_dir, fiber_id, DateTime.utc_now()}}
+        {command, {:capture, cli, work_dir, prompt_fiber_id, DateTime.utc_now()}}
 
       _ ->
         command = Agents.build_command(agent, prompt)
@@ -1068,6 +1091,65 @@ defmodule Shuttle.Dispatcher do
   end
 
   defp render_context_prompt(fiber_id, _, opts), do: render_prompt(fiber_id, opts)
+
+  defp exact_fiber_path(felt_store, fiber_id) do
+    felt_dir = Path.join(felt_store, ".felt")
+    leaf = fiber_id |> String.trim_trailing("/") |> String.split("/") |> List.last()
+
+    candidates =
+      if String.contains?(fiber_id, "/") do
+        [Path.join([felt_dir, fiber_id, leaf <> ".md"])]
+      else
+        [
+          Path.join([felt_dir, fiber_id, leaf <> ".md"]),
+          Path.join(felt_dir, leaf <> ".md")
+        ]
+      end
+
+    case Enum.find(candidates, &File.regular?/1) do
+      nil -> {:error, :not_found}
+      path -> {:ok, path}
+    end
+  end
+
+  defp realpath(path) do
+    case :file.read_link_all(String.to_charlist(path)) do
+      {:ok, real} ->
+        {:ok, List.to_string(real)}
+
+      {:error, :einval} ->
+        if File.exists?(path), do: {:ok, Path.expand(path)}, else: {:error, :enoent}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp path_inside?(path, ancestor) do
+    relative = Path.relative_to(path, ancestor)
+    relative != path and relative != "." and not String.starts_with?(relative, "..")
+  end
+
+  defp fiber_id_from_project_path(path, project_felt) do
+    relative = Path.relative_to(path, project_felt)
+    parts = Path.split(relative)
+    file = List.last(parts)
+    leaf = Path.basename(file, ".md")
+
+    cond do
+      Path.extname(file) != ".md" ->
+        {:error, :not_markdown}
+
+      length(parts) == 1 ->
+        {:ok, leaf}
+
+      List.last(Enum.drop(parts, -1)) == leaf ->
+        {:ok, parts |> Enum.drop(-1) |> Path.join()}
+
+      true ->
+        {:ok, parts |> List.replace_at(-1, leaf) |> Path.join()}
+    end
+  end
 
   @doc false
   # Public for tests. Builds the bash script that wraps the harness command

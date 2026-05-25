@@ -194,6 +194,85 @@ defmodule Shuttle.DispatcherTest do
     refute prompt =~ "Last session"
   end
 
+  test "prompt_fiber_id uses the worker cwd's project-local felt view" do
+    loom =
+      Path.join(System.tmp_dir!(), "shuttle-prompt-loom-#{System.unique_integer([:positive])}")
+
+    work_dir =
+      Path.join(System.tmp_dir!(), "shuttle-prompt-work-#{System.unique_integer([:positive])}")
+
+    canonical_path =
+      Path.join([
+        loom,
+        ".felt",
+        "ai-futures",
+        "shuttle",
+        "constitution-shuttle-ctl-ux-fixes",
+        "constitution-shuttle-ctl-ux-fixes.md"
+      ])
+
+    File.mkdir_p!(Path.dirname(canonical_path))
+    File.write!(canonical_path, "---\nname: test\n---\n")
+    File.mkdir_p!(work_dir)
+    File.ln_s!(Path.join([loom, ".felt", "ai-futures", "shuttle"]), Path.join(work_dir, ".felt"))
+
+    on_exit(fn ->
+      File.rm_rf!(loom)
+      File.rm_rf!(work_dir)
+    end)
+
+    assert Dispatcher.prompt_fiber_id(
+             "ai-futures/shuttle/constitution-shuttle-ctl-ux-fixes",
+             work_dir,
+             loom
+           ) == "constitution-shuttle-ctl-ux-fixes"
+  end
+
+  test "prompt_fiber_id preserves nested IDs under the project felt root" do
+    loom =
+      Path.join(System.tmp_dir!(), "shuttle-prompt-loom-#{System.unique_integer([:positive])}")
+
+    work_dir =
+      Path.join(System.tmp_dir!(), "shuttle-prompt-work-#{System.unique_integer([:positive])}")
+
+    canonical_path =
+      Path.join([
+        loom,
+        ".felt",
+        "ai-futures",
+        "portolan",
+        "portolan",
+        "constitution-shuttle-portolan-version-sync",
+        "constitution-shuttle-portolan-version-sync.md"
+      ])
+
+    File.mkdir_p!(Path.dirname(canonical_path))
+    File.write!(canonical_path, "---\nname: test\n---\n")
+    File.mkdir_p!(work_dir)
+    File.ln_s!(Path.join([loom, ".felt", "ai-futures", "portolan"]), Path.join(work_dir, ".felt"))
+
+    on_exit(fn ->
+      File.rm_rf!(loom)
+      File.rm_rf!(work_dir)
+    end)
+
+    assert Dispatcher.prompt_fiber_id(
+             "ai-futures/portolan/portolan/constitution-shuttle-portolan-version-sync",
+             work_dir,
+             loom
+           ) == "portolan/constitution-shuttle-portolan-version-sync"
+  end
+
+  test "render_prompt can display a project-local fiber while querying canonical history" do
+    prompt =
+      Dispatcher.render_prompt("ai-futures/shuttle/constitution-shuttle-ctl-ux-fixes",
+        prompt_fiber_id: "constitution-shuttle-ctl-ux-fixes"
+      )
+
+    assert prompt =~ "Fiber: constitution-shuttle-ctl-ux-fixes"
+    refute prompt =~ "Fiber: ai-futures/shuttle/constitution-shuttle-ctl-ux-fixes"
+  end
+
   test "session_name uses fiber leaf plus shuttle suffix" do
     assert Dispatcher.session_name("tests/haiku") == "haiku-shuttle"
     assert Dispatcher.session_name("a/b/c") == "c-shuttle"
