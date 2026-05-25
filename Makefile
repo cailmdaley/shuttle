@@ -13,7 +13,7 @@
 # never implies rebuilding the other; `make all` does both.
 
 LOG := $(HOME)/Library/Logs/shuttle.log
-PIDPATTERN := bin/shuttle.*-extra.*start
+PIDPATTERN := bin/shuttle -B .* -extra bin/shuttle start
 CLI_DEST := $(HOME)/go/bin/shuttle-ctl
 
 .PHONY: all build cli start stop restart logs status clean help
