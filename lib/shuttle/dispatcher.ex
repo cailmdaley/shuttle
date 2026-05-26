@@ -128,7 +128,7 @@ defmodule Shuttle.Dispatcher do
 
       _ ->
         check_opts =
-          [since: run_window_start(prompt_context)]
+          [since: if(force?, do: nil, else: run_window_start(prompt_context))]
           |> then(fn o -> if is_nil(felt_store), do: o, else: [{:felt_store, felt_store} | o] end)
 
         check_resume_intent(fiber_id, fiber, check_opts)

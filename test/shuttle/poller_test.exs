@@ -682,6 +682,50 @@ defmodule Shuttle.PollerTest do
     assert String.starts_with?(run_id, "29990101T080000")
   end
 
+  test "forced standing dispatch honors just-filed resume intent before next scheduled window" do
+    fiber_id = "tests/standing-force-resume-before-window"
+    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
+    MockRunner.set_fiber(fiber_id, fiber)
+
+    MockRunner.set_shuttle(
+      fiber_id,
+      """
+      enabled: true
+      kind: standing
+      agent: claude-sonnet
+      schedule:
+        expr: "0 9 * * 1-5"
+        tz: Europe/Paris
+      review:
+        state: awaiting
+        run_id: "adhoc-1779793385922"
+        completed_at: "2026-05-26T12:40:00Z"
+      session:
+        id: stored-standing-session-id
+      next_due_at: "2999-01-01T09:00:00+01:00"
+      """
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_standing_force_resume_before_window,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    append_review_comment(fiber_id, resume_mode: "previous")
+
+    assert {:ok, _session} = Poller.dispatch_fiber(poller, fiber_id, force: true)
+
+    script_path = new_session_scripts() |> List.last()
+    assert script_path, "expected at least one new-session script"
+    script = File.read!(script_path)
+
+    assert script =~ "--resume"
+    assert script =~ "stored-standing-session-id"
+  end
+
   test "force-dispatch runs a closed fiber while leaving its status untouched" do
     # Manual "New session" / "Resume" buttons on a closed kanban card must
     # spawn a worker even though the fiber is closed (composted/tempered).
