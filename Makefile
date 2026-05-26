@@ -18,6 +18,22 @@ CLI_DEST := $(HOME)/go/bin/shuttle-ctl
 
 .PHONY: all build cli start stop restart logs status clean help
 
+# share/agents.json is the single source of truth for the agent registry.
+# The Elixir daemon reads it at compile/runtime. The Go CLI reads it at
+# runtime via FindSharePath, falling back to an embedded copy when the
+# share/ dir isn't adjacent to the binary. That embedded copy lives in
+# pkg/schema/agents_embedded.go and is regenerated from share/agents.json
+# by this rule — never hand-edit the .go file.
+pkg/schema/agents_embedded.go: share/agents.json
+	@printf '%s\n' 'package schema' '' \
+	  '// embeddedAgentJSON is generated from share/agents.json by `make` —' \
+	  '// do not hand-edit. Run `make pkg/schema/agents_embedded.go` (or any' \
+	  '// target that depends on it, e.g. `make cli`) to regenerate.' \
+	  'var embeddedAgentJSON = []byte(`' > $@
+	@cat $< >> $@
+	@printf '%s\n' '`)' >> $@
+	@echo "regenerated $@ from $<"
+
 help:
 	@echo "shuttle daemon:"
 	@echo "  make build    — rebuild bin/shuttle escript (MIX_ENV=dev)"
@@ -43,7 +59,7 @@ build:
 # Build the Go CLI and install to $(CLI_DEST). `go install ./cmd/shuttle`
 # would output as `shuttle` (matches cobra Use:), so we use `go build -o`
 # to land it under the historical `shuttle-ctl` name.
-cli:
+cli: pkg/schema/agents_embedded.go
 	@go build -o $(CLI_DEST) ./cmd/shuttle
 	@echo "shuttle-ctl → $(CLI_DEST) ($$($(CLI_DEST) --help 2>/dev/null | head -1))"
 

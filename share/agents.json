@@ -18,6 +18,15 @@
     "default": false
   },
   {
+    "id": "claude-opus-chrome",
+    "cli": "claude",
+    "wrapper": "claude",
+    "model": "opus",
+    "extra_flags": "--dangerously-skip-permissions --chrome",
+    "aliases": [],
+    "default": false
+  },
+  {
     "id": "claude-haiku",
     "cli": "claude",
     "wrapper": "claude",
