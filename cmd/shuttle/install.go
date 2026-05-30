@@ -15,6 +15,7 @@ func newInstallCmd() *cobra.Command {
 	var (
 		installModel       string
 		installProjectDir  string
+		installHost        string
 		installDisabled    bool
 		installInteractive bool
 	)
@@ -63,13 +64,22 @@ Use 'shuttle repeat' for standing (recurring) roles.`,
 			// dispatch it"; the failure case is "I passed a flag that
 			// conflicts with what's already there."
 			if f.Block != nil {
-				return reportExistingBlock(cmd, args[0], f, installModel, installDisabled, installProjectDir, installInteractive)
+				return reportExistingBlock(cmd, args[0], f, installModel, installDisabled, installProjectDir, installInteractive, installHost)
+			}
+
+			// Stamp host so the block is born owned. Default to the local
+			// daemon's own_host_id; --host installs a block destined for
+			// another daemon.
+			host, err := resolveOwnHost(installHost)
+			if err != nil {
+				return err
 			}
 
 			block := &schema.Block{
 				Enabled:     !installDisabled,
 				Kind:        "oneshot",
 				Interactive: installInteractive,
+				Host:        host,
 			}
 
 			if installModel != "" {
@@ -118,6 +128,7 @@ Use 'shuttle repeat' for standing (recurring) roles.`,
 				state = "disabled (paused)"
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "installed %s as oneshot role (%s)\n", args[0], state)
+			fmt.Fprintf(cmd.OutOrStdout(), "  host: %s\n", block.Host)
 			if block.Agent != "" {
 				fmt.Fprintf(cmd.OutOrStdout(), "  agent: %s\n", block.Agent)
 			}
@@ -139,6 +150,7 @@ Use 'shuttle repeat' for standing (recurring) roles.`,
 	}
 	cmd.Flags().StringVarP(&installModel, "model", "m", "", "Agent ID (default: registry default)")
 	cmd.Flags().StringVar(&installProjectDir, "project-dir", "", "Worker cwd on the target host (required unless --disabled)")
+	cmd.Flags().StringVar(&installHost, "host", "", "Owning daemon's host id (default: local daemon's own_host_id; set for cross-host install)")
 	cmd.Flags().BoolVar(&installDisabled, "disabled", false, "Install with enabled=false (lands in drafts; use 'shuttle resume' to dispatch)")
 	cmd.Flags().BoolVar(&installInteractive, "interactive", false, "Dispatch in interactive mode (worker stays alive after initial task)")
 	return cmd
@@ -152,7 +164,7 @@ Use 'shuttle repeat' for standing (recurring) roles.`,
 // default" from "user explicitly passed the value" — only explicit
 // disagreements raise conflicts, so a plain `install <fiber>` with no
 // flags is always a pure state query.
-func reportExistingBlock(cmd *cobra.Command, fiberID string, f *schema.FiberFile, model string, disabled bool, projectDir string, interactive bool) error {
+func reportExistingBlock(cmd *cobra.Command, fiberID string, f *schema.FiberFile, model string, disabled bool, projectDir string, interactive bool, host string) error {
 	b := f.Block
 	out := cmd.OutOrStdout()
 	errOut := cmd.ErrOrStderr()
@@ -202,8 +214,14 @@ func reportExistingBlock(cmd *cobra.Command, fiberID string, f *schema.FiberFile
 	disabledChanged := cmd.Flags().Changed("disabled")
 	projectDirChanged := cmd.Flags().Changed("project-dir")
 	interactiveChanged := cmd.Flags().Changed("interactive")
+	hostChanged := cmd.Flags().Changed("host")
 
 	var mismatches []string
+	if hostChanged && strings.TrimSpace(host) != b.Host {
+		mismatches = append(mismatches,
+			fmt.Sprintf("--host %s ≠ current host %q  →  shuttle-ctl uninstall %s && shuttle-ctl install %s --host %s",
+				host, b.Host, fiberID, fiberID, host))
+	}
 	if modelChanged && model != b.Agent {
 		mismatches = append(mismatches,
 			fmt.Sprintf("--model %s ≠ current agent %q  →  shuttle-ctl set-model %s %s",
@@ -250,6 +268,7 @@ func writeBlockSummary(out io.Writer, b *schema.Block, statusNow string, statusC
 	fmt.Fprintln(out, "Current block:")
 	fmt.Fprintf(out, "  kind:        %s\n", nonEmpty(b.Kind, "(unset)"))
 	fmt.Fprintf(out, "  enabled:     %v\n", b.Enabled)
+	fmt.Fprintf(out, "  host:        %s\n", nonEmpty(b.Host, "(unset — NOT eligible on any daemon)"))
 	if b.Interactive {
 		fmt.Fprintln(out, "  interactive: true")
 	}

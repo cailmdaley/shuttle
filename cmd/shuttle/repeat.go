@@ -13,6 +13,7 @@ var (
 	repeatTZ         string
 	repeatModel      string
 	repeatProjectDir string
+	repeatHost       string
 )
 
 var repeatCmd = &cobra.Command{
@@ -39,11 +40,17 @@ The running daemon picks it up on its next poll.`,
 			return err
 		}
 
+		host, err := resolveOwnHost(repeatHost)
+		if err != nil {
+			return err
+		}
+
 		block := &schema.Block{
 			Enabled:     true,
 			Kind:        "standing",
 			Interactive: true,
 			ProjectDir:  projectDir,
+			Host:        host,
 			Schedule: &schema.Schedule{
 				Expr: repeatSchedule,
 				TZ:   repeatTZ,
@@ -90,6 +97,7 @@ The running daemon picks it up on its next poll.`,
 		}
 
 		fmt.Printf("installed %s as standing role\n", args[0])
+		fmt.Printf("  host:     %s\n", block.Host)
 		fmt.Printf("  schedule: %s (%s)\n", repeatSchedule, repeatTZ)
 		if block.Agent != "" {
 			fmt.Printf("  agent:    %s\n", block.Agent)
@@ -113,6 +121,7 @@ func init() {
 	repeatCmd.Flags().StringVarP(&repeatTZ, "tz", "z", "UTC", "IANA timezone name (default: UTC)")
 	repeatCmd.Flags().StringVarP(&repeatModel, "model", "m", "", "Agent ID (default: registry default)")
 	repeatCmd.Flags().StringVar(&repeatProjectDir, "project-dir", "", "Worker cwd on the target host (required)")
+	repeatCmd.Flags().StringVar(&repeatHost, "host", "", "Owning daemon's host id (default: local daemon's own_host_id; set for cross-host install)")
 	_ = repeatCmd.MarkFlagRequired("schedule")
 	rootCmd.AddCommand(repeatCmd)
 }

@@ -21,7 +21,8 @@
     },
     "host": {
       "type": "string",
-      "description": "Machine id that owns dispatch for this fiber. Daemons default absent/empty host to local and only dispatch blocks whose host matches their configured shuttle host id."
+      "minLength": 1,
+      "description": "Machine id (own_host_id) of the daemon that owns dispatch for this fiber. The dispatch predicate is strict: a daemon dispatches a block iff block.host == its own_host_id. There is no nil-wildcard and no 'local' default — an absent/empty host is unowned and ineligible on every daemon. install/repeat stamp this by default; required when enabled=true."
     },
     "project_dir": {
       "type": "string",
@@ -97,7 +98,7 @@
         "properties": { "enabled": { "const": true } }
       },
       "then": {
-        "required": ["project_dir"]
+        "required": ["project_dir", "host"]
       }
     }
   ],

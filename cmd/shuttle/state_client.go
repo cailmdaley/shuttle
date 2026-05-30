@@ -124,6 +124,35 @@ func fetchComposite() (*CompositeState, error) {
 	return fetchCompositeFrom(url)
 }
 
+// fetchLocalHost calls GET /api/v1/state and returns the local daemon's
+// own_host_id (the identity the poller compares a block's host: against).
+// This is the authoritative source for stamping host on install/repeat —
+// it's literally the value the dispatch predicate will check. Short timeout:
+// callers fall back to SHUTTLE_HOST / os.Hostname() when the daemon is down.
+func fetchLocalHost() (string, error) {
+	url := daemonURL() + "/api/v1/state"
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("daemon returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var s Snapshot
+	if err := json.Unmarshal(body, &s); err != nil {
+		return "", err
+	}
+	return s.Host, nil
+}
+
 func fetchCompositeFrom(url string) (*CompositeState, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Get(url)

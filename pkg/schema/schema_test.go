@@ -14,7 +14,7 @@ import (
 // ---- Validation tests -------------------------------------------------------
 
 func TestValidate_ValidOneshot(t *testing.T) {
-	b := &Block{Enabled: true, Kind: "oneshot", ProjectDir: "/tmp/project"}
+	b := &Block{Enabled: true, Kind: "oneshot", ProjectDir: "/tmp/project", Host: "test-host"}
 	if errs := Validate(b, nil); len(errs) != 0 {
 		t.Fatalf("expected no errors, got: %v", errs)
 	}
@@ -25,6 +25,7 @@ func TestValidate_ValidStanding(t *testing.T) {
 		Enabled:    true,
 		Kind:       "standing",
 		ProjectDir: "/tmp/project",
+		Host:       "test-host",
 		Schedule:   &Schedule{Expr: "0 9 * * 1-5", TZ: "Europe/Paris"},
 		Review:     &Review{State: "scheduled"},
 	}
@@ -44,11 +45,40 @@ func TestValidate_EnabledRequiresProjectDir(t *testing.T) {
 	}
 }
 
+func TestValidate_EnabledRequiresHost(t *testing.T) {
+	// An enabled block must carry a host: the strict dispatch predicate has no
+	// wildcard, so a host-less enabled block would silently never dispatch.
+	b := &Block{Enabled: true, Kind: "oneshot", ProjectDir: "/tmp/project"}
+	errs := Validate(b, nil)
+	if len(errs) == 0 {
+		t.Fatal("expected host validation error for enabled host-less block")
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "host" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a host error, got: %v", errs)
+	}
+}
+
+func TestValidate_DisabledAllowsMissingHost(t *testing.T) {
+	// A disabled draft need not be owned yet — resume/install stamps host
+	// when it goes live.
+	b := &Block{Enabled: false, Kind: "oneshot"}
+	if errs := Validate(b, nil); len(errs) != 0 {
+		t.Fatalf("expected no errors for disabled host-less block, got: %v", errs)
+	}
+}
+
 func TestValidate_BadCron(t *testing.T) {
 	b := &Block{
 		Enabled:    true,
 		Kind:       "standing",
 		ProjectDir: "/tmp/project",
+		Host:       "test-host",
 		Schedule:   &Schedule{Expr: "0 25 * * *", TZ: "UTC"},
 	}
 	errs := Validate(b, nil)
@@ -65,6 +95,7 @@ func TestValidate_BadTimezone(t *testing.T) {
 		Enabled:    true,
 		Kind:       "standing",
 		ProjectDir: "/tmp/project",
+		Host:       "test-host",
 		Schedule:   &Schedule{Expr: "0 9 * * *", TZ: "Atlantis/Bermuda"},
 	}
 	errs := Validate(b, nil)
@@ -443,7 +474,7 @@ func TestValidate_UnknownAgent(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(dir, "agents.json"), []byte(agentJSON), 0644)
 	agents, _ := LoadAgentRegistryFromFile(filepath.Join(dir, "agents.json"))
 
-	b := &Block{Enabled: true, Kind: "oneshot", ProjectDir: "/tmp/project", Agent: "unknown-agent"}
+	b := &Block{Enabled: true, Kind: "oneshot", ProjectDir: "/tmp/project", Host: "test-host", Agent: "unknown-agent"}
 	errs := Validate(b, agents)
 	if len(errs) == 0 {
 		t.Fatal("expected validation error for unknown agent")

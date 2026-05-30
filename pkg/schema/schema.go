@@ -191,6 +191,14 @@ func Validate(b *Block, agents *AgentRegistry) ValidationErrors {
 		add("project_dir", "required when enabled=true")
 	}
 
+	// An enabled block must declare which daemon owns it. The dispatch
+	// predicate is strict block.host == own_host_id with no wildcard, so a
+	// host-less enabled block would silently never dispatch. install/repeat
+	// stamp host by default; this guards the invariant at the write boundary.
+	if b.Enabled && strings.TrimSpace(b.Host) == "" {
+		add("host", "required when enabled=true (the owning daemon's host id; install/repeat stamp it by default)")
+	}
+
 	if b.Agent != "" && agents != nil {
 		if _, ok := agents.Find(b.Agent); !ok {
 			ids := agents.IDs()
