@@ -10,7 +10,7 @@ defmodule ShuttleWeb.LifecycleController do
 
   use Phoenix.Controller, formats: [:json]
 
-  @allowed ~w(install pause resume repeat accept set-model uninstall)
+  @allowed ~w(install pause resume repeat accept set-model set-interactive uninstall)
 
   def create(conn, params) do
     with {:ok, action} <- action(params),
@@ -41,6 +41,7 @@ defmodule ShuttleWeb.LifecycleController do
     args = add_string_flag(args, "--model", params["model"])
     args = add_string_flag(args, "--project-dir", params["project_dir"])
     args = add_bool_flag(args, "--disabled", params["disabled"])
+    args = add_bool_flag(args, "--interactive", params["interactive"])
     {:ok, args}
   end
 
@@ -63,6 +64,10 @@ defmodule ShuttleWeb.LifecycleController do
 
   defp args_for("set-model", %{"fiber" => fiber, "agent" => agent}),
     do: {:ok, ["set-model", fiber, agent]}
+
+  defp args_for("set-interactive", %{"fiber" => fiber, "interactive" => interactive})
+       when is_boolean(interactive),
+       do: {:ok, ["set-interactive", fiber, to_string(interactive)]}
 
   defp args_for("uninstall", %{"fiber" => fiber}), do: {:ok, ["uninstall", fiber]}
   defp args_for(action, _), do: {:error, "missing required fields for #{action}"}

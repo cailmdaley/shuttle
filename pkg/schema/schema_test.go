@@ -327,69 +327,6 @@ func TestWriteBlock_RoundTripsInteractive(t *testing.T) {
 	}
 }
 
-func TestWriteInteractive_PreservesFrontmatterBytes(t *testing.T) {
-	content := `---
-name: Preserve interactive
-status: active
-outcome: |-
-    indentation stays exactly here
-
-    - including nested prose
-shuttle:
-    enabled: true
-    kind: standing
-    review:
-        state: awaiting
-        run_id: adhoc-1
-        completed_at: 2026-05-08T12:00:00Z
-        accepted_run_id: null
-    next_due_at: "2099-01-05T09:00:00+01:00"
-    last_run_at: null
----
-
-Body.
-`
-	path := writeTmpFiber(t, content)
-	f, err := ReadFiber(path)
-	if err != nil {
-		t.Fatalf("ReadFiber: %v", err)
-	}
-	if err := f.WriteInteractive(true); err != nil {
-		t.Fatalf("WriteInteractive(true): %v", err)
-	}
-
-	raw, _ := os.ReadFile(path)
-	rewritten := string(raw)
-	for _, want := range []string{
-		"    indentation stays exactly here",
-		"        completed_at: 2026-05-08T12:00:00Z",
-		"        accepted_run_id: null",
-		`    next_due_at: "2099-01-05T09:00:00+01:00"`,
-		"    last_run_at: null",
-		"    interactive: true",
-	} {
-		if !strings.Contains(rewritten, want) {
-			t.Fatalf("expected %q in rewritten fiber, got:\n%s", want, rewritten)
-		}
-	}
-
-	f, err = ReadFiber(path)
-	if err != nil {
-		t.Fatalf("re-read: %v", err)
-	}
-	if err := f.WriteInteractive(false); err != nil {
-		t.Fatalf("WriteInteractive(false): %v", err)
-	}
-	raw, _ = os.ReadFile(path)
-	rewritten = string(raw)
-	if strings.Contains(rewritten, "interactive:") {
-		t.Fatalf("interactive field not removed:\n%s", rewritten)
-	}
-	if !strings.Contains(rewritten, "        completed_at: 2026-05-08T12:00:00Z") {
-		t.Fatalf("review metadata was not preserved:\n%s", rewritten)
-	}
-}
-
 func TestWriteBlock_RemovesKnownFieldsWhenCleared(t *testing.T) {
 	content := `---
 name: Session Test

@@ -62,6 +62,7 @@ shuttle-ctl repeat <fiber> --schedule "0 9 * * 1-5" --tz Europe/Paris --project-
 shuttle-ctl pause <fiber>                       # disable + kill live worker; --no-kill preserves it
 shuttle-ctl resume / accept <fiber>
 shuttle-ctl set-model <fiber> <agent-id>
+shuttle-ctl set-interactive <fiber> <true|false>
 shuttle-ctl dispatch <fiber>
 shuttle-ctl snapshot
 shuttle-ctl abort / attach <fiber>

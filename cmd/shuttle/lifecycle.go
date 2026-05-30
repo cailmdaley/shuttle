@@ -485,7 +485,8 @@ both autonomous dispatch.`,
 			return err
 		}
 
-		if err := f.WriteInteractive(value); err != nil {
+		f.Block.Interactive = value
+		if err := f.WriteBlock(f.Block); err != nil {
 			return fmt.Errorf("writing fiber: %w", err)
 		}
 
