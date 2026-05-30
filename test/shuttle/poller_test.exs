@@ -53,6 +53,20 @@ defmodule Shuttle.PollerTest do
     # The status defaults to "active" — pass an explicit value for tests that
     # verify eligibility gates (closed, untracked, etc.).
     def set_shuttle(id, yaml, status \\ "active") do
+      # Post-cutover, every installed block carries an explicit `host:` equal
+      # to the owning daemon's own_host_id (the strict eligibility predicate
+      # has no nil-wildcard). The factory mirrors that: a block whose YAML
+      # omits `host:` is stamped with the test daemon's identity
+      # ("test-host", set via SHUTTLE_HOST in config/test.exs) so generic
+      # dispatch tests stay eligible. Host-specific tests pass an explicit
+      # `host:` line, which wins.
+      yaml =
+        if Regex.match?(~r/^\s*host\s*:/m, yaml) do
+          yaml
+        else
+          String.trim_trailing(yaml) <> "\nhost: test-host\n"
+        end
+
       felt_dir = "/tmp/.felt"
       segments = String.split(id, "/")
       basename = List.last(segments)
@@ -1323,6 +1337,132 @@ defmodule Shuttle.PollerTest do
     assert retry.attempt == 1
   end
 
+  # Regression for the 2026-05-30 incident: a cineca/candide restart resurrected
+  # Mac-owned Portolan constitutions locally because the orphan-resurrection
+  # path never read `host`. The cutover routes resurrection through the same
+  # strict predicate as the poll path — a fiber owned by another host is not
+  # this daemon's orphan to resurrect.
+  test "poller does not resurrect a foreign-host orphaned oneshot" do
+    fiber_id = "tests/orphan-foreign-host"
+
+    MockRunner.set_shuttle(fiber_id, """
+    enabled: true
+    kind: oneshot
+    host: some-other-machine
+    session:
+      id: 577af64b-644a-4733-9e6a-f60d86b6941f
+      dispatched_at: 2026-05-24T10:36:35.176394Z
+    """)
+
+    # No add_tmux_session — the dispatched session has died. own_host_id is the
+    # default "test-host", which does not equal "some-other-machine".
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_resurrect_foreign_host,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    # Give the reconcile pass time to (not) act.
+    Process.sleep(150)
+
+    snap = Poller.snapshot(poller)
+    refute Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id)),
+           "a foreign-host orphan must never be resurrected on this daemon"
+    assert snap.claimed_count == 0
+
+    refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
+  end
+
+  # The project_dir disqualifier applies to resurrection too: a checkout that
+  # does not exist on this host means the worker can't run here, owned or not.
+  test "poller does not resurrect an orphan whose declared project_dir is missing" do
+    fiber_id = "tests/orphan-missing-project-dir"
+
+    MockRunner.set_shuttle(fiber_id, """
+    enabled: true
+    kind: oneshot
+    host: test-host
+    project_dir: /nonexistent/path/shuttle-orphan-missing
+    session:
+      id: 577af64b-644a-4733-9e6a-f60d86b6941f
+      dispatched_at: 2026-05-24T10:36:35.176394Z
+    """)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_resurrect_missing_project_dir,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    Process.sleep(150)
+
+    snap = Poller.snapshot(poller)
+    refute Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id)),
+           "an orphan with a missing project_dir must not be resurrected here"
+    assert snap.claimed_count == 0
+  end
+
+  # The poll path: an absent host: is unowned everywhere (no nil-wildcard).
+  # This is the failure mode that, before the cutover, made the wrong daemon
+  # grab single-host work. Distinct from the wrong-host case (host present but
+  # mismatched) — here host is structurally absent.
+  test "poller treats a host-less fiber as ineligible (absent host is unowned)" do
+    fiber_id = "tests/host-absent"
+
+    # Write the .md file directly (discovery walks files), bypassing the
+    # factory's host injection so the block genuinely has no host: key —
+    # exercising the literal "absent host" branch. The fiber is discovered
+    # (it carries a shuttle block) but unowned, hence ineligible everywhere.
+    dir_path = Path.join(["/tmp/.felt", fiber_id <> ".md"])
+    File.mkdir_p!(Path.dirname(dir_path))
+
+    File.write!(dir_path, """
+    ---
+    status: active
+    shuttle:
+      enabled: true
+      kind: oneshot
+      agent: claude-sonnet
+    ---
+    body
+    """)
+
+    fiber = make_fiber(fiber_id)
+
+    MockRunner.set_fiber(
+      fiber_id,
+      Map.put(fiber, "shuttle", %{"enabled" => true, "kind" => "oneshot", "agent" => "claude-sonnet"})
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_host_absent,
+        runner: MockRunner,
+        own_host_id: "test-host",
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    send(poller, :run_poll_cycle)
+    Process.sleep(50)
+
+    snap = Poller.snapshot(poller)
+    assert snap.eligible == []
+    assert snap.claimed_count == 0
+
+    refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
+  after
+    File.rm_rf!(Path.join(["/tmp/.felt", "tests/host-absent.md"]))
+  end
+
   test "poller does not resurrect a standing role even when its session.id is stale" do
     # Standing roles use review.state for lifecycle, not session.id presence;
     # an old session.id is the historical marker for the most recent run, not
@@ -1493,13 +1633,19 @@ defmodule Shuttle.PollerTest do
     File.rm_rf(Path.join(System.tmp_dir!(), "shuttle-test-proj-*"))
   end
 
-  test "poller falls back to felt_store when shuttle.project_dir does not exist" do
+  test "poller disqualifies (does not downgrade) a fiber whose declared project_dir is missing" do
+    # A declared project_dir absent on this host means the checkout lives on
+    # another machine. The pre-cutover behavior downgraded the worker cwd to a
+    # felt store and dispatched anyway (native-desktop misdispatch root cause
+    # #2); the cutover makes it *ineligible* — disqualify, don't downgrade.
+    # host: test-host matches so the only disqualifier under test is the dir.
     fiber = make_fiber("tests/missing-project-dir")
     MockRunner.set_fiber("tests/missing-project-dir", fiber)
 
     MockRunner.set_shuttle("tests/missing-project-dir", """
     enabled: true
     kind: oneshot
+    host: test-host
     project_dir: /nonexistent/path/shuttle-test-missing
     """)
 
@@ -1514,13 +1660,11 @@ defmodule Shuttle.PollerTest do
     send(poller, :run_poll_cycle)
     Process.sleep(100)
 
-    {_, args} =
-      Enum.find(MockRunner.commands(), fn {cmd, args} ->
-        cmd == "tmux" and hd(args) == "new-session"
-      end)
+    refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
 
-    # work_dir should fall back to the felt store
-    assert Enum.at(args, 5) == "/tmp"
+    assert Poller.snapshot(poller).eligible == []
   end
 
   test "poller adopts orphan sessions with literal hyphenated fiber ids" do
@@ -1533,7 +1677,8 @@ defmodule Shuttle.PollerTest do
       Map.put(fiber, "shuttle", %{
         "enabled" => true,
         "kind" => "oneshot",
-        "agent" => "claude-sonnet"
+        "agent" => "claude-sonnet",
+        "host" => "test-host"
       })
     )
 

@@ -284,7 +284,7 @@ defmodule Shuttle.Poller do
       tick_timer_ref: nil,
       tick_token: nil,
       felt_stores: felt_stores,
-      own_host_id: to_string(own_host_id || "local"),
+      own_host_id: to_string(own_host_id),
       auto_discover_felt_stores: auto_discover,
       runner: runner
     }
@@ -720,9 +720,17 @@ defmodule Shuttle.Poller do
       end
 
     cond do
-      # Only daemons targeting this host should act. A foreign-host fiber
-      # whose remote daemon is healthy must not get poked from here.
-      not host_pin_matches?(shuttle, state.own_host_id) ->
+      # Only the owning daemon may resurrect. A fiber owned by another host
+      # (or unowned — absent host:) is not this daemon's orphan; leave it for
+      # the owning daemon or the kanban. This is the load-bearing gate: a
+      # remote restart must never re-grab a Mac-owned fiber whose loom-synced
+      # block still carries a stale session UUID (the 2026-05-30 incident).
+      not host_owned?(shuttle, state.own_host_id) ->
+        state
+
+      # A declared project_dir absent on this host disqualifies resurrection
+      # too — same rule as the poll path.
+      not project_dir_available?(shuttle) ->
         state
 
       # Standing roles use review.state, not session.id, for lifecycle.
@@ -1211,10 +1219,15 @@ defmodule Shuttle.Poller do
         Map.get(shuttle, "enabled", false) != true ->
           false
 
-        # Must target this daemon. Missing host: is a nil-pin (no opinion);
-        # the fiber is eligible on whatever daemon reads it. Explicit host:
-        # must equal this daemon's own_host_id exactly.
-        not host_pin_matches?(shuttle, state.own_host_id) ->
+        # Must target this daemon. Exactly `block.host == own_host_id`; an
+        # absent host is unowned and ineligible everywhere (no wildcard, no
+        # "local" default).
+        not host_owned?(shuttle, state.own_host_id) ->
+          false
+
+        # A declared project_dir must exist on this host — disqualify, don't
+        # downgrade the worker cwd to a felt store.
+        not project_dir_available?(shuttle) ->
           false
 
         # Must be committed to active work
@@ -1285,7 +1298,7 @@ defmodule Shuttle.Poller do
     cond do
       not is_map(shuttle) -> false
       human_worker?(fiber) -> false
-      not host_pin_matches?(shuttle, state.own_host_id) -> false
+      not host_owned?(shuttle, state.own_host_id) -> false
       true -> true
     end
   end
@@ -1297,7 +1310,7 @@ defmodule Shuttle.Poller do
 
     with true <- is_map(shuttle),
          true <- Map.get(shuttle, "enabled", false) == true,
-         true <- host_pin_matches?(shuttle, state.own_host_id),
+         true <- host_owned?(shuttle, state.own_host_id),
          true <- status in ["open", "active"],
          {:ok, role} <- fetch_standing_role(fiber_id, state),
          true <- StandingRole.standing?(role),
@@ -1327,32 +1340,45 @@ defmodule Shuttle.Poller do
     end
   end
 
-  # Read a fiber's `shuttle.host` *pin*. The pin is an explicit declaration
-  # of which daemon owns this fiber's dispatch — a string equal to some
-  # daemon's `own_host_id`. Returns `nil` when the field is absent or empty.
+  # THE single host-ownership predicate. A fiber is owned by this daemon when
+  # its shuttle block carries an explicit `host:` equal to this daemon's
+  # `own_host_id`. There is no `nil`-as-wildcard and no `"local"` default: an
+  # absent or empty `host:` is unowned everywhere and therefore ineligible on
+  # every daemon — loud (the fiber simply never dispatches and the absence is
+  # visible in its frontmatter), never silently mis-dispatched on the wrong
+  # machine. Every dispatch path (poll, force, standing, orphan-resurrection)
+  # routes through this one function.
   #
-  # A `nil` pin means "no opinion": the fiber is eligible on whatever
-  # daemon happens to read it. An explicit pin must match exactly. The
-  # historical literal `"local"` default — synthesizing an opinion the
-  # fiber never asked for — was the source of a class of "ineligible
-  # forever" bugs and is gone.
-  defp shuttle_host_pin(shuttle) when is_map(shuttle) do
+  # Three pre-cutover failure modes this collapses:
+  #   - `(block.host || "local")` default → host-less fibers matched the
+  #     literal "local" daemon (which no real daemon advertised) → ineligible
+  #     everywhere, silently.
+  #   - `nil`-pin-as-wildcard → host-less fibers matched *every* daemon → the
+  #     wrong machine grabbed single-host work.
+  # Strict equality removes both: a block is owned by exactly one named host.
+  defp host_owned?(shuttle, own_host_id) when is_map(shuttle) do
     case Map.get(shuttle, "host") do
-      host when is_binary(host) and host != "" -> host
-      _ -> nil
+      host when is_binary(host) and host != "" -> host == own_host_id
+      _ -> false
     end
   end
 
-  defp shuttle_host_pin(_), do: nil
+  defp host_owned?(_, _), do: false
 
-  # A fiber's host pin matches this daemon's own identity when the pin is
-  # `nil` (no opinion) or equals `own_host_id` exactly.
-  defp host_pin_matches?(shuttle, own_host_id) do
-    case shuttle_host_pin(shuttle) do
-      nil -> true
-      pin -> pin == own_host_id
+  # A declared `project_dir` must exist on THIS host. Present-but-missing means
+  # the fiber's checkout lives on another machine — disqualify here rather than
+  # silently downgrading the worker cwd to a felt store (the native-desktop
+  # misdispatch root cause #2). This *disqualifies, does not downgrade*. An
+  # absent/empty project_dir is governed by install-time schema validation
+  # (enabled blocks must carry one), not re-litigated at every poll.
+  defp project_dir_available?(shuttle) when is_map(shuttle) do
+    case Map.get(shuttle, "project_dir") do
+      dir when is_binary(dir) and dir != "" -> File.dir?(Path.expand(dir))
+      _ -> true
     end
   end
+
+  defp project_dir_available?(_), do: true
 
   @doc """
   Resolves this daemon's `own_host_id` — the identity it advertises for the

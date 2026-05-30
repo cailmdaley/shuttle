@@ -48,6 +48,16 @@ defmodule ShuttleWeb.SnapshotChannelTest do
     # status defaults to "active" — pass an explicit value for tests that verify
     # eligibility gates (closed, untracked, etc.).
     def set_shuttle(id, yaml, status \\ "active") do
+      # Post-cutover every installed block carries an explicit host: equal to
+      # the owning daemon's own_host_id (strict eligibility, no nil-wildcard).
+      # Stamp the test daemon's identity ("test-host", from SHUTTLE_HOST in
+      # config/test.exs) when the YAML omits host:, so generic dispatch tests
+      # stay eligible. Host-specific tests pass an explicit host: line.
+      yaml =
+        if Regex.match?(~r/^\s*host\s*:/m, yaml),
+          do: yaml,
+          else: String.trim_trailing(yaml) <> "\nhost: test-host\n"
+
       felt_dir = "/tmp/.felt"
       segments = String.split(id, "/")
       basename = List.last(segments)

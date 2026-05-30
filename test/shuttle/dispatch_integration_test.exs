@@ -697,6 +697,7 @@ defmodule Shuttle.DispatchIntegrationTest do
       enabled: true
       kind: oneshot
       agent: claude-sonnet
+      host: test-host
     ---
     No session UUID in shuttle block.
     """)
@@ -749,6 +750,7 @@ defmodule Shuttle.DispatchIntegrationTest do
       enabled: true
       kind: oneshot
       agent: claude-sonnet
+      host: test-host
     ---
     No session UUID; dispatch will block.
     """)

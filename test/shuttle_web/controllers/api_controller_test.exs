@@ -58,6 +58,16 @@ defmodule ShuttleWeb.APIControllerTest do
     # Write a real .md file carrying the given shuttle: block and felt status so
     # that walk_shuttle_fibers (the file-walk discovery path) can find it.
     def set_shuttle(id, yaml, status \\ "active") do
+      # Post-cutover every installed block carries an explicit host: equal to
+      # the owning daemon's own_host_id (strict eligibility, no nil-wildcard).
+      # Stamp the test daemon's identity ("test-host", from SHUTTLE_HOST in
+      # config/test.exs) when the YAML omits host:, so generic dispatch tests
+      # stay eligible. Host-specific tests pass an explicit host: line.
+      yaml =
+        if Regex.match?(~r/^\s*host\s*:/m, yaml),
+          do: yaml,
+          else: String.trim_trailing(yaml) <> "\nhost: test-host\n"
+
       felt_dir = "/tmp/.felt"
       segments = String.split(id, "/")
       basename = List.last(segments)
