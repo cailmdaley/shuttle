@@ -5,7 +5,7 @@ defmodule ShuttleWeb.LifecycleController do
   Cross-host lifecycle requests from Portolan land here on the selected
   daemon. The endpoint delegates to the existing shuttle-ctl Go CLI, so the
   validated offline frontmatter writer remains the single implementation of
-  install/pause/resume/repeat/accept/set-model/uninstall.
+  install/pause/resume/repeat/accept/set-model/set-interactive/uninstall.
   """
 
   use Phoenix.Controller, formats: [:json]
