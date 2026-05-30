@@ -465,6 +465,46 @@ agent registry before writing. Removes any existing agent:* felt tag
 	},
 }
 
+var setInteractiveCmd = &cobra.Command{
+	Use:   "set-interactive <fiber> <true|false>",
+	Short: "Change interactive dispatch mode for a fiber",
+	Long: `Updates shuttle.interactive. When true, the dispatcher renders the
+Interactive Mode prompt block and the worker stays alive after its initial
+task for a human to attach. False removes the field; absent and false are
+both autonomous dispatch.`,
+	Args: cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		path, _, _ := resolveFiber(args[0])
+		f := readFiber(path)
+		if f.Block == nil {
+			return fmt.Errorf("fiber %s has no shuttle: block (use 'shuttle install' first)", args[0])
+		}
+
+		value, err := parseBoolArg(args[1])
+		if err != nil {
+			return err
+		}
+
+		if err := f.WriteInteractive(value); err != nil {
+			return fmt.Errorf("writing fiber: %w", err)
+		}
+
+		fmt.Printf("set interactive for %s → %v\n", args[0], value)
+		return nil
+	},
+}
+
+func parseBoolArg(value string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true", "1", "yes", "on":
+		return true, nil
+	case "false", "0", "no", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("expected true or false, got %q", value)
+	}
+}
+
 var uninstallCmd = &cobra.Command{
 	Use:   "uninstall <fiber>",
 	Short: "Remove the shuttle: block from a fiber",
@@ -567,5 +607,6 @@ func init() {
 	rootCmd.AddCommand(setOutcomeCmd)
 	rootCmd.AddCommand(acceptCmd)
 	rootCmd.AddCommand(setModelCmd)
+	rootCmd.AddCommand(setInteractiveCmd)
 	rootCmd.AddCommand(uninstallCmd)
 }

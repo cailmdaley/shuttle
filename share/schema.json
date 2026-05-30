@@ -15,6 +15,10 @@
       "enum": ["oneshot", "standing"],
       "description": "Dispatch mode. oneshot: dispatched once (daemon clears enabled after run). standing: recurring per schedule."
     },
+    "interactive": {
+      "type": "boolean",
+      "description": "When true, the dispatcher renders the Interactive Mode prompt block and the worker leaves the fiber active and the agent alive after its initial autonomous task. Absent or false means autonomous dispatch."
+    },
     "host": {
       "type": "string",
       "description": "Machine id that owns dispatch for this fiber. Daemons default absent/empty host to local and only dispatch blocks whose host matches their configured shuttle host id."
@@ -56,6 +60,11 @@
           "type": ["string", "null"],
           "description": "Current run identifier. Set by daemon when dispatching; ad-hoc standing runs use an adhoc- prefix."
         },
+        "completed_at": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "Completion timestamp for the run awaiting review. Set by daemon or worker handoff when review.state becomes awaiting."
+        },
         "accepted_run_id": {
           "type": ["string", "null"],
           "description": "Run id of the last accepted run. Set by CLI accept."
@@ -93,7 +102,7 @@
     }
   ],
   "notes": {
-    "writer_ownership": "CLI owns: enabled, kind, agent, schedule, review.state (scheduled/accepted transitions), review.accepted_run_id, next_due_at (initial and scheduled-run accept advance). Daemon/workers own: review.state=awaiting at run completion, review.run_id, last_run_at, enabled (false flip after oneshot run). Ad-hoc standing runs preserve next_due_at.",
+    "writer_ownership": "CLI owns: enabled, kind, interactive, agent, schedule, review.state (scheduled/accepted transitions), review.accepted_run_id, next_due_at (initial and scheduled-run accept advance). Daemon/workers own: review.state=awaiting at run completion, review.run_id, review.completed_at, last_run_at, enabled (false flip after oneshot run). Ad-hoc standing runs preserve next_due_at.",
     "derived_states": "due and running are snapshot/view states derived from next_due_at and live worker state. They are not persisted review.state values.",
     "legacy_review_aliases": "Older fibers may carry review.state=review or in_review for awaiting. Readers should normalize them when possible; new writers must use awaiting.",
     "schema_tz_migration": "Pre-CLI standing roles used schedule.timezone. Migration renames to schedule.tz. The Elixir daemon reads tz after migration.",

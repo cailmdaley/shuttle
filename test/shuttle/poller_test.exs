@@ -1132,8 +1132,8 @@ defmodule Shuttle.PollerTest do
     # The old kanban-modal flow had two separate paths: "New session"
     # (ad-hoc, force-fresh) and "Resume" (a special accept-then-dispatch
     # dance via shuttle-ctl resume). Under unified force semantics, BOTH
-    # buttons file a review-comment carrying resume_mode + interactive and
-    # dispatch with force: true. resolve_resume_intent honors the latest
+    # buttons file a review-comment carrying resume_mode and dispatch with
+    # force: true. resolve_resume_intent honors the latest
     # review-comment regardless of dispatch context (oneshot, standing
     # scheduled, standing ad-hoc).
     fiber_id = "tests/force-resume-unified"

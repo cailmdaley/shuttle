@@ -227,6 +227,113 @@ func (f *FiberFile) WriteBlock(block *Block) error {
 	return atomicWrite(f.Path, out.Bytes())
 }
 
+// WriteInteractive updates the shuttle.interactive scalar without
+// re-serializing frontmatter. This is used by the narrow Portolan-facing toggle,
+// where preserving fiber prose and review metadata byte-for-byte matters more
+// than normalizing the full shuttle block.
+func (f *FiberFile) WriteInteractive(interactive bool) error {
+	if f.Block == nil {
+		return fmt.Errorf("missing shuttle block in %s", f.Path)
+	}
+
+	fm, _, err := splitFrontmatter(f.rawContent)
+	if err != nil {
+		return err
+	}
+
+	lines := strings.Split(string(fm), "\n")
+	shuttleIdx := findTopLevelKeyLine(lines, "shuttle")
+	if shuttleIdx < 0 {
+		return fmt.Errorf("missing shuttle block in %s", f.Path)
+	}
+	if strings.TrimSpace(strings.TrimPrefix(lines[shuttleIdx], "shuttle:")) != "" {
+		f.Block.Interactive = interactive
+		return f.WriteBlock(f.Block)
+	}
+
+	baseIndent := leadingSpaces(lines[shuttleIdx])
+	endIdx := len(lines)
+	for i := shuttleIdx + 1; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if leadingSpaces(lines[i]) <= baseIndent {
+			endIdx = i
+			break
+		}
+	}
+
+	childIndent := baseIndent + 2
+	for i := shuttleIdx + 1; i < endIdx; i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		indent := leadingSpaces(lines[i])
+		if indent > baseIndent {
+			childIndent = indent
+			break
+		}
+	}
+
+	interactiveIdx := -1
+	for i := shuttleIdx + 1; i < endIdx; i++ {
+		if leadingSpaces(lines[i]) == childIndent && strings.HasPrefix(strings.TrimSpace(lines[i]), "interactive:") {
+			interactiveIdx = i
+			break
+		}
+	}
+
+	switch {
+	case interactive && interactiveIdx >= 0:
+		lines[interactiveIdx] = strings.Repeat(" ", childIndent) + "interactive: true"
+	case interactive:
+		insertIdx := preferredInteractiveInsertIndex(lines, shuttleIdx, endIdx, childIndent)
+		lines = append(lines, "")
+		copy(lines[insertIdx+1:], lines[insertIdx:])
+		lines[insertIdx] = strings.Repeat(" ", childIndent) + "interactive: true"
+	case interactiveIdx >= 0:
+		lines = append(lines[:interactiveIdx], lines[interactiveIdx+1:]...)
+	}
+
+	var out bytes.Buffer
+	out.WriteString("---\n")
+	out.WriteString(strings.Join(lines, "\n"))
+	out.WriteString("\n---\n")
+	out.Write(f.rawContent[f.bodyStart:])
+	return atomicWrite(f.Path, out.Bytes())
+}
+
+func findTopLevelKeyLine(lines []string, key string) int {
+	prefix := key + ":"
+	for i, line := range lines {
+		if leadingSpaces(line) == 0 && strings.HasPrefix(strings.TrimSpace(line), prefix) {
+			return i
+		}
+	}
+	return -1
+}
+
+func preferredInteractiveInsertIndex(lines []string, shuttleIdx, endIdx, childIndent int) int {
+	for i := shuttleIdx + 1; i < endIdx; i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if leadingSpaces(lines[i]) == childIndent && (strings.HasPrefix(trimmed, "kind:") || strings.HasPrefix(trimmed, "enabled:")) {
+			return i + 1
+		}
+	}
+	return shuttleIdx + 1
+}
+
+func leadingSpaces(line string) int {
+	for i, r := range line {
+		if r != ' ' {
+			return i
+		}
+	}
+	return len(line)
+}
+
 // atomicWrite writes data to path via a temp-file + rename.
 // If the write or sync fails, the original file is untouched.
 func atomicWrite(path string, data []byte) error {
@@ -346,6 +453,7 @@ var knownShuttleKeys = map[string]bool{
 	"enabled":     true,
 	"kind":        true,
 	"mode":        true, // legacy alias; rewritten to kind on the next save
+	"interactive": true,
 	"host":        true,
 	"project_dir": true,
 	"agent":       true,

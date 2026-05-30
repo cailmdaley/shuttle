@@ -191,6 +191,73 @@ Body.
 	}
 }
 
+func TestInstallCmd_WritesInteractive(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	projectDir := t.TempDir()
+	path := writeFiber(t, host, "install-interactive", `---
+name: Install interactive
+status: open
+---
+
+Body.
+`)
+
+	cmd := newInstallCmd()
+	cmd.SetArgs([]string{"install-interactive", "--project-dir", projectDir, "--interactive"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	if !strings.Contains(string(raw), "interactive: true") {
+		t.Fatalf("interactive not written:\n%s", raw)
+	}
+}
+
+func TestSetInteractiveCmd_WritesAndClearsField(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "toggle-interactive", `---
+name: Toggle interactive
+status: active
+shuttle:
+  enabled: true
+  kind: oneshot
+  project_dir: /tmp
+---
+
+Body.
+`)
+
+	if err := setInteractiveCmd.RunE(setInteractiveCmd, []string{"toggle-interactive", "true"}); err != nil {
+		t.Fatalf("set true: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	if !strings.Contains(string(raw), "interactive: true") {
+		t.Fatalf("interactive true not written:\n%s", raw)
+	}
+
+	if err := setInteractiveCmd.RunE(setInteractiveCmd, []string{"toggle-interactive", "false"}); err != nil {
+		t.Fatalf("set false: %v", err)
+	}
+	raw, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	if strings.Contains(string(raw), "interactive:") {
+		t.Fatalf("interactive field not cleared:\n%s", raw)
+	}
+}
+
 func TestInstallCmd_BumpsMissingStatusOnFreshInstall(t *testing.T) {
 	host, cleanup := withTempHost(t)
 	defer cleanup()

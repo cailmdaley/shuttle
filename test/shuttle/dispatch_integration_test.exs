@@ -525,20 +525,41 @@ defmodule Shuttle.DispatchIntegrationTest do
       enabled: true
       kind: oneshot
       agent: claude-sonnet
+      interactive: true
     ---
     A fiber dispatched for live human attachment.
     """)
-
-    append_review_comment(host, "tests/interactive-handoff",
-      summary: "",
-      interactive: true
-    )
 
     prelude = Dispatcher.render_interactive_prelude("tests/interactive-handoff", felt_store: host)
 
     assert prelude =~ "Interactive Mode"
     assert prelude =~ "leave the fiber active"
     assert prelude =~ "close-for-review + `kill $PPID` handoff waits"
+  end
+
+  test "interactive prelude ignores legacy review-comment payload", %{host: host} do
+    write_fiber(host, "tests/legacy-interactive-payload", """
+    ---
+    name: Legacy interactive payload
+    status: active
+    tags:
+      - constitution
+    shuttle:
+      enabled: true
+      kind: oneshot
+      agent: claude-sonnet
+    ---
+    A fiber whose old review-comment payload should not control interactivity.
+    """)
+
+    append_review_comment(host, "tests/legacy-interactive-payload",
+      summary: "",
+      interactive: true
+    )
+
+    assert Dispatcher.render_interactive_prelude("tests/legacy-interactive-payload",
+             felt_store: host
+           ) == ""
   end
 
   # Resume mode requested but no session UUID: fail loudly. "New session" is
@@ -962,6 +983,8 @@ defmodule Shuttle.DispatchIntegrationTest do
 
   # Appends a review-comment event to the fiber's felt history so that
   # check_resume_intent/3 and render_user_message_block/2 can read it.
+  # The interactive option is legacy regression coverage only; dispatcher
+  # interactivity now comes from shuttle.interactive.
   defp append_review_comment(host, id, opts) do
     summary = Keyword.get(opts, :summary, "Requeued")
     resume_mode = Keyword.get(opts, :resume_mode)

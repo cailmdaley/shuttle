@@ -297,6 +297,99 @@ func TestWriteBlock_PreservesProjectDirAndUnknownShuttleFields(t *testing.T) {
 	}
 }
 
+func TestWriteBlock_RoundTripsInteractive(t *testing.T) {
+	path := writeTmpFiber(t, sampleFiber)
+	f, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("ReadFiber: %v", err)
+	}
+
+	if err := f.WriteBlock(&Block{
+		Enabled:     true,
+		Kind:        "oneshot",
+		Interactive: true,
+		ProjectDir:  "/tmp/project",
+	}); err != nil {
+		t.Fatalf("WriteBlock: %v", err)
+	}
+
+	raw, _ := os.ReadFile(path)
+	if !strings.Contains(string(raw), "interactive: true") {
+		t.Fatalf("expected interactive=true in rewritten fiber, got:\n%s", raw)
+	}
+
+	f2, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	if f2.Block == nil || !f2.Block.Interactive {
+		t.Fatalf("expected interactive block after re-read, got %+v", f2.Block)
+	}
+}
+
+func TestWriteInteractive_PreservesFrontmatterBytes(t *testing.T) {
+	content := `---
+name: Preserve interactive
+status: active
+outcome: |-
+    indentation stays exactly here
+
+    - including nested prose
+shuttle:
+    enabled: true
+    kind: standing
+    review:
+        state: awaiting
+        run_id: adhoc-1
+        completed_at: 2026-05-08T12:00:00Z
+        accepted_run_id: null
+    next_due_at: "2099-01-05T09:00:00+01:00"
+    last_run_at: null
+---
+
+Body.
+`
+	path := writeTmpFiber(t, content)
+	f, err := ReadFiber(path)
+	if err != nil {
+		t.Fatalf("ReadFiber: %v", err)
+	}
+	if err := f.WriteInteractive(true); err != nil {
+		t.Fatalf("WriteInteractive(true): %v", err)
+	}
+
+	raw, _ := os.ReadFile(path)
+	rewritten := string(raw)
+	for _, want := range []string{
+		"    indentation stays exactly here",
+		"        completed_at: 2026-05-08T12:00:00Z",
+		"        accepted_run_id: null",
+		`    next_due_at: "2099-01-05T09:00:00+01:00"`,
+		"    last_run_at: null",
+		"    interactive: true",
+	} {
+		if !strings.Contains(rewritten, want) {
+			t.Fatalf("expected %q in rewritten fiber, got:\n%s", want, rewritten)
+		}
+	}
+
+	f, err = ReadFiber(path)
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	if err := f.WriteInteractive(false); err != nil {
+		t.Fatalf("WriteInteractive(false): %v", err)
+	}
+	raw, _ = os.ReadFile(path)
+	rewritten = string(raw)
+	if strings.Contains(rewritten, "interactive:") {
+		t.Fatalf("interactive field not removed:\n%s", rewritten)
+	}
+	if !strings.Contains(rewritten, "        completed_at: 2026-05-08T12:00:00Z") {
+		t.Fatalf("review metadata was not preserved:\n%s", rewritten)
+	}
+}
+
 func TestWriteBlock_RemovesKnownFieldsWhenCleared(t *testing.T) {
 	content := `---
 name: Session Test
@@ -304,6 +397,11 @@ status: active
 shuttle:
   enabled: true
   kind: oneshot
+  interactive: true
+  review:
+    state: awaiting
+    run_id: adhoc-1
+    completed_at: 2026-05-08T12:00:00Z
   session:
     id: old-session
     dispatched_at: 2026-05-08T12:00:00Z
@@ -321,6 +419,7 @@ Body.
 		t.Fatalf("expected session block, got %+v", f.Block)
 	}
 
+	f.Block.Interactive = false
 	f.Block.Session = nil
 	if err := f.WriteBlock(f.Block); err != nil {
 		t.Fatalf("WriteBlock: %v", err)
@@ -330,6 +429,12 @@ Body.
 	rewritten := string(raw)
 	if strings.Contains(rewritten, "session:") {
 		t.Fatalf("known cleared session field was preserved; got:\n%s", rewritten)
+	}
+	if strings.Contains(rewritten, "interactive:") {
+		t.Fatalf("known cleared interactive field was preserved; got:\n%s", rewritten)
+	}
+	if !strings.Contains(rewritten, "completed_at:") || !strings.Contains(rewritten, "2026-05-08T12:00:00Z") {
+		t.Fatalf("completed_at was not preserved; got:\n%s", rewritten)
 	}
 	if !strings.Contains(rewritten, "elixir_only: preserved") {
 		t.Fatalf("unknown field was not preserved; got:\n%s", rewritten)
@@ -418,6 +523,7 @@ func TestBlockUnmarshalJSON_NewFormat(t *testing.T) {
 	data := []byte(`{
 	  "enabled": true,
 	  "kind": "standing",
+	  "interactive": true,
 	  "agent": "claude-sonnet",
 	  "schedule": {"expr": "0 9 * * 1-5", "tz": "Europe/Paris"},
 	  "review": {"state": "scheduled"}
@@ -427,6 +533,9 @@ func TestBlockUnmarshalJSON_NewFormat(t *testing.T) {
 	}
 	if !block.Enabled || block.Kind != "standing" || block.Agent != "claude-sonnet" {
 		t.Fatalf("unexpected block: %+v", block)
+	}
+	if !block.Interactive {
+		t.Fatalf("expected interactive=true, got %+v", block)
 	}
 	if block.Schedule == nil || block.Schedule.TZ != "Europe/Paris" {
 		t.Fatalf("unexpected schedule: %+v", block.Schedule)

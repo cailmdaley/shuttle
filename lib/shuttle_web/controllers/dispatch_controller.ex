@@ -14,7 +14,6 @@ defmodule ShuttleWeb.DispatchController do
     notify_on_exit = Map.get(params, "notify_on_exit", false)
     force = truthy?(Map.get(params, "force", false))
     ad_hoc = truthy?(Map.get(params, "ad_hoc", false))
-    interactive = truthy?(Map.get(params, "interactive", false))
 
     if is_nil(fiber_id) do
       conn
@@ -24,8 +23,7 @@ defmodule ShuttleWeb.DispatchController do
       case Shuttle.Poller.dispatch_fiber(fiber_id,
              notify_on_exit: notify_on_exit,
              force: force or ad_hoc,
-             ad_hoc: ad_hoc,
-             interactive: interactive
+             ad_hoc: ad_hoc
            ) do
         {:ok, session} ->
           json(conn, %{

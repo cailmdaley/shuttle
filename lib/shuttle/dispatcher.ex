@@ -88,7 +88,8 @@ defmodule Shuttle.Dispatcher do
 
           resume_intent ->
             create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent,
-              felt_store: felt_store
+              felt_store: felt_store,
+              shuttle: Map.get(fiber, "shuttle")
             )
         end
       end
@@ -363,34 +364,51 @@ defmodule Shuttle.Dispatcher do
   end
 
   @doc """
-  Reads the most recent `--kind review-comment` event for `fiber_id` and
-  returns a prelude block instructing the worker to stay alive after its
-  initial task — when `payload.interactive == "true"`. Otherwise returns "".
+  Reads the fiber's `shuttle.interactive` field and returns a prelude block
+  instructing the worker to stay alive after its initial task when true.
+  Otherwise returns "".
 
-  The kanban's modal sets `interactive=true` when the user wants to
-  attach to the worker mid-conversation. The prelude creates an exception
-  to the usual worker handoff: the worker leaves the fiber active and
-  waits for the human to take over instead of closing for review and
-  exiting.
+  Interactivity is a property of the shuttle block, not of the latest
+  review-comment. The review-comment channel carries directive text and
+  resume intent; the block carries the interactive/autonomous dispatch mode.
 
   Pass `felt_store:` to control which `.felt/` index is queried.
   """
   @spec render_interactive_prelude(String.t(), keyword()) :: String.t()
   def render_interactive_prelude(fiber_id, opts \\ []) do
-    case query_history(fiber_id, ["--kind", "review-comment", "--last", "1", "--json"], opts) do
-      [event | _] ->
-        if interactive_flag?(get_in(event, ["payload", "interactive"])) do
-          render_block(
-            "Interactive Mode",
-            nil,
-            "A human will attach to this session shortly. Complete the initial task as the constitution describes, then leave the fiber active and the agent alive at a clean checkpoint. In this mode, the usual close-for-review + `kill $PPID` handoff waits until the human is done with the live session."
-          )
-        else
-          ""
+    shuttle = Keyword.get(opts, :shuttle) || query_shuttle_block(fiber_id, opts)
+
+    if interactive_flag?(Map.get(shuttle || %{}, "interactive")) do
+      render_block(
+        "Interactive Mode",
+        nil,
+        "A human will attach to this session shortly. Complete the initial task as the constitution describes, then leave the fiber active and the agent alive at a clean checkpoint. In this mode, the usual close-for-review + `kill $PPID` handoff waits until the human is done with the live session."
+      )
+    else
+      ""
+    end
+  end
+
+  defp query_shuttle_block(fiber_id, opts) do
+    felt_store = Keyword.get(opts, :felt_store, default_felt_store())
+
+    case System.cmd("felt", ["-C", felt_store, "show", fiber_id, "--json"],
+           stderr_to_stdout: true
+         ) do
+      {output, 0} ->
+        case Jason.decode(output) do
+          {:ok, %{} = fiber} ->
+            case Map.get(fiber, "shuttle") do
+              shuttle when is_map(shuttle) -> shuttle
+              _ -> %{}
+            end
+
+          _ ->
+            %{}
         end
 
       _ ->
-        ""
+        %{}
     end
   end
 
@@ -560,7 +578,10 @@ defmodule Shuttle.Dispatcher do
   # `felt history` on arrival, and duplicating either here risks drift
   # between the prompt's snapshot and felt's view.
   defp compose_prompt(header, fiber_id, opts) do
-    felt_opts = [felt_store: Keyword.get(opts, :felt_store, default_felt_store())]
+    felt_opts = [
+      felt_store: Keyword.get(opts, :felt_store, default_felt_store()),
+      shuttle: Keyword.get(opts, :shuttle)
+    ]
 
     # Order: header, exit contract, interactive exception (when set), user
     # message block. The exit contract is always present; the prelude is an

@@ -17,13 +17,14 @@ import (
 // Block is the in-memory representation of the shuttle: YAML block.
 // Fields mirror the JSON schema at share/schema.json.
 type Block struct {
-	Enabled    bool      `json:"enabled" yaml:"enabled"`
-	Kind       string    `json:"kind" yaml:"kind"`
-	Host       string    `json:"host,omitempty" yaml:"host,omitempty"`
-	ProjectDir string    `json:"project_dir,omitempty" yaml:"project_dir,omitempty"`
-	Agent      string    `json:"agent,omitempty" yaml:"agent,omitempty"`
-	Schedule   *Schedule `json:"schedule,omitempty" yaml:"schedule,omitempty"`
-	Review     *Review   `json:"review,omitempty" yaml:"review,omitempty"`
+	Enabled     bool      `json:"enabled" yaml:"enabled"`
+	Kind        string    `json:"kind" yaml:"kind"`
+	Interactive bool      `json:"interactive,omitempty" yaml:"interactive,omitempty"`
+	Host        string    `json:"host,omitempty" yaml:"host,omitempty"`
+	ProjectDir  string    `json:"project_dir,omitempty" yaml:"project_dir,omitempty"`
+	Agent       string    `json:"agent,omitempty" yaml:"agent,omitempty"`
+	Schedule    *Schedule `json:"schedule,omitempty" yaml:"schedule,omitempty"`
+	Review      *Review   `json:"review,omitempty" yaml:"review,omitempty"`
 	// Session is daemon-owned: written at dispatch time, read at resume time.
 	// The CLI preserves it through lifecycle operations (pause/resume/set-model).
 	// Set via 'shuttle session-set'; cleared via 'shuttle session-clear'.
@@ -101,6 +102,7 @@ func (s *Schedule) UnmarshalJSON(data []byte) error {
 type Review struct {
 	State         string  `json:"state,omitempty" yaml:"state,omitempty"`
 	RunID         *string `json:"run_id,omitempty" yaml:"run_id,omitempty"`
+	CompletedAt   string  `json:"completed_at,omitempty" yaml:"completed_at,omitempty"`
 	AcceptedRunID *string `json:"accepted_run_id,omitempty" yaml:"accepted_run_id,omitempty"`
 }
 
@@ -109,17 +111,18 @@ type Review struct {
 // view. Output always normalizes to `Kind`.
 func (b *Block) UnmarshalJSON(data []byte) error {
 	var aux struct {
-		Enabled    bool       `json:"enabled"`
-		Kind       string     `json:"kind"`
-		Mode       string     `json:"mode"`
-		Host       string     `json:"host"`
-		ProjectDir string     `json:"project_dir"`
-		Agent      string     `json:"agent"`
-		Schedule   *Schedule  `json:"schedule"`
-		Review     *Review    `json:"review"`
-		Session    *Session   `json:"session"`
-		NextDueAt  *time.Time `json:"next_due_at"`
-		LastRunAt  *time.Time `json:"last_run_at"`
+		Enabled     bool       `json:"enabled"`
+		Kind        string     `json:"kind"`
+		Mode        string     `json:"mode"`
+		Interactive bool       `json:"interactive"`
+		Host        string     `json:"host"`
+		ProjectDir  string     `json:"project_dir"`
+		Agent       string     `json:"agent"`
+		Schedule    *Schedule  `json:"schedule"`
+		Review      *Review    `json:"review"`
+		Session     *Session   `json:"session"`
+		NextDueAt   *time.Time `json:"next_due_at"`
+		LastRunAt   *time.Time `json:"last_run_at"`
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
@@ -129,6 +132,7 @@ func (b *Block) UnmarshalJSON(data []byte) error {
 	if b.Kind == "" {
 		b.Kind = aux.Mode
 	}
+	b.Interactive = aux.Interactive
 	b.Host = aux.Host
 	b.ProjectDir = aux.ProjectDir
 	b.Agent = aux.Agent
