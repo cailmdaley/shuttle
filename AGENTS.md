@@ -66,7 +66,6 @@ shuttle-ctl set-interactive <fiber> <true|false>
 shuttle-ctl dispatch <fiber>
 shuttle-ctl snapshot
 shuttle-ctl abort / attach <fiber>
-shuttle-ctl migrate --dry-run                 # preview eligibility migration
 ```
 
 ## Critical invariants
@@ -84,9 +83,13 @@ shuttle-ctl migrate --dry-run                 # preview eligibility migration
 - **`shuttle.agent` field drives agent selection.** The `shuttle:` block's
   `agent:` field resolves against the registry. Default agent is
   `claude-sonnet`.
-- **`shuttle.host` field drives daemon affinity.** Absent or empty means
-  `local`; each daemon only dispatches fibers whose `host:` matches its
-  configured `config :shuttle, :host`.
+- **`shuttle.host` field drives daemon affinity — strictly.** A daemon
+  dispatches a block iff `block.host == own_host_id` (its `SHUTTLE_HOST` or
+  `:inet.gethostname()`). There is no `"local"` default and no `nil`
+  wildcard: an absent or empty `host:` is unowned and ineligible on *every*
+  daemon. `shuttle-ctl install`/`repeat` stamp `host` by default so blocks
+  are born owned. The same predicate gates the orphan-resurrection path, so
+  a remote restart can't re-grab another host's fiber.
 - **`shuttle.project_dir` is required for enabled installs.** `shuttle-ctl
   install` and `repeat` require `--project-dir`; workers start there instead
   of falling back to the felt store.
