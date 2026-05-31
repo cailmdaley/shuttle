@@ -27,7 +27,23 @@ defmodule ShuttleWeb.LifecycleControllerTest do
   end
 
   test "set-interactive delegates to shuttle-ctl" do
+    root =
+      System.tmp_dir!()
+      |> Path.join("shuttle-lifecycle-store-#{System.unique_integer([:positive])}")
+
+    store = Path.join(root, "loom")
+    fiber_dir = Path.join([store, ".felt", "tests", "interactive"])
+    File.mkdir_p!(fiber_dir)
+    File.write!(Path.join(fiber_dir, "interactive.md"), "---\nname: Interactive\n---\n\n")
+
     args_file = install_fake_shuttle_ctl!()
+    old_loom_homes = System.get_env("LOOM_HOMES")
+    System.put_env("LOOM_HOMES", store)
+
+    on_exit(fn ->
+      restore_env("LOOM_HOMES", old_loom_homes)
+      File.rm_rf(root)
+    end)
 
     conn =
       post(
@@ -41,7 +57,9 @@ defmodule ShuttleWeb.LifecycleControllerTest do
       )
 
     assert conn.status == 200
-    assert File.read!(args_file) == "set-interactive\ntests/interactive\nfalse\n"
+
+    assert File.read!(args_file) ==
+             "--felt-store\n#{store}\nset-interactive\ntests/interactive\nfalse\n"
   end
 
   defp api_conn do
