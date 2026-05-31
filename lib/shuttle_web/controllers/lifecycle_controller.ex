@@ -10,6 +10,8 @@ defmodule ShuttleWeb.LifecycleController do
 
   use Phoenix.Controller, formats: [:json]
 
+  alias Shuttle.FeltStores
+
   @allowed ~w(install pause resume repeat accept set-model set-interactive uninstall)
 
   def create(conn, params) do
@@ -66,8 +68,11 @@ defmodule ShuttleWeb.LifecycleController do
     do: {:ok, ["set-model", fiber, agent]}
 
   defp args_for("set-interactive", %{"fiber" => fiber, "interactive" => interactive})
-       when is_boolean(interactive),
-       do: {:ok, ["set-interactive", fiber, to_string(interactive)]}
+       when is_boolean(interactive) do
+    with {:ok, host} <- host_for_fiber(fiber) do
+      {:ok, ["--felt-store", host, "set-interactive", fiber, to_string(interactive)]}
+    end
+  end
 
   defp args_for("uninstall", %{"fiber" => fiber}), do: {:ok, ["uninstall", fiber]}
   defp args_for(action, _), do: {:error, "missing required fields for #{action}"}
@@ -86,5 +91,35 @@ defmodule ShuttleWeb.LifecycleController do
     end
   rescue
     e in ErlangError -> {:error, Exception.message(e)}
+  end
+
+  defp host_for_fiber(fiber_id) do
+    FeltStores.configured_hosts()
+    |> Enum.find(&fiber_exists?(&1, fiber_id))
+    |> case do
+      nil -> {:error, "fiber not found: #{fiber_id}"}
+      host -> {:ok, host}
+    end
+  end
+
+  defp fiber_exists?(host, fiber_id) do
+    case exact_fiber_path(host, fiber_id) do
+      {:ok, _path} -> true
+      {:error, _} -> false
+    end
+  end
+
+  defp exact_fiber_path(host, fiber_id) do
+    segments = String.split(fiber_id, "/")
+    basename = List.last(segments)
+    felt_dir = Path.join(host, ".felt")
+    bare_path = Path.join(felt_dir, "#{basename}.md")
+    dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
+
+    cond do
+      not String.contains?(fiber_id, "/") and File.exists?(bare_path) -> {:ok, bare_path}
+      File.exists?(dir_path) -> {:ok, dir_path}
+      true -> {:error, :not_found}
+    end
   end
 end
