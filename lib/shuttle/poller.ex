@@ -35,7 +35,7 @@ defmodule Shuttle.Poller do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias Shuttle.{Actions, Dispatcher, StandingRole, WorkerWatcher}
+  alias Shuttle.{Actions, Dispatcher, RuntimeStore, StandingRole, WorkerWatcher}
 
   @pubsub_topic "shuttle:snapshot"
 
@@ -74,6 +74,8 @@ defmodule Shuttle.Poller do
       :felt_stores,
       # Machine identity used by shuttle.host dispatch affinity.
       :own_host_id,
+      # Host-local SQLite file where daemon runtime state is persisted.
+      :runtime_store_path,
       # When true, felt_stores is re-read from env + persisted registration on
       # each poll cycle. Set true when :felt_stores opt isn't passed to
       # start_link; false when the caller passed an explicit list (tests,
@@ -270,6 +272,11 @@ defmodule Shuttle.Poller do
         _ -> self()
       end
 
+    runtime_store_path =
+      Keyword.get_lazy(opts, :runtime_store_path, &default_runtime_store_path/0)
+
+    :ok = RuntimeStore.init(runtime_store_path)
+
     state = %State{
       self_ref: self_ref,
       poll_interval_ms: Keyword.get(opts, :poll_interval_ms, @default_poll_interval_ms),
@@ -285,14 +292,16 @@ defmodule Shuttle.Poller do
       tick_token: nil,
       felt_stores: felt_stores,
       own_host_id: to_string(own_host_id),
+      runtime_store_path: runtime_store_path,
       auto_discover_felt_stores: auto_discover,
       runner: runner
     }
 
     Logger.info("configured felt stores: #{inspect(felt_stores)}")
 
-    # Adopt existing tmux sessions on startup
-    state = adopt_orphans(state)
+    # Rehydrate the daemon-owned runtime store first, then adopt any live tmux
+    # sessions that predate the store or were created while the daemon was down.
+    state = state |> rehydrate_runtime_store() |> adopt_orphans()
 
     # Schedule first tick immediately
     state = schedule_tick(state, 0)
@@ -1623,33 +1632,21 @@ defmodule Shuttle.Poller do
         agent_name = fetch_shuttle_agent_name(fiber_id, state)
         {:ok, agent} = Shuttle.Agents.resolve_by_name(agent_name)
 
-        # Start a watcher for this worker
-        watcher_opts = [
-          fiber_id: fiber_id,
-          session: session,
-          poller: state.self_ref,
-          runner: state.runner,
-          heartbeat_interval_ms: state.heartbeat_interval_ms
-        ]
+        now = DateTime.utc_now()
 
-        case DynamicSupervisor.start_child(
-               Shuttle.WatcherSupervisor,
-               {WorkerWatcher, watcher_opts}
-             ) do
-          {:ok, watcher_pid} ->
-            now = DateTime.utc_now()
+        running_meta =
+          %{
+            session: session,
+            agent_id: agent.id,
+            started_at: now,
+            last_activity_at: now
+          }
+          |> Map.merge(running_prompt_metadata(prompt_context))
 
-            running_meta =
-              %{
-                pid: watcher_pid,
-                session: session,
-                agent_id: agent.id,
-                started_at: now,
-                last_activity_at: now
-              }
-              |> Map.merge(running_prompt_metadata(prompt_context))
-
+        case start_watcher(state, fiber_id, running_meta) do
+          {:ok, running_meta} ->
             running = Map.put(state.running, fiber_id, running_meta)
+            persist_running(state, fiber_id, running_meta)
 
             state = %{
               state
@@ -1789,6 +1786,66 @@ defmodule Shuttle.Poller do
     %{state | orphans: [orphan | state.orphans]}
   end
 
+  defp rehydrate_runtime_store(%State{} = state) do
+    state.runtime_store_path
+    |> RuntimeStore.list_running()
+    |> Enum.reduce(state, fn %{fiber_id: fiber_id, metadata: metadata}, state_acc ->
+      rehydrate_running_record(state_acc, fiber_id, metadata)
+    end)
+  end
+
+  defp rehydrate_running_record(%State{} = state, fiber_id, metadata) do
+    session = Map.get(metadata, :session, Dispatcher.session_name(fiber_id))
+
+    cond do
+      Map.has_key?(state.running, fiber_id) ->
+        state
+
+      not already_running_session?(state, session) ->
+        Logger.info(
+          "Runtime store record has no live tmux session: #{fiber_id} session=#{session}"
+        )
+
+        state
+        |> record_orphaned_running_worker(fiber_id, metadata)
+        |> delete_persisted_running(fiber_id)
+
+      true ->
+        case fetch_fiber_full(fiber_id, state) do
+          {:ok, fiber} ->
+            if Map.get(fiber, "status") == "closed" do
+              Logger.info(
+                "Runtime store record is closed in felt; killing stale session: #{session}"
+              )
+
+              _ =
+                state.runner.cmd("tmux", ["kill-session", "-t", session], stderr_to_stdout: true)
+
+              delete_persisted_running(state, fiber_id)
+            else
+              case start_watcher(state, fiber_id, metadata) do
+                {:ok, running_meta} ->
+                  Logger.info("Rehydrated runtime worker: #{fiber_id} session=#{session}")
+
+                  %{
+                    state
+                    | running: Map.put(state.running, fiber_id, running_meta),
+                      claimed: MapSet.put(state.claimed, fiber_id)
+                  }
+
+                {:error, reason} ->
+                  Logger.warning("Failed to rehydrate #{session}: #{inspect(reason)}")
+                  state
+              end
+            end
+
+          {:error, _} ->
+            Logger.debug("Runtime store record points at unknown fiber: #{fiber_id}")
+            delete_persisted_running(state, fiber_id)
+        end
+    end
+  end
+
   defp adopt_orphans(%State{} = state) do
     {:ok, sessions} = list_shuttle_sessions(state)
     lookup = candidate_session_lookup(state)
@@ -1807,29 +1864,19 @@ defmodule Shuttle.Poller do
           agent_name = fetch_shuttle_agent_name(fiber_id, state)
           {:ok, agent} = Shuttle.Agents.resolve_by_name(agent_name)
 
-          watcher_opts = [
-            fiber_id: fiber_id,
+          now = DateTime.utc_now()
+
+          running_meta = %{
             session: session,
-            poller: state.self_ref,
-            runner: state.runner,
-            heartbeat_interval_ms: state.heartbeat_interval_ms
-          ]
+            agent_id: agent.id,
+            started_at: now,
+            last_activity_at: now
+          }
 
-          case DynamicSupervisor.start_child(
-                 Shuttle.WatcherSupervisor,
-                 {WorkerWatcher, watcher_opts}
-               ) do
-            {:ok, watcher_pid} ->
-              now = DateTime.utc_now()
-
-              running =
-                Map.put(state.running, fiber_id, %{
-                  pid: watcher_pid,
-                  session: session,
-                  agent_id: agent.id,
-                  started_at: now,
-                  last_activity_at: now
-                })
+          case start_watcher(state, fiber_id, running_meta) do
+            {:ok, running_meta} ->
+              running = Map.put(state.running, fiber_id, running_meta)
+              persist_running(state, fiber_id, running_meta)
 
               Logger.info("Adopted orphan session: #{session}")
               %{state | running: running, claimed: MapSet.put(state.claimed, fiber_id)}
@@ -2064,11 +2111,40 @@ defmodule Shuttle.Poller do
   defp cancel_waiter_timeout(_), do: :ok
 
   defp remove_running(%State{} = state, fiber_id) do
+    delete_persisted_running(state, fiber_id)
+
     %{
       state
       | running: Map.delete(state.running, fiber_id),
         claimed: MapSet.delete(state.claimed, fiber_id)
     }
+  end
+
+  defp start_watcher(%State{} = state, fiber_id, metadata) do
+    watcher_opts = [
+      fiber_id: fiber_id,
+      session: Map.fetch!(metadata, :session),
+      poller: state.self_ref,
+      runner: state.runner,
+      heartbeat_interval_ms: state.heartbeat_interval_ms
+    ]
+
+    case DynamicSupervisor.start_child(Shuttle.WatcherSupervisor, {WorkerWatcher, watcher_opts}) do
+      {:ok, watcher_pid} ->
+        {:ok, Map.put(metadata, :pid, watcher_pid)}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp persist_running(%State{} = state, fiber_id, metadata) do
+    RuntimeStore.upsert_running(state.runtime_store_path, fiber_id, metadata)
+  end
+
+  defp delete_persisted_running(%State{} = state, fiber_id) do
+    RuntimeStore.delete_running(state.runtime_store_path, fiber_id)
+    state
   end
 
   # Append a felt history event noting the worker exit, including the
@@ -2180,7 +2256,12 @@ defmodule Shuttle.Poller do
 
   defp stop_watcher(meta) do
     if is_pid(meta.pid) and Process.alive?(meta.pid) do
-      WorkerWatcher.stop(meta.pid)
+      try do
+        WorkerWatcher.stop(meta.pid)
+      catch
+        :exit, {:noproc, _} -> :ok
+        :exit, :noproc -> :ok
+      end
     end
   end
 
@@ -2410,6 +2491,21 @@ defmodule Shuttle.Poller do
   # take precedence via init/1 (and disable the per-poll refresh in that case).
   defp default_felt_stores do
     Shuttle.FeltStores.configured_hosts()
+  end
+
+  defp default_runtime_store_path do
+    case System.get_env("SHUTTLE_RUNTIME_STORE") do
+      path when is_binary(path) and path != "" ->
+        Path.expand(path)
+
+      _ ->
+        if Application.get_env(:shuttle, :env) == :test do
+          suffix = :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
+          Path.join(System.tmp_dir!(), "shuttle-runtime-#{suffix}.db")
+        else
+          RuntimeStore.default_path()
+        end
+    end
   end
 
   # Re-reads the configured host list and updates state.felt_stores if the list

@@ -257,6 +257,20 @@ defmodule Shuttle.PollerTest do
     end
   end
 
+  defp runtime_store_path do
+    Path.join(
+      System.tmp_dir!(),
+      "shuttle-poller-runtime-test-#{System.unique_integer([:positive])}/runtime.db"
+    )
+  end
+
+  defp cleanup_runtime_store_paths do
+    System.tmp_dir!()
+    |> Path.join("shuttle-poller-runtime-test-*")
+    |> Path.wildcard()
+    |> Enum.each(&File.rm_rf/1)
+  end
+
   defp new_session_scripts do
     MockRunner.commands()
     |> Enum.filter(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
@@ -372,9 +386,10 @@ defmodule Shuttle.PollerTest do
              end)
            end)
 
-    snap = Poller.snapshot(poller)
-    assert length(snap.eligible) == 1
-    assert hd(snap.eligible).fiber_id == "tests/host-match"
+    assert wait_until(fn ->
+             snap = Poller.snapshot(poller)
+             length(snap.eligible) == 1 and hd(snap.eligible).fiber_id == "tests/host-match"
+           end)
   end
 
   # The Poller defaults `own_host_id` from a two-step precedence chain:
@@ -1368,8 +1383,10 @@ defmodule Shuttle.PollerTest do
     Process.sleep(150)
 
     snap = Poller.snapshot(poller)
+
     refute Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id)),
            "a foreign-host orphan must never be resurrected on this daemon"
+
     assert snap.claimed_count == 0
 
     refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
@@ -1403,8 +1420,10 @@ defmodule Shuttle.PollerTest do
     Process.sleep(150)
 
     snap = Poller.snapshot(poller)
+
     refute Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id)),
            "an orphan with a missing project_dir must not be resurrected here"
+
     assert snap.claimed_count == 0
   end
 
@@ -1437,7 +1456,11 @@ defmodule Shuttle.PollerTest do
 
     MockRunner.set_fiber(
       fiber_id,
-      Map.put(fiber, "shuttle", %{"enabled" => true, "kind" => "oneshot", "agent" => "claude-sonnet"})
+      Map.put(fiber, "shuttle", %{
+        "enabled" => true,
+        "kind" => "oneshot",
+        "agent" => "claude-sonnet"
+      })
     )
 
     {:ok, poller} =
@@ -1566,6 +1589,92 @@ defmodule Shuttle.PollerTest do
       |> Enum.count(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
 
     assert new_session_count >= 2
+  end
+
+  test "poller rehydrates live running workers from the runtime store on restart" do
+    fiber_id = "tests/runtime-rehydrate-live"
+    runtime_store_path = runtime_store_path()
+
+    fiber = make_fiber(fiber_id)
+    MockRunner.set_fiber(fiber_id, fiber)
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_runtime_rehydrate_live_1,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"],
+        runtime_store_path: runtime_store_path
+      )
+
+    assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, [])
+    assert Enum.any?(Poller.snapshot(poller).eligible, &(&1.fiber_id == fiber_id))
+
+    GenServer.stop(poller)
+
+    {:ok, restarted} =
+      Poller.start_link(
+        name: :test_poller_runtime_rehydrate_live_2,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"],
+        runtime_store_path: runtime_store_path
+      )
+
+    assert wait_until(fn ->
+             Poller.snapshot(restarted).eligible
+             |> Enum.any?(&(&1.fiber_id == fiber_id and &1.tmux_session == session))
+           end)
+  after
+    cleanup_runtime_store_paths()
+  end
+
+  test "poller drops runtime store records whose tmux session disappeared while daemon was down" do
+    fiber_id = "tests/runtime-rehydrate-missing"
+    runtime_store_path = runtime_store_path()
+
+    fiber = make_fiber(fiber_id)
+    MockRunner.set_fiber(fiber_id, fiber)
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_runtime_rehydrate_missing_1,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"],
+        runtime_store_path: runtime_store_path
+      )
+
+    assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, [])
+
+    GenServer.stop(poller)
+    MockRunner.remove_tmux_session(session)
+
+    {:ok, restarted} =
+      Poller.start_link(
+        name: :test_poller_runtime_rehydrate_missing_2,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"],
+        runtime_store_path: runtime_store_path
+      )
+
+    snap = Poller.snapshot(restarted)
+
+    assert [
+             %{
+               fiber_id: ^fiber_id,
+               tmux_session: ^session,
+               reason: "missing_tmux_session"
+             }
+             | _
+           ] = snap.orphans
+
+    assert [] = Shuttle.RuntimeStore.list_running(runtime_store_path)
+  after
+    cleanup_runtime_store_paths()
   end
 
   test "poller clears stale parent running state when only a child session exists" do
@@ -1724,8 +1833,10 @@ defmodule Shuttle.PollerTest do
              end)
            end)
 
-    snap = Poller.snapshot(poller)
-    assert Enum.any?(snap.eligible, &(&1.fiber_id == fiber_id))
+    assert wait_until(fn ->
+             Poller.snapshot(poller).eligible
+             |> Enum.any?(&(&1.fiber_id == fiber_id))
+           end)
   end
 
   test "dispatch_fiber waits past the default GenServer timeout for slow successful dispatches" do
