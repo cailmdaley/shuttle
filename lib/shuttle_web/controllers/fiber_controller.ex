@@ -17,7 +17,7 @@ defmodule ShuttleWeb.FiberController do
          {:ok, frontmatter} <- normalize_frontmatter(params, name),
          {:ok, frontmatter} <- normalize_shuttle_host(frontmatter),
          :ok <- validate_shuttle(frontmatter["shuttle"]),
-         {:ok, path} <- fiber_path(fiber_id),
+         {:ok, path} <- fiber_path(fiber_id, frontmatter),
          :ok <- ensure_new(path),
          :ok <- write_fiber(path, frontmatter, body) do
       json(conn, %{id: fiber_id, path: path})
@@ -90,11 +90,11 @@ defmodule ShuttleWeb.FiberController do
 
   defp validate_shuttle(_), do: {:error, "shuttle must be an object"}
 
-  defp fiber_path(fiber_id) do
+  defp fiber_path(fiber_id, frontmatter) do
     with :ok <- validate_fiber_id(fiber_id) do
       segments = String.split(fiber_id, "/")
       basename = List.last(segments)
-      {:ok, Path.join([felt_root(), ".felt"] ++ segments ++ ["#{basename}.md"])}
+      {:ok, Path.join([felt_root(frontmatter), ".felt"] ++ segments ++ ["#{basename}.md"])}
     end
   end
 
@@ -133,7 +133,11 @@ defmodule ShuttleWeb.FiberController do
     end
   end
 
-  defp felt_root do
+  defp felt_root(%{"shuttle" => %{"project_dir" => project_dir}}) when is_binary(project_dir) and project_dir != "" do
+    Path.expand(project_dir)
+  end
+
+  defp felt_root(_frontmatter) do
     FeltStores.configured_hosts()
     |> List.first()
   end

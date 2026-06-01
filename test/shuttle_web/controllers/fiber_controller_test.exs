@@ -75,6 +75,41 @@ defmodule ShuttleWeb.FiberControllerTest do
              |> YamlElixir.read_from_string()
   end
 
+  test "POST /api/v1/fiber/create writes under shuttle.project_dir when it differs from daemon root", %{
+    tmp: tmp
+  } do
+    daemon_root = Path.join(tmp, "daemon-root")
+    project_dir = Path.join(tmp, "project-dir")
+    File.mkdir_p!(daemon_root)
+    File.mkdir_p!(project_dir)
+    System.put_env("LOOM_HOME", daemon_root)
+
+    conn =
+      api_conn()
+      |> post(
+        "/api/v1/fiber/create",
+        Jason.encode!(%{
+          id: "tests/project-local",
+          name: "Project local",
+          body: "hello\n",
+          frontmatter: %{
+            status: "open",
+            shuttle: %{
+              enabled: false,
+              kind: "oneshot",
+              project_dir: project_dir
+            }
+          }
+        })
+      )
+
+    assert %{"id" => "tests/project-local", "path" => path} = Jason.decode!(conn.resp_body)
+    assert conn.status == 200
+    assert path == Path.join([project_dir, ".felt", "tests", "project-local", "project-local.md"])
+    refute File.exists?(Path.join([daemon_root, ".felt", "tests", "project-local", "project-local.md"]))
+    assert File.exists?(path)
+  end
+
   test "POST /api/v1/fiber/create rejects enabled fibers without project_dir" do
     conn =
       api_conn()
