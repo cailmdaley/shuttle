@@ -212,6 +212,27 @@ defmodule Shuttle.RuntimeStore do
     end)
   end
 
+  @spec fetch_lifecycle(path(), String.t()) :: map() | nil
+  def fetch_lifecycle(path, fiber_id) when is_binary(path) and is_binary(fiber_id) do
+    init(path)
+
+    sql = """
+    SELECT metadata_json
+    FROM lifecycle_state
+    WHERE fiber_id = #{sql_string(fiber_id)}
+    LIMIT 1;
+    """
+
+    case query_lines(path, sql) do
+      [metadata_json | _] ->
+        %{"metadata" => metadata} = Jason.decode!(metadata_json)
+        decode_metadata(metadata)
+
+      [] ->
+        nil
+    end
+  end
+
   @spec upsert_lifecycle(path(), String.t(), map()) :: :ok
   def upsert_lifecycle(path, fiber_id, metadata)
       when is_binary(path) and is_binary(fiber_id) and is_map(metadata) do

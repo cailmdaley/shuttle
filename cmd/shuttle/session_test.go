@@ -114,6 +114,42 @@ Body.
 	}
 }
 
+func TestSessionSetCmd_FailsClosedWhenDaemonUnavailable(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "session-fiber", `---
+name: Session fiber
+status: active
+shuttle:
+  enabled: true
+  kind: oneshot
+---
+
+Body.
+`)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+
+	enableDaemonSession(t, "http://127.0.0.1:1")
+
+	cmd := newSessionSetCmd()
+	cmd.SetArgs([]string{"session-fiber", "worker-session", "--agent", "codex"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatalf("expected daemon transport error")
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("session command must not fall back to frontmatter writes. before:\n%s\nafter:\n%s", before, after)
+	}
+}
+
 func enableDaemonSession(t *testing.T, url string) {
 	t.Helper()
 	prevOffline, hadOffline := os.LookupEnv("SHUTTLE_SESSION_OFFLINE")

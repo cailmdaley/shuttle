@@ -50,6 +50,9 @@ defmodule Shuttle.Dispatcher do
       under force) and `resolve_resume_intent` ignores the ad-hoc
       short-circuit so the most recent review-comment's `resume_mode` is
       honored regardless of dispatch context.
+    * `:runtime_session_id` — daemon-owned prior session UUID supplied by the
+      Poller from RuntimeStore. Falls back to legacy frontmatter/history when
+      absent so standalone dispatch remains compatible.
   """
   @spec dispatch(String.t(), keyword()) :: dispatch_result()
   def dispatch(fiber_id, opts \\ []) do
@@ -79,7 +82,10 @@ defmodule Shuttle.Dispatcher do
               :fresh
 
             true ->
-              resolve_resume_intent(prompt_context, fiber_id, fiber, felt_store, force: force)
+              resolve_resume_intent(prompt_context, fiber_id, fiber, felt_store,
+                force: force,
+                session_id: Keyword.get(opts, :runtime_session_id)
+              )
           end
 
         case resume_intent do
@@ -131,6 +137,15 @@ defmodule Shuttle.Dispatcher do
         check_opts =
           [since: if(force?, do: nil, else: run_window_start(prompt_context))]
           |> then(fn o -> if is_nil(felt_store), do: o, else: [{:felt_store, felt_store} | o] end)
+          |> then(fn o ->
+            case Keyword.get(opts, :session_id) do
+              session_id when is_binary(session_id) and session_id != "" ->
+                [{:session_id, session_id} | o]
+
+              _ ->
+                o
+            end
+          end)
 
         check_resume_intent(fiber_id, fiber, check_opts)
     end
@@ -175,9 +190,10 @@ defmodule Shuttle.Dispatcher do
   - `{:previous, session_id}` — resume requested and session UUID available.
     The dispatcher will invoke the harness-appropriate resume command.
   - `{:error, :missing_session_id}` — previous-session resume was requested,
-    but neither `shuttle.session.id` nor worker-exit history contains a usable
-    session id. The caller should surface this instead of silently starting
-    fresh; "New session" is the explicit fresh path.
+    but neither the daemon runtime store, legacy `shuttle.session.id`, nor
+    worker-exit history contains a usable session id. The caller should surface
+    this instead of silently starting fresh; "New session" is the explicit fresh
+    path.
 
   Reads the latest `--kind review-comment` event from felt history. The
   `resume_mode` field in the event payload is set at requeue time by the user
@@ -188,6 +204,7 @@ defmodule Shuttle.Dispatcher do
       --since`. Used by scheduled standing-run dispatches to ignore
       directives that pre-date the current run window. When unset (oneshots,
       ad-hoc dispatches), the latest review-comment of all time applies.
+    * `:session_id` — daemon-owned prior session UUID supplied by the Poller.
   """
   @spec check_resume_intent(String.t(), map(), keyword()) ::
           :fresh | {:previous, String.t()} | {:error, :missing_session_id}
@@ -209,7 +226,8 @@ defmodule Shuttle.Dispatcher do
         resume_mode = get_in(event, ["payload", "resume_mode"])
 
         session_id =
-          get_in(fiber, ["shuttle", "session", "id"]) ||
+          Keyword.get(opts, :session_id) ||
+            get_in(fiber, ["shuttle", "session", "id"]) ||
             latest_history_session_id(fiber_id, felt_store: felt_store)
 
         case {resume_mode, session_id} do

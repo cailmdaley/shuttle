@@ -365,6 +365,59 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert script =~ "Shuttle resumed your previous session"
   end
 
+  test "poller resume uses runtime-store session when frontmatter session was cleared", %{
+    host: host
+  } do
+    runtime_store_path =
+      Path.join(host, "runtime.db")
+
+    write_fiber(host, "tests/poller-runtime-resume", """
+    ---
+    name: Poller runtime resume fiber
+    status: active
+    tags:
+      - constitution
+    shuttle:
+      enabled: true
+      kind: oneshot
+      agent: claude-sonnet
+      host: test-host
+    ---
+    A fiber whose resume handle lives only in the daemon runtime store.
+    """)
+
+    RuntimeStore.upsert_lifecycle(runtime_store_path, "tests/poller-runtime-resume", %{
+      kind: "oneshot",
+      phase: "dispatched",
+      session: %{
+        "id" => "runtime-resume-session-uuid",
+        "agent" => "claude-sonnet",
+        "dispatched_at" => "2026-05-01T09:00:00Z"
+      }
+    })
+
+    append_review_comment(host, "tests/poller-runtime-resume",
+      summary: "Continue from the runtime handle",
+      resume_mode: "previous"
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_runtime_resume,
+        runner: IntegrationRunner,
+        poll_interval_ms: 600_000,
+        felt_stores: [host],
+        runtime_store_path: runtime_store_path
+      )
+
+    assert {:ok, _} =
+             Poller.dispatch_fiber(poller, "tests/poller-runtime-resume", [])
+
+    script = read_run_script()
+    assert script =~ "--resume 'runtime-resume-session-uuid'"
+    assert script =~ "Shuttle resumed your previous session"
+  end
+
   test "resume previous dispatch reaches each harness-specific resume command", %{host: host} do
     matrix = [
       {"claude-sonnet", "claude-session-111", ["claude", "--resume 'claude-session-111'", "<<<"],

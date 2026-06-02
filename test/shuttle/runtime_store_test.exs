@@ -111,6 +111,30 @@ defmodule Shuttle.RuntimeStoreTest do
 
     RuntimeStore.delete_lifecycle(path, "tests/standing")
     assert [] = RuntimeStore.list_lifecycle(path)
+    assert RuntimeStore.fetch_lifecycle(path, "tests/standing") == nil
+  after
+    System.tmp_dir!()
+    |> Path.join("shuttle-runtime-store-test-*")
+    |> Path.wildcard()
+    |> Enum.each(&File.rm_rf/1)
+  end
+
+  test "fetches lifecycle metadata for one fiber" do
+    path = temp_db_path()
+
+    RuntimeStore.upsert_lifecycle(path, "tests/session-runtime", %{
+      kind: "oneshot",
+      phase: "dispatched",
+      session: %{"id" => "runtime-session-uuid", "agent" => "codex"}
+    })
+
+    assert %{
+             kind: "oneshot",
+             phase: "dispatched",
+             session: %{"id" => "runtime-session-uuid", "agent" => "codex"}
+           } = RuntimeStore.fetch_lifecycle(path, "tests/session-runtime")
+
+    assert RuntimeStore.fetch_lifecycle(path, "tests/missing") == nil
   after
     System.tmp_dir!()
     |> Path.join("shuttle-runtime-store-test-*")

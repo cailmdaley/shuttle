@@ -837,7 +837,7 @@ defmodule Shuttle.Poller do
 
   # ── Orphan Resurrection ──
 
-  # Detect fibers that were dispatched at least once (shuttle.session.id set)
+  # Detect fibers that were dispatched at least once (runtime session.id set)
   # but whose tmux sessions are no longer alive AND aren't being tracked by a
   # WorkerWatcher. This happens when the worker exits while the daemon is down
   # — `worker_watcher` never fires `worker_exited`, the continuation retry
@@ -851,8 +851,8 @@ defmodule Shuttle.Poller do
   # was dispatched. Mirrors what `handle_worker_exit` would have done if the
   # daemon had been up.
   #
-  # Standing roles are excluded: they use `review.state` for lifecycle, not
-  # session.id presence. A standing role's session.id is the historical
+  # Standing roles are excluded: they use runtime review state for lifecycle,
+  # not session.id presence. A standing role's session.id is the historical
   # marker for the most recent run, not a signal that a worker should still
   # be running now.
   defp reconcile_dispatched_dead_fibers(%State{} = state, candidates) do
@@ -873,18 +873,14 @@ defmodule Shuttle.Poller do
     status = Map.get(fiber, "status", "")
     kind = Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot"))
 
-    session_id =
-      case Map.get(shuttle, "session", %{}) do
-        %{"id" => id} when is_binary(id) and id != "" -> id
-        _ -> nil
-      end
+    session_id = stored_session_id(state, fiber_id, fiber)
 
     cond do
       # Only the owning daemon may resurrect. A fiber owned by another host
       # (or unowned — absent host:) is not this daemon's orphan; leave it for
       # the owning daemon or the kanban. This is the load-bearing gate: a
       # remote restart must never re-grab a Mac-owned fiber whose loom-synced
-      # block still carries a stale session UUID (the 2026-05-30 incident).
+      # runtime store carries a stale session UUID (the 2026-05-30 incident).
       not host_owned?(shuttle, state.own_host_id) ->
         state
 
@@ -1793,7 +1789,8 @@ defmodule Shuttle.Poller do
            prompt_context: prompt_context,
            felt_store: felt_store,
            force_fresh: Keyword.get(opts, :force_fresh, false),
-           force: Keyword.get(opts, :force, false)
+           force: Keyword.get(opts, :force, false),
+           runtime_session_id: stored_session_id(state, fiber_id, fiber)
          ) do
       {:ok, :human_no_op} ->
         # Human-worker fibers don't need a watcher or running-state entry —
@@ -1984,6 +1981,37 @@ defmodule Shuttle.Poller do
       |> Map.new(fn %{fiber_id: fiber_id, metadata: metadata} -> {fiber_id, metadata} end)
 
     %{state | lifecycle: lifecycle}
+  end
+
+  defp runtime_lifecycle(%State{} = state, fiber_id) do
+    RuntimeStore.fetch_lifecycle(state.runtime_store_path, fiber_id) ||
+      Map.get(state.lifecycle, fiber_id, %{})
+  end
+
+  defp lifecycle_session_id(metadata) when is_map(metadata) do
+    case Map.get(metadata, :session) do
+      %{"id" => id} when is_binary(id) and id != "" -> id
+      %{id: id} when is_binary(id) and id != "" -> id
+      _ -> nil
+    end
+  end
+
+  defp lifecycle_session_id(_), do: nil
+
+  defp legacy_frontmatter_session_id(fiber) do
+    case get_in(fiber, ["shuttle", "session", "id"]) do
+      uuid when is_binary(uuid) and uuid != "" -> uuid
+      _ -> nil
+    end
+  end
+
+  defp stored_session_id(%State{} = state, fiber_id, fiber) do
+    runtime_session_id =
+      state
+      |> runtime_lifecycle(fiber_id)
+      |> lifecycle_session_id()
+
+    runtime_session_id || legacy_frontmatter_session_id(fiber)
   end
 
   defp rehydrate_retry_record(%State{} = state, fiber_id, metadata) do
@@ -2409,11 +2437,7 @@ defmodule Shuttle.Poller do
   # (`claude --resume <uuid>` directly) or shape a refinement via
   # `shuttle-ctl resume`.
   defp log_worker_exit(fiber_id, fiber, meta, reason, state) do
-    session_uuid =
-      case get_in(fiber, ["shuttle", "session", "id"]) do
-        uuid when is_binary(uuid) and uuid != "" -> uuid
-        _ -> nil
-      end
+    session_uuid = stored_session_id(state, fiber_id, fiber)
 
     agent_id = Map.get(meta, :agent_id, "unknown")
 
