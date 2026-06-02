@@ -151,6 +151,65 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     File.rm_rf(root)
   end
 
+  test "accept re-enables a paused standing role (temper resumes it)" do
+    root =
+      System.tmp_dir!()
+      |> Path.join("shuttle-lifecycle-accept-reenable-#{System.unique_integer([:positive])}")
+
+    store = Path.join(root, "loom")
+    runtime_store = Path.join(root, "runtime.db")
+    fiber_dir = Path.join([store, ".felt", "tests", "standing-accept-reenable"])
+    File.mkdir_p!(fiber_dir)
+    path = Path.join(fiber_dir, "standing-accept-reenable.md")
+
+    # A role that was paused (enabled: false → Drafts) but whose last run's
+    # awaiting review was preserved. Accepting it ("temper") should reschedule
+    # AND flip enabled back on so it re-enters the queue.
+    File.write!(path, """
+    ---
+    name: Standing accept reenable
+    status: active
+    shuttle:
+      enabled: false
+      kind: standing
+      host: #{Shuttle.Poller.own_host_id()}
+      project_dir: #{store}
+      schedule:
+        expr: 0 9 * * 1-5
+        tz: UTC
+      review:
+        state: awaiting
+        run_id: run-1
+        completed_at: 2026-06-01T09:12:00Z
+        accepted_run_id: null
+      next_due_at: 2026-06-01T09:00:00Z
+      last_run_at: 2026-06-01T09:12:00Z
+    ---
+
+    Body.
+    """)
+
+    with_env(%{"LOOM_HOMES" => store, "SHUTTLE_RUNTIME_STORE" => runtime_store}, fn ->
+      conn =
+        post(
+          api_conn(),
+          "/api/v1/lifecycle",
+          Jason.encode!(%{
+            "action" => "accept",
+            "fiber" => "tests/standing-accept-reenable"
+          })
+        )
+
+      assert conn.status == 200
+
+      frontmatter = frontmatter(File.read!(path))
+      assert frontmatter =~ "enabled: true"
+      assert frontmatter =~ "status: active"
+    end)
+
+    File.rm_rf(root)
+  end
+
   test "resume for standing roles writes immediate lifecycle store and evicts runtime frontmatter" do
     root =
       System.tmp_dir!()

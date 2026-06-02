@@ -15,6 +15,7 @@ defmodule Shuttle.StandingRole do
     :next_due_at,
     :last_run_at,
     :run_id,
+    enabled: true,
     validation_errors: []
   ]
 
@@ -31,6 +32,7 @@ defmodule Shuttle.StandingRole do
           next_due_at: DateTime.t() | nil,
           last_run_at: DateTime.t() | nil,
           run_id: String.t() | nil,
+          enabled: boolean(),
           validation_errors: [String.t()]
         }
 
@@ -43,7 +45,10 @@ defmodule Shuttle.StandingRole do
       review: map(data["review"]),
       next_due_at: parse_datetime(data["next_due_at"]),
       last_run_at: parse_datetime(data["last_run_at"]),
-      run_id: string(get_in(data, ["review", "run_id"]))
+      run_id: string(get_in(data, ["review", "run_id"])),
+      # `enabled` gates the schedule-derived phases. Absent or true ⇒ armed;
+      # only an explicit `false` (a pause) makes the role dormant. See state/3.
+      enabled: Map.get(data, "enabled") != false
     }
 
     {:ok, %{role | validation_errors: validation_errors(role)}}
@@ -58,7 +63,15 @@ defmodule Shuttle.StandingRole do
     review_state = role.review["state"] || "scheduled"
 
     cond do
+      # A live worker is a fact, not a schedule conclusion — it wins even for a
+      # role paused with `--no-kill`, so the card reads true until the run ends.
       running? -> "running"
+      # Paused (`enabled: false`) collapses every schedule-derived phase to
+      # dormant → the kanban reads Drafts. A preserved `review` survives in the
+      # facts (accept/temper re-enables and reschedules); it just doesn't keep
+      # the card out of Drafts. The dispatch gate (poller `eligible?`) already
+      # honored `enabled`; this aligns the *display* with it.
+      not role.enabled -> "dormant"
       review_state in @awaiting_review_states -> "review"
       review_state == "accepted" -> "accepted"
       due?(role, now) -> "due"

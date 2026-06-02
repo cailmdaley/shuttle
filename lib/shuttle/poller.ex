@@ -749,6 +749,7 @@ defmodule Shuttle.Poller do
   end
 
   defp standing_phase(%{state: "running"}), do: "running"
+  defp standing_phase(%{state: "dormant"}), do: "dormant"
   defp standing_phase(%{state: "due"}), do: "due"
   defp standing_phase(%{review: %{"state" => state}}) when is_binary(state), do: state
   defp standing_phase(_), do: "scheduled"

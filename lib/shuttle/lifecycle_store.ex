@@ -206,12 +206,24 @@ defmodule Shuttle.LifecycleStore do
       |> Map.put("status", "active")
       |> Map.delete("tempered")
       |> Map.delete("closed-at")
+      |> enable_shuttle()
 
     frontmatter =
       if keep_outcome?, do: frontmatter, else: Map.put(frontmatter, "outcome", "")
 
     {:ok, frontmatter}
   end
+
+  # accept/resume both re-arm the role. A paused standing role (`enabled:
+  # false`) sits in Drafts with its last run's `review` preserved; accepting
+  # (the human "temper") or resuming it reschedules the next run AND flips
+  # `enabled` back on, so it re-enters the queue. Already-enabled roles are
+  # unaffected (no-op).
+  defp enable_shuttle(%{"shuttle" => shuttle} = frontmatter) when is_map(shuttle) do
+    %{frontmatter | "shuttle" => Map.put(shuttle, "enabled", true)}
+  end
+
+  defp enable_shuttle(frontmatter), do: frontmatter
 
   defp evict_runtime_keys(%{"shuttle" => shuttle} = frontmatter) do
     %{frontmatter | "shuttle" => Map.drop(shuttle, @runtime_keys)}
