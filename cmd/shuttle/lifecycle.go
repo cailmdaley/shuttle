@@ -570,6 +570,9 @@ func isLifecycleTransportError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if _, ok := err.(lifecycleStatusError); ok {
+		return false
+	}
 	return strings.Contains(err.Error(), "reaching daemon") ||
 		strings.Contains(err.Error(), "SHUTTLE_LIFECYCLE_OFFLINE")
 }

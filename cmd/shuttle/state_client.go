@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -178,9 +179,21 @@ func postLifecycle(action string, payload map[string]any) (string, error) {
 		return "", fmt.Errorf("reading daemon response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("daemon returned %d: %s", resp.StatusCode, string(respBody))
+		return "", lifecycleStatusError{
+			status: resp.StatusCode,
+			body:   strings.TrimSpace(string(respBody)),
+		}
 	}
 	return string(respBody), nil
+}
+
+type lifecycleStatusError struct {
+	status int
+	body   string
+}
+
+func (e lifecycleStatusError) Error() string {
+	return fmt.Sprintf("daemon returned %d: %s", e.status, e.body)
 }
 
 func postSession(action string, payload map[string]any) (string, error) {

@@ -1196,6 +1196,57 @@ Body.
 	}
 }
 
+func TestAcceptCmd_DaemonLifecycleErrorDoesNotFallbackToFrontmatter(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "daily-report", `---
+name: Daily report
+status: active
+outcome: digest
+shuttle:
+  enabled: true
+  kind: standing
+  schedule:
+    expr: "0 9 * * 1-5"
+    tz: Europe/Paris
+  review:
+    state: awaiting
+    run_id: "20260508T070000+0000"
+---
+
+Body.
+`)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "runtime store rejected transition", http.StatusUnprocessableEntity)
+	}))
+	defer srv.Close()
+	enableDaemonLifecycle(t, srv.URL)
+
+	cmd := newAcceptCmd()
+	cmd.SetArgs([]string{"daily-report"})
+	err = cmd.Execute()
+	if err == nil {
+		t.Fatal("expected daemon lifecycle error")
+	}
+	if !strings.Contains(err.Error(), "runtime store rejected transition") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("daemon error should not fall back to frontmatter rewrite. before:\n%s\nafter:\n%s", before, after)
+	}
+}
+
 func TestResumeCmd_StandingReviewUsesDaemonLifecycleWhenAvailable(t *testing.T) {
 	host, cleanup := withTempHost(t)
 	defer cleanup()

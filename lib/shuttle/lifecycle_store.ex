@@ -18,6 +18,7 @@ defmodule Shuttle.LifecycleStore do
 
     with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
+         shuttle <- merge_lifecycle_overlay(fiber_id, shuttle),
          :ok <- require_standing(shuttle),
          {:ok, review} <- require_review_state(shuttle, "awaiting"),
          {:ok, schedule} <- require_schedule(shuttle),
@@ -57,6 +58,7 @@ defmodule Shuttle.LifecycleStore do
   def resume(fiber_id) when is_binary(fiber_id) do
     with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
+         shuttle <- merge_lifecycle_overlay(fiber_id, shuttle),
          :ok <- require_standing(shuttle),
          {:ok, review} <- require_any_review_state(shuttle, ["awaiting", "review", "in_review"]),
          {:ok, frontmatter} <- update_document(frontmatter, true) do
@@ -140,6 +142,20 @@ defmodule Shuttle.LifecycleStore do
 
   defp shuttle_block(%{"shuttle" => shuttle}) when is_map(shuttle), do: {:ok, shuttle}
   defp shuttle_block(_), do: {:error, "fiber has no shuttle: block"}
+
+  defp merge_lifecycle_overlay(fiber_id, shuttle) do
+    case RuntimeStore.fetch_lifecycle(runtime_store_path(), fiber_id) do
+      lifecycle when is_map(lifecycle) ->
+        shuttle
+        |> put_if_missing("review", stringify_keys(Map.get(lifecycle, :review, %{})))
+        |> put_if_missing("next_due_at", Map.get(lifecycle, :next_due_at))
+        |> put_if_missing("last_run_at", Map.get(lifecycle, :last_run_at))
+        |> put_if_missing("session", stringify_keys(Map.get(lifecycle, :session, %{})))
+
+      _ ->
+        shuttle
+    end
+  end
 
   defp require_standing(%{"kind" => "standing"}), do: :ok
   defp require_standing(%{"mode" => "standing"}), do: :ok
@@ -228,6 +244,18 @@ defmodule Shuttle.LifecycleStore do
   defp put_if_present(map, _key, ""), do: map
   defp put_if_present(map, _key, nil), do: map
   defp put_if_present(map, key, value), do: Map.put(map, key, value)
+  defp put_if_missing(map, _key, nil), do: map
+  defp put_if_missing(map, _key, value) when value == %{}, do: map
+
+  defp put_if_missing(map, key, value) do
+    case Map.get(map, key) do
+      nil -> Map.put(map, key, value)
+      "" -> Map.put(map, key, value)
+      %{} = nested when map_size(nested) == 0 -> Map.put(map, key, value)
+      _ -> map
+    end
+  end
+
   defp empty_to_nil(""), do: nil
   defp empty_to_nil(value), do: value
 

@@ -40,7 +40,7 @@ defmodule ShuttleWeb.LifecycleController do
   defp execute("accept", %{"fiber" => fiber} = params) do
     case LifecycleStore.accept(fiber, keep_outcome: truthy?(params["keep_outcome"])) do
       {:ok, output} -> append_accept_history(fiber, output)
-      {:error, _reason} -> args_for("accept", params) |> then(&run_elem/1)
+      {:error, reason} -> {:error, reason}
     end
   end
 

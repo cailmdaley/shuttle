@@ -221,6 +221,134 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     File.rm_rf(root)
   end
 
+  test "accept reads review and timing from lifecycle store after frontmatter eviction" do
+    root =
+      System.tmp_dir!()
+      |> Path.join("shuttle-lifecycle-accept-overlay-#{System.unique_integer([:positive])}")
+
+    store = Path.join(root, "loom")
+    runtime_store = Path.join(root, "runtime.db")
+    fiber_dir = Path.join([store, ".felt", "tests", "standing-accept-overlay"])
+    File.mkdir_p!(fiber_dir)
+    path = Path.join(fiber_dir, "standing-accept-overlay.md")
+
+    File.write!(path, """
+    ---
+    name: Standing accept overlay
+    status: closed
+    outcome: digest
+    shuttle:
+      enabled: true
+      kind: standing
+      host: #{Shuttle.Poller.own_host_id()}
+      project_dir: #{store}
+      schedule:
+        expr: 0 9 * * 1-5
+        tz: UTC
+    ---
+
+    Body.
+    """)
+
+    with_env(%{"LOOM_HOMES" => store, "SHUTTLE_RUNTIME_STORE" => runtime_store}, fn ->
+      RuntimeStore.upsert_lifecycle(runtime_store, "tests/standing-accept-overlay", %{
+        kind: "standing",
+        phase: "awaiting",
+        run_id: "run-overlay",
+        next_due_at: ~U[2026-06-01 09:00:00Z],
+        last_run_at: ~U[2026-06-01 09:12:00Z],
+        review: %{
+          "state" => "awaiting",
+          "run_id" => "run-overlay",
+          "completed_at" => "2026-06-01T09:12:00Z"
+        }
+      })
+
+      conn =
+        post(
+          api_conn(),
+          "/api/v1/lifecycle",
+          Jason.encode!(%{
+            "action" => "accept",
+            "fiber" => "tests/standing-accept-overlay"
+          })
+        )
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "accepted run run-overlay"
+
+      frontmatter = path |> File.read!() |> frontmatter()
+      refute frontmatter =~ "review:"
+      refute frontmatter =~ "next_due_at:"
+      refute frontmatter =~ "last_run_at:"
+
+      assert [
+               %{
+                 metadata: %{
+                   phase: "scheduled",
+                   run_id: "run-overlay",
+                   next_due_at: next_due_at,
+                   last_run_at: ~U[2026-06-01 09:12:00Z],
+                   review: %{
+                     "state" => "scheduled",
+                     "run_id" => "run-overlay",
+                     "accepted_run_id" => "run-overlay"
+                   }
+                 }
+               }
+             ] = RuntimeStore.list_lifecycle(runtime_store)
+
+      assert DateTime.to_iso8601(next_due_at) == "2026-06-02T09:00:00Z"
+    end)
+
+    File.rm_rf(root)
+  end
+
+  test "accept fails closed instead of falling back to shuttle-ctl frontmatter writes" do
+    args_file = install_fake_shuttle_ctl!()
+
+    root =
+      System.tmp_dir!()
+      |> Path.join("shuttle-lifecycle-accept-fail-closed-#{System.unique_integer([:positive])}")
+
+    store = Path.join(root, "loom")
+    fiber_dir = Path.join([store, ".felt", "tests", "standing-accept-fail"])
+    File.mkdir_p!(fiber_dir)
+
+    File.write!(Path.join(fiber_dir, "standing-accept-fail.md"), """
+    ---
+    name: Standing accept fail
+    status: active
+    shuttle:
+      enabled: true
+      kind: standing
+      schedule:
+        expr: 0 9 * * 1-5
+        tz: UTC
+    ---
+
+    Body.
+    """)
+
+    with_env(%{"LOOM_HOMES" => store}, fn ->
+      conn =
+        post(
+          api_conn(),
+          "/api/v1/lifecycle",
+          Jason.encode!(%{
+            "action" => "accept",
+            "fiber" => "tests/standing-accept-fail"
+          })
+        )
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "fiber has no review state"
+      refute File.exists?(args_file)
+    end)
+
+    File.rm_rf(root)
+  end
+
   defp api_conn do
     build_conn()
     |> put_req_header("content-type", "application/json")
