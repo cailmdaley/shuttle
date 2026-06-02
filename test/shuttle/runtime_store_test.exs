@@ -41,6 +41,38 @@ defmodule Shuttle.RuntimeStoreTest do
     |> Enum.each(&File.rm_rf/1)
   end
 
+  test "round-trips retry metadata through sqlite" do
+    path = temp_db_path()
+    due_at_ms = DateTime.utc_now() |> DateTime.to_unix(:millisecond)
+
+    RuntimeStore.upsert_retry(path, "tests/retry", %{
+      attempt: 2,
+      due_at_ms: due_at_ms,
+      error: "worker exited",
+      delay_type: :continuation
+    })
+
+    assert [
+             %{
+               fiber_id: "tests/retry",
+               metadata: %{
+                 attempt: 2,
+                 due_at_ms: ^due_at_ms,
+                 error: "worker exited",
+                 delay_type: :continuation
+               }
+             }
+           ] = RuntimeStore.list_retries(path)
+
+    RuntimeStore.delete_retry(path, "tests/retry")
+    assert [] = RuntimeStore.list_retries(path)
+  after
+    System.tmp_dir!()
+    |> Path.join("shuttle-runtime-store-test-*")
+    |> Path.wildcard()
+    |> Enum.each(&File.rm_rf/1)
+  end
+
   defp temp_db_path do
     Path.join(
       System.tmp_dir!(),

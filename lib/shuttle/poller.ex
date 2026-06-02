@@ -301,7 +301,7 @@ defmodule Shuttle.Poller do
 
     # Rehydrate the daemon-owned runtime store first, then adopt any live tmux
     # sessions that predate the store or were created while the daemon was down.
-    state = state |> rehydrate_runtime_store() |> adopt_orphans()
+    state = state |> rehydrate_runtime_store() |> adopt_orphans() |> rehydrate_retry_queue()
 
     # Schedule first tick immediately
     state = schedule_tick(state, 0)
@@ -1794,6 +1794,53 @@ defmodule Shuttle.Poller do
     end)
   end
 
+  defp rehydrate_retry_queue(%State{} = state) do
+    state.runtime_store_path
+    |> RuntimeStore.list_retries()
+    |> Enum.reduce(state, fn %{fiber_id: fiber_id, metadata: metadata}, state_acc ->
+      rehydrate_retry_record(state_acc, fiber_id, metadata)
+    end)
+  end
+
+  defp rehydrate_retry_record(%State{} = state, fiber_id, metadata) do
+    cond do
+      Map.has_key?(state.running, fiber_id) ->
+        delete_persisted_retry(state, fiber_id)
+
+      Map.has_key?(state.retry_queue, fiber_id) ->
+        state
+
+      true ->
+        attempt = Map.get(metadata, :attempt, 1)
+
+        due_at_ms =
+          Map.get(metadata, :due_at_ms, DateTime.to_unix(DateTime.utc_now(), :millisecond))
+
+        delay_ms = max(0, due_at_ms - DateTime.to_unix(DateTime.utc_now(), :millisecond))
+        retry_token = make_ref()
+        timer_ref = Process.send_after(state.self_ref, {:retry, fiber_id, retry_token}, delay_ms)
+
+        retry = %{
+          attempt: attempt,
+          timer_ref: timer_ref,
+          retry_token: retry_token,
+          due_at_ms: due_at_ms,
+          error: Map.get(metadata, :error),
+          delay_type: Map.get(metadata, :delay_type, :failure)
+        }
+
+        Logger.info(
+          "Rehydrated retry: fiber_id=#{fiber_id} in #{delay_ms}ms (attempt #{attempt})"
+        )
+
+        %{
+          state
+          | retry_queue: Map.put(state.retry_queue, fiber_id, retry),
+            claimed: MapSet.put(state.claimed, fiber_id)
+        }
+    end
+  end
+
   defp rehydrate_running_record(%State{} = state, fiber_id, metadata) do
     session = Map.get(metadata, :session, Dispatcher.session_name(fiber_id))
 
@@ -2039,6 +2086,13 @@ defmodule Shuttle.Poller do
         delay_type: delay_type
       })
 
+    persist_retry(state, fiber_id, %{
+      attempt: next_attempt,
+      due_at_ms: due_at_ms,
+      error: error,
+      delay_type: delay_type
+    })
+
     state = %{state | retry_queue: retry_queue, claimed: MapSet.put(state.claimed, fiber_id)}
     broadcast_snapshot(state)
     state
@@ -2047,7 +2101,12 @@ defmodule Shuttle.Poller do
   defp pop_retry(%State{} = state, fiber_id, retry_token) when is_reference(retry_token) do
     case Map.get(state.retry_queue, fiber_id) do
       %{retry_token: ^retry_token} = retry ->
-        {:ok, retry, %{state | retry_queue: Map.delete(state.retry_queue, fiber_id)}}
+        state =
+          state
+          |> delete_persisted_retry(fiber_id)
+          |> Map.put(:retry_queue, Map.delete(state.retry_queue, fiber_id))
+
+        {:ok, retry, state}
 
       _ ->
         :missing
@@ -2144,6 +2203,15 @@ defmodule Shuttle.Poller do
 
   defp delete_persisted_running(%State{} = state, fiber_id) do
     RuntimeStore.delete_running(state.runtime_store_path, fiber_id)
+    state
+  end
+
+  defp persist_retry(%State{} = state, fiber_id, metadata) do
+    RuntimeStore.upsert_retry(state.runtime_store_path, fiber_id, metadata)
+  end
+
+  defp delete_persisted_retry(%State{} = state, fiber_id) do
+    RuntimeStore.delete_retry(state.runtime_store_path, fiber_id)
     state
   end
 

@@ -2,10 +2,9 @@ defmodule Shuttle.RuntimeStore do
   @moduledoc """
   Host-local durable runtime state for the Shuttle daemon.
 
-  This is intentionally narrower than the eventual lifecycle store: first it
-  persists the live-worker set so daemon restarts do not lose or ghost workers.
-  The fiber remains the source of document truth; this store is daemon-owned
-  runtime only.
+  This is intentionally narrower than the eventual lifecycle store: it persists
+  daemon-owned runtime that must survive restarts while the fiber remains the
+  source of document truth.
   """
 
   require Logger
@@ -37,6 +36,15 @@ defmodule Shuttle.RuntimeStore do
       run_kind TEXT,
       started_at TEXT NOT NULL,
       last_activity_at TEXT NOT NULL,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS retry_queue (
+      fiber_id TEXT PRIMARY KEY,
+      attempt INTEGER NOT NULL,
+      due_at_ms INTEGER NOT NULL,
+      delay_type TEXT NOT NULL DEFAULT 'failure',
+      error TEXT,
       metadata_json TEXT NOT NULL DEFAULT '{}',
       updated_at TEXT NOT NULL
     );
@@ -114,6 +122,65 @@ defmodule Shuttle.RuntimeStore do
     exec!(path, "DELETE FROM running_workers WHERE fiber_id = #{sql_string(fiber_id)};")
   end
 
+  @spec list_retries(path()) :: [%{fiber_id: String.t(), metadata: map()}]
+  def list_retries(path) when is_binary(path) do
+    init(path)
+
+    sql = """
+    SELECT fiber_id, metadata_json
+    FROM retry_queue
+    ORDER BY due_at_ms, fiber_id;
+    """
+
+    path
+    |> query_lines(sql)
+    |> Enum.map(fn line ->
+      [fiber_id, metadata_json] = String.split(line, "\t", parts: 2)
+      %{"metadata" => metadata} = Jason.decode!(metadata_json)
+      %{fiber_id: fiber_id, metadata: decode_metadata(metadata)}
+    end)
+  end
+
+  @spec upsert_retry(path(), String.t(), map()) :: :ok
+  def upsert_retry(path, fiber_id, metadata) when is_binary(path) and is_binary(fiber_id) do
+    init(path)
+
+    attempt = Map.fetch!(metadata, :attempt)
+    due_at_ms = Map.fetch!(metadata, :due_at_ms)
+    delay_type = metadata |> Map.get(:delay_type, :failure) |> to_string()
+    error = Map.get(metadata, :error)
+    updated_at = DateTime.utc_now() |> DateTime.to_iso8601()
+
+    metadata_json =
+      %{metadata: encode_metadata(metadata)}
+      |> Jason.encode!()
+
+    sql = """
+    INSERT INTO retry_queue (
+      fiber_id, attempt, due_at_ms, delay_type, error, metadata_json, updated_at
+    ) VALUES (
+      #{sql_string(fiber_id)}, #{attempt}, #{due_at_ms},
+      #{sql_string(delay_type)}, #{sql_string(error)}, #{sql_string(metadata_json)},
+      #{sql_string(updated_at)}
+    )
+    ON CONFLICT(fiber_id) DO UPDATE SET
+      attempt = excluded.attempt,
+      due_at_ms = excluded.due_at_ms,
+      delay_type = excluded.delay_type,
+      error = excluded.error,
+      metadata_json = excluded.metadata_json,
+      updated_at = excluded.updated_at;
+    """
+
+    exec!(path, sql)
+  end
+
+  @spec delete_retry(path(), String.t()) :: :ok
+  def delete_retry(path, fiber_id) when is_binary(path) and is_binary(fiber_id) do
+    init(path)
+    exec!(path, "DELETE FROM retry_queue WHERE fiber_id = #{sql_string(fiber_id)};")
+  end
+
   defp exec!(path, sql) do
     case System.cmd("sqlite3", sqlite_args(path, sql), stderr_to_stdout: true) do
       {_, 0} ->
@@ -152,6 +219,7 @@ defmodule Shuttle.RuntimeStore do
     |> Map.drop([:pid])
     |> Map.new(fn
       {key, %DateTime{} = value} -> {to_string(key), DateTime.to_iso8601(value)}
+      {key, value} when is_atom(value) -> {to_string(key), to_string(value)}
       {key, value} -> {to_string(key), value}
     end)
   end
@@ -161,6 +229,7 @@ defmodule Shuttle.RuntimeStore do
     |> Map.new(fn
       {"started_at", value} -> {:started_at, decode_datetime(value)}
       {"last_activity_at", value} -> {:last_activity_at, decode_datetime(value)}
+      {"delay_type", value} when is_binary(value) -> {:delay_type, String.to_atom(value)}
       {key, value} -> {String.to_atom(key), value}
     end)
   end

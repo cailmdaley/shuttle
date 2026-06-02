@@ -1157,6 +1157,65 @@ defmodule Shuttle.PollerTest do
     assert new_session_count == 2
   end
 
+  test "poller rehydrates pending retries from runtime store on restart" do
+    fiber_id = "tests/retry-rehydrate"
+    runtime_store_path = runtime_store_path()
+
+    fiber = make_fiber(fiber_id)
+    MockRunner.set_fiber(fiber_id, fiber)
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_retry_rehydrate_1,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"],
+        runtime_store_path: runtime_store_path
+      )
+
+    assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, [])
+    MockRunner.remove_tmux_session(session)
+    send(poller, {:worker_exited, fiber_id, :normal_exit, false})
+
+    assert wait_until(fn ->
+             Poller.snapshot(poller).retrying
+             |> Enum.any?(&(&1.fiber_id == fiber_id))
+           end)
+
+    assert [
+             %{
+               fiber_id: ^fiber_id,
+               metadata: %{attempt: 1, delay_type: :continuation}
+             }
+           ] = Shuttle.RuntimeStore.list_retries(runtime_store_path)
+
+    GenServer.stop(poller)
+
+    {:ok, restarted} =
+      Poller.start_link(
+        name: :test_poller_retry_rehydrate_2,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"],
+        runtime_store_path: runtime_store_path
+      )
+
+    assert wait_until(
+             fn ->
+               MockRunner.commands()
+               |> Enum.count(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
+               |> Kernel.==(2)
+             end,
+             80
+           )
+
+    refute Enum.any?(Poller.snapshot(restarted).retrying, &(&1.fiber_id == fiber_id))
+    assert [] = Shuttle.RuntimeStore.list_retries(runtime_store_path)
+  after
+    cleanup_runtime_store_paths()
+  end
+
   test "force-dispatch honors resume_mode: previous review-comment (unified resume path)" do
     # The old kanban-modal flow had two separate paths: "New session"
     # (ad-hoc, force-fresh) and "Resume" (a special accept-then-dispatch
