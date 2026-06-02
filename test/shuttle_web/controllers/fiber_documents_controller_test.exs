@@ -1,0 +1,107 @@
+defmodule ShuttleWeb.FiberDocumentsControllerTest do
+  use ExUnit.Case
+  import Phoenix.ConnTest
+  import Plug.Conn
+
+  @endpoint ShuttleWeb.Endpoint
+
+  setup do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "shuttle-fiber-documents-controller-#{System.unique_integer([:positive])}"
+      )
+
+    store = Path.join(root, "loom")
+    File.mkdir_p!(store)
+
+    old_loom_homes = System.get_env("LOOM_HOMES")
+    old_shuttle_host = System.get_env("SHUTTLE_HOST")
+
+    System.put_env("LOOM_HOMES", store)
+    System.put_env("SHUTTLE_HOST", "test-host")
+
+    on_exit(fn ->
+      restore_env("LOOM_HOMES", old_loom_homes)
+      restore_env("SHUTTLE_HOST", old_shuttle_host)
+      File.rm_rf(root)
+    end)
+
+    {:ok, store: store}
+  end
+
+  test "GET /api/v1/fibers returns daemon-local felt JSON with path metadata", %{store: store} do
+    write_fiber!(store, "tests/document", """
+    ---
+    name: Document route
+    status: active
+    tags:
+      - shuttle
+    shuttle:
+      enabled: true
+      host: test-host
+    ---
+
+    Body.
+    """)
+
+    report = Path.join([store, ".felt", "tests", "document", "report.html"])
+    File.write!(report, "<p>report</p>\n")
+
+    conn = get(api_conn(), "/api/v1/fibers")
+
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+    assert body["host"] == "test-host"
+    assert body["felt_stores"] == [store]
+
+    assert [
+             %{
+               "felt_store" => ^store,
+               "path" => "tests/document/document.md",
+               "report_path" => ^report,
+               "fiber" => %{
+                 "id" => "tests/document",
+                 "name" => "Document route",
+                 "status" => "active",
+                 "shuttle" => %{"enabled" => true, "host" => "test-host"}
+               }
+             }
+           ] = body["fibers"]
+
+    refute Map.has_key?(hd(body["fibers"])["fiber"], "body")
+  end
+
+  test "GET /api/v1/fibers?body=true includes felt bodies", %{store: store} do
+    write_fiber!(store, "tests/body", """
+    ---
+    name: Body route
+    status: open
+    ---
+
+    Body text.
+    """)
+
+    conn = get(api_conn(), "/api/v1/fibers?body=true")
+
+    assert conn.status == 200
+    assert [%{"fiber" => %{"body" => "Body text."}}] = Jason.decode!(conn.resp_body)["fibers"]
+  end
+
+  defp write_fiber!(store, fiber_id, content) do
+    segments = String.split(fiber_id, "/")
+    basename = List.last(segments)
+    dir = Path.join([store, ".felt" | segments])
+    File.mkdir_p!(dir)
+    File.write!(Path.join(dir, "#{basename}.md"), content)
+  end
+
+  defp api_conn do
+    build_conn()
+    |> put_req_header("content-type", "application/json")
+    |> put_req_header("accept", "application/json")
+  end
+
+  defp restore_env(key, nil), do: System.delete_env(key)
+  defp restore_env(key, value), do: System.put_env(key, value)
+end

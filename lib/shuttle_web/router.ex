@@ -23,6 +23,7 @@ defmodule ShuttleWeb.Router do
     post("/reserve", ReserveController, :create)
     get("/state", StateController, :show)
     get("/state/composite", StateController, :composite)
+    get("/fibers", FiberDocumentsController, :index)
     get("/origins", OriginsController, :show)
     post("/lifecycle", LifecycleController, :create)
     post("/session", SessionController, :create)
