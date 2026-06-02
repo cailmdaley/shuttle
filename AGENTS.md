@@ -23,6 +23,15 @@ make status     # shuttle-ctl ps + snapshot summary
 make clean      # rm _build and stray Elixir.*.beam at project root
 ```
 
+**Deploying to remote hosts (candide, cineca):** push to GitHub first, then build on the host — don't copy the macOS escript, as BEAM bytecode format varies across OTP versions and the binary will crash on startup on a different host.
+
+```bash
+ssh candide "cd ~/Documents/projects/shuttle && git pull && make all"
+ssh cineca  "cd ~/Documents/projects/shuttle && git pull && make all"
+```
+
+Candide: OTP 27.3.4.12 pinned in `~/.tool-versions` (OTP 28.0.2 had a compilation crash — do not upgrade to 28.0.x). Daemon log: `~/.shuttle/shuttle.log`. Respawn loop in tmux session `shuttle-daemon`; `make stop` lets it auto-restart with the new binary.
+
 **Two artifacts, two languages, two release cadences.** The Elixir daemon
 (`bin/shuttle`) and the Go CLI (`~/go/bin/shuttle-ctl`) are independent —
 rebuilding one never implies rebuilding the other. Editing `cmd/shuttle/*.go`
