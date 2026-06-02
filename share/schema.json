@@ -50,7 +50,7 @@
     },
     "review": {
       "type": "object",
-      "description": "Persisted per-run review state for standing roles. Runtime-only states such as due/running come from daemon snapshots, not frontmatter.",
+      "description": "Legacy per-run review state for standing roles. The authoritative home is now the per-host daemon runtime store (~/.shuttle/runtime.db); this frontmatter block is read-only compatibility for fibers dispatched before the eviction and is no longer written by the CLI or daemon. Runtime-only states such as due/running are runtime-store phases, never frontmatter.",
       "properties": {
         "state": {
           "type": "string",
@@ -103,8 +103,8 @@
     }
   ],
   "notes": {
-    "writer_ownership": "CLI owns: enabled, kind, interactive, agent, schedule, review.state (scheduled/accepted transitions), review.accepted_run_id, next_due_at (initial and scheduled-run accept advance). Daemon/workers own: review.state=awaiting at run completion, review.run_id, review.completed_at, last_run_at, enabled (false flip after oneshot run). Ad-hoc standing runs preserve next_due_at.",
-    "derived_states": "due and running are snapshot/view states derived from next_due_at and live worker state. They are not persisted review.state values.",
+    "writer_ownership": "Document fields the CLI writes to synced frontmatter: enabled, kind, interactive, agent, schedule, host, project_dir. Runtime fields (review.state/run_id/completed_at/accepted_run_id, session, next_due_at, last_run_at) are NOT written to frontmatter anymore — they live in the per-host daemon runtime store (~/.shuttle/runtime.db), which is authoritative. CLI lifecycle verbs (accept/resume/pause/session-set) mutate that store via the daemon HTTP routes and fail closed when the daemon is unreachable rather than rewriting the synced fiber. The review/next_due_at/last_run_at blocks here remain only to validate and read legacy fibers. Constitution: shuttle-durable-runtime-store.",
+    "derived_states": "due and running are runtime-store phases derived from next_due_at and live worker state. They are not persisted review.state values.",
     "legacy_review_aliases": "Older fibers may carry review.state=review or in_review for awaiting. Readers should normalize them when possible; new writers must use awaiting.",
     "schema_tz_migration": "Pre-CLI standing roles used schedule.timezone. Migration renames to schedule.tz. The Elixir daemon reads tz after migration.",
     "kind_migration": "Pre-CLI standing roles used shuttle.mode instead of shuttle.kind. Migration renames to kind."
