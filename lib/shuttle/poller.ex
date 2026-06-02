@@ -621,7 +621,7 @@ defmodule Shuttle.Poller do
         }
       end)
 
-    %{
+    snap = %{
       poll_at: now_ms,
       # Reflect the dispatch-filter identity, not just :inet.gethostname().
       # When SHUTTLE_HOST is set this matches the host operators read in logs
@@ -636,7 +636,149 @@ defmodule Shuttle.Poller do
       claimed_count: MapSet.size(state.claimed),
       max_concurrent: state.max_concurrent_workers
     }
+
+    Map.put(snap, :runtime, runtime_by_fiber(state, snap, now))
   end
+
+  defp runtime_by_fiber(%State{} = state, snap, now) do
+    state.lifecycle
+    |> Enum.reduce(%{}, fn {fiber_id, metadata}, acc ->
+      Map.put(acc, fiber_id, lifecycle_runtime(fiber_id, metadata))
+    end)
+    |> merge_running_runtime(snap.eligible)
+    |> merge_retry_runtime(snap.retrying)
+    |> merge_standing_runtime(snap.standing_roles, now)
+  end
+
+  defp lifecycle_runtime(fiber_id, metadata) do
+    review = stringify_keys(Map.get(metadata, :review, %{}))
+
+    %{
+      fiber_id: fiber_id,
+      kind: Map.get(metadata, :kind, "oneshot"),
+      phase: Map.get(metadata, :phase) || Map.get(review, "state") || "scheduled",
+      run_id: Map.get(metadata, :run_id),
+      run_kind: Map.get(metadata, :run_kind),
+      session: stringify_keys(Map.get(metadata, :session, %{})),
+      review: review,
+      next_due_at: unix_ms(Map.get(metadata, :next_due_at)),
+      last_run_at: unix_ms(Map.get(metadata, :last_run_at))
+    }
+    |> compact_runtime()
+  end
+
+  defp merge_running_runtime(runtime, running) do
+    Enum.reduce(running, runtime, fn worker, acc ->
+      fiber_id = worker.fiber_id
+
+      Map.update(acc, fiber_id, running_runtime(worker), fn existing ->
+        existing
+        |> Map.merge(running_runtime(worker))
+        |> Map.put(:phase, "running")
+      end)
+    end)
+  end
+
+  defp running_runtime(worker) do
+    %{
+      fiber_id: worker.fiber_id,
+      phase: "running",
+      running: true,
+      tmux_session: worker.tmux_session,
+      agent: worker.agent,
+      run_id: worker.run_id,
+      started_at: worker.started_at,
+      last_activity_at: worker.last_activity_at,
+      runtime_seconds: worker.runtime_seconds
+    }
+    |> compact_runtime()
+  end
+
+  defp merge_retry_runtime(runtime, retrying) do
+    Enum.reduce(retrying, runtime, fn retry, acc ->
+      fiber_id = retry.fiber_id
+
+      Map.update(acc, fiber_id, retry_runtime(retry), fn existing ->
+        existing
+        |> Map.merge(retry_runtime(retry))
+        |> Map.put(:phase, "retrying")
+      end)
+    end)
+  end
+
+  defp retry_runtime(retry) do
+    %{
+      fiber_id: retry.fiber_id,
+      phase: "retrying",
+      retry: %{
+        attempt: retry.attempt,
+        due_in_ms: retry.due_in_ms,
+        error: retry.error
+      }
+    }
+    |> compact_runtime()
+  end
+
+  defp merge_standing_runtime(runtime, standing_roles, now) do
+    Enum.reduce(standing_roles, runtime, fn role, acc ->
+      fiber_id = role.fiber_id
+
+      Map.update(acc, fiber_id, standing_runtime(role, now), fn existing ->
+        existing
+        |> Map.merge(standing_runtime(role, now))
+        |> preserve_active_phase()
+      end)
+    end)
+  end
+
+  defp standing_runtime(role, now) do
+    %{
+      fiber_id: role.fiber_id,
+      kind: "standing",
+      phase: standing_phase(role),
+      state: role.state,
+      run_id: role.run_id,
+      next_due_at: role.next_due_at,
+      last_run_at: role.last_run_at,
+      review: role.review,
+      schedule: role.schedule,
+      validation_errors: role.validation_errors,
+      due_in_ms: due_in_ms(role.next_due_at, now)
+    }
+    |> compact_runtime()
+  end
+
+  defp standing_phase(%{state: "running"}), do: "running"
+  defp standing_phase(%{state: "due"}), do: "due"
+  defp standing_phase(%{review: %{"state" => state}}) when is_binary(state), do: state
+  defp standing_phase(_), do: "scheduled"
+
+  defp preserve_active_phase(%{phase: phase} = runtime) when phase in ["running", "retrying"] do
+    runtime
+  end
+
+  defp preserve_active_phase(runtime), do: runtime
+
+  defp compact_runtime(map) do
+    Map.reject(map, fn
+      {_key, nil} -> true
+      {_key, %{}} -> true
+      {_key, []} -> true
+      _ -> false
+    end)
+  end
+
+  defp due_in_ms(nil, _now), do: nil
+
+  defp due_in_ms(next_due_at, now) when is_integer(next_due_at) do
+    max(0, next_due_at - DateTime.to_unix(now, :millisecond))
+  end
+
+  defp due_in_ms(_, _now), do: nil
+
+  defp unix_ms(%DateTime{} = datetime), do: DateTime.to_unix(datetime, :millisecond)
+  defp unix_ms(value) when is_integer(value), do: value
+  defp unix_ms(_), do: nil
 
   # Stringifies dispatch-failure reasons for the snapshot. Atoms become their
   # name (':missing_session_id' is more useful in the UI than the raw atom);

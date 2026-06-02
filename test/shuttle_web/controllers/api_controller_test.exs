@@ -749,6 +749,8 @@ defmodule ShuttleWeb.APIControllerTest do
     assert body["host"] != nil
     assert is_list(body["eligible"])
     assert is_list(body["running_detail"])
+    assert body["runtime"]["tests/state"]["phase"] == "running"
+    assert body["runtime"]["tests/state"]["tmux_session"] == "state-shuttle"
     assert is_list(body["reservations"])
     assert is_list(body["waiters"])
   end
