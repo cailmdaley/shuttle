@@ -10,14 +10,13 @@ defmodule ShuttleWeb.LifecycleController do
 
   use Phoenix.Controller, formats: [:json]
 
-  alias Shuttle.FeltStores
+  alias Shuttle.{FeltStores, LifecycleStore}
 
   @allowed ~w(install pause resume repeat accept set-model set-interactive uninstall)
 
   def create(conn, params) do
     with {:ok, action} <- action(params),
-         {:ok, args} <- args_for(action, params),
-         {:ok, output} <- run(args) do
+         {:ok, output} <- execute(action, params) do
       conn
       |> put_resp_content_type("text/plain")
       |> send_resp(200, output)
@@ -37,6 +36,29 @@ defmodule ShuttleWeb.LifecycleController do
   defp action(%{"action" => action}) when action in @allowed, do: {:ok, action}
   defp action(%{"action" => action}), do: {:error, "unknown lifecycle action #{inspect(action)}"}
   defp action(_), do: {:error, "missing lifecycle action"}
+
+  defp execute("accept", %{"fiber" => fiber} = params) do
+    case LifecycleStore.accept(fiber, keep_outcome: truthy?(params["keep_outcome"])) do
+      {:ok, output} -> append_accept_history(fiber, output)
+      {:error, _reason} -> args_for("accept", params) |> then(&run_elem/1)
+    end
+  end
+
+  defp execute("resume", %{"fiber" => fiber}) do
+    case LifecycleStore.resume(fiber) do
+      {:ok, output} -> append_resume_history(fiber, output)
+      {:error, _reason} -> args_for("resume", %{"fiber" => fiber}) |> then(&run_elem/1)
+    end
+  end
+
+  defp execute(action, params) do
+    action
+    |> args_for(params)
+    |> run_elem()
+  end
+
+  defp run_elem({:ok, args}), do: run(args)
+  defp run_elem(error), do: error
 
   defp args_for("install", %{"fiber" => fiber} = params) do
     args = ["install", fiber]
@@ -84,6 +106,9 @@ defmodule ShuttleWeb.LifecycleController do
   defp add_bool_flag(args, flag, true), do: args ++ [flag]
   defp add_bool_flag(args, _flag, _), do: args
 
+  defp truthy?(true), do: true
+  defp truthy?(_), do: false
+
   defp run(args) do
     case System.cmd("shuttle-ctl", args, stderr_to_stdout: true) do
       {output, 0} -> {:ok, output}
@@ -91,6 +116,44 @@ defmodule ShuttleWeb.LifecycleController do
     end
   rescue
     e in ErlangError -> {:error, Exception.message(e)}
+  end
+
+  defp append_accept_history(fiber, output) do
+    summary =
+      output
+      |> String.split("\n", trim: true)
+      |> List.first()
+      |> case do
+        nil -> "accepted standing-role run via daemon runtime store"
+        line -> line
+      end
+
+    append_history(fiber, summary)
+    {:ok, output}
+  end
+
+  defp append_resume_history(fiber, output) do
+    summary =
+      output
+      |> String.split("\n", trim: true)
+      |> List.first()
+      |> case do
+        nil -> "resumed standing role via daemon runtime store"
+        line -> line
+      end
+
+    append_history(fiber, summary)
+    {:ok, output}
+  end
+
+  defp append_history(fiber, summary) do
+    with {:ok, host} <- host_for_fiber(fiber) do
+      System.cmd("felt", ["-C", host, "history", "append", fiber, "--summary", summary],
+        stderr_to_stdout: true
+      )
+    end
+  rescue
+    _ -> nil
   end
 
   defp host_for_fiber(fiber_id) do

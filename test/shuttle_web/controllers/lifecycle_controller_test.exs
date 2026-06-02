@@ -3,6 +3,8 @@ defmodule ShuttleWeb.LifecycleControllerTest do
   import Plug.Conn
   import Phoenix.ConnTest
 
+  alias Shuttle.RuntimeStore
+
   @endpoint ShuttleWeb.Endpoint
 
   test "install forwards interactive through shuttle-ctl" do
@@ -62,10 +64,187 @@ defmodule ShuttleWeb.LifecycleControllerTest do
              "--felt-store\n#{store}\nset-interactive\ntests/interactive\nfalse\n"
   end
 
+  test "accept for standing roles writes lifecycle store and evicts runtime frontmatter" do
+    root =
+      System.tmp_dir!()
+      |> Path.join("shuttle-lifecycle-accept-#{System.unique_integer([:positive])}")
+
+    store = Path.join(root, "loom")
+    runtime_store = Path.join(root, "runtime.db")
+    fiber_dir = Path.join([store, ".felt", "tests", "standing-accept"])
+    File.mkdir_p!(fiber_dir)
+    path = Path.join(fiber_dir, "standing-accept.md")
+
+    File.write!(path, """
+    ---
+    name: Standing accept
+    status: closed
+    outcome: digest
+    tempered: false
+    closed-at: 2026-06-01T09:30:00Z
+    shuttle:
+      enabled: true
+      kind: standing
+      host: #{Shuttle.Poller.own_host_id()}
+      project_dir: #{store}
+      schedule:
+        expr: 0 9 * * 1-5
+        tz: UTC
+      review:
+        state: awaiting
+        run_id: run-1
+        completed_at: 2026-06-01T09:12:00Z
+        accepted_run_id: null
+      next_due_at: 2026-06-01T09:00:00Z
+      last_run_at: 2026-06-01T09:12:00Z
+      session:
+        id: stale-session
+        dispatched_at: 2026-06-01T09:00:00Z
+    ---
+
+    Body.
+    """)
+
+    with_env(%{"LOOM_HOMES" => store, "SHUTTLE_RUNTIME_STORE" => runtime_store}, fn ->
+      conn =
+        post(
+          api_conn(),
+          "/api/v1/lifecycle",
+          Jason.encode!(%{
+            "action" => "accept",
+            "fiber" => "tests/standing-accept"
+          })
+        )
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "accepted run run-1"
+
+      text = File.read!(path)
+      frontmatter = frontmatter(text)
+      refute frontmatter =~ "review:"
+      refute frontmatter =~ "next_due_at:"
+      refute frontmatter =~ "last_run_at:"
+      refute frontmatter =~ "session:"
+      assert frontmatter =~ "status: active"
+      assert frontmatter =~ ~s(outcome: "")
+      assert frontmatter =~ "schedule:"
+
+      assert [
+               %{
+                 fiber_id: "tests/standing-accept",
+                 metadata: %{
+                   phase: "scheduled",
+                   run_id: "run-1",
+                   next_due_at: next_due_at,
+                   review: %{
+                     "state" => "scheduled",
+                     "run_id" => "run-1",
+                     "accepted_run_id" => "run-1"
+                   }
+                 }
+               }
+             ] = RuntimeStore.list_lifecycle(runtime_store)
+
+      assert DateTime.to_iso8601(next_due_at) == "2026-06-02T09:00:00Z"
+    end)
+
+    File.rm_rf(root)
+  end
+
+  test "resume for standing roles writes immediate lifecycle store and evicts runtime frontmatter" do
+    root =
+      System.tmp_dir!()
+      |> Path.join("shuttle-lifecycle-resume-#{System.unique_integer([:positive])}")
+
+    store = Path.join(root, "loom")
+    runtime_store = Path.join(root, "runtime.db")
+    fiber_dir = Path.join([store, ".felt", "tests", "standing-resume"])
+    File.mkdir_p!(fiber_dir)
+    path = Path.join(fiber_dir, "standing-resume.md")
+
+    File.write!(path, """
+    ---
+    name: Standing resume
+    status: active
+    outcome: digest
+    shuttle:
+      enabled: true
+      kind: standing
+      host: #{Shuttle.Poller.own_host_id()}
+      project_dir: #{store}
+      schedule:
+        expr: 0 9 * * 1-5
+        tz: UTC
+      review:
+        state: awaiting
+        run_id: run-2
+      next_due_at: null
+      last_run_at: 2026-06-01T09:12:00Z
+    ---
+
+    Body.
+    """)
+
+    with_env(%{"LOOM_HOMES" => store, "SHUTTLE_RUNTIME_STORE" => runtime_store}, fn ->
+      conn =
+        post(
+          api_conn(),
+          "/api/v1/lifecycle",
+          Jason.encode!(%{
+            "action" => "resume",
+            "fiber" => "tests/standing-resume"
+          })
+        )
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "re-queued for immediate dispatch"
+
+      frontmatter = path |> File.read!() |> frontmatter()
+      refute frontmatter =~ "review:"
+      refute frontmatter =~ "next_due_at:"
+      refute frontmatter =~ "last_run_at:"
+      assert frontmatter =~ "outcome: digest"
+
+      assert [
+               %{
+                 fiber_id: "tests/standing-resume",
+                 metadata: %{
+                   phase: "scheduled",
+                   run_id: "run-2",
+                   next_due_at: %DateTime{},
+                   review: %{"state" => "scheduled", "run_id" => "run-2"}
+                 }
+               }
+             ] = RuntimeStore.list_lifecycle(runtime_store)
+    end)
+
+    File.rm_rf(root)
+  end
+
   defp api_conn do
     build_conn()
     |> put_req_header("content-type", "application/json")
     |> put_req_header("accept", "application/json")
+  end
+
+  defp frontmatter(content) do
+    [_, frontmatter | _] = String.split(content, "---\n", parts: 3)
+    frontmatter
+  end
+
+  defp with_env(vars, fun) do
+    old = Map.new(vars, fn {key, _value} -> {key, System.get_env(key)} end)
+
+    Enum.each(vars, fn {key, value} -> System.put_env(key, value) end)
+
+    try do
+      fun.()
+    after
+      Enum.each(old, fn
+        {key, nil} -> System.delete_env(key)
+        {key, value} -> System.put_env(key, value)
+      end)
+    end
   end
 
   defp install_fake_shuttle_ctl! do

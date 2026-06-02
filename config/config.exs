@@ -1,5 +1,8 @@
 import Config
 
+config :elixir, :time_zone_database, Tzdata.TimeZoneDatabase
+config :tzdata, :autoupdate, :disabled
+
 config :shuttle,
   env: config_env(),
   # `:host` is intentionally left unset here. Per-daemon identity resolves at
