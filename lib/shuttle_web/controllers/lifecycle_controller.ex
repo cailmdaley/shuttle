@@ -110,7 +110,9 @@ defmodule ShuttleWeb.LifecycleController do
   defp truthy?(_), do: false
 
   defp run(args) do
-    case System.cmd("shuttle-ctl", args, stderr_to_stdout: true) do
+    env = [{"SHUTTLE_LIFECYCLE_OFFLINE", "1"}]
+
+    case System.cmd("shuttle-ctl", args, stderr_to_stdout: true, env: env) do
       {output, 0} -> {:ok, output}
       {output, status} -> {:command_error, status, output}
     end

@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -101,14 +104,23 @@ func withTempHost(t *testing.T) (host string, cleanup func()) {
 	t.Helper()
 	host = t.TempDir()
 	prev := os.Getenv("LOOM_HOME")
+	prevOffline, hadOffline := os.LookupEnv("SHUTTLE_LIFECYCLE_OFFLINE")
 	if err := os.Setenv("LOOM_HOME", host); err != nil {
 		t.Fatalf("setenv LOOM_HOME: %v", err)
+	}
+	if err := os.Setenv("SHUTTLE_LIFECYCLE_OFFLINE", "1"); err != nil {
+		t.Fatalf("setenv SHUTTLE_LIFECYCLE_OFFLINE: %v", err)
 	}
 	cleanup = func() {
 		if prev == "" {
 			_ = os.Unsetenv("LOOM_HOME")
 		} else {
 			_ = os.Setenv("LOOM_HOME", prev)
+		}
+		if hadOffline {
+			_ = os.Setenv("SHUTTLE_LIFECYCLE_OFFLINE", prevOffline)
+		} else {
+			_ = os.Unsetenv("SHUTTLE_LIFECYCLE_OFFLINE")
 		}
 	}
 	return host, cleanup
@@ -1121,4 +1133,145 @@ Body.
 	if !strings.Contains(text, "Worth keeping across the boundary.") {
 		t.Fatalf("--keep-outcome did not preserve outcome:\n%s", text)
 	}
+}
+
+func TestAcceptCmd_UsesDaemonLifecycleWhenAvailable(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "daily-report", `---
+name: Daily report
+status: active
+outcome: digest
+shuttle:
+  enabled: true
+  kind: standing
+  schedule:
+    expr: "0 9 * * 1-5"
+    tz: Europe/Paris
+  review:
+    state: awaiting
+    run_id: "20260508T070000+0000"
+  session:
+    id: stale-session
+---
+
+Body.
+`)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+
+	var requestPath string
+	var payload map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		_, _ = w.Write([]byte("accepted run 20260508T070000+0000 for daily-report\n"))
+	}))
+	defer srv.Close()
+	enableDaemonLifecycle(t, srv.URL)
+
+	cmd := newAcceptCmd()
+	cmd.SetArgs([]string{"daily-report", "--keep-outcome"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("daemon path should not rewrite frontmatter. before:\n%s\nafter:\n%s", before, after)
+	}
+	if requestPath != "/api/v1/lifecycle" {
+		t.Fatalf("unexpected request path %q", requestPath)
+	}
+	if payload["action"] != "accept" || payload["fiber"] != "daily-report" || payload["keep_outcome"] != true {
+		t.Fatalf("unexpected lifecycle payload: %#v", payload)
+	}
+}
+
+func TestResumeCmd_StandingReviewUsesDaemonLifecycleWhenAvailable(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "daily-report", `---
+name: Daily report
+status: active
+outcome: digest
+shuttle:
+  enabled: true
+  kind: standing
+  schedule:
+    expr: "0 9 * * 1-5"
+    tz: Europe/Paris
+  review:
+    state: awaiting
+    run_id: "20260508T070000+0000"
+  next_due_at: null
+---
+
+Body.
+`)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+
+	var payload map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/lifecycle" {
+			t.Fatalf("unexpected request path %q", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		_, _ = w.Write([]byte("resumed daily-report (standing role; re-queued for immediate dispatch)\n"))
+	}))
+	defer srv.Close()
+	enableDaemonLifecycle(t, srv.URL)
+
+	cmd := newResumeCmd()
+	cmd.SetArgs([]string{"daily-report"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("daemon path should not rewrite frontmatter. before:\n%s\nafter:\n%s", before, after)
+	}
+	if payload["action"] != "resume" || payload["fiber"] != "daily-report" {
+		t.Fatalf("unexpected lifecycle payload: %#v", payload)
+	}
+}
+
+func enableDaemonLifecycle(t *testing.T, url string) {
+	t.Helper()
+	prevOffline, hadOffline := os.LookupEnv("SHUTTLE_LIFECYCLE_OFFLINE")
+	prevURL, hadURL := os.LookupEnv("SHUTTLE_DAEMON_URL")
+
+	_ = os.Unsetenv("SHUTTLE_LIFECYCLE_OFFLINE")
+	_ = os.Setenv("SHUTTLE_DAEMON_URL", url)
+
+	t.Cleanup(func() {
+		if hadOffline {
+			_ = os.Setenv("SHUTTLE_LIFECYCLE_OFFLINE", prevOffline)
+		} else {
+			_ = os.Unsetenv("SHUTTLE_LIFECYCLE_OFFLINE")
+		}
+		if hadURL {
+			_ = os.Setenv("SHUTTLE_DAEMON_URL", prevURL)
+		} else {
+			_ = os.Unsetenv("SHUTTLE_DAEMON_URL")
+		}
+	})
 }

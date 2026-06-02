@@ -107,6 +107,12 @@ closed fiber back into active work.`,
 			// StandingRole.due? rejects review.state == "awaiting". Transition to
 			// scheduled with next_due_at=now so the daemon dispatches immediately.
 			if f.Block.Kind == "standing" && standingInReviewState(f.Block.Review) {
+				if output, err := postLifecycle("resume", map[string]any{"fiber": fiberID}); err == nil {
+					fmt.Print(output)
+					return nil
+				} else if !isLifecycleTransportError(err) {
+					return err
+				}
 				return resumeStandingFromReview(args[0], fiberID, host, f)
 			}
 
@@ -354,6 +360,16 @@ Appends a felt history event recording the acceptance.`,
 				return fmt.Errorf("fiber %s has no schedule", args[0])
 			}
 
+			if output, err := postLifecycle("accept", map[string]any{
+				"fiber":        fiberID,
+				"keep_outcome": keepOutcome,
+			}); err == nil {
+				fmt.Print(output)
+				return nil
+			} else if !isLifecycleTransportError(err) {
+				return err
+			}
+
 			runID := ""
 			if f.Block.Review.RunID != nil {
 				runID = *f.Block.Review.RunID
@@ -548,6 +564,14 @@ func standingInReviewState(review *schema.Review) bool {
 	}
 	s := review.State
 	return s == "awaiting" || s == "review" || s == "in_review"
+}
+
+func isLifecycleTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "reaching daemon") ||
+		strings.Contains(err.Error(), "SHUTTLE_LIFECYCLE_OFFLINE")
 }
 
 // resumeStandingFromReview re-queues a standing role that is in awaiting/review
