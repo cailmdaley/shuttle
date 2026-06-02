@@ -882,24 +882,18 @@ defmodule Shuttle.Dispatcher do
   # - Claude: UUID was pre-specified; write synchronously.
   # - Codex/Pi: capture UUID from session file asynchronously with backoff.
   # - None: agent doesn't support session IDs; skip.
-  defp store_session_id(fiber_id, agent_id, {:claude, uuid}, runner, felt_store) do
+  defp store_session_id(fiber_id, agent_id, {:claude, uuid}, _runner, felt_store) do
     # Fire-and-forget: storing the UUID is best-effort; blocking dispatch on a
     # shuttle-ctl call would delay WorkerWatcher startup and cause flaky tests
     # (the watcher init checks the session, but the session can be removed by
     # other actors while we wait for shuttle-ctl to finish).
     Task.start(fn ->
-      case runner.cmd(
-             "shuttle-ctl",
-             ["--felt-store", felt_store, "session-set", fiber_id, uuid, "--agent", agent_id],
-             stderr_to_stdout: true
-           ) do
-        {_, 0} ->
+      case Shuttle.SessionStore.set(fiber_id, uuid, agent_id, felt_store: felt_store) do
+        {:ok, _} ->
           Logger.info("Stored session UUID #{uuid} for #{fiber_id}")
 
-        {output, code} ->
-          Logger.warning(
-            "Could not store session UUID for #{fiber_id}: exit #{code}: #{String.trim(output)}"
-          )
+        {:error, reason} ->
+          Logger.warning("Could not store session UUID for #{fiber_id}: #{reason}")
       end
     end)
   end
@@ -908,7 +902,7 @@ defmodule Shuttle.Dispatcher do
          fiber_id,
          agent_id,
          {:capture, cli, work_dir, capture_fiber_id, dispatched_after},
-         runner,
+         _runner,
          felt_store
        ) do
     # Fire-and-forget: capture the session UUID from the harness's JSONL file
@@ -918,18 +912,14 @@ defmodule Shuttle.Dispatcher do
     Task.start(fn ->
       case capture_session_uuid(cli, work_dir, capture_fiber_id, dispatched_after, 100) do
         {:ok, uuid} ->
-          case runner.cmd(
-                 "shuttle-ctl",
-                 ["--felt-store", felt_store, "session-set", fiber_id, uuid, "--agent", agent_id],
-                 stderr_to_stdout: true
-               ) do
-            {_, 0} ->
+          case Shuttle.SessionStore.set(fiber_id, uuid, agent_id, felt_store: felt_store) do
+            {:ok, _} ->
               Logger.info("Captured and stored session UUID #{uuid} for #{fiber_id}")
 
-            {output, code} ->
+            {:error, reason} ->
               Logger.warning(
                 "Captured UUID #{uuid} but could not store for #{fiber_id}: " <>
-                  "exit #{code}: #{String.trim(output)}"
+                  reason
               )
           end
 

@@ -1493,6 +1493,7 @@ defmodule Shuttle.Poller do
     |> put_if_missing("review", stringify_keys(Map.get(lifecycle, :review, %{})))
     |> put_if_missing("next_due_at", Map.get(lifecycle, :next_due_at))
     |> put_if_missing("last_run_at", Map.get(lifecycle, :last_run_at))
+    |> put_if_missing("session", stringify_keys(Map.get(lifecycle, :session, %{})))
   end
 
   # Resolves which configured felt store owns `fiber_id`.

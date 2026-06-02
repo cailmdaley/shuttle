@@ -1,7 +1,9 @@
 import Config
 
-config :elixir, :time_zone_database, Tzdata.TimeZoneDatabase
-config :tzdata, :autoupdate, :disabled
+# NOTE: escript boot does NOT load this compile-time config (see
+# Shuttle.Application.start/2, which also sets the DB at runtime). This line
+# covers Mix/test contexts; the runtime call covers the daemon escript.
+config :elixir, :time_zone_database, Tz.TimeZoneDatabase
 
 config :shuttle,
   env: config_env(),

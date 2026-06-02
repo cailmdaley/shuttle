@@ -28,6 +28,13 @@ defmodule Shuttle.Application do
     # Mix run context), this is a no-op.
     maybe_configure_endpoint()
 
+    # Same escript-config gap applies to the time zone database: the
+    # `config :elixir, :time_zone_database` line in config/config.exs is not
+    # loaded in the daemon escript, so DateTime.shift_zone/2 (cron scheduling)
+    # would fall back to the UTC-only DB. Set it explicitly at runtime; this is
+    # the load-bearing wiring for `tz` in the escript daemon.
+    Calendar.put_time_zone_database(Tz.TimeZoneDatabase)
+
     children = [
       {Phoenix.PubSub, name: Shuttle.PubSub},
       {DynamicSupervisor, strategy: :one_for_one, name: Shuttle.WatcherSupervisor}

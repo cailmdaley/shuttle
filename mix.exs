@@ -37,7 +37,11 @@ defmodule Shuttle.MixProject do
     [
       {:jason, "~> 1.4"},
       {:yaml_elixir, "~> 2.12"},
-      {:tzdata, "~> 1.1"},
+      # tz (compile-time IANA DB) over tzdata: tzdata's runtime data dir
+      # resolves to a path *under* the bin/shuttle escript file (:enotdir),
+      # which crashes the daemon on boot. tz bakes the data into modules —
+      # no runtime data dir, safe in an escript. See finding-self-defeating-loop.
+      {:tz, "~> 0.28"},
       {:phoenix, "~> 1.7"},
       {:bandit, "~> 1.0"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false}

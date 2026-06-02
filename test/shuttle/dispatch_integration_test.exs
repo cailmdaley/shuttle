@@ -1,7 +1,7 @@
 defmodule Shuttle.DispatchIntegrationTest do
   use ExUnit.Case, async: false
 
-  alias Shuttle.{Dispatcher, Poller}
+  alias Shuttle.{Dispatcher, Poller, RuntimeStore}
 
   # ── Integration Runner ─────────────────────────────────────────────────────
   # Passes `felt` commands to the real felt CLI (with -C felt_store).
@@ -435,16 +435,25 @@ defmodule Shuttle.DispatchIntegrationTest do
 
   test "codex session capture ignores newer non-worker session in same cwd", %{host: host} do
     session_dir = Path.join(host, "codex-sessions")
+    runtime_store = Path.join(host, "runtime.db")
     File.mkdir_p!(session_dir)
 
     previous_dir = System.get_env("SHUTTLE_CODEX_SESSIONS_DIR")
+    previous_runtime_store = System.get_env("SHUTTLE_RUNTIME_STORE")
     System.put_env("SHUTTLE_CODEX_SESSIONS_DIR", session_dir)
+    System.put_env("SHUTTLE_RUNTIME_STORE", runtime_store)
 
     on_exit(fn ->
       if previous_dir do
         System.put_env("SHUTTLE_CODEX_SESSIONS_DIR", previous_dir)
       else
         System.delete_env("SHUTTLE_CODEX_SESSIONS_DIR")
+      end
+
+      if previous_runtime_store do
+        System.put_env("SHUTTLE_RUNTIME_STORE", previous_runtime_store)
+      else
+        System.delete_env("SHUTTLE_RUNTIME_STORE")
       end
     end)
 
@@ -491,17 +500,12 @@ defmodule Shuttle.DispatchIntegrationTest do
              )
 
     assert eventually(fn ->
-             Enum.any?(IntegrationRunner.commands(), fn
-               {"shuttle-ctl", args} ->
-                 args == [
-                   "--felt-store",
-                   host,
-                   "session-set",
-                   "tests/codex-capture",
-                   "right-worker-session",
-                   "--agent",
-                   "codex"
-                 ]
+             Enum.any?(RuntimeStore.list_lifecycle(runtime_store), fn
+               %{
+                 fiber_id: "tests/codex-capture",
+                 metadata: %{session: %{"id" => "right-worker-session", "agent" => "codex"}}
+               } ->
+                 true
 
                _ ->
                  false
@@ -509,6 +513,7 @@ defmodule Shuttle.DispatchIntegrationTest do
            end)
 
     refute Enum.any?(IntegrationRunner.commands(), fn
+             {"shuttle-ctl", ["session-set" | _]} -> true
              {"shuttle-ctl", args} -> "wrong-human-session" in args
              _ -> false
            end)
