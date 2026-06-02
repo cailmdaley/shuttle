@@ -90,6 +90,7 @@ defmodule Shuttle.Poller do
       reservations: %{},
       completed_standing_runs: MapSet.new(),
       standing_roles: [],
+      lifecycle: %{},
       orphans: [],
       # %{fiber_id => felt_store} — populated by discover_candidates/1 on each
       # poll cycle and by host_for_fiber/2 on demand. Entries are never evicted
@@ -301,7 +302,12 @@ defmodule Shuttle.Poller do
 
     # Rehydrate the daemon-owned runtime store first, then adopt any live tmux
     # sessions that predate the store or were created while the daemon was down.
-    state = state |> rehydrate_runtime_store() |> adopt_orphans() |> rehydrate_retry_queue()
+    state =
+      state
+      |> rehydrate_lifecycle_store()
+      |> rehydrate_runtime_store()
+      |> adopt_orphans()
+      |> rehydrate_retry_queue()
 
     # Schedule first tick immediately
     state = schedule_tick(state, 0)
@@ -654,10 +660,13 @@ defmodule Shuttle.Poller do
     # Merge newly resolved host entries into the cache. Existing entries
     # are not evicted — earlier-configured hosts win for ID collisions,
     # and cache entries are stable for the daemon's lifetime.
+    {standing_roles, lifecycle} = standing_roles_from_candidates(candidates, state)
+
     state = %{
       state
       | fiber_host_cache: Map.merge(new_host_map, state.fiber_host_cache),
-        standing_roles: standing_roles_from_candidates(candidates),
+        standing_roles: standing_roles,
+        lifecycle: lifecycle,
         dispatch_failures: evict_stale_dispatch_failures(state.dispatch_failures, candidates)
     }
 
@@ -827,6 +836,7 @@ defmodule Shuttle.Poller do
         completed_standing_runs:
           MapSet.union(poll_state.completed_standing_runs, current.completed_standing_runs),
         standing_roles: poll_state.standing_roles,
+        lifecycle: poll_state.lifecycle,
         orphans: poll_state.orphans,
         # Carry the poll cycle's view. Sync :dispatch calls that ran in
         # parallel with the poll Task lose their dispatch_failures updates;
@@ -1442,25 +1452,47 @@ defmodule Shuttle.Poller do
   # init/handle_call code.
   defp resolve_own_host_id, do: own_host_id()
 
-  defp standing_roles_from_candidates(candidates) do
-    Enum.flat_map(candidates, fn fiber ->
-      case standing_role_from_fiber(fiber) do
+  defp standing_roles_from_candidates(candidates, state) do
+    candidates
+    |> Enum.reduce({[], %{}}, fn fiber, {roles, lifecycle} ->
+      case standing_role_from_fiber(fiber, state) do
         {:ok, role} ->
-          if StandingRole.standing?(role), do: [role], else: []
+          if StandingRole.standing?(role) do
+            metadata = lifecycle_metadata_from_role(role)
+            persist_lifecycle(state, role.fiber_id, metadata)
+            {[role | roles], Map.put(lifecycle, role.fiber_id, metadata)}
+          else
+            {roles, lifecycle}
+          end
 
         {:error, _} ->
-          []
+          {roles, lifecycle}
       end
     end)
+    |> then(fn {roles, lifecycle} -> {Enum.reverse(roles), lifecycle} end)
   end
 
-  defp standing_role_from_fiber(fiber) do
+  defp standing_role_from_fiber(fiber, state) do
     fiber_id = Map.get(fiber, "id", "")
 
     case Map.get(fiber, "shuttle") do
-      shuttle when is_map(shuttle) -> StandingRole.from_map(fiber_id, shuttle)
-      _ -> {:error, :no_shuttle_block}
+      shuttle when is_map(shuttle) ->
+        shuttle
+        |> merge_lifecycle_overlay(Map.get(state.lifecycle, fiber_id))
+        |> then(&StandingRole.from_map(fiber_id, &1))
+
+      _ ->
+        {:error, :no_shuttle_block}
     end
+  end
+
+  defp merge_lifecycle_overlay(shuttle, nil), do: shuttle
+
+  defp merge_lifecycle_overlay(shuttle, lifecycle) when is_map(shuttle) and is_map(lifecycle) do
+    shuttle
+    |> put_if_missing("review", stringify_keys(Map.get(lifecycle, :review, %{})))
+    |> put_if_missing("next_due_at", Map.get(lifecycle, :next_due_at))
+    |> put_if_missing("last_run_at", Map.get(lifecycle, :last_run_at))
   end
 
   # Resolves which configured felt store owns `fiber_id`.
@@ -1800,6 +1832,15 @@ defmodule Shuttle.Poller do
     |> Enum.reduce(state, fn %{fiber_id: fiber_id, metadata: metadata}, state_acc ->
       rehydrate_retry_record(state_acc, fiber_id, metadata)
     end)
+  end
+
+  defp rehydrate_lifecycle_store(%State{} = state) do
+    lifecycle =
+      state.runtime_store_path
+      |> RuntimeStore.list_lifecycle()
+      |> Map.new(fn %{fiber_id: fiber_id, metadata: metadata} -> {fiber_id, metadata} end)
+
+    %{state | lifecycle: lifecycle}
   end
 
   defp rehydrate_retry_record(%State{} = state, fiber_id, metadata) do
@@ -2407,8 +2448,13 @@ defmodule Shuttle.Poller do
 
   defp fetch_standing_role(fiber_id, state) do
     case fetch_shuttle_block(fiber_id, state) do
-      {:ok, shuttle} -> StandingRole.from_map(fiber_id, shuttle)
-      {:error, _} -> {:error, :no_shuttle_block}
+      {:ok, shuttle} ->
+        shuttle
+        |> merge_lifecycle_overlay(Map.get(state.lifecycle, fiber_id))
+        |> then(&StandingRole.from_map(fiber_id, &1))
+
+      {:error, _} ->
+        {:error, :no_shuttle_block}
     end
   end
 
@@ -2424,6 +2470,39 @@ defmodule Shuttle.Poller do
   defp completed_standing_run?(state, fiber_id, run_id) do
     MapSet.member?(state.completed_standing_runs, {fiber_id, run_id})
   end
+
+  defp lifecycle_metadata_from_role(%StandingRole{} = role) do
+    %{
+      kind: role.mode || "standing",
+      phase: role.review["state"] || "scheduled",
+      run_id: role.run_id,
+      next_due_at: role.next_due_at,
+      last_run_at: role.last_run_at,
+      review: role.review
+    }
+  end
+
+  defp persist_lifecycle(%State{} = state, fiber_id, metadata) do
+    RuntimeStore.upsert_lifecycle(state.runtime_store_path, fiber_id, metadata)
+  end
+
+  defp put_if_missing(map, _key, nil), do: map
+  defp put_if_missing(map, _key, value) when value == %{}, do: map
+
+  defp put_if_missing(map, key, value) do
+    case Map.get(map, key) do
+      nil -> Map.put(map, key, value)
+      "" -> Map.put(map, key, value)
+      %{} = nested when map_size(nested) == 0 -> Map.put(map, key, value)
+      _ -> map
+    end
+  end
+
+  defp stringify_keys(value) when is_map(value) do
+    Map.new(value, fn {key, value} -> {to_string(key), value} end)
+  end
+
+  defp stringify_keys(_), do: %{}
 
   defp standing_role_snapshots(roles, running, now) do
     Enum.map(roles, fn role ->

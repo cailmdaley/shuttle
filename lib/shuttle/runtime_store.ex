@@ -48,6 +48,18 @@ defmodule Shuttle.RuntimeStore do
       metadata_json TEXT NOT NULL DEFAULT '{}',
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS lifecycle_state (
+      fiber_id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL DEFAULT 'oneshot',
+      phase TEXT NOT NULL DEFAULT 'scheduled',
+      run_id TEXT,
+      run_kind TEXT,
+      next_due_at TEXT,
+      last_run_at TEXT,
+      review_json TEXT NOT NULL DEFAULT '{}',
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT NOT NULL
+    );
     INSERT OR IGNORE INTO schema_migrations(version, applied_at)
     VALUES (#{@schema_version}, #{sql_string(DateTime.utc_now() |> DateTime.to_iso8601())});
     """
@@ -181,6 +193,74 @@ defmodule Shuttle.RuntimeStore do
     exec!(path, "DELETE FROM retry_queue WHERE fiber_id = #{sql_string(fiber_id)};")
   end
 
+  @spec list_lifecycle(path()) :: [%{fiber_id: String.t(), metadata: map()}]
+  def list_lifecycle(path) when is_binary(path) do
+    init(path)
+
+    sql = """
+    SELECT fiber_id, metadata_json
+    FROM lifecycle_state
+    ORDER BY fiber_id;
+    """
+
+    path
+    |> query_lines(sql)
+    |> Enum.map(fn line ->
+      [fiber_id, metadata_json] = String.split(line, "\t", parts: 2)
+      %{"metadata" => metadata} = Jason.decode!(metadata_json)
+      %{fiber_id: fiber_id, metadata: decode_metadata(metadata)}
+    end)
+  end
+
+  @spec upsert_lifecycle(path(), String.t(), map()) :: :ok
+  def upsert_lifecycle(path, fiber_id, metadata)
+      when is_binary(path) and is_binary(fiber_id) and is_map(metadata) do
+    init(path)
+
+    kind = metadata |> Map.get(:kind, "oneshot") |> to_string()
+    phase = metadata |> Map.get(:phase, "scheduled") |> to_string()
+    run_id = Map.get(metadata, :run_id)
+    run_kind = Map.get(metadata, :run_kind)
+    next_due_at = metadata |> Map.get(:next_due_at) |> encode_optional_datetime()
+    last_run_at = metadata |> Map.get(:last_run_at) |> encode_optional_datetime()
+    review_json = Jason.encode!(Map.get(metadata, :review, %{}))
+    updated_at = DateTime.utc_now() |> DateTime.to_iso8601()
+
+    metadata_json =
+      %{metadata: encode_metadata(metadata)}
+      |> Jason.encode!()
+
+    sql = """
+    INSERT INTO lifecycle_state (
+      fiber_id, kind, phase, run_id, run_kind, next_due_at, last_run_at,
+      review_json, metadata_json, updated_at
+    ) VALUES (
+      #{sql_string(fiber_id)}, #{sql_string(kind)}, #{sql_string(phase)},
+      #{sql_string(run_id)}, #{sql_string(run_kind)}, #{sql_string(next_due_at)},
+      #{sql_string(last_run_at)}, #{sql_string(review_json)},
+      #{sql_string(metadata_json)}, #{sql_string(updated_at)}
+    )
+    ON CONFLICT(fiber_id) DO UPDATE SET
+      kind = excluded.kind,
+      phase = excluded.phase,
+      run_id = excluded.run_id,
+      run_kind = excluded.run_kind,
+      next_due_at = excluded.next_due_at,
+      last_run_at = excluded.last_run_at,
+      review_json = excluded.review_json,
+      metadata_json = excluded.metadata_json,
+      updated_at = excluded.updated_at;
+    """
+
+    exec!(path, sql)
+  end
+
+  @spec delete_lifecycle(path(), String.t()) :: :ok
+  def delete_lifecycle(path, fiber_id) when is_binary(path) and is_binary(fiber_id) do
+    init(path)
+    exec!(path, "DELETE FROM lifecycle_state WHERE fiber_id = #{sql_string(fiber_id)};")
+  end
+
   defp exec!(path, sql) do
     case System.cmd("sqlite3", sqlite_args(path, sql), stderr_to_stdout: true) do
       {_, 0} ->
@@ -229,6 +309,12 @@ defmodule Shuttle.RuntimeStore do
     |> Map.new(fn
       {"started_at", value} -> {:started_at, decode_datetime(value)}
       {"last_activity_at", value} -> {:last_activity_at, decode_datetime(value)}
+      {"next_due_at", nil} -> {:next_due_at, nil}
+      {"next_due_at", ""} -> {:next_due_at, nil}
+      {"next_due_at", value} -> {:next_due_at, decode_datetime(value)}
+      {"last_run_at", nil} -> {:last_run_at, nil}
+      {"last_run_at", ""} -> {:last_run_at, nil}
+      {"last_run_at", value} -> {:last_run_at, decode_datetime(value)}
       {"delay_type", value} when is_binary(value) -> {:delay_type, String.to_atom(value)}
       {key, value} -> {String.to_atom(key), value}
     end)
@@ -236,6 +322,10 @@ defmodule Shuttle.RuntimeStore do
 
   defp encode_datetime(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
   defp encode_datetime(value) when is_binary(value), do: value
+
+  defp encode_optional_datetime(nil), do: nil
+  defp encode_optional_datetime(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
+  defp encode_optional_datetime(value) when is_binary(value), do: value
 
   defp decode_datetime(value) when is_binary(value) do
     case DateTime.from_iso8601(value) do

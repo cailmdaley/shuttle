@@ -584,6 +584,113 @@ defmodule Shuttle.PollerTest do
              Poller.snapshot(poller).standing_roles
   end
 
+  test "poller persists standing-role lifecycle state to the runtime store" do
+    fiber_id = "tests/standing-lifecycle-persist"
+    runtime_store_path = runtime_store_path()
+    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
+    MockRunner.set_fiber(fiber_id, fiber)
+
+    MockRunner.set_shuttle(
+      fiber_id,
+      """
+      enabled: true
+      kind: standing
+      schedule:
+        expr: "0 9 * * 1-5"
+        tz: Europe/Paris
+      review:
+        state: awaiting
+        run_id: run-1
+        accepted_run_id: null
+      next_due_at: null
+      last_run_at: "2026-06-02T09:13:00+02:00"
+      """
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_standing_lifecycle_persist,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"],
+        runtime_store_path: runtime_store_path
+      )
+
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             Shuttle.RuntimeStore.list_lifecycle(runtime_store_path)
+             |> Enum.any?(&(&1.fiber_id == fiber_id))
+           end)
+
+    assert [
+             %{
+               fiber_id: ^fiber_id,
+               metadata: %{
+                 kind: "standing",
+                 phase: "awaiting",
+                 run_id: "run-1",
+                 review: %{"state" => "awaiting"}
+               }
+             }
+           ] = Shuttle.RuntimeStore.list_lifecycle(runtime_store_path)
+
+    assert [%{fiber_id: ^fiber_id, state: "review", run_id: "run-1"}] =
+             Poller.snapshot(poller).standing_roles
+  after
+    cleanup_runtime_store_paths()
+  end
+
+  test "poller overlays persisted lifecycle when rebuilding standing-role snapshots" do
+    fiber_id = "tests/standing-lifecycle-overlay"
+    runtime_store_path = runtime_store_path()
+    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
+    MockRunner.set_fiber(fiber_id, fiber)
+
+    MockRunner.set_shuttle(
+      fiber_id,
+      """
+      enabled: true
+      kind: standing
+      schedule:
+        expr: "0 9 * * 1-5"
+        tz: Europe/Paris
+      review:
+        state: scheduled
+      next_due_at: null
+      """
+    )
+
+    Shuttle.RuntimeStore.upsert_lifecycle(runtime_store_path, fiber_id, %{
+      kind: "standing",
+      phase: "scheduled",
+      run_id: nil,
+      next_due_at: ~U[2999-01-01 08:00:00Z],
+      last_run_at: nil,
+      review: %{"state" => "scheduled"}
+    })
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_standing_lifecycle_overlay,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"],
+        runtime_store_path: runtime_store_path
+      )
+
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             match?([%{fiber_id: ^fiber_id}], Poller.snapshot(poller).standing_roles)
+           end)
+
+    assert [%{fiber_id: ^fiber_id, state: "scheduled", validation_errors: []}] =
+             Poller.snapshot(poller).standing_roles
+  after
+    cleanup_runtime_store_paths()
+  end
+
   test "direct ad-hoc dispatch creates an ad-hoc standing run before the schedule is due" do
     fiber_id = "tests/standing-force-now"
     fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
@@ -1147,14 +1254,14 @@ defmodule Shuttle.PollerTest do
     assert length(snap2.retrying) == 1
     assert hd(snap2.retrying).fiber_id == "tests/haiku-retry"
 
-    Process.sleep(1_100)
-
-    new_session_count =
-      MockRunner.commands()
-      |> Enum.filter(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
-      |> length()
-
-    assert new_session_count == 2
+    assert wait_until(
+             fn ->
+               MockRunner.commands()
+               |> Enum.count(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
+               |> Kernel.==(2)
+             end,
+             80
+           )
   end
 
   test "poller rehydrates pending retries from runtime store on restart" do

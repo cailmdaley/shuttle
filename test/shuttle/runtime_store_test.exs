@@ -73,6 +73,51 @@ defmodule Shuttle.RuntimeStoreTest do
     |> Enum.each(&File.rm_rf/1)
   end
 
+  test "round-trips lifecycle metadata through sqlite" do
+    path = temp_db_path()
+    next_due_at = ~U[2026-06-03 07:00:00Z]
+    last_run_at = ~U[2026-06-02 07:13:00Z]
+
+    RuntimeStore.upsert_lifecycle(path, "tests/standing", %{
+      kind: "standing",
+      phase: "awaiting",
+      run_id: "20260602T090000+0200",
+      next_due_at: next_due_at,
+      last_run_at: last_run_at,
+      review: %{
+        "state" => "awaiting",
+        "run_id" => "20260602T090000+0200",
+        "accepted_run_id" => nil
+      }
+    })
+
+    assert [
+             %{
+               fiber_id: "tests/standing",
+               metadata: %{
+                 kind: "standing",
+                 phase: "awaiting",
+                 run_id: "20260602T090000+0200",
+                 next_due_at: ^next_due_at,
+                 last_run_at: ^last_run_at,
+                 review: %{
+                   "state" => "awaiting",
+                   "run_id" => "20260602T090000+0200",
+                   "accepted_run_id" => nil
+                 }
+               }
+             }
+           ] = RuntimeStore.list_lifecycle(path)
+
+    RuntimeStore.delete_lifecycle(path, "tests/standing")
+    assert [] = RuntimeStore.list_lifecycle(path)
+  after
+    System.tmp_dir!()
+    |> Path.join("shuttle-runtime-store-test-*")
+    |> Path.wildcard()
+    |> Enum.each(&File.rm_rf/1)
+  end
+
   defp temp_db_path do
     Path.join(
       System.tmp_dir!(),
