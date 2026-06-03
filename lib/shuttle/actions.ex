@@ -11,15 +11,13 @@ defmodule Shuttle.Actions do
           :pause
           | :reopen
           | :accept_run
-          | :continue_run_fresh
-          | :continue_run_previous
           | :dispatch_ad_hoc
           | :close_awaiting_review
           | :close_tempered
           | :close_composted
 
   @transition_targets ~w(drafts inFlight queued active awaitingReview tempered composted)
-  @action_ids ~w(pause reopen accept-run continue-run-fresh continue-run-previous dispatch-ad-hoc close-awaiting-review close-tempered close-composted)
+  @action_ids ~w(pause reopen accept-run dispatch-ad-hoc close-awaiting-review close-tempered close-composted)
 
   @spec actions_for(map(), boolean()) :: [map()]
   def actions_for(fiber, running? \\ false) when is_map(fiber) do
@@ -54,8 +52,7 @@ defmodule Shuttle.Actions do
         [:reopen, :close_tempered, :close_composted]
 
       standing?(shuttle) and review_state(shuttle) == "awaiting" ->
-        [:accept_run, :continue_run_fresh] ++
-          maybe_continue_previous(shuttle) ++ [:close_composted]
+        [:accept_run, :close_composted]
 
       standing?(shuttle) and enabled?(shuttle) ->
         [:pause, :dispatch_ad_hoc]
@@ -68,13 +65,6 @@ defmodule Shuttle.Actions do
 
       true ->
         [:reopen, :close_awaiting_review, :close_tempered, :close_composted]
-    end
-  end
-
-  defp maybe_continue_previous(shuttle) do
-    case get_in(shuttle, ["session", "id"]) do
-      id when is_binary(id) and id != "" -> [:continue_run_previous]
-      _ -> []
     end
   end
 
@@ -118,8 +108,6 @@ defmodule Shuttle.Actions do
   defp invocation(:pause), do: %{verb: "pause"}
   defp invocation(:reopen), do: %{verb: "reopen"}
   defp invocation(:accept_run), do: %{verb: "accept"}
-  defp invocation(:continue_run_fresh), do: %{verb: "resume", resume_mode: "fresh"}
-  defp invocation(:continue_run_previous), do: %{verb: "resume", resume_mode: "previous"}
   defp invocation(:dispatch_ad_hoc), do: %{verb: "dispatch", ad_hoc: true}
   defp invocation(:close_awaiting_review), do: %{verb: "close"}
   defp invocation(:close_tempered), do: %{verb: "close", tempered: true}

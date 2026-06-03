@@ -74,12 +74,14 @@ defmodule Shuttle.ActionsTest do
     refute Enum.any?(actions, &(&1.id == "reopen"))
   end
 
-  test "actions list exposes continue previous only when a session id exists" do
-    without_session = standing("awaiting")
-    with_session = put_in(without_session, ["shuttle", "session"], %{"id" => "session-1"})
+  test "awaiting standing-role offers accept or compost, not a continue verb" do
+    fiber = standing("awaiting")
+    actions = Actions.actions_for(fiber)
 
-    refute Enum.any?(Actions.actions_for(without_session), &(&1.id == "continue-run-previous"))
-    assert Enum.any?(Actions.actions_for(with_session), &(&1.id == "continue-run-previous"))
+    assert Enum.any?(actions, &(&1.id == "accept-run"))
+    assert Enum.any?(actions, &(&1.id == "close-composted"))
+    refute Enum.any?(actions, &(&1.id == "continue-run-fresh"))
+    refute Enum.any?(actions, &(&1.id == "continue-run-previous"))
   end
 
   defp standing(review_state) do

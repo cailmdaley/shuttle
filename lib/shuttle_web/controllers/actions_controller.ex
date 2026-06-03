@@ -168,8 +168,6 @@ defmodule ShuttleWeb.ActionsController do
     end
   end
 
-  defp invoke_action(fiber_id, "continue-run-fresh", host), do: run(["resume", fiber_id], host)
-  defp invoke_action(fiber_id, "continue-run-previous", host), do: run(["resume", fiber_id], host)
   defp invoke_action(fiber_id, "close-awaiting-review", host), do: run(["close", fiber_id], host)
 
   defp invoke_action(fiber_id, "close-tempered", host),
