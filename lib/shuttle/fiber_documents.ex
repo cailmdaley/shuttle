@@ -46,7 +46,13 @@ defmodule Shuttle.FiberDocuments do
     args = ["ls", "-s", "all", "-j"]
     args = if with_body?, do: args ++ ["--body"], else: args
 
-    case System.cmd("felt", args, cd: store, stderr_to_stdout: true) do
+    # Do NOT fold stderr into stdout: felt prints `warning: failed to parse …`
+    # for stray non-fiber `.md` files (SPEC.md, README.md) to stderr while still
+    # emitting valid JSON on stdout and exiting 0. Capturing stderr would prepend
+    # those warnings to the JSON and break Jason.decode for the whole store —
+    # 500ing the entire /fibers endpoint. Felt's warnings land in the daemon log
+    # instead; only stdout is parsed.
+    case System.cmd("felt", args, cd: store) do
       {output, 0} ->
         decode_store(store, output)
 
@@ -65,13 +71,21 @@ defmodule Shuttle.FiberDocuments do
   end
 
   defp entry_for(store, %{"id" => id} = fiber) when is_binary(id) and id != "" do
+    # `path` (and thus the physical file location) is derived from felt's
+    # traversal id *before* we overwrite `id` — it stays store-relative so
+    # remote clients open the file via `felt_store` + `path`. The card's logical
+    # `id`, by contrast, is canonicalized: realpath → enclosing .felt → slug,
+    # the one rule shared with /state runtime keying. For a fiber physically
+    # rooted in this store the two coincide; for a symlink-traversed fiber (loom
+    # walking through `loom/.felt/shapepipe → project/.felt`) the canonical id
+    # drops the store prefix to match the project-relative runtime key.
     path = relative_felt_path(fiber)
     full_path = Path.join([store, ".felt", path])
 
     entry = %{
       felt_store: store,
       path: path,
-      fiber: fiber
+      fiber: Map.put(fiber, "id", canonical_id(full_path, id))
     }
 
     report_path = full_path |> Path.dirname() |> Path.join("report.html")
@@ -84,6 +98,13 @@ defmodule Shuttle.FiberDocuments do
   end
 
   defp entry_for(_store, _fiber), do: []
+
+  defp canonical_id(full_path, fallback) do
+    case Shuttle.FiberId.canonical_id(full_path) do
+      {:ok, id} -> id
+      {:error, _} -> fallback
+    end
+  end
 
   defp relative_felt_path(%{"id" => id, "entry_point" => true}) do
     "#{Path.basename(id)}.md"

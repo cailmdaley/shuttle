@@ -88,6 +88,64 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
     assert [%{"fiber" => %{"body" => "Body text."}}] = Jason.decode!(conn.resp_body)["fibers"]
   end
 
+  test "GET /api/v1/fibers canonicalizes ids through symlinked stores", %{store: store} do
+    # Build the shapepipe shape: loom's `.felt/shapepipe` is a symlink into a
+    # separate project store. `felt ls` walks loom and reports the traversal id
+    # `shapepipe/review-ngmix`, but the realpath lands in the project store where
+    # the slug is `review-ngmix` — which is also how /state keys the runtime.
+    # The endpoint must emit the canonical (project-relative) id so the kanban
+    # join matches, while keeping `path` store-relative for file access.
+    root = Path.dirname(store)
+    project = Path.join(root, "shapepipe")
+
+    write_fiber!(project, "review-ngmix", """
+    ---
+    name: Ngmix review
+    status: active
+    shuttle:
+      enabled: true
+      host: test-host
+    ---
+
+    Body.
+    """)
+
+    File.mkdir_p!(Path.join(store, ".felt"))
+    File.ln_s!(Path.join(project, ".felt"), Path.join([store, ".felt", "shapepipe"]))
+
+    conn = get(api_conn(), "/api/v1/fibers")
+    assert conn.status == 200
+
+    entry =
+      Jason.decode!(conn.resp_body)["fibers"]
+      |> Enum.find(&(&1["fiber"]["name"] == "Ngmix review"))
+
+    assert entry["fiber"]["id"] == "review-ngmix"
+    assert entry["path"] == "shapepipe/review-ngmix/review-ngmix.md"
+    assert entry["felt_store"] == store
+  end
+
+  test "GET /api/v1/fibers survives stray non-fiber .md files in a store", %{store: store} do
+    # A store with a SPEC.md (no frontmatter) makes `felt ls` print a stderr
+    # warning while still emitting valid JSON on stdout. Folding stderr into
+    # stdout used to corrupt the JSON and 500 the whole endpoint.
+    write_fiber!(store, "tests/real", """
+    ---
+    name: Real fiber
+    status: active
+    ---
+
+    Body.
+    """)
+
+    File.write!(Path.join([store, ".felt", "SPEC.md"]), "no frontmatter here\n")
+
+    conn = get(api_conn(), "/api/v1/fibers")
+    assert conn.status == 200
+    fibers = Jason.decode!(conn.resp_body)["fibers"]
+    assert Enum.any?(fibers, &(&1["fiber"]["name"] == "Real fiber"))
+  end
+
   defp write_fiber!(store, fiber_id, content) do
     segments = String.split(fiber_id, "/")
     basename = List.last(segments)
