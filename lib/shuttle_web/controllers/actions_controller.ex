@@ -5,12 +5,12 @@ defmodule ShuttleWeb.ActionsController do
 
   use Phoenix.Controller, formats: [:json]
 
-  alias Shuttle.{Actions, Dispatcher, FeltStores}
+  alias Shuttle.{Actions, FeltStores, LifecycleService, Poller}
 
   def show(conn, %{"fiber_id" => parts}) do
     fiber_id = Path.join(parts)
 
-    case actions_for(fiber_id) do
+    case Poller.actions_for(fiber_id) do
       {:ok, actions} ->
         json(conn, %{fiber_id: fiber_id, actions: actions})
 
@@ -35,7 +35,7 @@ defmodule ShuttleWeb.ActionsController do
   end
 
   def resolve(conn, %{"fiber_id" => fiber_id, "target" => target}) do
-    case resolve_action(fiber_id, target) do
+    case Poller.resolve_action(fiber_id, target) do
       {:ok, action} ->
         json(conn, %{fiber_id: fiber_id, target: target, action: action})
 
@@ -106,11 +106,18 @@ defmodule ShuttleWeb.ActionsController do
     if Actions.known_action?(action), do: :ok, else: {:error, :unknown_action}
   end
 
+  # Action availability is resolved by the Poller, which overlays the
+  # daemon-owned runtime lifecycle (review state lives in the runtime store, not
+  # the frontmatter). Reading availability anywhere else — e.g. parsing the
+  # frontmatter here — sees the default `scheduled` review state and wrongly
+  # rejects valid standing-role transitions (accept-run) as
+  # `action_not_available`. The host is resolved separately for the shuttle-ctl
+  # verbs that still shell out (close / pause / reopen).
   defp validate_available(fiber_id, action) do
-    case actions_for(fiber_id) do
-      {:ok, actions, host} ->
+    case Poller.actions_for(fiber_id) do
+      {:ok, actions} ->
         if Enum.any?(actions, &(Map.get(&1, :id) == action || Map.get(&1, "id") == action)) do
-          {:ok, host}
+          host_for_fiber(fiber_id)
         else
           {:error, :action_not_available}
         end
@@ -120,37 +127,16 @@ defmodule ShuttleWeb.ActionsController do
     end
   end
 
-  defp actions_for(fiber_id) do
-    with {:ok, fiber, host} <- fetch_fiber(fiber_id) do
-      {:ok, Actions.actions_for(fiber, running?(fiber_id)), host}
-    end
-  end
-
-  defp resolve_action(fiber_id, target) do
-    with {:ok, fiber, _host} <- fetch_fiber(fiber_id) do
-      Actions.resolve_transition(fiber, target, running?(fiber_id))
-    end
-  end
-
-  # Returns {:ok, fiber, host} so callers can pass the right `--felt-store`
-  # to shuttle-ctl. Without that flag, the CLI walks from its own PWD looking
-  # for `.felt/` and hits a different store than the one the daemon resolved
-  # the fiber from — typical symptom is "shuttle: fiber X has no shuttle:
-  # block" for fibers whose canonical store is a project-scoped felt-store
-  # symlinked into loom (e.g. lightcone).
-  defp fetch_fiber(fiber_id) do
+  # Resolves the felt store owning `fiber_id` so shuttle-ctl verbs get the right
+  # `--felt-store` flag. Without it the CLI walks from its own PWD and can hit a
+  # different store — typical symptom is "shuttle: fiber X has no shuttle: block"
+  # for fibers whose canonical store is project-scoped (e.g. lightcone).
+  defp host_for_fiber(fiber_id) do
     FeltStores.configured_hosts()
-    |> Enum.find_value(fn host ->
-      with {:ok, path} <- exact_fiber_path(host, fiber_id),
-           {:ok, fiber} <- read_fiber_frontmatter(path, fiber_id) do
-        {:ok, fiber, host}
-      else
-        _ -> nil
-      end
-    end)
+    |> Enum.find(&match?({:ok, _}, exact_fiber_path(&1, fiber_id)))
     |> case do
       nil -> {:error, :not_found}
-      result -> result
+      host -> {:ok, host}
     end
   end
 
@@ -168,41 +154,20 @@ defmodule ShuttleWeb.ActionsController do
     end
   end
 
-  defp read_fiber_frontmatter(path, fiber_id) do
-    with {:ok, text} <- File.read(path),
-         {:ok, frontmatter} <- split_frontmatter(text),
-         {:ok, fiber} <- YamlElixir.read_from_string(frontmatter) do
-      {:ok, Map.put(fiber || %{}, "id", fiber_id)}
-    else
-      {:error, reason} -> {:error, reason}
-      _ -> {:error, :invalid_frontmatter}
-    end
-  end
-
-  defp split_frontmatter("---\n" <> rest) do
-    case :binary.split(rest, "\n---", [:global]) do
-      [frontmatter, _body] -> {:ok, frontmatter}
-      [frontmatter, _separator_tail | _] -> {:ok, frontmatter}
-      _ -> {:error, :missing_frontmatter}
-    end
-  end
-
-  defp split_frontmatter(_), do: {:error, :missing_frontmatter}
-
-  defp running?(fiber_id) do
-    case System.cmd("tmux", ["has-session", "-t", "=" <> Dispatcher.session_name(fiber_id)],
-           stderr_to_stdout: true
-         ) do
-      {_, 0} -> true
-      _ -> false
-    end
-  rescue
-    _ -> false
-  end
-
   defp invoke_action(fiber_id, "pause", host), do: run(["pause", fiber_id], host)
   defp invoke_action(fiber_id, "reopen", host), do: run(["reopen", fiber_id], host)
-  defp invoke_action(fiber_id, "accept-run", host), do: run(["accept", fiber_id], host)
+
+  # accept-run goes through the in-process runtime-store-aware path (which also
+  # refreshes the Poller's lifecycle cache), not the Go `shuttle-ctl accept`,
+  # which re-reads `review.state` from frontmatter where it no longer lives and
+  # refuses with "not awaiting review".
+  defp invoke_action(fiber_id, "accept-run", _host) do
+    case LifecycleService.accept(fiber_id) do
+      {:ok, _output} -> :ok
+      {:error, reason} -> {:error, {:command_error, 1, reason}}
+    end
+  end
+
   defp invoke_action(fiber_id, "continue-run-fresh", host), do: run(["resume", fiber_id], host)
   defp invoke_action(fiber_id, "continue-run-previous", host), do: run(["resume", fiber_id], host)
   defp invoke_action(fiber_id, "close-awaiting-review", host), do: run(["close", fiber_id], host)

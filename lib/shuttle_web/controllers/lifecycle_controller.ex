@@ -10,7 +10,7 @@ defmodule ShuttleWeb.LifecycleController do
 
   use Phoenix.Controller, formats: [:json]
 
-  alias Shuttle.{FeltStores, LifecycleStore}
+  alias Shuttle.{FeltStores, LifecycleService}
 
   @allowed ~w(install pause resume repeat accept set-model set-interactive uninstall)
 
@@ -38,15 +38,12 @@ defmodule ShuttleWeb.LifecycleController do
   defp action(_), do: {:error, "missing lifecycle action"}
 
   defp execute("accept", %{"fiber" => fiber} = params) do
-    case LifecycleStore.accept(fiber, keep_outcome: truthy?(params["keep_outcome"])) do
-      {:ok, output} -> append_accept_history(fiber, output)
-      {:error, reason} -> {:error, reason}
-    end
+    LifecycleService.accept(fiber, keep_outcome: truthy?(params["keep_outcome"]))
   end
 
   defp execute("resume", %{"fiber" => fiber}) do
-    case LifecycleStore.resume(fiber) do
-      {:ok, output} -> append_resume_history(fiber, output)
+    case LifecycleService.resume(fiber) do
+      {:ok, output} -> {:ok, output}
       {:error, _reason} -> args_for("resume", %{"fiber" => fiber}) |> then(&run_elem/1)
     end
   end
@@ -118,44 +115,6 @@ defmodule ShuttleWeb.LifecycleController do
     end
   rescue
     e in ErlangError -> {:error, Exception.message(e)}
-  end
-
-  defp append_accept_history(fiber, output) do
-    summary =
-      output
-      |> String.split("\n", trim: true)
-      |> List.first()
-      |> case do
-        nil -> "accepted standing-role run via daemon runtime store"
-        line -> line
-      end
-
-    append_history(fiber, summary)
-    {:ok, output}
-  end
-
-  defp append_resume_history(fiber, output) do
-    summary =
-      output
-      |> String.split("\n", trim: true)
-      |> List.first()
-      |> case do
-        nil -> "resumed standing role via daemon runtime store"
-        line -> line
-      end
-
-    append_history(fiber, summary)
-    {:ok, output}
-  end
-
-  defp append_history(fiber, summary) do
-    with {:ok, host} <- host_for_fiber(fiber) do
-      System.cmd("felt", ["-C", host, "history", "append", fiber, "--summary", summary],
-        stderr_to_stdout: true
-      )
-    end
-  rescue
-    _ -> nil
   end
 
   defp host_for_fiber(fiber_id) do

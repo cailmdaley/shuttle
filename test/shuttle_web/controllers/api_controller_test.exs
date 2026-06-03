@@ -431,7 +431,7 @@ defmodule ShuttleWeb.APIControllerTest do
   # ── Shuttle actions ──
 
   @tag :capture_log
-  test "actions resolve returns the canonical lifecycle action from local frontmatter" do
+  test "actions resolve returns the canonical lifecycle action via the Poller" do
     with_actions_host()
 
     MockRunner.set_shuttle(
@@ -453,7 +453,10 @@ defmodule ShuttleWeb.APIControllerTest do
     assert body["target"] == "tempered"
     assert body["action"]["id"] == "accept-run"
 
-    refute Enum.any?(MockRunner.commands(), fn {command, args} ->
+    # Resolution now runs through the Poller, which fetches the fiber (and
+    # overlays the daemon-owned runtime lifecycle) rather than parsing the
+    # frontmatter inline in the controller.
+    assert Enum.any?(MockRunner.commands(), fn {command, args} ->
              command == "felt" and "show" in args
            end)
   end

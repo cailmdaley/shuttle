@@ -271,6 +271,9 @@ defmodule Shuttle.PollerTest do
     |> Enum.each(&File.rm_rf/1)
   end
 
+  defp restore_env(key, nil), do: System.delete_env(key)
+  defp restore_env(key, value), do: System.put_env(key, value)
+
   defp new_session_scripts do
     MockRunner.commands()
     |> Enum.filter(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
@@ -687,6 +690,131 @@ defmodule Shuttle.PollerTest do
 
     assert [%{fiber_id: ^fiber_id, state: "scheduled", validation_errors: []}] =
              Poller.snapshot(poller).standing_roles
+  after
+    cleanup_runtime_store_paths()
+  end
+
+  # Regression: standing-role review state lives in the runtime store, not the
+  # frontmatter (LifecycleStore evicts it). Action resolution must overlay it,
+  # or `accept-run` on an awaiting role is wrongly rejected as
+  # `action_not_available` (the kanban "can't temper the weekly arXiv role" bug).
+  test "actions reflect runtime-store review state even when the frontmatter omits it" do
+    fiber_id = "tests/standing-actions-overlay"
+    runtime_store_path = runtime_store_path()
+    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
+    MockRunner.set_fiber(fiber_id, fiber)
+
+    # No review: block in the frontmatter — the daemon owns review state.
+    MockRunner.set_shuttle(
+      fiber_id,
+      """
+      enabled: true
+      kind: standing
+      schedule:
+        expr: "0 9 * * 1"
+        tz: Europe/Paris
+      """
+    )
+
+    Shuttle.RuntimeStore.upsert_lifecycle(runtime_store_path, fiber_id, %{
+      kind: "standing",
+      phase: "awaiting",
+      run_id: "run-1",
+      next_due_at: nil,
+      last_run_at: nil,
+      review: %{"state" => "awaiting", "run_id" => "run-1"}
+    })
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_actions_overlay,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"],
+        runtime_store_path: runtime_store_path
+      )
+
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             match?([%{fiber_id: ^fiber_id}], Poller.snapshot(poller).standing_roles)
+           end)
+
+    {:ok, actions} = Poller.actions_for(poller, fiber_id, [])
+    ids = Enum.map(actions, &(Map.get(&1, :id) || Map.get(&1, "id")))
+    assert "accept-run" in ids
+
+    assert {:ok, %{id: "accept-run"}} =
+             Poller.resolve_action(poller, fiber_id, "tempered", [])
+  after
+    cleanup_runtime_store_paths()
+  end
+
+  # Regression: accepting a standing run through the Poller must advance the
+  # runtime store AND refresh the in-memory lifecycle cache, or the very next
+  # poll re-derives the role from the stale cache and clobbers the acceptance
+  # straight back to `awaiting` (why an accepted weekly-arXiv run kept
+  # reappearing in Awaiting review).
+  test "accept through the Poller advances the runtime store and survives the next poll" do
+    fiber_id = "tests/standing-accept-sticks"
+    runtime_store_path = runtime_store_path()
+    File.mkdir_p!(Path.dirname(runtime_store_path))
+
+    previous_runtime_store = System.get_env("SHUTTLE_RUNTIME_STORE")
+    previous_loom_homes = System.get_env("LOOM_HOMES")
+    # LifecycleStore reads SHUTTLE_RUNTIME_STORE; share it with the Poller so
+    # both sides of the transition touch the same DB (mirrors production, where
+    # both fall back to the same default path).
+    System.put_env("SHUTTLE_RUNTIME_STORE", runtime_store_path)
+    System.put_env("LOOM_HOMES", "/tmp")
+
+    on_exit(fn ->
+      restore_env("SHUTTLE_RUNTIME_STORE", previous_runtime_store)
+      restore_env("LOOM_HOMES", previous_loom_homes)
+    end)
+
+    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
+    MockRunner.set_fiber(fiber_id, fiber)
+
+    MockRunner.set_shuttle(
+      fiber_id,
+      """
+      enabled: true
+      kind: standing
+      schedule:
+        expr: "0 9 * * 1"
+        tz: Europe/Paris
+      """
+    )
+
+    Shuttle.RuntimeStore.upsert_lifecycle(runtime_store_path, fiber_id, %{
+      kind: "standing",
+      phase: "awaiting",
+      run_id: "20260601T070000+0000",
+      next_due_at: nil,
+      last_run_at: nil,
+      review: %{"state" => "awaiting", "run_id" => "20260601T070000+0000"}
+    })
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_accept_sticks,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    assert {:ok, _output} = Poller.lifecycle_transition(poller, :accept, fiber_id, [])
+
+    assert %{phase: "scheduled", review: %{"state" => "scheduled"}} =
+             Shuttle.RuntimeStore.fetch_lifecycle(runtime_store_path, fiber_id)
+
+    send(poller, :run_poll_cycle)
+    Process.sleep(75)
+
+    assert %{phase: "scheduled"} =
+             Shuttle.RuntimeStore.fetch_lifecycle(runtime_store_path, fiber_id),
+           "the next poll clobbered the acceptance back to awaiting"
   after
     cleanup_runtime_store_paths()
   end

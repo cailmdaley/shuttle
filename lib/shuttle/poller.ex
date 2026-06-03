@@ -35,7 +35,7 @@ defmodule Shuttle.Poller do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias Shuttle.{Actions, Dispatcher, RuntimeStore, StandingRole, WorkerWatcher}
+  alias Shuttle.{Actions, Dispatcher, LifecycleStore, RuntimeStore, StandingRole, WorkerWatcher}
 
   @pubsub_topic "shuttle:snapshot"
 
@@ -176,6 +176,26 @@ defmodule Shuttle.Poller do
           {:ok, map()} | {:error, term()}
   def resolve_action(server, fiber_id, target, opts, timeout_ms) do
     GenServer.call(server, {:resolve_action, fiber_id, target, opts}, timeout_ms)
+  end
+
+  @doc """
+  Run a standing-role lifecycle transition (`:accept` / `:resume`) through the
+  Poller so the in-memory lifecycle cache is refreshed from the runtime store
+  immediately after the write. Without this, `LifecycleStore.accept` writes the
+  runtime DB but the next poll re-derives `state.lifecycle` from the stale
+  in-memory copy and clobbers the write straight back to `awaiting` (see
+  `merge_lifecycle_overlay` in the poll path). Running the transition inside the
+  GenServer makes the DB write + cache refresh atomic against poll cycles.
+  """
+  @spec lifecycle_transition(:accept | :resume, String.t(), keyword()) ::
+          {:ok, String.t()} | {:error, term()}
+  def lifecycle_transition(verb, fiber_id, opts \\ []),
+    do: lifecycle_transition(__MODULE__, verb, fiber_id, opts)
+
+  @spec lifecycle_transition(GenServer.server(), :accept | :resume, String.t(), keyword()) ::
+          {:ok, String.t()} | {:error, term()}
+  def lifecycle_transition(server, verb, fiber_id, opts) do
+    GenServer.call(server, {:lifecycle_transition, verb, fiber_id, opts}, @dispatch_call_timeout_ms)
   end
 
   @spec wait_for_tempered(String.t(), non_neg_integer(), keyword()) ::
@@ -464,6 +484,7 @@ defmodule Shuttle.Poller do
   def handle_call({:actions, fiber_id, opts}, _from, state) do
     case fetch_fiber_full(fiber_id, state) do
       {:ok, fiber} ->
+        fiber = overlay_runtime_lifecycle(fiber, fiber_id, state)
         running? = Keyword.get(opts, :running, Map.has_key?(state.running, fiber_id))
         {:reply, {:ok, Actions.actions_for(fiber, running?)}, state}
 
@@ -475,11 +496,29 @@ defmodule Shuttle.Poller do
   def handle_call({:resolve_action, fiber_id, target, opts}, _from, state) do
     case fetch_fiber_full(fiber_id, state) do
       {:ok, fiber} ->
+        fiber = overlay_runtime_lifecycle(fiber, fiber_id, state)
         running? = Keyword.get(opts, :running, Map.has_key?(state.running, fiber_id))
         {:reply, Actions.resolve_transition(fiber, target, running?), state}
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:lifecycle_transition, verb, fiber_id, opts}, _from, state) do
+    result =
+      case verb do
+        :accept -> LifecycleStore.accept(fiber_id, opts)
+        :resume -> LifecycleStore.resume(fiber_id)
+        other -> {:error, "unknown lifecycle transition #{inspect(other)}"}
+      end
+
+    case result do
+      {:ok, output} ->
+        {:reply, {:ok, output}, refresh_lifecycle_entry(state, fiber_id)}
+
+      {:error, _} = error ->
+        {:reply, error, state}
     end
   end
 
@@ -1987,6 +2026,39 @@ defmodule Shuttle.Poller do
   defp runtime_lifecycle(%State{} = state, fiber_id) do
     RuntimeStore.fetch_lifecycle(state.runtime_store_path, fiber_id) ||
       Map.get(state.lifecycle, fiber_id, %{})
+  end
+
+  # Overlay daemon-owned runtime lifecycle (review state, next_due_at, …) onto a
+  # fiber's `shuttle:` block before action classification. Standing-role review
+  # state lives in the runtime store, not the frontmatter (LifecycleStore evicts
+  # it), so `fetch_fiber_full` — which reads only `felt show --json` — returns a
+  # fiber whose `review.state` always looks like the default `scheduled`. Action
+  # availability would then disagree with `/state` (which is runtime-derived),
+  # rejecting valid transitions like accept-run with `action_not_available`.
+  # Reads the runtime store DB-first so resolution is correct even if the
+  # in-memory cache lags a just-landed transition.
+  defp overlay_runtime_lifecycle(fiber, fiber_id, %State{} = state) do
+    case Map.get(fiber, "shuttle") do
+      shuttle when is_map(shuttle) ->
+        Map.put(fiber, "shuttle", merge_lifecycle_overlay(shuttle, runtime_lifecycle(state, fiber_id)))
+
+      _ ->
+        fiber
+    end
+  end
+
+  # Refresh a single fiber's in-memory lifecycle entry from the runtime store
+  # after an external transition wrote it. Keeps `state.lifecycle` in lock-step
+  # with the DB so the next poll's `merge_lifecycle_overlay` reads the new state
+  # instead of clobbering it back.
+  defp refresh_lifecycle_entry(%State{} = state, fiber_id) do
+    case RuntimeStore.fetch_lifecycle(state.runtime_store_path, fiber_id) do
+      metadata when is_map(metadata) ->
+        %{state | lifecycle: Map.put(state.lifecycle, fiber_id, metadata)}
+
+      _ ->
+        %{state | lifecycle: Map.delete(state.lifecycle, fiber_id)}
+    end
   end
 
   defp lifecycle_session_id(metadata) when is_map(metadata) do
