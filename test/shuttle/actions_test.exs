@@ -127,6 +127,89 @@ defmodule Shuttle.ActionsTest do
     refute Enum.any?(actions, &(&1.id == "continue-run-previous"))
   end
 
+  describe "resolve/availability invariant (the whole 409 class)" do
+    # The load-bearing property: for every (state × kanban target) combination,
+    # the action `resolve_transition` picks for a drag MUST be present in the
+    # `actions_for` availability set. When it isn't, the daemon's
+    # `validate_available` rejects the invoke with 409 `action_not_available`.
+    #
+    # Before the by-construction fix (action_ids derived from action_for_target),
+    # the two cond-chains were hand-maintained independently and disagreed for
+    # 110 of these 270 combinations. This test sweeps the full matrix so any
+    # future edit that reintroduces a disagreement fails here, loudly, with the
+    # exact offending combination — not silently in a live drag.
+    @kanban_targets ~w(drafts inFlight awaitingReview tempered composted)
+    @statuses ~w(open active closed)
+    @kinds ~w(oneshot standing)
+    @review_states ~w(scheduled awaiting accepted)
+
+    test "every resolved drag target is an available action across the full matrix" do
+      combos =
+        for status <- @statuses,
+            enabled <- [true, false],
+            kind <- @kinds,
+            review <- @review_states,
+            running? <- [false, true],
+            target <- @kanban_targets do
+          fiber = %{
+            "id" => "work/matrix",
+            "status" => status,
+            "shuttle" => %{
+              "enabled" => enabled,
+              "kind" => kind,
+              "review" => %{"state" => review}
+            }
+          }
+
+          available = Actions.actions_for(fiber, running?) |> Enum.map(& &1.id)
+          {:ok, %{id: resolved}} = Actions.resolve_transition(fiber, target, running?)
+
+          {%{
+             status: status,
+             enabled: enabled,
+             kind: kind,
+             review: review,
+             running: running?,
+             target: target,
+             resolved: resolved,
+             available: available
+           }, resolved in available}
+        end
+
+      violations =
+        combos
+        |> Enum.reject(fn {_combo, ok?} -> ok? end)
+        |> Enum.map(fn {combo, _} -> combo end)
+
+      assert violations == [],
+             "resolve/availability disagreement for #{length(violations)} combos:\n" <>
+               Enum.map_join(violations, "\n", fn v ->
+                 "  status=#{v.status} enabled=#{v.enabled} kind=#{v.kind} " <>
+                   "review=#{v.review} running=#{v.running} target=#{v.target} " <>
+                   "→ resolved=#{v.resolved} NOT IN #{inspect(v.available)}"
+               end)
+    end
+
+    test "a disabled standing role can still be composted (the canary repro)" do
+      # ai-futures/shuttle/misc/standing-roles/canary-local-snapshot: a disabled
+      # standing role used to expose `[:reopen]` only, so dragging it to any
+      # close column 409'd. It must now offer the full close vocabulary.
+      fiber = %{
+        "id" => "work/disabled-standing",
+        "status" => "active",
+        "shuttle" => %{"enabled" => false, "kind" => "standing", "review" => %{"state" => "scheduled"}}
+      }
+
+      actions = Actions.actions_for(fiber) |> Enum.map(& &1.id)
+      assert "reopen" in actions
+      assert "close-composted" in actions
+      assert "close-tempered" in actions
+
+      assert {:ok, %{id: "close-composted"}} = Actions.resolve_transition(fiber, "composted")
+      assert {:ok, %{id: "close-tempered"}} = Actions.resolve_transition(fiber, "tempered")
+    end
+  end
+
   defp standing(review_state) do
     %{
       "id" => "work/standing",

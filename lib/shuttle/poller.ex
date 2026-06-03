@@ -2520,6 +2520,13 @@ defmodule Shuttle.Poller do
           {:error, _} -> {:error, :invalid_json}
         end
 
+      # run_felt already wraps a non-zero exit in a descriptive
+      # `felt -C <host> show <id> failed: <stderr>` string. A common case here
+      # is a felt-store path that doesn't exist on THIS host — e.g. a foreign
+      # absolute path (`/Users/.../loom`) that another machine's portolan
+      # registered. Surfacing the path + stderr instead of a bare reason is what
+      # turns the old undiagnosable blank 500 into an actionable error. See
+      # `gotcha-remote-daemon-foreign-felt-store-path`.
       {:error, reason} ->
         {:error, reason}
     end
@@ -2642,12 +2649,26 @@ defmodule Shuttle.Poller do
 
   # Run a felt CLI command against an explicit host directory.
   # Every felt-touching helper calls this directly with the resolved host.
+  #
+  # On a non-zero exit, the error is a self-describing string carrying the
+  # command, the host directory it ran in, the exit status, and trimmed
+  # stderr. felt's own stderr for a nonexistent store can be empty (it just
+  # finds no index), which previously bubbled up as a BLANK `{:error, ""}` →
+  # an undiagnosable 500 at the ActionsController boundary. Including the host
+  # path names the actual fault — typically a felt-store path that doesn't
+  # exist on this machine (a foreign absolute path registered by another
+  # host's portolan).
   defp run_felt(host, runner, args) when is_binary(host) do
     opts = [cd: host, stderr_to_stdout: true]
 
     case runner.cmd("felt", args, opts) do
-      {output, 0} -> {:ok, output}
-      {output, _} -> {:error, output}
+      {output, 0} ->
+        {:ok, output}
+
+      {output, status} ->
+        trimmed = String.trim(to_string(output))
+        detail = if trimmed == "", do: "(no output)", else: trimmed
+        {:error, "felt #{Enum.join(args, " ")} (cd #{host}) exited #{status}: #{detail}"}
     end
   end
 

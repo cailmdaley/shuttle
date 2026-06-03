@@ -40,45 +40,83 @@ defmodule Shuttle.Actions do
   @spec known_action?(String.t()) :: boolean()
   def known_action?(id), do: id in @action_ids
 
+  # The normalized kanban drag targets, in column order. `action_ids/2`
+  # derives the available-action set from `action_for_target/3` over exactly
+  # this list, so the two functions can never disagree.
+  @kanban_targets ~w(drafts inFlight awaitingReview tempered composted)
+
+  # The available-action set is the distinct set of actions `action_for_target`
+  # produces over every kanban drag target, plus `:pause` for a running worker
+  # (which is always interruptible even when no column maps to pause in that
+  # state — e.g. a closed-but-still-running fiber).
+  #
+  # Deriving the set *from* the resolver is the load-bearing invariant: for
+  # every valid target t, `action_for_target(fiber, t, running?) ∈
+  # action_ids(fiber, running?)` holds by construction, so a drag can never
+  # 409 `action_not_available` from a resolve/availability disagreement. The
+  # two cond-chains that used to be hand-maintained independently drifted
+  # apart for 110 of the 270 (state × target) combinations; this collapses the
+  # second chain into a projection of the first. Order is preserved
+  # (`@kanban_targets` then `:pause`) so the rendered list is stable.
+  #
+  # See `gotcha-shuttle-resolve-invoke-daemon-split`.
   defp action_ids(fiber, running?) do
-    shuttle = shuttle(fiber)
-    status = Map.get(fiber, "status")
+    derived =
+      @kanban_targets
+      |> Enum.map(&action_for_target(fiber, &1, running?))
 
-    cond do
-      running? ->
-        [:pause, :close_awaiting_review, :close_tempered, :close_composted]
+    extras = if running?, do: [:pause], else: []
 
-      status == "closed" ->
-        [:reopen, :close_tempered, :close_composted]
-
-      standing?(shuttle) and review_state(shuttle) == "awaiting" ->
-        [:accept_run, :close_composted]
-
-      standing?(shuttle) and enabled?(shuttle) ->
-        [:pause, :dispatch_ad_hoc]
-
-      standing?(shuttle) ->
-        [:reopen]
-
-      enabled?(shuttle) ->
-        [:pause, :dispatch_ad_hoc, :close_awaiting_review, :close_tempered, :close_composted]
-
-      true ->
-        [:reopen, :close_awaiting_review, :close_tempered, :close_composted]
-    end
+    (derived ++ extras) |> Enum.uniq()
   end
 
-  defp action_for_target(fiber, target, _running?) do
+  defp action_for_target(fiber, target, running?) do
     shuttle = shuttle(fiber)
     status = Map.get(fiber, "status")
 
     cond do
-      status == "closed" and target == "inFlight" ->
+      # A live worker: the close columns end it, drafts pauses it. inFlight is
+      # the column it already lives in (a no-op same-column drop); resolve it to
+      # `pause` so it stays a valid, non-destructive-on-its-own action that the
+      # daemon already exposes for running workers — never a re-dispatch, which
+      # the daemon would bounce as already_running.
+      running? and target in ["drafts", "inFlight"] ->
+        :pause
+
+      running? and target == "awaitingReview" ->
+        :close_awaiting_review
+
+      running? and target == "tempered" ->
+        :close_tempered
+
+      running? and target == "composted" ->
+        :close_composted
+
+      # A closed fiber's only forward move is reopen (which clears closed_at /
+      # tempered); shuttle-ctl refuses a direct pause/close on an already-closed
+      # fiber. Portolan's un-temper sequence drags through inFlight first for
+      # the other open-lifecycle targets, so every non-close target collapses to
+      # reopen here. The close columns still re-close with the chosen verdict.
+      status == "closed" and target in ["drafts", "inFlight", "awaitingReview"] ->
         :reopen
 
       standing?(shuttle) and review_state(shuttle) == "awaiting" and
           target in ["inFlight", "tempered"] ->
         :accept_run
+
+      # An awaiting standing role isn't a draft to pause: dragging it out of
+      # review to drafts/awaitingReview is the same human verdict as composting
+      # the pending run — accept-run is the only "keep it" verb, compost the only
+      # "drop it" verb. Map the ambiguous columns to compost so they stay
+      # available (a pause/close here would 409 — pause isn't a review verb).
+      standing?(shuttle) and review_state(shuttle) == "awaiting" and
+          target in ["drafts", "awaitingReview", "composted"] ->
+        :close_composted
+
+      # A disabled fiber (paused draft) dragged out of drafts re-enables via
+      # reopen; staying in drafts is a no-op pause. The close columns close it.
+      not enabled?(shuttle) and target in ["drafts", "inFlight"] ->
+        :reopen
 
       target == "drafts" ->
         :pause
