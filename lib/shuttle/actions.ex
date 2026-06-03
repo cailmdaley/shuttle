@@ -61,7 +61,7 @@ defmodule Shuttle.Actions do
         [:reopen]
 
       enabled?(shuttle) ->
-        [:pause, :close_awaiting_review, :close_tempered, :close_composted]
+        [:pause, :dispatch_ad_hoc, :close_awaiting_review, :close_tempered, :close_composted]
 
       true ->
         [:reopen, :close_awaiting_review, :close_tempered, :close_composted]
@@ -85,6 +85,16 @@ defmodule Shuttle.Actions do
 
       standing?(shuttle) and enabled?(shuttle) and target == "inFlight" and
           review_state(shuttle) in ["scheduled", "accepted"] ->
+        :dispatch_ad_hoc
+
+      # An enabled (non-standing) oneshot is already in the dispatch contract;
+      # `inFlight` means "launch it now", not `reopen` (reopen only applies to a
+      # closed or disabled fiber and is NOT in actions_for for an enabled one —
+      # resolving to it here is what produced the 409 `action_not_available`
+      # when a stranded-but-enabled oneshot was dragged from drafts to inFlight).
+      # Force-dispatch instead, which surfaces the real dispatch outcome
+      # (spawned, or a concrete error like missing host / project_dir).
+      enabled?(shuttle) and not standing?(shuttle) and target == "inFlight" ->
         :dispatch_ad_hoc
 
       target == "inFlight" ->

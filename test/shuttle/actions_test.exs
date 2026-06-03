@@ -74,6 +74,49 @@ defmodule Shuttle.ActionsTest do
     refute Enum.any?(actions, &(&1.id == "reopen"))
   end
 
+  test "enabled idle oneshot dragged to inFlight force-dispatches (not reopen)" do
+    # Regression for the 409 `action_not_available` bug: an enabled oneshot
+    # with no live worker classifies into the drafts fallback, so dragging it
+    # to inFlight resolved to `reopen` — which is NOT in actions_for for an
+    # enabled fiber, so the invoke step (validate_available) rejected it. The
+    # resolve and availability cond-chains disagreed. The fix: inFlight on an
+    # enabled oneshot means "launch it now" → dispatch-ad-hoc, which IS made
+    # available below. This test pins the invariant: every resolved action
+    # must be present in actions_for.
+    fiber = %{
+      "id" => "work/idle-enabled",
+      "status" => "active",
+      "shuttle" => %{"enabled" => true, "kind" => "oneshot"}
+    }
+
+    actions = Actions.actions_for(fiber)
+    assert Enum.any?(actions, &(&1.id == "dispatch-ad-hoc"))
+    assert Enum.any?(actions, &(&1.id == "pause"))
+    refute Enum.any?(actions, &(&1.id == "reopen"))
+
+    assert {:ok, %{id: resolved}} = Actions.resolve_transition(fiber, "inFlight")
+    assert resolved == "dispatch-ad-hoc"
+    # The invariant the bug violated: the resolved action is available.
+    assert Enum.any?(actions, &(&1.id == resolved))
+  end
+
+  test "disabled oneshot draft dragged to inFlight still reopens (enables it)" do
+    # The disabled path is unchanged: reopen is the verb that flips a paused
+    # draft back to enabled, and it remains in actions_for for disabled fibers.
+    fiber = %{
+      "id" => "work/paused-draft",
+      "status" => "open",
+      "shuttle" => %{"enabled" => false, "kind" => "oneshot"}
+    }
+
+    actions = Actions.actions_for(fiber)
+    assert Enum.any?(actions, &(&1.id == "reopen"))
+    refute Enum.any?(actions, &(&1.id == "dispatch-ad-hoc"))
+
+    assert {:ok, %{id: "reopen", invocation: %{verb: "reopen"}}} =
+             Actions.resolve_transition(fiber, "inFlight")
+  end
+
   test "awaiting standing-role offers accept or compost, not a continue verb" do
     fiber = standing("awaiting")
     actions = Actions.actions_for(fiber)
