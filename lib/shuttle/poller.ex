@@ -480,7 +480,7 @@ defmodule Shuttle.Poller do
                 {:reply, result || {:ok, session}, new_state}
 
               true ->
-                {:reply, {:error, :not_eligible}, state}
+                {:reply, {:error, dispatch_ineligible_reason(fiber, state, opts)}, state}
             end
 
           {:error, reason} ->
@@ -1387,6 +1387,50 @@ defmodule Shuttle.Poller do
       human_worker?(fiber) -> false
       not host_owned?(shuttle, state.own_host_id) -> false
       true -> true
+    end
+  end
+
+  # Names WHY a dispatch was refused so the kanban can say something true
+  # instead of the catch-all "disabled, not yet due, or closed". The most
+  # common confusing case is a remote-homed fiber dispatched against the wrong
+  # daemon: a force-dispatch of a `host: cineca` fiber that reaches any daemon
+  # whose `own_host_id != cineca` fails `host_owned?` and used to report a flat
+  # `not_eligible`. The reason atoms (`:homed_elsewhere`, `:project_dir_missing`,
+  # `:disabled`, `:closed`, `:human_worker`, `:no_shuttle_block`,
+  # `:not_due_or_blocked`) are surfaced to the UI as accurate copy.
+  #
+  # Only called on the ineligible branch, so the eligible (dispatch-now) path is
+  # untouched. For a force/ad_hoc dispatch the irreducible gate is `force_*`'s;
+  # for a plain dispatch the fuller `eligible?` rules apply, so the reason is
+  # computed against the same `force` intent the caller passed.
+  defp dispatch_ineligible_reason(fiber, state, opts) do
+    shuttle = Map.get(fiber, "shuttle")
+    status = Map.get(fiber, "status", "")
+    forced? = Keyword.get(opts, :force, false) or Keyword.get(opts, :ad_hoc, false)
+
+    cond do
+      not is_map(shuttle) ->
+        {:not_eligible, :no_shuttle_block}
+
+      human_worker?(fiber) ->
+        {:not_eligible, :human_worker}
+
+      not host_owned?(shuttle, state.own_host_id) ->
+        {:not_eligible, {:homed_elsewhere, Map.get(shuttle, "host"), state.own_host_id}}
+
+      not project_dir_available?(shuttle) ->
+        {:not_eligible, {:project_dir_missing, Map.get(shuttle, "project_dir")}}
+
+      # The remaining cases only gate a NON-forced dispatch (force overrides
+      # status/enabled). Report them so a plain dispatch failure is legible.
+      not forced? and Map.get(shuttle, "enabled", false) != true ->
+        {:not_eligible, :disabled}
+
+      not forced? and status == "closed" ->
+        {:not_eligible, :closed}
+
+      true ->
+        {:not_eligible, :not_due_or_blocked}
     end
   end
 

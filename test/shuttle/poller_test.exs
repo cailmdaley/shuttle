@@ -847,7 +847,11 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
-    assert {:error, :not_eligible} = Poller.dispatch_fiber(poller, fiber_id, [])
+    # Enabled standing role whose schedule is far in the future: a plain
+    # dispatch is refused as not-yet-due (force/ad_hoc overrides the schedule).
+    assert {:error, {:not_eligible, :not_due_or_blocked}} =
+             Poller.dispatch_fiber(poller, fiber_id, [])
+
     assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, force: true, ad_hoc: true)
     assert session == Dispatcher.session_name(fiber_id)
 
@@ -1015,8 +1019,9 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
-    # Without force, a closed fiber is not eligible.
-    assert {:error, :not_eligible} = Poller.dispatch_fiber(poller, fiber_id, [])
+    # Without force, a closed fiber is not eligible — and the reason now names
+    # the cause (closed) so the kanban can say "reopen it first".
+    assert {:error, {:not_eligible, :closed}} = Poller.dispatch_fiber(poller, fiber_id, [])
     # With force, the same fiber dispatches.
     assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, force: true)
     assert session == Dispatcher.session_name(fiber_id)
@@ -1038,7 +1043,7 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
-    assert {:error, :not_eligible} = Poller.dispatch_fiber(poller, fiber_id, [])
+    assert {:error, {:not_eligible, :disabled}} = Poller.dispatch_fiber(poller, fiber_id, [])
     assert {:ok, _session} = Poller.dispatch_fiber(poller, fiber_id, force: true)
   end
 
@@ -1062,7 +1067,12 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
-    assert {:error, :not_eligible} = Poller.dispatch_fiber(poller, fiber_id, force: true)
+    # The refusal now NAMES the cause: the fiber is homed elsewhere, carrying
+    # both its declared host and this daemon's own id. The kanban surfaces this
+    # as "homed on <host>, can only run there" instead of the misleading
+    # "disabled, not yet due, or closed" — the Bug-3 fix.
+    assert {:error, {:not_eligible, {:homed_elsewhere, "some-other-machine", "test-host"}}} =
+             Poller.dispatch_fiber(poller, fiber_id, force: true)
   end
 
   test "force-dispatch still refuses human-worker fibers" do

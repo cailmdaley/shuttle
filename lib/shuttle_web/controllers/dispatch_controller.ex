@@ -44,6 +44,16 @@ defmodule ShuttleWeb.DispatchController do
           |> put_status(422)
           |> json(%{dispatched: false, reason: "not_eligible", fiber_id: fiber_id})
 
+        {:error, {:not_eligible, detail}} ->
+          conn
+          |> put_status(422)
+          |> json(
+            Map.merge(
+              %{dispatched: false, reason: "not_eligible", fiber_id: fiber_id},
+              ineligible_detail(detail)
+            )
+          )
+
         {:error, {:awaiting_review, run_id, completed_at}} ->
           conn
           |> put_status(422)
@@ -67,6 +77,53 @@ defmodule ShuttleWeb.DispatchController do
 
   defp truthy?(value) when value in [true, "true", "1", 1], do: true
   defp truthy?(_), do: false
+
+  # Turns a structured ineligibility detail into a stable `detail` code plus a
+  # human `message`. The kanban renders `detail` to accurate copy and falls
+  # back to `message`; both beat the old flat "not_eligible".
+  defp ineligible_detail({:homed_elsewhere, fiber_host, own_host}) do
+    %{
+      detail: "homed_elsewhere",
+      fiber_host: fiber_host,
+      daemon_host: own_host,
+      message:
+        "This fiber is homed on #{describe_host(fiber_host)} and can only run there. " <>
+          "The daemon that received this dispatch is #{describe_host(own_host)}."
+    }
+  end
+
+  defp ineligible_detail({:project_dir_missing, dir}) do
+    %{
+      detail: "project_dir_missing",
+      project_dir: dir,
+      message:
+        "The fiber's project_dir (#{describe_host(dir)}) does not exist on the owning host."
+    }
+  end
+
+  defp ineligible_detail(:disabled),
+    do: %{detail: "disabled", message: "Disabled — set shuttle.enabled: true to allow dispatch."}
+
+  defp ineligible_detail(:closed),
+    do: %{detail: "closed", message: "Fiber is closed — reopen it before dispatching."}
+
+  defp ineligible_detail(:human_worker),
+    do: %{detail: "human_worker", message: "Human-worker fiber — there is nothing to dispatch."}
+
+  defp ineligible_detail(:no_shuttle_block),
+    do: %{detail: "no_shuttle_block", message: "Fiber has no shuttle: block to dispatch."}
+
+  defp ineligible_detail(:not_due_or_blocked),
+    do: %{
+      detail: "not_due_or_blocked",
+      message: "Not currently dispatchable — not yet due, or blocked by an unmet dependency."
+    }
+
+  defp ineligible_detail(other),
+    do: %{detail: to_string(other)}
+
+  defp describe_host(value) when is_binary(value) and value != "", do: value
+  defp describe_host(_), do: "(unset)"
 
   defp review_detail(run_id, completed_at) do
     parts =
