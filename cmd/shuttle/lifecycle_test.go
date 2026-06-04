@@ -1326,3 +1326,194 @@ func enableDaemonLifecycle(t *testing.T, url string) {
 		}
 	})
 }
+
+func TestCloseCmd_ResetsStandingReviewToScheduled(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	// A standing role finishing a run carries review.state=awaiting. Closing it
+	// (composting) must reset review to scheduled in frontmatter — otherwise the
+	// poll overlay's put_if_missing keeps a stale awaiting and the un-temper
+	// drag re-composts the card. The runtime-store half is exercised by the
+	// daemon-path test below; SHUTTLE_LIFECYCLE_OFFLINE (set by withTempHost)
+	// makes this case isolate the frontmatter reset.
+	path := writeFiber(t, host, "newsletter", `---
+name: Newsletter
+status: active
+shuttle:
+  enabled: true
+  kind: standing
+  schedule:
+    expr: "0 9 * * 1-5"
+    tz: UTC
+  review:
+    state: awaiting
+    run_id: "run-1"
+    completed_at: 2026-06-01T09:12:00Z
+---
+
+Body.
+`)
+
+	closeTempered = "false"
+	defer func() { closeTempered = "" }()
+	if err := closeCmd.RunE(closeCmd, []string{"newsletter"}); err != nil {
+		t.Fatalf("RunE: %v", err)
+	}
+
+	text := readFiberText(t, path)
+	if !strings.Contains(text, "status: closed") {
+		t.Fatalf("expected status: closed:\n%s", text)
+	}
+	if !strings.Contains(text, "state: scheduled") {
+		t.Fatalf("review.state should reset to scheduled:\n%s", text)
+	}
+	if strings.Contains(text, "state: awaiting") {
+		t.Fatalf("stale awaiting review must be gone:\n%s", text)
+	}
+	// The finished run's cycle fields are cleared with the reset.
+	if strings.Contains(text, "run_id: run-1") || strings.Contains(text, "completed_at:") {
+		t.Fatalf("run-cycle review fields should be cleared on reset:\n%s", text)
+	}
+}
+
+func TestReopenCmd_ResetsStandingReviewToScheduled(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	// Reopen is the un-temper path's first step. A composted standing role can
+	// still carry review.state=awaiting in frontmatter; reopen must reset it so
+	// the reopened (active) role resolves awaitingReview → close-awaiting-review
+	// instead of close-composted.
+	path := writeFiber(t, host, "cc-bills", `---
+name: CC bills
+status: closed
+tempered: false
+closed-at: 2026-06-01T09:30:00Z
+shuttle:
+  enabled: false
+  kind: standing
+  schedule:
+    expr: "0 9 1 * *"
+    tz: UTC
+  review:
+    state: awaiting
+    run_id: "run-7"
+---
+
+Body.
+`)
+
+	if err := reopenCmd.RunE(reopenCmd, []string{"cc-bills"}); err != nil {
+		t.Fatalf("RunE: %v", err)
+	}
+
+	text := readFiberText(t, path)
+	if !strings.Contains(text, "status: active") {
+		t.Fatalf("expected status: active after reopen:\n%s", text)
+	}
+	if !strings.Contains(text, "state: scheduled") {
+		t.Fatalf("review.state should reset to scheduled:\n%s", text)
+	}
+	if strings.Contains(text, "state: awaiting") {
+		t.Fatalf("stale awaiting review must be gone after reopen:\n%s", text)
+	}
+}
+
+func TestCloseCmd_LeavesOneshotReviewUntouched(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	// reset_review is standing-role-only. A oneshot has no recurring review
+	// cycle, so close must not invent or mutate a review block.
+	path := writeFiber(t, host, "oneoff", `---
+name: One off
+status: active
+shuttle:
+  enabled: true
+  kind: oneshot
+---
+
+Body.
+`)
+
+	closeTempered = "true"
+	defer func() { closeTempered = "" }()
+	if err := closeCmd.RunE(closeCmd, []string{"oneoff"}); err != nil {
+		t.Fatalf("RunE: %v", err)
+	}
+
+	text := readFiberText(t, path)
+	if !strings.Contains(text, "status: closed") {
+		t.Fatalf("expected status: closed:\n%s", text)
+	}
+	if strings.Contains(text, "review:") || strings.Contains(text, "state: scheduled") {
+		t.Fatalf("oneshot close should not write a review block:\n%s", text)
+	}
+}
+
+func TestCloseCmd_ClearsRuntimeReviewThroughDaemon(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	// The runtime-store half: with a reachable daemon, close drives a
+	// reset-review POST so the daemon clears the role's runtime lifecycle row
+	// (reviving RuntimeStore.delete_lifecycle). The frontmatter reset still
+	// happens locally; the daemon call clears the OTHER store.
+	path := writeFiber(t, host, "weekly", `---
+name: Weekly
+status: active
+shuttle:
+  enabled: true
+  kind: standing
+  schedule:
+    expr: "0 9 * * 1"
+    tz: UTC
+  review:
+    state: awaiting
+    run_id: "run-9"
+---
+
+Body.
+`)
+
+	var requestPath string
+	var payload map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		_, _ = w.Write([]byte("reset review lifecycle for weekly (was awaiting)\n"))
+	}))
+	defer srv.Close()
+	enableDaemonLifecycle(t, srv.URL)
+
+	closeTempered = "false"
+	defer func() { closeTempered = "" }()
+	if err := closeCmd.RunE(closeCmd, []string{"weekly"}); err != nil {
+		t.Fatalf("RunE: %v", err)
+	}
+
+	if requestPath != "/api/v1/lifecycle" {
+		t.Fatalf("expected reset-review to POST /api/v1/lifecycle, got %q", requestPath)
+	}
+	if payload["action"] != "reset-review" || payload["fiber"] != "weekly" {
+		t.Fatalf("unexpected reset-review payload: %#v", payload)
+	}
+
+	// Frontmatter reset still applied locally alongside the daemon call.
+	text := readFiberText(t, path)
+	if !strings.Contains(text, "status: closed") || !strings.Contains(text, "state: scheduled") {
+		t.Fatalf("close should still reset frontmatter when daemon is reachable:\n%s", text)
+	}
+}
+
+func readFiberText(t *testing.T, path string) string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	return string(raw)
+}

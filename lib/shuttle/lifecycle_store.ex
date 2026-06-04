@@ -89,6 +89,54 @@ defmodule Shuttle.LifecycleStore do
     end
   end
 
+  @doc """
+  Clear a standing role's runtime lifecycle state on close/reopen.
+
+  Close and reopen are lifecycle transitions just like accept/resume — they
+  end (or restart) a role's review cycle — so they must reset `review.state`,
+  the mirror of what accept does when it advances the cycle. Before this, no
+  verb reset review on close/reopen: a composted standing role kept
+  `review.state: awaiting`, and the un-temper sequence (reopen → re-resolve)
+  re-resolved `awaitingReview` to close-composted, silently re-composting the
+  card the user dragged toward Awaiting Review.
+
+  Two stores hold review state and BOTH must be cleared (neither alone closes
+  the loop):
+
+    - The **runtime store** lifecycle row. `RuntimeStore.delete_lifecycle`
+      existed but had no production caller — close/reopen wrote only
+      frontmatter, so a stale `awaiting` row survived indefinitely and the
+      poll-path `merge_lifecycle_overlay` (frontmatter-precedence
+      `put_if_missing`) re-injected it on the next poll for any role whose
+      frontmatter lacked a review key. This is the revival.
+    - The **frontmatter** `review.state`. Reset to `scheduled` so a role that
+      DOES carry review in frontmatter (real standing roles do) reads
+      `scheduled` directly, and `put_if_missing` then has nothing to fix.
+
+  The frontmatter reset is performed by the Go `shuttle-ctl close`/`reopen`
+  writer (which already owns the status/tempered/closed-at write); this verb
+  owns the runtime-store half and exists so the kanban invoke path and the
+  remote daemon can clear the runtime row in-process (atomic against poll
+  cycles via `Poller.refresh_lifecycle_entry`). A no-op when the fiber has no
+  runtime row (oneshots, already-clean roles).
+  """
+  @spec reset_review(String.t()) :: {:ok, String.t()} | {:error, String.t()}
+  def reset_review(fiber_id) when is_binary(fiber_id) do
+    existing = RuntimeStore.fetch_lifecycle(runtime_store_path(), fiber_id)
+    RuntimeStore.delete_lifecycle(runtime_store_path(), fiber_id)
+
+    note =
+      case existing do
+        %{review: %{"state" => state}} when is_binary(state) and state != "scheduled" ->
+          " (was #{state})"
+
+        _ ->
+          ""
+      end
+
+    {:ok, "reset review lifecycle for #{fiber_id}#{note}\n"}
+  end
+
   defp read_fiber(fiber_id) do
     with {:ok, path} <- resolve_fiber_path(fiber_id),
          {:ok, text} <- File.read(path),

@@ -154,8 +154,22 @@ defmodule ShuttleWeb.ActionsController do
     end
   end
 
-  defp invoke_action(fiber_id, "pause", host), do: run(["pause", fiber_id], host)
-  defp invoke_action(fiber_id, "reopen", host), do: run(["reopen", fiber_id], host)
+  # pause / reopen / close shell the Go frontmatter writer with
+  # SHUTTLE_LIFECYCLE_OFFLINE so it writes frontmatter only (status, tempered,
+  # closed-at, and the standing-role review→scheduled reset) WITHOUT calling
+  # back into this daemon's /api/v1/lifecycle — we own the runtime store and do
+  # the runtime half in-process right after, atomic against poll cycles via the
+  # Poller's lifecycle-cache refresh. For close/reopen the runtime half is
+  # `reset_review`, which clears the role's stale runtime review row (the mirror
+  # of accept-run's runtime write). reset_review is a no-op for oneshots and
+  # already-clean roles, so it's safe to call unconditionally.
+  defp invoke_action(fiber_id, "pause", host), do: run_offline(["pause", fiber_id], host)
+
+  defp invoke_action(fiber_id, "reopen", host) do
+    with :ok <- run_offline(["reopen", fiber_id], host) do
+      reset_review_runtime(fiber_id)
+    end
+  end
 
   # accept-run goes through the in-process runtime-store-aware path (which also
   # refreshes the Poller's lifecycle cache), not the Go `shuttle-ctl accept`,
@@ -168,13 +182,23 @@ defmodule ShuttleWeb.ActionsController do
     end
   end
 
-  defp invoke_action(fiber_id, "close-awaiting-review", host), do: run(["close", fiber_id], host)
+  defp invoke_action(fiber_id, "close-awaiting-review", host) do
+    with :ok <- run_offline(["close", fiber_id], host) do
+      reset_review_runtime(fiber_id)
+    end
+  end
 
-  defp invoke_action(fiber_id, "close-tempered", host),
-    do: run(["close", fiber_id, "--tempered=true"], host)
+  defp invoke_action(fiber_id, "close-tempered", host) do
+    with :ok <- run_offline(["close", fiber_id, "--tempered=true"], host) do
+      reset_review_runtime(fiber_id)
+    end
+  end
 
-  defp invoke_action(fiber_id, "close-composted", host),
-    do: run(["close", fiber_id, "--tempered=false"], host)
+  defp invoke_action(fiber_id, "close-composted", host) do
+    with :ok <- run_offline(["close", fiber_id, "--tempered=false"], host) do
+      reset_review_runtime(fiber_id)
+    end
+  end
 
   defp invoke_action(fiber_id, "dispatch-ad-hoc", _host) do
     case Shuttle.Poller.dispatch_fiber(Shuttle.Poller, fiber_id,
@@ -186,21 +210,50 @@ defmodule ShuttleWeb.ActionsController do
     end
   end
 
-  # Prepend `--felt-store <host>` so shuttle-ctl reads the same `.felt/` index
-  # the daemon resolved the fiber against. Without this, shuttle-ctl falls
-  # back to its own default discovery (PWD walk / config) which can land on a
-  # different store and report bogus "no shuttle: block" errors for fibers
-  # whose canonical store is project-scoped (e.g. lightcone).
-  defp run(args, nil), do: run_cmd(args)
-  defp run(args, host) when is_binary(host), do: run_cmd(["--felt-store", host | args])
+  # Shell the Go writer for the frontmatter-mutating verbs (pause / reopen /
+  # close). Two things this does:
+  #
+  #   1. Prepend `--felt-store <host>` so shuttle-ctl reads the same `.felt/`
+  #      index the daemon resolved the fiber against. Without it, shuttle-ctl
+  #      falls back to its own default discovery (PWD walk / config) which can
+  #      land on a different store and report bogus "no shuttle: block" errors
+  #      for fibers whose canonical store is project-scoped (e.g. lightcone).
+  #
+  #   2. Pin SHUTTLE_LIFECYCLE_OFFLINE so the Go writer does its frontmatter
+  #      mutation WITHOUT HTTP-calling back into this daemon — we drive the
+  #      runtime-store half in-process (`reset_review_runtime`). Without this the
+  #      shelled `shuttle-ctl close`/`reopen` would re-enter /api/v1/lifecycle for
+  #      its own reset-review, an avoidable within-daemon round-trip.
+  defp run_offline(args, nil), do: run_cmd(args, lifecycle_offline_env())
 
-  defp run_cmd(args) do
-    case System.cmd("shuttle-ctl", args, stderr_to_stdout: true) do
+  defp run_offline(args, host) when is_binary(host),
+    do: run_cmd(["--felt-store", host | args], lifecycle_offline_env())
+
+  defp lifecycle_offline_env, do: [{"SHUTTLE_LIFECYCLE_OFFLINE", "1"}]
+
+  defp run_cmd(args, env) do
+    case System.cmd("shuttle-ctl", args, stderr_to_stdout: true, env: env) do
       {_, 0} -> :ok
       {output, status} -> {:error, {:command_error, status, output}}
     end
   rescue
     e in ErlangError -> {:error, Exception.message(e)}
+  end
+
+  # Clear the standing role's runtime review row after a close/reopen. A failure
+  # here must NOT fail the close/reopen — the frontmatter reset (done by the Go
+  # writer above) already blocks the poll overlay from re-injecting a stale
+  # awaiting state, so the runtime clear is belt-and-suspenders. Logged, swallowed.
+  defp reset_review_runtime(fiber_id) do
+    case LifecycleService.reset_review(fiber_id) do
+      {:ok, _output} ->
+        :ok
+
+      {:error, reason} ->
+        require Logger
+        Logger.warning("reset_review runtime clear failed for #{fiber_id}: #{inspect(reason)}")
+        :ok
+    end
   end
 
   defp render_error(reason) when is_binary(reason), do: reason

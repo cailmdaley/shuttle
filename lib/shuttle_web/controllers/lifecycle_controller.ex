@@ -12,7 +12,7 @@ defmodule ShuttleWeb.LifecycleController do
 
   alias Shuttle.{FeltStores, LifecycleService}
 
-  @allowed ~w(install pause resume repeat accept set-model set-interactive uninstall)
+  @allowed ~w(install pause resume repeat accept reset-review set-model set-interactive uninstall)
 
   def create(conn, params) do
     with {:ok, action} <- action(params),
@@ -45,6 +45,18 @@ defmodule ShuttleWeb.LifecycleController do
     case LifecycleService.resume(fiber) do
       {:ok, output} -> {:ok, output}
       {:error, _reason} -> args_for("resume", %{"fiber" => fiber}) |> then(&run_elem/1)
+    end
+  end
+
+  # reset-review is daemon-runtime-only: it clears the standing role's runtime
+  # lifecycle row (the frontmatter half is owned by the Go close/reopen writer
+  # that calls us). There is no shuttle-ctl fallback verb — the runtime store is
+  # the daemon's exclusively. The Go side treats a transport error as
+  # "no daemon, nothing to clear" and proceeds on the frontmatter reset alone.
+  defp execute("reset-review", %{"fiber" => fiber}) do
+    case LifecycleService.reset_review(fiber) do
+      {:ok, output} -> {:ok, output}
+      {:error, reason} -> {:error, reason}
     end
   end
 

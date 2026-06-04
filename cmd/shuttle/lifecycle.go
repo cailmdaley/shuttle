@@ -176,7 +176,7 @@ The shuttle block stays installed; closed fibers are ignored by the daemon
 until they are reopened.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		path, _, _ := resolveFiber(args[0])
+		path, fiberID, _ := resolveFiber(args[0])
 		f := readFiber(path)
 		if f.Block == nil {
 			return fmt.Errorf("fiber %s has no shuttle: block", args[0])
@@ -194,6 +194,7 @@ until they are reopened.`,
 		f.SetStatus("closed")
 		f.SetTempered(tempered)
 		f.SetClosedAtIfMissing(time.Now().UTC().Format("2006-01-02T15:04:05.000Z"))
+		reviewReset := resetStandingReview(f.Block)
 		if err := f.WriteBlock(f.Block); err != nil {
 			return fmt.Errorf("writing fiber: %w", err)
 		}
@@ -207,6 +208,7 @@ until they are reopened.`,
 		default:
 			fmt.Println("  tempered: false")
 		}
+		clearRuntimeReviewLifecycle(fiberID, reviewReset)
 		return nil
 	},
 }
@@ -221,7 +223,7 @@ This is the canonical reopen path for Kanban requeues from Awaiting review,
 Tempered, or Composted back to In flight.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		path, _, _ := resolveFiber(args[0])
+		path, fiberID, _ := resolveFiber(args[0])
 		f := readFiber(path)
 		if f.Block == nil {
 			return fmt.Errorf("fiber %s has no shuttle: block", args[0])
@@ -232,6 +234,7 @@ Tempered, or Composted back to In flight.`,
 		f.SetTempered(nil)
 		f.ClearClosedAt()
 		f.Block.Enabled = true
+		reviewReset := resetStandingReview(f.Block)
 		if err := f.WriteBlock(f.Block); err != nil {
 			return fmt.Errorf("writing fiber: %w", err)
 		}
@@ -243,6 +246,7 @@ Tempered, or Composted back to In flight.`,
 			fmt.Printf("  status: %s → active\n", statusBefore)
 		}
 		fmt.Println("  cleared: tempered, closed-at")
+		clearRuntimeReviewLifecycle(fiberID, reviewReset)
 		return nil
 	},
 }
@@ -552,6 +556,59 @@ func joinIDs(ids []string) string {
 		result += id
 	}
 	return result
+}
+
+// resetStandingReview resets a standing role's frontmatter review.state back to
+// "scheduled" on close/reopen, clearing the finished run's cycle fields. Close
+// and reopen end (or restart) a review cycle, so the awaiting/review verdict
+// state must reset — the mirror of accept, which advances the cycle. Returns
+// the prior state when a reset actually happened (so the caller can log it and
+// decide whether to bother clearing the daemon's runtime row), or "" otherwise.
+//
+// Why this is load-bearing: the daemon's poll-path merge_lifecycle_overlay uses
+// frontmatter-precedence put_if_missing — a PRESENT frontmatter review.state
+// blocks the runtime store's value from being injected. Before this, close left
+// review.state=awaiting in frontmatter; the un-temper sequence (reopen →
+// re-resolve awaitingReview) then re-resolved to close-composted, silently
+// re-composting the card. Resetting to scheduled here makes the reopened role
+// resolve awaitingReview → close-awaiting-review (back into the review pile)
+// instead. Non-standing fibers and already-scheduled roles are untouched.
+func resetStandingReview(block *schema.Block) string {
+	if block == nil || block.Kind != "standing" || block.Review == nil {
+		return ""
+	}
+	prior := block.Review.State
+	if prior == "" || prior == "scheduled" {
+		return ""
+	}
+	block.Review = &schema.Review{State: "scheduled"}
+	return prior
+}
+
+// clearRuntimeReviewLifecycle clears the standing role's runtime-store lifecycle
+// row through the daemon. The frontmatter half is already done by
+// resetStandingReview; this clears the OTHER store (review state lives in both
+// for standing roles — see lib/shuttle/lifecycle_store.ex reset_review). Reviving
+// RuntimeStore.delete_lifecycle, which had no production caller: close/reopen
+// wrote only frontmatter, so a stale runtime awaiting row survived indefinitely
+// and re-injected on the next poll for any role lacking a frontmatter review key.
+//
+// Best-effort: a transport error (daemon offline / SHUTTLE_LIFECYCLE_OFFLINE)
+// means there is no runtime store to clear from here — the frontmatter reset
+// already blocks overlay re-injection — so we proceed silently. A real daemon
+// error (e.g. 4xx) is surfaced as a note but does not fail the close/reopen.
+// Skips entirely when no review reset happened (oneshots, already-scheduled).
+func clearRuntimeReviewLifecycle(fiberID, priorReviewState string) {
+	if priorReviewState == "" || fiberID == "" {
+		return
+	}
+	if _, err := postLifecycle("reset-review", map[string]any{"fiber": fiberID}); err != nil {
+		if !isLifecycleTransportError(err) {
+			fmt.Printf("  note: daemon reset-review failed (%v); frontmatter review reset still applied\n", err)
+		}
+		return
+	}
+	fmt.Printf("  review.state: %s → scheduled (runtime lifecycle cleared)\n", priorReviewState)
 }
 
 // standingInReviewState returns true when a standing role's review block is in

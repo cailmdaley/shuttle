@@ -45,6 +45,20 @@ defmodule Shuttle.LifecycleService do
     end
   end
 
+  # Clear a standing role's runtime review state on close/reopen. Unlike
+  # accept/resume this writes no felt-history event — close/reopen already log
+  # their own status transition, and the runtime-store clear is bookkeeping, not
+  # a reviewable verdict. Routed through the Poller (when live) so the runtime
+  # delete and the in-memory lifecycle-cache eviction are atomic against poll
+  # cycles, mirroring accept/resume.
+  @spec reset_review(String.t()) :: {:ok, String.t()} | {:error, String.t()}
+  def reset_review(fiber_id) when is_binary(fiber_id) do
+    case transition(:reset_review, fiber_id, []) do
+      {:ok, output} -> {:ok, output}
+      {:error, reason} -> {:error, to_message(reason)}
+    end
+  end
+
   # When the Poller is running (the live daemon) route through it so the runtime
   # DB write and the in-memory lifecycle-cache refresh happen atomically against
   # poll cycles — otherwise the next poll re-derives the role from the stale
@@ -60,6 +74,7 @@ defmodule Shuttle.LifecycleService do
 
   defp lifecycle_store_args(:accept, fiber_id, opts), do: [fiber_id, opts]
   defp lifecycle_store_args(:resume, fiber_id, _opts), do: [fiber_id]
+  defp lifecycle_store_args(:reset_review, fiber_id, _opts), do: [fiber_id]
 
   defp record_history(fiber_id, output, fallback) do
     summary =

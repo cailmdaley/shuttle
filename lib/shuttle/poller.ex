@@ -195,13 +195,17 @@ defmodule Shuttle.Poller do
   `merge_lifecycle_overlay` in the poll path). Running the transition inside the
   GenServer makes the DB write + cache refresh atomic against poll cycles.
   """
-  @spec lifecycle_transition(:accept | :resume, String.t(), keyword()) ::
+  @spec lifecycle_transition(:accept | :resume | :reset_review, String.t(), keyword()) ::
           {:ok, String.t()} | {:error, term()}
   def lifecycle_transition(verb, fiber_id, opts \\ []),
     do: lifecycle_transition(__MODULE__, verb, fiber_id, opts)
 
-  @spec lifecycle_transition(GenServer.server(), :accept | :resume, String.t(), keyword()) ::
-          {:ok, String.t()} | {:error, term()}
+  @spec lifecycle_transition(
+          GenServer.server(),
+          :accept | :resume | :reset_review,
+          String.t(),
+          keyword()
+        ) :: {:ok, String.t()} | {:error, term()}
   def lifecycle_transition(server, verb, fiber_id, opts) do
     GenServer.call(server, {:lifecycle_transition, verb, fiber_id, opts}, @dispatch_call_timeout_ms)
   end
@@ -518,6 +522,7 @@ defmodule Shuttle.Poller do
       case verb do
         :accept -> LifecycleStore.accept(fiber_id, opts)
         :resume -> LifecycleStore.resume(fiber_id)
+        :reset_review -> LifecycleStore.reset_review(fiber_id)
         other -> {:error, "unknown lifecycle transition #{inspect(other)}"}
       end
 

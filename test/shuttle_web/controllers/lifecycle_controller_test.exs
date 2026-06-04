@@ -159,6 +159,82 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     File.rm_rf(root)
   end
 
+  test "reset-review clears the runtime lifecycle row for a standing role" do
+    # The runtime half of the close/reopen review reset. A standing role that
+    # finished a run carries `review.state: awaiting` in the runtime store; close
+    # never cleared it (RuntimeStore.delete_lifecycle had no production caller),
+    # so the stale row survived and the poll overlay re-injected it on reopen,
+    # re-composting the un-tempered card. This endpoint (driven by the Go
+    # close/reopen writer) clears that row in-process.
+    root =
+      System.tmp_dir!()
+      |> Path.join("shuttle-lifecycle-reset-#{System.unique_integer([:positive])}")
+
+    store = Path.join(root, "loom")
+    runtime_store = Path.join(root, "runtime.db")
+    fiber_dir = Path.join([store, ".felt", "tests", "standing-reset"])
+    File.mkdir_p!(fiber_dir)
+    path = Path.join(fiber_dir, "standing-reset.md")
+
+    # Closed standing role with a stale awaiting review (the composted-role state
+    # that re-composts on un-temper). Frontmatter review was already reset to
+    # scheduled by the Go close writer; the runtime row is what we clear here.
+    File.write!(path, """
+    ---
+    name: Standing reset
+    status: closed
+    tempered: false
+    closed-at: 2026-06-01T09:30:00Z
+    shuttle:
+      enabled: true
+      kind: standing
+      host: #{Shuttle.Poller.own_host_id()}
+      project_dir: #{store}
+      schedule:
+        expr: 0 9 * * 1-5
+        tz: UTC
+      review:
+        state: scheduled
+    ---
+
+    Body.
+    """)
+
+    RuntimeStore.upsert_lifecycle(runtime_store, "tests/standing-reset", %{
+      kind: "standing",
+      phase: "awaiting",
+      run_id: "run-1",
+      review: %{"state" => "awaiting", "run_id" => "run-1"}
+    })
+
+    with_env(%{"LOOM_HOMES" => store, "SHUTTLE_RUNTIME_STORE" => runtime_store}, fn ->
+      assert RuntimeStore.fetch_lifecycle(runtime_store, "tests/standing-reset") != nil
+
+      conn =
+        post(
+          api_conn(),
+          "/api/v1/lifecycle",
+          Jason.encode!(%{
+            "action" => "reset-review",
+            "fiber" => "tests/standing-reset"
+          })
+        )
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "reset review lifecycle for tests/standing-reset"
+      assert conn.resp_body =~ "was awaiting"
+
+      # The runtime row is gone, so the poll overlay's put_if_missing has nothing
+      # to inject — combined with the frontmatter review.state: scheduled, a
+      # subsequent resolve of awaitingReview returns close-awaiting-review, not
+      # close-composted.
+      assert RuntimeStore.fetch_lifecycle(runtime_store, "tests/standing-reset") == nil
+      assert RuntimeStore.list_lifecycle(runtime_store) == []
+    end)
+
+    File.rm_rf(root)
+  end
+
   test "accept re-enables a paused standing role (temper resumes it)" do
     root =
       System.tmp_dir!()
