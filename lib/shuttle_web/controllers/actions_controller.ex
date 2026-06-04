@@ -76,6 +76,31 @@ defmodule ShuttleWeb.ActionsController do
           error: "action_not_available"
         })
 
+      # A dispatch-ad-hoc against a fiber whose worker is already running is not
+      # a server fault — it's the benign "already there" case the kanban
+      # coalesces to a no-op. Surface a recognizable 409 (was a bare 500).
+      {:error, :already_running} ->
+        conn
+        |> put_status(409)
+        |> json(%{
+          fiber_id: fiber_id,
+          action: action,
+          invoked: false,
+          error: "already_running"
+        })
+
+      # Unknown fiber: match the read paths (show / resolve both 404) instead of
+      # the catch-all 500.
+      {:error, :not_found} ->
+        conn
+        |> put_status(404)
+        |> json(%{
+          fiber_id: fiber_id,
+          action: action,
+          invoked: false,
+          error: "not_found"
+        })
+
       {:error, {:command_error, status, output}} ->
         conn
         |> put_status(422)
@@ -122,8 +147,12 @@ defmodule ShuttleWeb.ActionsController do
           {:error, :action_not_available}
         end
 
-      {:error, reason} ->
-        {:error, reason}
+      # actions_for failed to resolve/read the fiber (unknown id, unreadable
+      # frontmatter, foreign felt-store path). The read paths (show / resolve)
+      # already map this to 404; normalize it to :not_found here so invoke
+      # matches them instead of the catch-all 500. (overnight-audit C1+C10.)
+      {:error, _reason} ->
+        {:error, :not_found}
     end
   end
 

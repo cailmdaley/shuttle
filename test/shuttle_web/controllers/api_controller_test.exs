@@ -561,6 +561,24 @@ defmodule ShuttleWeb.APIControllerTest do
     assert body["invoked"] == false
   end
 
+  test "actions invoke for an unknown fiber returns 404, matching show/resolve" do
+    with_actions_host()
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/actions/invoke",
+        Jason.encode!(%{fiber_id: "tests/does-not-exist", action: "pause"})
+      )
+
+    # Was a bare 500; the read paths (show / resolve) already 404 for an
+    # unknown fiber, so invoke matches them. (overnight-audit C1+C10 error UX.)
+    assert conn.status == 404
+    body = Jason.decode!(conn.resp_body)
+    assert body["error"] == "not_found"
+    assert body["invoked"] == false
+  end
+
   # Regression: the daemon used to shell out to `shuttle-ctl` without
   # `--felt-store`, so the CLI's default discovery (PWD walk / loom default)
   # could land on a different store than the one fetch_fiber/1 resolved the
