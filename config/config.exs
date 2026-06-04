@@ -14,6 +14,10 @@ config :shuttle,
   # let remote and local daemons fight over the same fibers.
   start_poller: true,
   start_remote_registry: true,
+  # Per-host periodic publish-only loom git-sync (Shuttle.LoomSync). Keeps an
+  # idle host's loom from freezing — it stopped pulling once Stop/SessionEnd
+  # hooks were the only trigger. Interval/script via SHUTTLE_LOOM_SYNC_* env.
+  start_loom_sync: true,
   # Per-host snapshots from remote Shuttle daemons reachable via
   # SSH tunnels. Each entry: %{name: String, url: String,
   # poll_interval_ms: pos_integer (default 5000), request_timeout_ms:

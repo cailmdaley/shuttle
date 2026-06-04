@@ -55,6 +55,13 @@ defmodule Shuttle.Application do
       end
 
     children =
+      if Application.get_env(:shuttle, :start_loom_sync, true) do
+        children ++ [Shuttle.LoomSync]
+      else
+        children
+      end
+
+    children =
       if Application.get_env(:shuttle, :start_endpoint, true) do
         children ++ [ShuttleWeb.Endpoint]
       else

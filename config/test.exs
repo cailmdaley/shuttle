@@ -4,6 +4,7 @@ config :shuttle,
   env: :test,
   start_poller: false,
   start_remote_registry: false,
+  start_loom_sync: false,
   remotes: []
 
 # Test daemon identity. Resolved at Poller boot via SHUTTLE_HOST → the
