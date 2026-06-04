@@ -498,6 +498,93 @@ defmodule ShuttleWeb.APIControllerTest do
            end)
   end
 
+  # overnight-audit C10 / finding 3: the inline-fiber resolve clause validated
+  # only `is_map(fiber)`, never the shape of fiber["shuttle"] / ["review"]. A
+  # non-map shuttle raised BadMapError; a scalar/list review raised
+  # FunctionClauseError — both bubbling to a bare Phoenix 500 where a graceful
+  # response is the documented contract. The accessors are now total.
+  @tag :capture_log
+  test "actions resolve degrades a malformed shuttle/review shape instead of 500ing" do
+    malformed = [
+      %{"id" => "x", "status" => "open", "shuttle" => "enabled"},
+      %{"id" => "x", "status" => "open", "shuttle" => [1, 2]},
+      %{"id" => "x", "status" => "open", "shuttle" => 7},
+      %{
+        "id" => "x",
+        "status" => "open",
+        "shuttle" => %{"enabled" => true, "kind" => "standing", "review" => "awaiting"}
+      },
+      %{
+        "id" => "x",
+        "status" => "open",
+        "shuttle" => %{"enabled" => true, "kind" => "standing", "review" => ["awaiting"]}
+      },
+      %{
+        "id" => "x",
+        "status" => "open",
+        "shuttle" => %{"enabled" => true, "kind" => "standing", "review" => 3}
+      }
+    ]
+
+    for fiber <- malformed do
+      conn =
+        post(
+          api_conn(),
+          "/api/v1/actions/resolve",
+          Jason.encode!(%{fiber: fiber, target: "tempered"})
+        )
+
+      # Graceful: a resolved action (degraded to the default path), never a 500.
+      assert conn.status == 200, "expected graceful 200 for #{inspect(fiber)}, got #{conn.status}"
+      assert Jason.decode!(conn.resp_body)["action"]["id"] != nil
+    end
+  end
+
+  # Controls: well-formed shapes still resolve correctly after the hardening.
+  @tag :capture_log
+  test "actions resolve controls: well-formed shapes still resolve correctly" do
+    # A non-standing fiber's review key is irrelevant — even a string review
+    # must not change the resolution (it degrades to the default path).
+    nonstanding =
+      post(
+        api_conn(),
+        "/api/v1/actions/resolve",
+        Jason.encode!(%{
+          fiber: %{
+            "id" => "x",
+            "status" => "open",
+            "shuttle" => %{"enabled" => true, "kind" => "oneshot", "review" => "awaiting"}
+          },
+          target: "inFlight"
+        })
+      )
+
+    assert nonstanding.status == 200
+    assert Jason.decode!(nonstanding.resp_body)["action"]["id"] == "dispatch-ad-hoc"
+
+    # A well-formed awaiting standing role still resolves accept-run.
+    standing =
+      post(
+        api_conn(),
+        "/api/v1/actions/resolve",
+        Jason.encode!(%{
+          fiber: %{
+            "id" => "x",
+            "status" => "active",
+            "shuttle" => %{
+              "enabled" => true,
+              "kind" => "standing",
+              "review" => %{"state" => "awaiting"}
+            }
+          },
+          target: "tempered"
+        })
+      )
+
+    assert standing.status == 200
+    assert Jason.decode!(standing.resp_body)["action"]["id"] == "accept-run"
+  end
+
   # Single-source invariant (C1/C2 dual-source fix). The by-fiber-id resolve
   # (`Poller.resolve_action`) and the by-fiber-id availability
   # (`Poller.actions_for`, which `validate_available` gates on) BOTH derive

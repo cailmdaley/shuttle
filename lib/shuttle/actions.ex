@@ -196,8 +196,25 @@ defmodule Shuttle.Actions do
   defp normalize_target("active"), do: "inFlight"
   defp normalize_target(target), do: target
 
-  defp shuttle(fiber), do: Map.get(fiber, "shuttle", %{}) || %{}
+  # Total accessors: a malformed inline fiber (shuttle/review as a scalar or
+  # list rather than a map) must degrade to the default path, not crash the
+  # resolver with BadMapError / ArgumentError → a bare Phoenix 500. The current
+  # client always builds well-formed shapes, so this is public-contract
+  # robustness for any other caller. (overnight-audit C10 / finding 3.)
+  defp shuttle(fiber) do
+    case Map.get(fiber, "shuttle", %{}) do
+      m when is_map(m) -> m
+      _ -> %{}
+    end
+  end
+
   defp enabled?(shuttle), do: Map.get(shuttle, "enabled") == true
   defp standing?(shuttle), do: Map.get(shuttle, "kind", Map.get(shuttle, "mode")) == "standing"
-  defp review_state(shuttle), do: get_in(shuttle, ["review", "state"]) || "scheduled"
+
+  defp review_state(shuttle) do
+    case Map.get(shuttle, "review") do
+      review when is_map(review) -> Map.get(review, "state") || "scheduled"
+      _ -> "scheduled"
+    end
+  end
 end
