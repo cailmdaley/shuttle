@@ -913,6 +913,49 @@ defmodule Shuttle.PollerTest do
            end)
   end
 
+  test "actions/resolve read tmux-live running state, not a stale registry hit" do
+    # C1-adjacent: :dispatch reconciles against tmux before reading state.running,
+    # but :actions and :resolve_action used to read the registry raw. So in the
+    # window after a worker's session dies (before the poll tick reconciles), a
+    # drag→inFlight resolved to `pause` for a worker that no longer exists — and
+    # invoke (which reconciles) then 409s. The read legs now derive `running?`
+    # from a live tmux check (`live_running?`), matching the dispatch leg —
+    # without the eviction side effects (those stay on the poll/dispatch path).
+    fiber_id = "tests/reconcile-dead-session"
+    fiber = make_fiber(fiber_id)
+    MockRunner.set_fiber(fiber_id, fiber)
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_reconcile_dead_session,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    # Spawn a worker so the fiber is in state.running.
+    assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, force: true)
+    assert session == Dispatcher.session_name(fiber_id)
+
+    # While the session is live, the running branch is read: inFlight → pause.
+    assert {:ok, %{id: "pause"}} = Poller.resolve_action(poller, fiber_id, "inFlight", [])
+
+    # Kill the tmux session WITHOUT a poll tick or :worker_exited message.
+    MockRunner.remove_tmux_session(session)
+
+    # The read legs now see the session is gone (live tmux check), so the fiber
+    # reads idle and inFlight resolves to a fresh dispatch (not pause). The
+    # discriminator is the inFlight resolution — `pause` is in the idle
+    # availability set too (drafts→pause), so we assert on resolve, not the set.
+    assert {:ok, %{id: "dispatch-ad-hoc"}} =
+             Poller.resolve_action(poller, fiber_id, "inFlight", [])
+
+    {:ok, actions} = Poller.actions_for(poller, fiber_id, [])
+    ids = Enum.map(actions, &(Map.get(&1, :id) || Map.get(&1, "id")))
+    assert "dispatch-ad-hoc" in ids
+  end
+
   test "forced non-ad-hoc standing dispatch keeps scheduled run context for resume" do
     fiber_id = "tests/standing-force-scheduled"
     fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})

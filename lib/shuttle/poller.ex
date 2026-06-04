@@ -497,7 +497,7 @@ defmodule Shuttle.Poller do
     case fetch_fiber_full(fiber_id, state) do
       {:ok, fiber} ->
         fiber = overlay_runtime_lifecycle(fiber, fiber_id, state)
-        running? = Keyword.get(opts, :running, Map.has_key?(state.running, fiber_id))
+        running? = Keyword.get(opts, :running, live_running?(state, fiber_id))
         {:reply, {:ok, Actions.actions_for(fiber, running?)}, state}
 
       {:error, reason} ->
@@ -509,7 +509,7 @@ defmodule Shuttle.Poller do
     case fetch_fiber_full(fiber_id, state) do
       {:ok, fiber} ->
         fiber = overlay_runtime_lifecycle(fiber, fiber_id, state)
-        running? = Keyword.get(opts, :running, Map.has_key?(state.running, fiber_id))
+        running? = Keyword.get(opts, :running, live_running?(state, fiber_id))
         {:reply, Actions.resolve_transition(fiber, target, running?), state}
 
       {:error, reason} ->
@@ -2225,6 +2225,23 @@ defmodule Shuttle.Poller do
   end
 
   # ── Retry ──
+
+  # Whether a fiber is GENUINELY running right now: in the registry AND its tmux
+  # session is actually alive. The read legs (:actions / :resolve_action) use
+  # this instead of a raw `Map.has_key?(state.running, …)`, so a resolved action
+  # agrees with what the dispatch leg's `reconcile_running_fiber` would conclude.
+  # Unlike reconcile, this is a PURE read — no watcher teardown, no state
+  # mutation — so resolve/actions stay side-effect-free; the actual eviction
+  # happens on the next poll tick or the dispatch leg. Without it, in the window
+  # after a worker's session dies the registry still reports it running, so a
+  # drag→inFlight resolves to `pause` for a worker that no longer exists and the
+  # matching invoke (which reconciles) 409s. (C1-adjacent.)
+  defp live_running?(%State{} = state, fiber_id) do
+    case Map.get(state.running, fiber_id) do
+      nil -> false
+      %{session: session} -> already_running_session?(state, session)
+    end
+  end
 
   defp reconcile_running_fiber(%State{} = state, fiber_id) do
     case Map.get(state.running, fiber_id) do
