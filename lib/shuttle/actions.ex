@@ -96,21 +96,52 @@ defmodule Shuttle.Actions do
       # tempered); shuttle-ctl refuses a direct pause/close on an already-closed
       # fiber. Portolan's un-temper sequence drags through inFlight first for
       # the other open-lifecycle targets, so every non-close target collapses to
-      # reopen here. The close columns still re-close with the chosen verdict.
+      # reopen here. The close columns re-close with the chosen verdict.
+      #
+      # The verdict columns are split out from the open-lifecycle group (rather
+      # than left to fall through to the standing-awaiting clauses below). A
+      # CLOSED standing role can carry a stale `review.state: awaiting` in its
+      # runtime store (close never reset it before the lifecycle-reset fix); if
+      # `tempered`/`composted` fell through, c6/c7 would catch them — `tempered`
+      # → accept-run, which re-arms a *closed* role's schedule (status forced
+      # active, next_due_at in the future), silently dropping the user's
+      # verdict. Resolving the verdict columns to their close verbs here keeps
+      # the contract symmetric (tempered → close-tempered, composted →
+      # close-composted) regardless of any leftover review state, and the
+      # rendered set stays drag-safe by construction.
       status == "closed" and target in ["drafts", "inFlight", "awaitingReview"] ->
         :reopen
 
+      status == "closed" and target == "tempered" ->
+        :close_tempered
+
+      status == "closed" and target == "composted" ->
+        :close_composted
+
+      # An awaiting standing role's pending run gets a human verdict: accept-run
+      # keeps it (advance the schedule), close-composted drops it. inFlight ("run
+      # it again now") is the same "keep it" gesture as tempered.
       standing?(shuttle) and review_state(shuttle) == "awaiting" and
           target in ["inFlight", "tempered"] ->
         :accept_run
 
-      # An awaiting standing role isn't a draft to pause: dragging it out of
-      # review to drafts/awaitingReview is the same human verdict as composting
-      # the pending run — accept-run is the only "keep it" verb, compost the only
-      # "drop it" verb. Map the ambiguous columns to compost so they stay
-      # available (a pause/close here would 409 — pause isn't a review verb).
+      # `awaitingReview` is the awaiting role's HOME column — a drop there is a
+      # same-column no-op (Portolan's drop handler already short-circuits
+      # `fromColumn == target`, so this is only reached by a non-shipping caller
+      # or a stale multi-step sequence). Resolve it to close-awaiting-review —
+      # the non-verdict "this stays in review" verb — NOT close-composted, which
+      # would silently destroy the pending run on what the user meant as a no-op.
+      # close-awaiting-review joins `action_ids` by construction (it's the
+      # resolution of a kanban target), so resolve ⊆ availability still holds.
       standing?(shuttle) and review_state(shuttle) == "awaiting" and
-          target in ["drafts", "awaitingReview", "composted"] ->
+          target == "awaitingReview" ->
+        :close_awaiting_review
+
+      # drafts ("park it") on an awaiting role has no non-destructive verb in the
+      # review vocabulary (pause isn't a review verb and would 409); compost the
+      # pending run so the column stays available.
+      standing?(shuttle) and review_state(shuttle) == "awaiting" and
+          target in ["drafts", "composted"] ->
         :close_composted
 
       # A disabled fiber (paused draft) dragged out of drafts re-enables via

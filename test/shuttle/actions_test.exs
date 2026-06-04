@@ -190,6 +190,54 @@ defmodule Shuttle.ActionsTest do
                end)
     end
 
+    test "closed standing role with stale awaiting review resolves verdicts to their close verbs, not accept/reopen" do
+      # Regression for the C4 cond-ordering bug. A standing role can reach
+      # status=closed while its runtime store still holds review.state=awaiting
+      # (close never reset it before the lifecycle-reset fix). The matrix test
+      # above only proves resolve ⊆ availability — it cannot catch a
+      # semantically-wrong-but-available resolution. Here the closed clause used
+      # to omit tempered/composted, so they fell through to the standing-awaiting
+      # clauses: `tempered` → accept-run (re-arming a CLOSED role's schedule,
+      # dropping the user's verdict), while `composted` happened to land on
+      # close-composted by luck — an asymmetric, corrupt contract.
+      fiber = %{
+        "id" => "work/closed-stale-awaiting",
+        "status" => "closed",
+        "shuttle" => %{"enabled" => true, "kind" => "standing", "review" => %{"state" => "awaiting"}}
+      }
+
+      assert {:ok, %{id: "close-tempered", invocation: %{verb: "close", tempered: true}}} =
+               Actions.resolve_transition(fiber, "tempered")
+
+      assert {:ok, %{id: "close-composted", invocation: %{verb: "close", tempered: false}}} =
+               Actions.resolve_transition(fiber, "composted")
+
+      # The open-lifecycle columns still reopen (clears closed_at / tempered);
+      # accept-run must NOT appear for a closed role.
+      for target <- ~w(drafts inFlight awaitingReview) do
+        assert {:ok, %{id: "reopen"}} = Actions.resolve_transition(fiber, target)
+      end
+
+      available = Actions.actions_for(fiber) |> Enum.map(& &1.id)
+      refute "accept-run" in available
+    end
+
+    test "same-column awaitingReview drop on a live awaiting standing role is non-destructive" do
+      # The awaiting role's HOME column is awaitingReview. A drop there is a
+      # same-column no-op; it must not silently compost the pending run. Resolves
+      # to close-awaiting-review (the non-verdict "stays in review" verb), never
+      # close-composted. Pins the legit verdict columns at the same time:
+      # tempered/inFlight = accept (keep the run), composted = compost (drop it).
+      fiber = standing("awaiting")
+
+      assert {:ok, %{id: "close-awaiting-review", invocation: %{verb: "close"}}} =
+               Actions.resolve_transition(fiber, "awaitingReview")
+
+      assert {:ok, %{id: "accept-run"}} = Actions.resolve_transition(fiber, "tempered")
+      assert {:ok, %{id: "accept-run"}} = Actions.resolve_transition(fiber, "inFlight")
+      assert {:ok, %{id: "close-composted"}} = Actions.resolve_transition(fiber, "composted")
+    end
+
     test "a disabled standing role can still be composted (the canary repro)" do
       # ai-futures/shuttle/misc/standing-roles/canary-local-snapshot: a disabled
       # standing role used to expose `[:reopen]` only, so dragging it to any
