@@ -185,13 +185,17 @@ func exactFiberPath(host, fiberID string) (string, bool) {
 	basename := segments[len(segments)-1]
 	feltDir := filepath.Join(host, ".felt")
 
-	if !strings.Contains(fiberID, "/") {
-		bare := filepath.Join(feltDir, basename+".md")
-		if _, err := os.Stat(bare); err == nil {
-			return bare, true
-		}
+	// Flat layout: <.felt>/<fiberID>.md — covers both root-level (`foo.md`) and
+	// nested (`sp_validation/sp-validation-restructuring.md`) flat fibers. The
+	// nested-flat case is what made a dragged flat fiber 400/422 "file not
+	// found": felt resolved the id (`sp_validation/sp-validation-restructuring`)
+	// but the old reconstruction only built the dir layout below.
+	flat := filepath.Join(feltDir, filepath.FromSlash(fiberID)+".md")
+	if _, err := os.Stat(flat); err == nil {
+		return flat, true
 	}
 
+	// Dir-contained layout: <.felt>/<fiberID>/<leaf>.md
 	dir := filepath.Join(feltDir, filepath.FromSlash(fiberID), basename+".md")
 	if _, err := os.Stat(dir); err == nil {
 		return dir, true

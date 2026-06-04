@@ -60,6 +60,44 @@ func TestFiberRefFromPath_RootFiber(t *testing.T) {
 	}
 }
 
+func TestResolveFiberInHost_FlatFiberInSymlinkedStore(t *testing.T) {
+	// candide's sp-validation-restructuring shape: a ROOT-flat fiber in a
+	// project's own .felt, mounted into loom as a symlinked sub-store. Queried by
+	// its loom-traversal id (`sp_validation/sp-validation-restructuring` — what
+	// felt returns for the bare leaf), the path is the flat `<sub>/<leaf>.md`.
+	// Before the fix, exactFiberPath only built the dir layout for multi-segment
+	// ids, so this 422'd "resolved to ID … but file not found".
+	loom := t.TempDir()
+	project := t.TempDir()
+
+	projFelt := filepath.Join(project, ".felt")
+	flat := filepath.Join(projFelt, "sp-validation-restructuring.md")
+	writeFiberFile(t, flat)
+
+	if err := os.MkdirAll(filepath.Join(loom, ".felt"), 0o755); err != nil {
+		t.Fatalf("mkdir loom .felt: %v", err)
+	}
+	if err := os.Symlink(projFelt, filepath.Join(loom, ".felt", "sp_validation")); err != nil {
+		t.Fatalf("symlink sub-store: %v", err)
+	}
+
+	ref, err := ResolveFiberInHost(loom, "sp_validation/sp-validation-restructuring")
+	if err != nil {
+		t.Fatalf("ResolveFiberInHost (flat in symlinked store): %v", err)
+	}
+	wantPath, err := filepath.EvalSymlinks(flat)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	if ref.Path != wantPath {
+		t.Fatalf("path = %q, want %q", ref.Path, wantPath)
+	}
+	// Canonical id is the project-relative (root-flat) slug.
+	if ref.ID != "sp-validation-restructuring" {
+		t.Fatalf("id = %q, want %q", ref.ID, "sp-validation-restructuring")
+	}
+}
+
 func TestResolveFiberInHost_CanonicalizesSymlinkedProjectView(t *testing.T) {
 	loom := t.TempDir()
 	projectRoot := filepath.Join(t.TempDir(), "portolan")
