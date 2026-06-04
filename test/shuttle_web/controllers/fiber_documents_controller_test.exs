@@ -88,6 +88,46 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
     assert [%{"fiber" => %{"body" => "Body text."}}] = Jason.decode!(conn.resp_body)["fibers"]
   end
 
+  test "GET /api/v1/fibers?shuttle=true returns only fibers with a shuttle block", %{store: store} do
+    write_fiber!(store, "tests/managed", """
+    ---
+    name: Managed
+    status: active
+    shuttle:
+      enabled: true
+      host: test-host
+    ---
+
+    Body.
+    """)
+
+    write_fiber!(store, "tests/plain", """
+    ---
+    name: Plain todo
+    status: open
+    due: 2026-01-01
+    ---
+
+    Body.
+    """)
+
+    # Unfiltered: both fibers come back (back-compatible default).
+    all = get(api_conn(), "/api/v1/fibers")
+    assert all.status == 200
+
+    all_names =
+      Jason.decode!(all.resp_body)["fibers"]
+      |> Enum.map(& &1["fiber"]["name"])
+      |> Enum.sort()
+
+    assert all_names == ["Managed", "Plain todo"]
+
+    # shuttle=true: only the fiber carrying a non-empty `shuttle:` block.
+    only = get(api_conn(), "/api/v1/fibers?shuttle=true")
+    assert only.status == 200
+    assert [%{"fiber" => %{"name" => "Managed"}}] = Jason.decode!(only.resp_body)["fibers"]
+  end
+
   test "GET /api/v1/fibers canonicalizes ids through symlinked stores", %{store: store} do
     # Build the shapepipe shape: loom's `.felt/shapepipe` is a symlink into a
     # separate project store. `felt ls` walks loom and reports the traversal id

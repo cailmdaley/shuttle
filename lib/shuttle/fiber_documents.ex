@@ -21,8 +21,9 @@ defmodule Shuttle.FiberDocuments do
   def list(opts \\ []) do
     stores = Keyword.get_lazy(opts, :felt_stores, &FeltStores.configured_hosts/0)
     with_body? = Keyword.get(opts, :with_body, false)
+    shuttle_only? = Keyword.get(opts, :shuttle_only, false)
 
-    results = Enum.map(stores, &list_store(&1, with_body?))
+    results = Enum.map(stores, &list_store(&1, with_body?, shuttle_only?))
     errors = Enum.flat_map(results, &store_errors/1)
 
     if errors == [] do
@@ -42,7 +43,7 @@ defmodule Shuttle.FiberDocuments do
     end
   end
 
-  defp list_store(store, with_body?) do
+  defp list_store(store, with_body?, shuttle_only?) do
     args = ["ls", "-s", "all", "-j"]
     args = if with_body?, do: args ++ ["--body"], else: args
 
@@ -54,21 +55,34 @@ defmodule Shuttle.FiberDocuments do
     # instead; only stdout is parsed.
     case System.cmd("felt", args, cd: store) do
       {output, 0} ->
-        decode_store(store, output)
+        decode_store(store, output, shuttle_only?)
 
       {output, status} ->
         {:error, %{felt_store: store, status: status, error: String.trim(output)}}
     end
   end
 
-  defp decode_store(store, output) do
+  defp decode_store(store, output, shuttle_only?) do
     with {:ok, decoded} when is_list(decoded) <- Jason.decode(output) do
-      {:ok, decoded |> Enum.flat_map(&entry_for(store, &1))}
+      rows = if shuttle_only?, do: Enum.filter(decoded, &shuttle_fiber?/1), else: decoded
+      {:ok, rows |> Enum.flat_map(&entry_for(store, &1))}
     else
       {:ok, _} -> {:error, %{felt_store: store, error: "felt ls returned non-list JSON"}}
       {:error, error} -> {:error, %{felt_store: store, error: Exception.message(error)}}
     end
   end
+
+  # A fiber is kanban-relevant to Portolan iff it carries a non-empty `shuttle:`
+  # block. Filtering here — before entry_for's realpath + report.html stat — lets
+  # a remote daemon serve the few hundred shuttle fibers Portolan's kanban needs
+  # instead of the several thousand it holds, collapsing the cross-tunnel transfer
+  # that dominated kanban cold-load. An un-upgraded daemon simply ignores the
+  # `?shuttle=` query param and returns everything, so the Portolan side degrades
+  # gracefully (no speedup, no breakage). Non-shuttle due-dated todos are a
+  # Portolan-local concern and never live on a remote, so this drops nothing the
+  # kanban shows.
+  defp shuttle_fiber?(%{"shuttle" => shuttle}) when is_map(shuttle) and map_size(shuttle) > 0, do: true
+  defp shuttle_fiber?(_), do: false
 
   defp entry_for(store, %{"id" => id} = fiber) when is_binary(id) and id != "" do
     # `path` (and thus the physical file location) is derived from felt's

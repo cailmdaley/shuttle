@@ -5,14 +5,22 @@ defmodule ShuttleWeb.FiberDocumentsController do
   `GET /api/v1/fibers` returns the fibers visible to this daemon's configured
   felt stores. The `fiber` payload is felt JSON, intentionally leaving
   document parsing semantics with felt and Portolan's existing reader.
+
+  Query params:
+    * `body=true`    — include each fiber's markdown body.
+    * `shuttle=true` — return ONLY fibers carrying a `shuttle:` block (the
+      subset Portolan's kanban needs). Lets the daemon serve the few hundred
+      shuttle fibers instead of the several thousand it holds, collapsing the
+      cross-tunnel transfer. Omitted/unknown => unfiltered (back-compatible).
   """
 
   use Phoenix.Controller, formats: [:json]
 
   def index(conn, params) do
     with_body? = Map.get(params, "body") in ["1", "true", true]
+    shuttle_only? = Map.get(params, "shuttle") in ["1", "true", true]
 
-    case Shuttle.FiberDocuments.list(with_body: with_body?) do
+    case Shuttle.FiberDocuments.list(with_body: with_body?, shuttle_only: shuttle_only?) do
       {:ok, body} ->
         json(conn, body)
 
