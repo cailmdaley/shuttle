@@ -32,6 +32,66 @@ defmodule Shuttle.FeltStores do
     end
   end
 
+  @doc """
+  Resolve which configured felt store owns `fiber_id`, as `{:ok, host}` or
+  `{:error, :not_found}`.
+
+  The match criterion is the ONE canonical rule — `Shuttle.FiberId.canonical_id`
+  (realpath → outermost `.felt` → slug) — the same derivation `/api/v1/fibers`
+  and the runtime keying use, so id resolution never disagrees across daemon
+  surfaces. Candidate files are generated cheaply (exact store path first; a
+  glob-by-leaf only when that misses) and each candidate is *verified* by
+  canonical id, so a leaf collision across stores still resolves to the right
+  one.
+
+  The glob fallback covers the "prefix-drop" topology: a project's `.felt`
+  symlinked into loom (`loom/.felt/shapepipe → shapepipe/.felt`) makes the
+  canonical id a bare leaf (`review-ngmix-v2-pr740`) while the file lives under
+  the loom path (`shapepipe/review-ngmix-v2-pr740/...`). Exact construction from
+  the leaf misses; the file is still discoverable by leaf and confirmed by
+  canonical id. `felt` and the Go CLI's `resolveFiber` already resolve these, so
+  the daemon must too — without it, host-routed lifecycle/actions verbs 400 with
+  "fiber not found" on project-resident fibers.
+  """
+  @spec host_for_fiber(String.t()) :: {:ok, String.t()} | {:error, :not_found}
+  def host_for_fiber(fiber_id) do
+    hosts = configured_hosts()
+
+    with nil <- Enum.find(hosts, &exact_canonical_match?(&1, fiber_id)),
+         nil <- Enum.find(hosts, &nested_canonical_match?(&1, fiber_id)) do
+      {:error, :not_found}
+    else
+      host -> {:ok, host}
+    end
+  end
+
+  defp exact_canonical_match?(host, fiber_id) do
+    segments = String.split(fiber_id, "/")
+    leaf = List.last(segments)
+    felt_dir = Path.join(host, ".felt")
+
+    [
+      Path.join([felt_dir | segments] ++ ["#{leaf}.md"]),
+      Path.join(felt_dir, "#{leaf}.md")
+    ]
+    |> Enum.any?(&canonical_match?(&1, fiber_id))
+  end
+
+  defp nested_canonical_match?(host, fiber_id) do
+    leaf = fiber_id |> String.split("/") |> List.last()
+    felt_dir = Path.join(host, ".felt")
+
+    File.dir?(felt_dir) and
+      [felt_dir, "**", leaf, "#{leaf}.md"]
+      |> Path.join()
+      |> Path.wildcard(match_dot: true)
+      |> Enum.any?(&canonical_match?(&1, fiber_id))
+  end
+
+  defp canonical_match?(path, fiber_id) do
+    File.regular?(path) and Shuttle.FiberId.canonical_id(path) == {:ok, fiber_id}
+  end
+
   @spec registered_hosts() :: host_list()
   def registered_hosts do
     path = config_path()

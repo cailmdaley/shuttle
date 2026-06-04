@@ -156,32 +156,12 @@ defmodule ShuttleWeb.ActionsController do
     end
   end
 
-  # Resolves the felt store owning `fiber_id` so shuttle-ctl verbs get the right
-  # `--felt-store` flag. Without it the CLI walks from its own PWD and can hit a
-  # different store — typical symptom is "shuttle: fiber X has no shuttle: block"
-  # for fibers whose canonical store is project-scoped (e.g. lightcone).
-  defp host_for_fiber(fiber_id) do
-    FeltStores.configured_hosts()
-    |> Enum.find(&match?({:ok, _}, exact_fiber_path(&1, fiber_id)))
-    |> case do
-      nil -> {:error, :not_found}
-      host -> {:ok, host}
-    end
-  end
-
-  defp exact_fiber_path(host, fiber_id) do
-    segments = String.split(fiber_id, "/")
-    basename = List.last(segments)
-    felt_dir = Path.join(host, ".felt")
-    bare_path = Path.join(felt_dir, "#{basename}.md")
-    dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
-
-    cond do
-      not String.contains?(fiber_id, "/") and File.exists?(bare_path) -> {:ok, bare_path}
-      File.exists?(dir_path) -> {:ok, dir_path}
-      true -> {:error, :not_found}
-    end
-  end
+  # Resolve the felt store owning `fiber_id` (so shuttle-ctl verbs get the right
+  # `--felt-store`) via the one canonical-id rule — the same Shuttle.FiberId
+  # derivation /api/v1/fibers uses, so resolution never disagrees with the id we
+  # advertised (including project-resident "prefix-drop" fibers, whose canonical
+  # id is a bare leaf the old naive path construction couldn't resolve).
+  defp host_for_fiber(fiber_id), do: FeltStores.host_for_fiber(fiber_id)
 
   # pause / reopen / close shell the Go frontmatter writer with
   # SHUTTLE_LIFECYCLE_OFFLINE so it writes frontmatter only (status, tempered,

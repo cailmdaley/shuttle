@@ -129,33 +129,16 @@ defmodule ShuttleWeb.LifecycleController do
     e in ErlangError -> {:error, Exception.message(e)}
   end
 
+  # Resolve the felt store owning `fiber_id` via the one canonical-id rule
+  # (FeltStores.host_for_fiber → Shuttle.FiberId), the same derivation
+  # /api/v1/fibers advertises — so a host-routed lifecycle verb resolves the
+  # exact id the kanban sent, including project-resident ("prefix-drop") fibers
+  # whose canonical id is a bare leaf. Keeps the user-facing "fiber not found"
+  # message on a genuine miss.
   defp host_for_fiber(fiber_id) do
-    FeltStores.configured_hosts()
-    |> Enum.find(&fiber_exists?(&1, fiber_id))
-    |> case do
-      nil -> {:error, "fiber not found: #{fiber_id}"}
-      host -> {:ok, host}
-    end
-  end
-
-  defp fiber_exists?(host, fiber_id) do
-    case exact_fiber_path(host, fiber_id) do
-      {:ok, _path} -> true
-      {:error, _} -> false
-    end
-  end
-
-  defp exact_fiber_path(host, fiber_id) do
-    segments = String.split(fiber_id, "/")
-    basename = List.last(segments)
-    felt_dir = Path.join(host, ".felt")
-    bare_path = Path.join(felt_dir, "#{basename}.md")
-    dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
-
-    cond do
-      not String.contains?(fiber_id, "/") and File.exists?(bare_path) -> {:ok, bare_path}
-      File.exists?(dir_path) -> {:ok, dir_path}
-      true -> {:error, :not_found}
+    case FeltStores.host_for_fiber(fiber_id) do
+      {:ok, host} -> {:ok, host}
+      {:error, :not_found} -> {:error, "fiber not found: #{fiber_id}"}
     end
   end
 end
