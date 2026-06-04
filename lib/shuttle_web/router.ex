@@ -24,6 +24,7 @@ defmodule ShuttleWeb.Router do
     get("/state", StateController, :show)
     get("/state/composite", StateController, :composite)
     get("/fibers", FiberDocumentsController, :index)
+    get("/fibers/*id", FiberDocumentsController, :show)
     get("/origins", OriginsController, :show)
     post("/lifecycle", LifecycleController, :create)
     post("/session", SessionController, :create)

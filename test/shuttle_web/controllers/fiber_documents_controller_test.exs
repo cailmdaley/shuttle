@@ -186,6 +186,112 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
     assert Enum.any?(fibers, &(&1["fiber"]["name"] == "Real fiber"))
   end
 
+  test "GET /api/v1/fibers/:id resolves a single fiber by canonical id (fast path)",
+       %{store: store} do
+    write_fiber!(store, "tests/single", """
+    ---
+    name: Single fiber
+    status: active
+    shuttle:
+      enabled: true
+      host: test-host
+    ---
+
+    Body text.
+    """)
+
+    report = Path.join([store, ".felt", "tests", "single", "report.html"])
+    File.write!(report, "<p>report</p>\n")
+
+    conn = get(api_conn(), "/api/v1/fibers/tests/single")
+
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+    assert body["host"] == "test-host"
+
+    assert [
+             %{
+               "felt_store" => ^store,
+               "path" => "tests/single/single.md",
+               "report_path" => ^report,
+               "fiber" => %{"id" => "tests/single", "name" => "Single fiber"}
+             }
+           ] = body["fibers"]
+
+    # Default omits the body (metadata-only, like the locate path).
+    refute Map.has_key?(hd(body["fibers"])["fiber"], "body")
+  end
+
+  test "GET /api/v1/fibers/:id?body=true includes the felt body", %{store: store} do
+    write_fiber!(store, "tests/single-body", """
+    ---
+    name: Single with body
+    status: open
+    ---
+
+    The body content.
+    """)
+
+    conn = get(api_conn(), "/api/v1/fibers/tests/single-body?body=true")
+
+    assert conn.status == 200
+
+    assert [%{"fiber" => %{"body" => "The body content."}}] =
+             Jason.decode!(conn.resp_body)["fibers"]
+  end
+
+  test "GET /api/v1/fibers/:id resolves a symlink-traversed fiber via the canonical id (scan fallback)",
+       %{store: store} do
+    # Mirror the list endpoint's shapepipe case: loom's `.felt/shapepipe` is a
+    # symlink into a separate project store. felt's traversal id is
+    # `shapepipe/review-ngmix`, but the canonical (project-relative) id is
+    # `review-ngmix` — so `felt show review-ngmix` in the loom store misses and
+    # the endpoint must fall back to scanning to match the canonical id.
+    root = Path.dirname(store)
+    project = Path.join(root, "shapepipe")
+
+    write_fiber!(project, "review-ngmix", """
+    ---
+    name: Ngmix review
+    status: active
+    shuttle:
+      enabled: true
+      host: test-host
+    ---
+
+    Body.
+    """)
+
+    File.mkdir_p!(Path.join(store, ".felt"))
+    File.ln_s!(Path.join(project, ".felt"), Path.join([store, ".felt", "shapepipe"]))
+
+    conn = get(api_conn(), "/api/v1/fibers/review-ngmix")
+    assert conn.status == 200
+
+    assert [
+             %{
+               "felt_store" => ^store,
+               "path" => "shapepipe/review-ngmix/review-ngmix.md",
+               "fiber" => %{"id" => "review-ngmix", "name" => "Ngmix review"}
+             }
+           ] = Jason.decode!(conn.resp_body)["fibers"]
+  end
+
+  test "GET /api/v1/fibers/:id returns an empty fiber list for an unknown id", %{store: store} do
+    write_fiber!(store, "tests/present", """
+    ---
+    name: Present
+    status: active
+    ---
+
+    Body.
+    """)
+
+    conn = get(api_conn(), "/api/v1/fibers/tests/absent")
+    assert conn.status == 200
+    assert Jason.decode!(conn.resp_body)["fibers"] == []
+  end
+
   defp write_fiber!(store, fiber_id, content) do
     segments = String.split(fiber_id, "/")
     basename = List.last(segments)

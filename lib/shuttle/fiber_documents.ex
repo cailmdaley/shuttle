@@ -27,20 +27,115 @@ defmodule Shuttle.FiberDocuments do
     errors = Enum.flat_map(results, &store_errors/1)
 
     if errors == [] do
-      entries =
-        results
-        |> Enum.flat_map(fn {:ok, rows} -> rows end)
-
-      {:ok,
-       %{
-         host: own_host_id(),
-         felt_stores: stores,
-         generated_at: DateTime.to_iso8601(DateTime.utc_now()),
-         fibers: entries
-       }}
+      entries = Enum.flat_map(results, fn {:ok, rows} -> rows end)
+      {:ok, envelope(stores, entries)}
     else
       {:error, errors}
     end
+  end
+
+  @doc """
+  Resolve a SINGLE fiber by its canonical id without dragging in the whole
+  store. This is the per-fiber dual of `list/1`: Portolan resolves a remote
+  fiber's content/owner (kanban card → vellum view) through this instead of
+  fetching every fiber and linear-scanning, collapsing a ~3.5MB cross-tunnel
+  transfer to one fiber.
+
+  Two-tier lookup:
+
+    * **Fast path** — `felt show <id> -j` per store. For a fiber physically
+      rooted in the store the canonical id equals felt's traversal id, so the
+      direct show resolves in milliseconds.
+    * **Scan fallback** — for a symlink-traversed fiber (loom's `.felt/shapepipe`
+      → a separate project store) the canonical id drops the store prefix, so
+      `felt show <canonical-id>` misses. We then reuse the `list/1` machinery to
+      enumerate the store and match on the canonical id. This costs a full
+      `felt ls` daemon-side but still returns a single fiber over the wire, and
+      only fires for the handful of symlinked-out projects.
+
+  Returns the same `{:ok, %{host, felt_stores, fibers: […]}}` envelope as
+  `list/1` with zero or one fiber, so Portolan reuses the same response parser.
+  A missing fiber is `{:ok, …, fibers: []}` (not an error); a felt failure
+  during the scan fallback surfaces as `{:error, errors}`.
+  """
+  @spec get(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def get(id, opts \\ []) do
+    stores = Keyword.get_lazy(opts, :felt_stores, &FeltStores.configured_hosts/0)
+    with_body? = Keyword.get(opts, :with_body, false)
+
+    case fast_lookup(stores, id, with_body?) do
+      {:ok, entry} -> {:ok, envelope(stores, [entry])}
+      :miss -> scan_lookup(stores, id, with_body?)
+    end
+  end
+
+  # Direct `felt show` per store; first store that resolves the id wins.
+  defp fast_lookup(stores, id, with_body?) do
+    Enum.find_value(stores, :miss, fn store ->
+      case show_store(store, id, with_body?) do
+        {:ok, [entry | _]} -> {:ok, entry}
+        _ -> nil
+      end
+    end)
+  end
+
+  defp show_store(store, id, with_body?) do
+    args = ["show", id, "-j"]
+    args = if with_body?, do: args ++ ["--body"], else: args
+
+    # Same stderr discipline as list_store: never fold stderr into stdout — felt
+    # prints "no felt found matching …" (and parse warnings) to stderr while
+    # emitting JSON on stdout. A missing fiber exits non-zero with empty stdout,
+    # which we treat as "not in this store" and fall through to the next.
+    case System.cmd("felt", args, cd: store) do
+      {output, 0} ->
+        case Jason.decode(output) do
+          # `felt show -j` always emits `body`, even without `--body` (unlike
+          # `felt ls -j`). Drop it when the caller didn't ask, so the metadata
+          # path stays minimal and the response matches the list endpoint's
+          # body=… contract.
+          {:ok, %{} = fiber} ->
+            fiber = if with_body?, do: fiber, else: Map.delete(fiber, "body")
+            {:ok, entry_for(store, fiber)}
+
+          _ ->
+            :miss
+        end
+
+      {_output, _status} ->
+        :miss
+    end
+  end
+
+  # Enumerate each store and match the requested canonical id. Reuses list_store
+  # so the entry shape (canonical id, store-relative path, report_path) is
+  # byte-identical to the list endpoint.
+  defp scan_lookup(stores, id, with_body?) do
+    results = Enum.map(stores, &list_store(&1, with_body?, false))
+    errors = Enum.flat_map(results, &store_errors/1)
+
+    match =
+      results
+      |> Enum.flat_map(fn
+        {:ok, rows} -> rows
+        _ -> []
+      end)
+      |> Enum.find(&(&1.fiber["id"] == id))
+
+    cond do
+      match != nil -> {:ok, envelope(stores, [match])}
+      errors != [] -> {:error, errors}
+      true -> {:ok, envelope(stores, [])}
+    end
+  end
+
+  defp envelope(stores, entries) do
+    %{
+      host: own_host_id(),
+      felt_stores: stores,
+      generated_at: DateTime.to_iso8601(DateTime.utc_now()),
+      fibers: entries
+    }
   end
 
   defp list_store(store, with_body?, shuttle_only?) do
