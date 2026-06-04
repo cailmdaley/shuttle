@@ -11,6 +11,52 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// ownerMismatchError is returned by ensureOwnedHere when a lifecycle verb runs
+// against a fiber owned by a different daemon. A distinct type so callers and
+// tests can assert the guard fired rather than string-matching the message.
+type ownerMismatchError struct {
+	fiber, owner, own string
+}
+
+func (e ownerMismatchError) Error() string {
+	return fmt.Sprintf(
+		"fiber %s is owned by host %q, but this daemon is %q.\n"+
+			"  Refusing to write the local git-sync mirror — that desyncs the owner's\n"+
+			"  copy and resurrects on the next loom sync (single-writer-per-fiber).\n"+
+			"  Run this verb on %q, or use the kanban (it routes to the owning daemon).",
+		e.fiber, e.owner, e.own, e.owner)
+}
+
+// ensureOwnedHere refuses to mutate a fiber whose shuttle.host names a daemon
+// other than this machine. Under loom git-sync the same fiber file exists on
+// every host, so a bare `shuttle <verb>` run on the wrong machine resolves the
+// LOCAL mirror and writes it — producing split-brain that only git-sync
+// reconciles, lazily and sometimes wrongly (the resurrecting tempered-card bug).
+// The owning daemon is the single writer; cross-host lifecycle must reach it —
+// the kanban routes there, or run the verb on the owning host.
+//
+// Best-effort, fail-open: a host-less block (legacy, pre-"born-owned") or an
+// unresolvable own-host identity falls through to a normal local write rather
+// than hard-blocking. The guard closes the known mirror-write footgun; it is not
+// a gate on every edit.
+func ensureOwnedHere(f *schema.FiberFile, fiber string) error {
+	if f == nil || f.Block == nil {
+		return nil
+	}
+	owner := strings.TrimSpace(f.Block.Host)
+	if owner == "" {
+		return nil
+	}
+	own, err := resolveOwnHost("")
+	if err != nil {
+		return nil
+	}
+	if own = strings.TrimSpace(own); own == "" || owner == own {
+		return nil
+	}
+	return ownerMismatchError{fiber: fiber, owner: owner, own: own}
+}
+
 func newPauseCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "pause <fiber>",
@@ -35,6 +81,10 @@ This makes pause the single-writer transition for the Kanban's Drafts target.`,
 			f := readFiber(path)
 			if f.Block == nil {
 				return fmt.Errorf("fiber %s has no shuttle: block", args[0])
+			}
+
+			if err := ensureOwnedHere(f, args[0]); err != nil {
+				return err
 			}
 
 			statusBefore := f.Status()
@@ -100,6 +150,10 @@ closed fiber back into active work.`,
 			f := readFiber(path)
 			if f.Block == nil {
 				return fmt.Errorf("fiber %s has no shuttle: block", args[0])
+			}
+
+			if err := ensureOwnedHere(f, args[0]); err != nil {
+				return err
 			}
 
 			// Standing roles in awaiting/review state need special handling: just
@@ -182,6 +236,10 @@ until they are reopened.`,
 			return fmt.Errorf("fiber %s has no shuttle: block", args[0])
 		}
 
+		if err := ensureOwnedHere(f, args[0]); err != nil {
+			return err
+		}
+
 		var tempered *bool
 		if closeTempered != "" {
 			parsed, err := parseOptionalBool(closeTempered)
@@ -229,6 +287,10 @@ Tempered, or Composted back to In flight.`,
 			return fmt.Errorf("fiber %s has no shuttle: block", args[0])
 		}
 
+		if err := ensureOwnedHere(f, args[0]); err != nil {
+			return err
+		}
+
 		statusBefore := f.Status()
 		f.SetStatus("active")
 		f.SetTempered(nil)
@@ -269,6 +331,10 @@ Examples:
 			f := readFiber(path)
 			if f.Block == nil {
 				return fmt.Errorf("fiber %s has no shuttle: block", args[0])
+			}
+
+			if err := ensureOwnedHere(f, args[0]); err != nil {
+				return err
 			}
 
 			outcome, err := resolveOutcomeValue(cmd, outcomeValue)
@@ -349,6 +415,9 @@ Appends a felt history event recording the acceptance.`,
 			f := readFiber(path)
 			if f.Block == nil {
 				return fmt.Errorf("fiber %s has no shuttle: block", args[0])
+			}
+			if err := ensureOwnedHere(f, args[0]); err != nil {
+				return err
 			}
 			if f.Block.Kind != "standing" {
 				return fmt.Errorf("accept only applies to standing roles (fiber has kind=%s)", f.Block.Kind)
@@ -470,6 +539,10 @@ agent registry before writing. Removes any existing agent:* felt tag
 			return fmt.Errorf("fiber %s has no shuttle: block (use 'shuttle repeat' to install first)", args[0])
 		}
 
+		if err := ensureOwnedHere(f, args[0]); err != nil {
+			return err
+		}
+
 		agentID := args[1]
 		if _, ok := agents.Find(agentID); !ok {
 			return fmt.Errorf("unknown agent %q (known: %s)", agentID, joinIDs(agents.IDs()))
@@ -498,6 +571,10 @@ both autonomous dispatch.`,
 		f := readFiber(path)
 		if f.Block == nil {
 			return fmt.Errorf("fiber %s has no shuttle: block (use 'shuttle install' first)", args[0])
+		}
+
+		if err := ensureOwnedHere(f, args[0]); err != nil {
+			return err
 		}
 
 		value, err := parseBoolArg(args[1])
@@ -538,6 +615,9 @@ daemon will no longer dispatch it. The felt tags and status are not changed.`,
 		if f.Block == nil {
 			fmt.Printf("fiber %s has no shuttle: block (nothing to do)\n", args[0])
 			return nil
+		}
+		if err := ensureOwnedHere(f, args[0]); err != nil {
+			return err
 		}
 		if err := f.WriteBlock(nil); err != nil {
 			return fmt.Errorf("removing shuttle block: %w", err)
