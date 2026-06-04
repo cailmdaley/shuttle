@@ -819,6 +819,88 @@ defmodule Shuttle.PollerTest do
     cleanup_runtime_store_paths()
   end
 
+  test "an accept that lands during a poll read is not clobbered when the poll completes" do
+    # Regression for Symptom B of the poll-merge wedge (sibling of the retry
+    # case): a standing-role `accept` writes `scheduled` to the runtime store,
+    # but pre-refactor a poll Task already in flight — snapshotted while the role
+    # was still `awaiting` — recomputed lifecycle from that stale snapshot,
+    # re-persisted `awaiting`, and `merge_poll_cycle_state` set
+    # `lifecycle: poll_state.lifecycle`, reverting the acceptance. Post-refactor
+    # the Task only reads; lifecycle is recomputed and persisted in
+    # `apply_poll_cycle/2` from current state, so the accept stands. The sibling
+    # test above does NOT catch this — it accepts before the poll even starts.
+    fiber_id = "tests/standing-accept-during-poll"
+    runtime_store_path = runtime_store_path()
+    File.mkdir_p!(Path.dirname(runtime_store_path))
+
+    previous_runtime_store = System.get_env("SHUTTLE_RUNTIME_STORE")
+    previous_loom_homes = System.get_env("LOOM_HOMES")
+    System.put_env("SHUTTLE_RUNTIME_STORE", runtime_store_path)
+    System.put_env("LOOM_HOMES", "/tmp")
+
+    on_exit(fn ->
+      restore_env("SHUTTLE_RUNTIME_STORE", previous_runtime_store)
+      restore_env("LOOM_HOMES", previous_loom_homes)
+    end)
+
+    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
+    MockRunner.set_fiber(fiber_id, fiber)
+
+    MockRunner.set_shuttle(
+      fiber_id,
+      """
+      enabled: true
+      kind: standing
+      schedule:
+        expr: "0 9 * * 1"
+        tz: Europe/Paris
+      """
+    )
+
+    Shuttle.RuntimeStore.upsert_lifecycle(runtime_store_path, fiber_id, %{
+      kind: "standing",
+      phase: "awaiting",
+      run_id: "20260601T070000+0000",
+      next_due_at: nil,
+      last_run_at: nil,
+      review: %{"state" => "awaiting", "run_id" => "20260601T070000+0000"}
+    })
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_accept_during_poll,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    # Hold the next poll inside its read-only felt walk; its snapshot still sees
+    # the role as `awaiting`.
+    MockRunner.set_felt_ls_delay(400)
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+               cmd == "felt" and Enum.take(args, 2) == ["ls", "--json"]
+             end)
+           end)
+
+    # Accept while the poll is still reading (the GenServer stays responsive).
+    assert {:ok, _output} = Poller.lifecycle_transition(poller, :accept, fiber_id, [])
+
+    assert %{phase: "scheduled"} =
+             Shuttle.RuntimeStore.fetch_lifecycle(runtime_store_path, fiber_id)
+
+    # Let the held poll complete and apply against current state.
+    Process.sleep(500)
+
+    assert %{phase: "scheduled"} =
+             Shuttle.RuntimeStore.fetch_lifecycle(runtime_store_path, fiber_id),
+           "a poll completing after the accept reverted the acceptance to awaiting"
+  after
+    cleanup_runtime_store_paths()
+  end
+
   test "direct ad-hoc dispatch creates an ad-hoc standing run before the schedule is due" do
     fiber_id = "tests/standing-force-now"
     fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
