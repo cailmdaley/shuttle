@@ -196,7 +196,18 @@ defmodule Shuttle.LifecycleStore do
   end
 
   defp accepted_next_due_at(schedule, shuttle, _review) do
-    from = parse_datetime(Map.get(shuttle, "next_due_at")) || DateTime.utc_now()
+    now = DateTime.utc_now()
+    stored = parse_datetime(Map.get(shuttle, "next_due_at"))
+
+    # Anchor on the present. Advancing from a STALE stored next_due_at (manual
+    # dispatch, late accept, daemon downtime) only moves one cron tick and can
+    # stay in the past — then `due?` stays true and the role re-fires immediately
+    # instead of waiting for the next real occurrence (the morning-post drift
+    # bug). Use the later of stored/now so we always land on the next occurrence
+    # AFTER now; missed ticks are skipped, not replayed (correct for a recurring
+    # role — you want the next morning post, not a backlog of them).
+    from = if stored && DateTime.compare(stored, now) == :gt, do: stored, else: now
+
     Cron.next_occurrence(schedule, from)
   end
 

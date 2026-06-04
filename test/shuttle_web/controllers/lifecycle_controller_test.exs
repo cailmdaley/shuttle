@@ -145,7 +145,15 @@ defmodule ShuttleWeb.LifecycleControllerTest do
                }
              ] = RuntimeStore.list_lifecycle(runtime_store)
 
-      assert DateTime.to_iso8601(next_due_at) == "2026-06-02T09:00:00Z"
+      # Regression for the next_due_at drift bug: accept must land on the next
+      # occurrence AFTER now, not one cron tick from the STALE stored value. The
+      # fixture's stored next_due_at (2026-06-01) is in the past; the old code
+      # advanced it to 2026-06-02 — also in the past — so `due?` stayed true and
+      # the role re-fired immediately (the morning-post drift). The fix anchors
+      # on max(now, stored), so the result is a real future 09:00 tick.
+      now = DateTime.utc_now()
+      assert DateTime.compare(next_due_at, now) == :gt
+      assert next_due_at.hour == 9 and next_due_at.minute == 0
     end)
 
     File.rm_rf(root)
@@ -357,7 +365,15 @@ defmodule ShuttleWeb.LifecycleControllerTest do
                }
              ] = RuntimeStore.list_lifecycle(runtime_store)
 
-      assert DateTime.to_iso8601(next_due_at) == "2026-06-02T09:00:00Z"
+      # Regression for the next_due_at drift bug: accept must land on the next
+      # occurrence AFTER now, not one cron tick from the STALE stored value. The
+      # fixture's stored next_due_at (2026-06-01) is in the past; the old code
+      # advanced it to 2026-06-02 — also in the past — so `due?` stayed true and
+      # the role re-fired immediately (the morning-post drift). The fix anchors
+      # on max(now, stored), so the result is a real future 09:00 tick.
+      now = DateTime.utc_now()
+      assert DateTime.compare(next_due_at, now) == :gt
+      assert next_due_at.hour == 9 and next_due_at.minute == 0
     end)
 
     File.rm_rf(root)
