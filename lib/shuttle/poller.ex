@@ -367,18 +367,29 @@ defmodule Shuttle.Poller do
   def handle_info(:run_poll_cycle, state) do
     parent = self()
 
+    # The Task does only the slow, READ-ONLY work (felt-store walk + remote
+    # SSH discovery) and returns plain data — never a `%State{}`, never a
+    # mutation, never an armed timer. Keeping the slow I/O off the GenServer
+    # thread preserves daemon responsiveness; making it pure means there is
+    # only one mutable state (the GenServer's), so there is nothing to merge
+    # when the Task completes. See `poll_reads/1` and `apply_poll_cycle/2`.
     {:ok, _pid} =
       Task.start_link(fn ->
-        send(parent, {:poll_cycle_complete, run_poll_cycle_safely(state)})
+        send(parent, {:poll_world, poll_reads(state)})
       end)
 
     {:noreply, %{state | poll_check_in_progress: true}}
   end
 
-  def handle_info({:poll_cycle_complete, {:ok, poll_state}}, state) do
+  # The poll Task finished its reads. Apply the world it observed to the
+  # GenServer's CURRENT state — anything that changed during the Task (a sync
+  # :dispatch, a :worker_exited retry, a :retry firing) is already reflected
+  # and is simply respected by the re-validating apply, never clobbered by a
+  # stale snapshot.
+  def handle_info({:poll_world, {:ok, world}}, state) do
     state =
       state
-      |> merge_poll_cycle_state(poll_state)
+      |> apply_poll_cycle(world)
       |> Map.put(:poll_check_in_progress, false)
       |> schedule_tick(state.poll_interval_ms)
 
@@ -386,7 +397,7 @@ defmodule Shuttle.Poller do
     {:noreply, state}
   end
 
-  def handle_info({:poll_cycle_complete, {:error, reason}}, state) do
+  def handle_info({:poll_world, {:error, reason}}, state) do
     Logger.error("Poll cycle failed: #{reason}")
 
     state =
@@ -848,9 +859,39 @@ defmodule Shuttle.Poller do
 
   # ── Dispatch ──
 
-  defp maybe_dispatch(%State{} = state) do
-    state = state |> refresh_felt_stores() |> reconcile()
-    {:ok, candidates, new_host_map} = discover_candidates(state)
+  # READ-ONLY poll work, run inside the poll Task. Walks felt stores (local +
+  # remote over SSH) to discover candidate fibers; returns plain data. It never
+  # mutates state, runs an effect, or arms a timer — so there is nothing to
+  # merge back when it completes (`apply_poll_cycle/2` does the mutating work on
+  # the live GenServer). The rescue/catch turns a felt/SSH explosion into a
+  # logged `{:error, _}` rather than a crash that would take the linked poller
+  # down with the Task.
+  defp poll_reads(%State{} = state) do
+    state = refresh_felt_stores(state)
+    {:ok, candidates, host_map} = discover_candidates(state)
+    {:ok, %{felt_stores: state.felt_stores, candidates: candidates, host_map: host_map}}
+  rescue
+    error ->
+      {:error, Exception.format(:error, error, __STACKTRACE__)}
+  catch
+    kind, reason ->
+      {:error, Exception.format(kind, reason, __STACKTRACE__)}
+  end
+
+  # Apply an observed `world` (from `poll_reads/1`) to the GenServer's CURRENT
+  # state. This is the only place the poll cycle reconciles, dispatches, or
+  # schedules retries, and it runs on the live GenServer process — so anything
+  # that changed during the Task's read is reflected in `state` and respected
+  # here, never overwritten from a stale snapshot. Reconcile is reordered after
+  # discovery (it was before, in the old single-pass `maybe_dispatch`); the two
+  # are independent given refreshed felt stores, and reconcile now sees current
+  # `running` rather than the Task's snapshot.
+  defp apply_poll_cycle(%State{} = state, %{
+         felt_stores: felt_stores,
+         candidates: candidates,
+         host_map: new_host_map
+       }) do
+    state = reconcile(%{state | felt_stores: felt_stores})
 
     # Merge newly resolved host entries into the cache. Existing entries
     # are not evicted — earlier-configured hosts win for ID collisions,
@@ -997,68 +1038,6 @@ defmodule Shuttle.Poller do
       |> MapSet.new()
 
     Map.filter(failures, fn {fiber_id, _entry} -> MapSet.member?(active_ids, fiber_id) end)
-  end
-
-  defp run_poll_cycle_safely(%State{} = state) do
-    {:ok, maybe_dispatch(state)}
-  rescue
-    error ->
-      {:error, Exception.format(:error, error, __STACKTRACE__)}
-  catch
-    kind, reason ->
-      {:error, Exception.format(kind, reason, __STACKTRACE__)}
-  end
-
-  defp merge_poll_cycle_state(%State{} = current, %State{} = poll_state) do
-    running = merge_running_state(current.running, poll_state.running, poll_state.orphans)
-
-    retry_queue =
-      poll_state.retry_queue
-      |> Map.merge(current.retry_queue)
-      |> Map.drop(Map.keys(running))
-
-    %{
-      poll_state
-      | running: running,
-        claimed: claimed_from(running, retry_queue),
-        retry_queue: retry_queue,
-        waiters: current.waiters,
-        reservations: current.reservations,
-        completed_standing_runs:
-          MapSet.union(poll_state.completed_standing_runs, current.completed_standing_runs),
-        standing_roles: poll_state.standing_roles,
-        lifecycle: poll_state.lifecycle,
-        orphans: poll_state.orphans,
-        # Carry the poll cycle's view. Sync :dispatch calls that ran in
-        # parallel with the poll Task lose their dispatch_failures updates;
-        # they'll re-record on the next attempt. The alternative — merging
-        # both — keeps stale entries when the poll evicts a fiber that just
-        # finished a sync dispatch from outside.
-        dispatch_failures: poll_state.dispatch_failures
-    }
-  end
-
-  defp merge_running_state(current_running, poll_running, poll_orphans) do
-    stale_sessions =
-      MapSet.new(
-        Enum.map(poll_orphans, fn orphan ->
-          {Map.get(orphan, :fiber_id), Map.get(orphan, :tmux_session)}
-        end)
-      )
-
-    current_running
-    |> Enum.reject(fn {fiber_id, meta} ->
-      MapSet.member?(stale_sessions, {fiber_id, Map.get(meta, :session)})
-    end)
-    |> Map.new()
-    |> then(&Map.merge(poll_running, &1))
-  end
-
-  defp claimed_from(running, retry_queue) do
-    running
-    |> Map.keys()
-    |> Enum.concat(Map.keys(retry_queue))
-    |> MapSet.new()
   end
 
   # Discovers candidate fibers by walking <host>/.felt/ for files that carry a
@@ -2300,12 +2279,12 @@ defmodule Shuttle.Poller do
       Process.cancel_timer(previous.timer_ref)
     end
 
-    # Target the poller via its registered name/pid, not `self()`. When
-    # `schedule_retry` runs inside the poll-cycle Task spawned by
-    # `handle_info(:run_poll_cycle, ...)`, `self()` is the Task pid; the
-    # timer would fire into a dead process and the retry would never run.
-    # `state.self_ref` is the poller's registered name (atom) or pid,
-    # captured in init/1.
+    # Target the poller via its registered name/pid (`state.self_ref`, captured
+    # in init/1), not `self()`. Retry scheduling now always runs on the GenServer
+    # — worker-exit, retry-firing, and the poll cycle's `apply_poll_cycle/2` all
+    # execute in-process — so `self()` would in fact be the poller here. We keep
+    # `self_ref` regardless: it is correct unconditionally, survives a restart,
+    # and removes any dependence on which process armed the timer.
     timer_ref = Process.send_after(state.self_ref, {:retry, fiber_id, retry_token}, delay_ms)
 
     error = Map.get(metadata, :error)

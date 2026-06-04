@@ -1445,6 +1445,71 @@ defmodule Shuttle.PollerTest do
            )
   end
 
+  test "a continuation retry scheduled during a poll read survives the cycle with a live timer" do
+    # Regression for the wedge that motivated making the poll Task a pure read.
+    # Pre-refactor, the Task computed a rival %State{} from a pre-exit snapshot
+    # and `merge_poll_cycle_state` reassembled `running`/`retry_queue` from two
+    # lineages — so a worker-exit retry scheduled *while a poll was in flight*
+    # could be dropped (fiber resurrected into `running`) or have its timer
+    # orphaned (entry survives, timer already fired), wedging the fiber until a
+    # daemon restart. Post-refactor the Task only reads; the retry is born and
+    # lives in the GenServer's current state, which the completing poll never
+    # overwrites. This test holds a poll mid-read, schedules the retry, lets the
+    # poll complete, and asserts the retry is intact with a LIVE timer.
+    fiber_id = "tests/retry-survives-poll"
+    fiber = make_fiber(fiber_id)
+    MockRunner.set_fiber(fiber_id, fiber)
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_retry_survives_poll,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, [])
+
+    # Hold the next poll cycle inside its read-only felt walk, then confirm the
+    # Task is actually mid-read (its snapshot has the fiber running).
+    MockRunner.set_felt_ls_delay(400)
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+               cmd == "felt" and Enum.take(args, 2) == ["ls", "--json"]
+             end)
+           end)
+
+    # Worker exits while the poll is still reading. handle_worker_exit schedules
+    # a continuation retry on the GenServer's CURRENT state.
+    MockRunner.remove_tmux_session(session)
+    send(poller, {:worker_exited, fiber_id, :normal_exit, false})
+
+    assert wait_until(fn ->
+             snap = Poller.snapshot(poller)
+             Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id))
+           end)
+
+    # Let the held poll complete (~400ms) and apply against current state.
+    Process.sleep(500)
+
+    state = :sys.get_state(poller)
+    retry = Map.get(state.retry_queue, fiber_id)
+
+    assert retry, "continuation retry was dropped by the completing poll cycle"
+    assert is_reference(retry.timer_ref)
+
+    assert Process.read_timer(retry.timer_ref),
+           "retry timer was orphaned (already fired/cancelled) — the fiber would wedge"
+
+    assert MapSet.member?(state.claimed, fiber_id)
+
+    refute Map.has_key?(state.running, fiber_id),
+           "the exited fiber must not be resurrected into running by the completing poll"
+  end
+
   test "poller rehydrates pending retries from runtime store on restart" do
     fiber_id = "tests/retry-rehydrate"
     runtime_store_path = runtime_store_path()
@@ -1952,12 +2017,25 @@ defmodule Shuttle.PollerTest do
     MockRunner.remove_tmux_session(session)
     send(poller, :run_poll_cycle)
 
-    assert wait_until(fn ->
-             snap = Poller.snapshot(poller)
+    # The poll must clear the dead-session running entry, record it as an
+    # orphan, and recover the fiber by re-dispatching it. Whether the fiber is
+    # *currently* in `running` is a transient: the watcher for the now-dead
+    # session fires a late `{:worker_exited}` that flips it toward a retry, and
+    # the retry re-dispatches again — so "running right now" flaps on watcher
+    # timing. The stable invariants are the orphan record and that a second
+    # dispatch happened, so assert those instead of catching the flap.
+    assert wait_until(
+             fn ->
+               snap = Poller.snapshot(poller)
 
-             Enum.any?(snap.orphans, &(&1.fiber_id == fiber_id)) and
-               Enum.any?(snap.eligible, &(&1.fiber_id == fiber_id))
-           end)
+               new_session_count =
+                 MockRunner.commands()
+                 |> Enum.count(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
+
+               Enum.any?(snap.orphans, &(&1.fiber_id == fiber_id)) and new_session_count >= 2
+             end,
+             80
+           )
 
     snap = Poller.snapshot(poller)
 
@@ -1969,12 +2047,6 @@ defmodule Shuttle.PollerTest do
              }
              | _
            ] = snap.orphans
-
-    new_session_count =
-      MockRunner.commands()
-      |> Enum.count(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
-
-    assert new_session_count >= 2
   end
 
   test "poller rehydrates live running workers from the runtime store on restart" do
