@@ -498,6 +498,51 @@ defmodule ShuttleWeb.APIControllerTest do
            end)
   end
 
+  # Single-source invariant (C1/C2 dual-source fix). The by-fiber-id resolve
+  # (`Poller.resolve_action`) and the by-fiber-id availability
+  # (`Poller.actions_for`, which `validate_available` gates on) BOTH derive
+  # `running?` from `state.running` and overlay the runtime lifecycle from the
+  # SAME state — so for a RUNNING fiber, every resolved action is guaranteed to
+  # be in the availability set. Portolan routes local daemon-owned transitions
+  # through this by-id path precisely so resolve ⊆ availability holds across the
+  # process boundary; the inline-fiber path can't promise this because its
+  # `running?`/`review.state` are caller-supplied and may disagree with the
+  # daemon's registry. This pins that no kanban target can resolve to an action
+  # the invoke leg then rejects with 409 for a running fiber.
+  @tag :capture_log
+  test "by-fiber-id resolve ⊆ availability for a RUNNING fiber across all kanban targets" do
+    with_actions_host()
+    fiber_id = "tests/action-running-single-source"
+    MockRunner.set_fiber(fiber_id, make_fiber(fiber_id))
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+
+    # Dispatch synchronously populates state.running — the daemon's worker
+    # registry now holds a live worker for this fiber.
+    assert {:ok, _session} = Poller.dispatch_fiber(fiber_id, [])
+
+    # Availability is the daemon's running-branch set (no reopen/dispatch-ad-hoc).
+    avail_conn = get(api_conn(), "/api/v1/actions/#{fiber_id}")
+    assert avail_conn.status == 200
+    available_ids = avail_conn.resp_body |> Jason.decode!() |> Map.fetch!("actions") |> Enum.map(& &1["id"])
+    # Sanity: a running fiber's set is pause + close-*, never reopen.
+    assert "pause" in available_ids
+    refute "reopen" in available_ids
+
+    for target <- ["drafts", "inFlight", "awaitingReview", "tempered", "composted"] do
+      resolve_conn =
+        post(api_conn(), "/api/v1/actions/resolve", Jason.encode!(%{fiber_id: fiber_id, target: target}))
+
+      assert resolve_conn.status == 200, "resolve #{target} should 200 for a running owned fiber"
+      action_id = resolve_conn.resp_body |> Jason.decode!() |> get_in(["action", "id"])
+
+      # The by-construction invariant: a resolved action MUST be invocable. This
+      # is the contract Portolan's by-fiber-id routing relies on — both legs read
+      # one source, so resolve ⊆ availability and the invoke never 409s.
+      assert action_id in available_ids,
+             "running fiber: resolve(#{target})=#{action_id} not in availability #{inspect(available_ids)}"
+    end
+  end
+
   @tag :capture_log
   test "actions invoke rejects unavailable action ids before mutating" do
     with_actions_host()
