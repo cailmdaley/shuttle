@@ -53,6 +53,37 @@ defmodule Shuttle.FeltStoresTest do
       assert Path.expand(host) == Path.expand(loom)
     end
 
+    # Regression: a FLAT fiber (`<leaf>.md` directly in .felt, no enclosing
+    # `<leaf>/` dir) must resolve by its leaf. The first canonical-resolver fix
+    # only matched the dir-contained layout, so flat fibers 400'd "fiber not
+    # found" — e.g. dragging "SP Validation Restructuring" to In flight.
+    test "resolves a flat fiber (`<leaf>.md` directly in the store)" do
+      loom = tmp_dir()
+      felt = Path.join(loom, ".felt")
+      File.mkdir_p!(felt)
+      File.write!(Path.join(felt, "flat-fiber.md"), "---\nname: Flat\n---\n\nBody.\n")
+      System.put_env("LOOM_HOMES", loom)
+
+      assert {:ok, host} = FeltStores.host_for_fiber("flat-fiber")
+      assert Path.expand(host) == Path.expand(loom)
+    end
+
+    # The exact sp-validation-restructuring shape: a flat fiber inside a
+    # symlinked sub-store, resolved by its bare leaf.
+    test "resolves a flat fiber inside a symlinked store by its bare leaf" do
+      loom = tmp_dir()
+      project = tmp_dir()
+      File.mkdir_p!(Path.join(loom, ".felt"))
+      pfelt = Path.join(project, ".felt")
+      File.mkdir_p!(pfelt)
+      File.write!(Path.join(pfelt, "sp-validation-restructuring.md"), "---\nname: SP\n---\n")
+      File.ln_s!(pfelt, Path.join([loom, ".felt", "sp_validation"]))
+      System.put_env("LOOM_HOMES", loom)
+
+      assert {:ok, host} = FeltStores.host_for_fiber("sp-validation-restructuring")
+      assert Path.expand(host) == Path.expand(loom)
+    end
+
     test "returns :not_found for an unknown fiber" do
       loom = tmp_dir()
       File.mkdir_p!(Path.join(loom, ".felt"))

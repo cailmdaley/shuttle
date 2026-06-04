@@ -71,8 +71,10 @@ defmodule Shuttle.FeltStores do
     felt_dir = Path.join(host, ".felt")
 
     [
+      # dir-contained: <.felt>/<segments>/<leaf>.md
       Path.join([felt_dir | segments] ++ ["#{leaf}.md"]),
-      Path.join(felt_dir, "#{leaf}.md")
+      # flat: <.felt>/<segments>.md (covers both root-level and nested flat fibers)
+      Path.join([felt_dir | segments]) <> ".md"
     ]
     |> Enum.any?(&canonical_match?(&1, fiber_id))
   end
@@ -81,8 +83,13 @@ defmodule Shuttle.FeltStores do
     leaf = fiber_id |> String.split("/") |> List.last()
     felt_dir = Path.join(host, ".felt")
 
+    # Match the fiber file by leaf anywhere under .felt. A felt fiber is always
+    # `<leaf>.md` — flat (`<leaf>.md`) or dir-contained (`<leaf>/<leaf>.md`) —
+    # and both end in `<leaf>.md`, so one glob covers both layouts (and crosses
+    # symlinked/automounted sub-stores). Each candidate is verified by canonical
+    # id, so over-matches are rejected.
     File.dir?(felt_dir) and
-      [felt_dir, "**", leaf, "#{leaf}.md"]
+      [felt_dir, "**", "#{leaf}.md"]
       |> Path.join()
       |> Path.wildcard(match_dot: true)
       |> Enum.any?(&canonical_match?(&1, fiber_id))
