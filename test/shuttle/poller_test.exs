@@ -1,7 +1,7 @@
 defmodule Shuttle.PollerTest do
   use ExUnit.Case
 
-  alias Shuttle.Poller
+  alias Shuttle.{Poller, RuntimeStore}
   alias Shuttle.Dispatcher
 
   # ── Mock Runner ──
@@ -393,6 +393,74 @@ defmodule Shuttle.PollerTest do
              snap = Poller.snapshot(poller)
              length(snap.eligible) == 1 and hd(snap.eligible).fiber_id == "tests/host-match"
            end)
+  end
+
+  test "poller migrates stale address-keyed lifecycle rows after discovery" do
+    runtime_store_path = runtime_store_path()
+    uid = "01KTCA2CWXBSNHETE66MXKPVE7"
+    backfill_uid = "01KTCA2D66ESFB8CBRPETGQQBK"
+
+    RuntimeStore.upsert_lifecycle(runtime_store_path, "tests/lifecycle-migrates", %{
+      kind: "standing",
+      phase: "scheduled"
+    })
+
+    RuntimeStore.upsert_lifecycle(runtime_store_path, "tests/lifecycle-backfills", %{
+      uid: backfill_uid,
+      kind: "standing",
+      phase: "scheduled"
+    })
+
+    MockRunner.set_fiber(
+      "tests/lifecycle-migrates",
+      make_fiber("tests/lifecycle-migrates", %{"uid" => uid})
+    )
+
+    MockRunner.set_fiber(
+      "tests/lifecycle-backfills",
+      make_fiber("tests/lifecycle-backfills", %{"uid" => backfill_uid})
+    )
+
+    MockRunner.set_shuttle("tests/lifecycle-migrates", "enabled: false\nkind: standing\n")
+    MockRunner.set_shuttle("tests/lifecycle-backfills", "enabled: false\nkind: standing\n")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_lifecycle_store_reconcile,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"],
+        runtime_store_path: runtime_store_path
+      )
+
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             RuntimeStore.list_lifecycle(runtime_store_path)
+             |> Enum.map(& &1.runtime_key)
+             |> Enum.sort() ==
+               ["01KTCA2CWXBSNHETE66MXKPVE7", "01KTCA2D66ESFB8CBRPETGQQBK"]
+           end)
+
+    assert [
+             %{
+               runtime_key: "01KTCA2CWXBSNHETE66MXKPVE7",
+               fiber_id: "tests/lifecycle-migrates",
+               uid: ^uid,
+               metadata: %{fiber_id: "tests/lifecycle-migrates", uid: ^uid}
+             },
+             %{
+               runtime_key: "01KTCA2D66ESFB8CBRPETGQQBK",
+               fiber_id: "tests/lifecycle-backfills",
+               uid: ^backfill_uid,
+               metadata: %{
+                 fiber_id: "tests/lifecycle-backfills",
+                 uid: ^backfill_uid
+               }
+             }
+           ] = RuntimeStore.list_lifecycle(runtime_store_path)
+
+    cleanup_runtime_store_paths()
   end
 
   # The Poller defaults `own_host_id` from a two-step precedence chain:
@@ -2331,6 +2399,109 @@ defmodule Shuttle.PollerTest do
            } = Map.fetch!(snap.runtime, uid)
 
     refute Map.has_key?(snap.runtime, fiber_id)
+  after
+    cleanup_runtime_store_paths()
+  end
+
+  test "poller prefers uid running row when legacy row rehydrates first" do
+    fiber_id = "tests/runtime-prefers-uid"
+    uid = "01KTCA2CWXBSNHETE66MXKPVE7"
+    session = Dispatcher.session_name(fiber_id)
+    runtime_store_path = runtime_store_path()
+    earlier = ~U[2026-06-05 17:00:00Z]
+    later = ~U[2026-06-05 17:01:00Z]
+
+    fiber = make_fiber(fiber_id, %{"uid" => uid})
+    MockRunner.set_fiber(fiber_id, fiber)
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+    MockRunner.add_tmux_session(session)
+
+    RuntimeStore.upsert_running(runtime_store_path, fiber_id, %{
+      session: session,
+      agent_id: "codex",
+      state: "running",
+      started_at: earlier,
+      last_activity_at: earlier
+    })
+
+    RuntimeStore.upsert_running(runtime_store_path, fiber_id, %{
+      uid: uid,
+      session: session,
+      agent_id: "codex",
+      state: "running",
+      started_at: later,
+      last_activity_at: later
+    })
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_runtime_rehydrate_prefers_uid,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"],
+        runtime_store_path: runtime_store_path
+      )
+
+    assert wait_until(fn ->
+             state = :sys.get_state(poller)
+             Map.has_key?(state.running, uid) and not Map.has_key?(state.running, fiber_id)
+           end)
+
+    assert [
+             %{
+               runtime_key: ^uid,
+               fiber_id: ^fiber_id,
+               uid: ^uid
+             }
+           ] = RuntimeStore.list_running(runtime_store_path)
+  after
+    cleanup_runtime_store_paths()
+  end
+
+  test "poller migrates address-keyed running rows after discovery" do
+    fiber_id = "tests/runtime-migrates-after-discovery"
+    uid = "01KTCA2F0QRRH749B6MB4G6G20"
+    session = Dispatcher.session_name(fiber_id)
+    runtime_store_path = runtime_store_path()
+    now = ~U[2026-06-05 17:00:00Z]
+
+    fiber = make_fiber(fiber_id, %{"uid" => uid})
+    MockRunner.set_fiber(fiber_id, fiber)
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+    MockRunner.add_tmux_session(session)
+
+    RuntimeStore.upsert_running(runtime_store_path, fiber_id, %{
+      session: session,
+      agent_id: "codex",
+      state: "running",
+      started_at: now,
+      last_activity_at: now
+    })
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_runtime_reconcile_running,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"],
+        runtime_store_path: runtime_store_path
+      )
+
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             state = :sys.get_state(poller)
+             Map.has_key?(state.running, uid) and not Map.has_key?(state.running, fiber_id)
+           end)
+
+    assert [
+             %{
+               runtime_key: ^uid,
+               fiber_id: ^fiber_id,
+               uid: ^uid,
+               metadata: %{fiber_id: ^fiber_id, uid: ^uid}
+             }
+           ] = RuntimeStore.list_running(runtime_store_path)
   after
     cleanup_runtime_store_paths()
   end

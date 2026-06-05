@@ -137,6 +137,12 @@ defmodule Shuttle.RuntimeStore do
     )
   end
 
+  @spec delete_running_key(path(), String.t()) :: :ok
+  def delete_running_key(path, runtime_key) when is_binary(path) and is_binary(runtime_key) do
+    init(path)
+    exec!(path, "DELETE FROM running_workers WHERE fiber_id = #{sql_string(runtime_key)};")
+  end
+
   @spec list_retries(path()) :: [
           %{fiber_id: String.t(), runtime_key: String.t(), metadata: map()}
         ]
@@ -286,6 +292,12 @@ defmodule Shuttle.RuntimeStore do
       path,
       "DELETE FROM lifecycle_state WHERE #{runtime_row_matches("fiber_id", fiber_id)};"
     )
+  end
+
+  @spec delete_lifecycle_key(path(), String.t()) :: :ok
+  def delete_lifecycle_key(path, runtime_key) when is_binary(path) and is_binary(runtime_key) do
+    init(path)
+    exec!(path, "DELETE FROM lifecycle_state WHERE fiber_id = #{sql_string(runtime_key)};")
   end
 
   defp exec!(path, sql) do

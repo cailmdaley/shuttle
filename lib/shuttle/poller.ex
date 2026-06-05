@@ -1094,6 +1094,11 @@ defmodule Shuttle.Poller do
     # Merge newly resolved host entries into the cache. Existing entries
     # are not evicted — earlier-configured hosts win for ID collisions,
     # and cache entries are stable for the daemon's lifetime.
+    state =
+      state
+      |> reconcile_persisted_running(candidates, new_uid_map)
+      |> reconcile_persisted_lifecycle(candidates, new_uid_map)
+
     {standing_roles, lifecycle} = standing_roles_from_candidates(candidates, state)
 
     state = %{
@@ -2144,8 +2149,9 @@ defmodule Shuttle.Poller do
   defp rehydrate_runtime_store(%State{} = state) do
     state.runtime_store_path
     |> RuntimeStore.list_running()
-    |> Enum.reduce(state, fn %{fiber_id: fiber_id, metadata: metadata}, state_acc ->
-      rehydrate_running_record(state_acc, fiber_id, metadata)
+    |> Enum.reduce(state, fn %{fiber_id: fiber_id, runtime_key: runtime_key, metadata: metadata},
+                             state_acc ->
+      rehydrate_running_record(state_acc, fiber_id, runtime_key, metadata)
     end)
   end
 
@@ -2166,6 +2172,91 @@ defmodule Shuttle.Poller do
       end)
 
     %{state | lifecycle: lifecycle}
+  end
+
+  defp reconcile_persisted_lifecycle(%State{} = state, candidates, uid_map) do
+    {candidate_ids, uid_to_address} = runtime_reconcile_indexes(candidates, uid_map)
+
+    lifecycle =
+      Enum.reduce(state.lifecycle, %{}, fn {runtime_key, metadata}, acc ->
+        address =
+          case fiber_address(metadata) do
+            "" -> Map.get(uid_to_address, runtime_key, runtime_key)
+            fiber_id -> fiber_id
+          end
+
+        uid = metadata_uid(metadata) || Map.get(uid_map, address)
+
+        known? =
+          MapSet.member?(candidate_ids, address) or Map.has_key?(uid_to_address, runtime_key)
+
+        cond do
+          known? and is_binary(uid) and uid != "" and
+              (runtime_key != uid or metadata_uid(metadata) != uid or
+                 fiber_address(metadata) != address) ->
+            migrated = metadata |> Map.put(:fiber_id, address) |> Map.put(:uid, uid)
+
+            if runtime_key != uid do
+              RuntimeStore.delete_lifecycle_key(state.runtime_store_path, runtime_key)
+            end
+
+            RuntimeStore.upsert_lifecycle(state.runtime_store_path, address, migrated)
+            Map.put(acc, uid, migrated)
+
+          true ->
+            Map.put(acc, runtime_key, metadata)
+        end
+      end)
+
+    %{state | lifecycle: lifecycle}
+  end
+
+  defp reconcile_persisted_running(%State{} = state, candidates, uid_map) do
+    {candidate_ids, uid_to_address} = runtime_reconcile_indexes(candidates, uid_map)
+
+    running =
+      Enum.reduce(state.running, %{}, fn {runtime_key, metadata}, acc ->
+        address =
+          case fiber_address(metadata) do
+            "" -> Map.get(uid_to_address, runtime_key, runtime_key)
+            fiber_id -> fiber_id
+          end
+
+        uid = metadata_uid(metadata) || Map.get(uid_map, address)
+
+        known? =
+          MapSet.member?(candidate_ids, address) or Map.has_key?(uid_to_address, runtime_key)
+
+        cond do
+          known? and is_binary(uid) and uid != "" and
+              (runtime_key != uid or metadata_uid(metadata) != uid or
+                 fiber_address(metadata) != address) ->
+            migrated = metadata |> Map.put(:fiber_id, address) |> Map.put(:uid, uid)
+
+            if runtime_key != uid do
+              RuntimeStore.delete_running_key(state.runtime_store_path, runtime_key)
+            end
+
+            RuntimeStore.upsert_running(state.runtime_store_path, address, migrated)
+            Map.put(acc, uid, migrated)
+
+          true ->
+            Map.put(acc, runtime_key, metadata)
+        end
+      end)
+
+    %{state | running: running}
+  end
+
+  defp runtime_reconcile_indexes(candidates, uid_map) do
+    candidate_ids =
+      candidates
+      |> Enum.map(&Map.get(&1, "id", ""))
+      |> MapSet.new()
+
+    uid_to_address = Map.new(uid_map, fn {address, uid} -> {uid, address} end)
+
+    {candidate_ids, uid_to_address}
   end
 
   defp runtime_lifecycle(%State{} = state, fiber_id) do
@@ -2291,11 +2382,25 @@ defmodule Shuttle.Poller do
     end
   end
 
-  defp rehydrate_running_record(%State{} = state, fiber_id, metadata) do
+  defp rehydrate_running_record(%State{} = state, fiber_id, runtime_key, metadata) do
     session = Map.get(metadata, :session, Dispatcher.session_name(fiber_id))
+    existing_key = running_key(state, fiber_id)
 
     cond do
-      running_key(state, fiber_id) != nil ->
+      existing_key != nil and metadata_uid(metadata) != nil and existing_key != runtime_key ->
+        RuntimeStore.delete_running_key(state.runtime_store_path, existing_key)
+        running_meta = Map.merge(Map.fetch!(state.running, existing_key), metadata)
+
+        %{
+          state
+          | running:
+              state.running
+              |> Map.delete(existing_key)
+              |> Map.put(runtime_key, running_meta)
+        }
+
+      existing_key != nil ->
+        RuntimeStore.delete_running_key(state.runtime_store_path, runtime_key)
         state
 
       not already_running_session?(state, session) ->

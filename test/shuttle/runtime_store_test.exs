@@ -75,6 +75,43 @@ defmodule Shuttle.RuntimeStoreTest do
     |> Enum.each(&File.rm_rf/1)
   end
 
+  test "deletes a running row by exact runtime key" do
+    path = temp_db_path()
+    now = DateTime.utc_now()
+
+    RuntimeStore.upsert_running(path, "tests/runtime-address", %{
+      uid: "01KTCA2CWXBSNHETE66MXKPVE7",
+      session: "runtime-shuttle",
+      agent_id: "codex",
+      state: "running",
+      started_at: now,
+      last_activity_at: now
+    })
+
+    RuntimeStore.upsert_running(path, "tests/runtime-address", %{
+      session: "runtime-shuttle-legacy",
+      agent_id: "codex",
+      state: "running",
+      started_at: now,
+      last_activity_at: now
+    })
+
+    RuntimeStore.delete_running_key(path, "tests/runtime-address")
+
+    assert [
+             %{
+               fiber_id: "tests/runtime-address",
+               runtime_key: "01KTCA2CWXBSNHETE66MXKPVE7",
+               uid: "01KTCA2CWXBSNHETE66MXKPVE7"
+             }
+           ] = RuntimeStore.list_running(path)
+  after
+    System.tmp_dir!()
+    |> Path.join("shuttle-runtime-store-test-*")
+    |> Path.wildcard()
+    |> Enum.each(&File.rm_rf/1)
+  end
+
   test "round-trips retry metadata through sqlite" do
     path = temp_db_path()
     due_at_ms = DateTime.utc_now() |> DateTime.to_unix(:millisecond)
@@ -216,6 +253,38 @@ defmodule Shuttle.RuntimeStoreTest do
 
     RuntimeStore.delete_lifecycle(path, "tests/lifecycle-address")
     assert [] = RuntimeStore.list_lifecycle(path)
+  after
+    System.tmp_dir!()
+    |> Path.join("shuttle-runtime-store-test-*")
+    |> Path.wildcard()
+    |> Enum.each(&File.rm_rf/1)
+  end
+
+  test "deletes a lifecycle row by exact runtime key" do
+    path = temp_db_path()
+
+    RuntimeStore.upsert_lifecycle(path, "tests/lifecycle-address", %{
+      uid: "01KTCA2CWXBSNHETE66MXKPVE7",
+      kind: "oneshot",
+      phase: "dispatched",
+      session: %{"id" => "runtime-session-uuid", "agent" => "codex"}
+    })
+
+    RuntimeStore.upsert_lifecycle(path, "tests/lifecycle-address", %{
+      kind: "oneshot",
+      phase: "dispatched",
+      session: %{"id" => "legacy-session-uuid", "agent" => "codex"}
+    })
+
+    RuntimeStore.delete_lifecycle_key(path, "tests/lifecycle-address")
+
+    assert [
+             %{
+               fiber_id: "tests/lifecycle-address",
+               runtime_key: "01KTCA2CWXBSNHETE66MXKPVE7",
+               uid: "01KTCA2CWXBSNHETE66MXKPVE7"
+             }
+           ] = RuntimeStore.list_lifecycle(path)
   after
     System.tmp_dir!()
     |> Path.join("shuttle-runtime-store-test-*")
