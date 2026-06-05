@@ -41,6 +41,8 @@ Read verbs:
   dispatch     Ask the local daemon to dispatch a fiber now
   session-name Print the canonical tmux session name for a fiber
   attach       Attach to a running worker's tmux session
+  validate-identity
+               Validate federated fiber UID readiness across daemon feeds
 
 To stop a running worker, use 'shuttle pause <fiber>' — it disables
 dispatch and kills the live worker (use --no-kill to preserve the worker).

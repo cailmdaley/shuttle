@@ -75,6 +75,7 @@ shuttle-ctl set-interactive <fiber> <true|false>
 shuttle-ctl dispatch <fiber>
 shuttle-ctl snapshot
 shuttle-ctl abort / attach <fiber>
+shuttle-ctl validate-identity                # UID migration/cross-city validation
 ```
 
 ## Critical invariants
@@ -156,6 +157,7 @@ tmux ls | grep '^shuttle-'               # live workers
 curl -s http://127.0.0.1:4000/api/v1/agents | jq
 curl -s http://127.0.0.1:4000/api/v1/state | jq
 curl -s http://127.0.0.1:4000/api/v1/state/composite | jq
+shuttle-ctl validate-identity                # checks :4000/:4001/:4002 by default
 ```
 
 Dispatch sanity ladder:
