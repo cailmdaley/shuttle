@@ -2170,6 +2170,38 @@ defmodule Shuttle.PollerTest do
     cleanup_runtime_store_paths()
   end
 
+  test "poller persists running workers under intrinsic uid when present" do
+    fiber_id = "tests/runtime-uid-keyed"
+    uid = "01KTCA2CWXBSNHETE66MXKPVE7"
+    runtime_store_path = runtime_store_path()
+
+    fiber = make_fiber(fiber_id, %{"uid" => uid})
+    MockRunner.set_fiber(fiber_id, fiber)
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_runtime_uid_keyed,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"],
+        runtime_store_path: runtime_store_path
+      )
+
+    assert {:ok, _session} = Poller.dispatch_fiber(poller, fiber_id, [])
+
+    assert [
+             %{
+               fiber_id: ^fiber_id,
+               runtime_key: ^uid,
+               uid: ^uid,
+               metadata: %{fiber_id: ^fiber_id, uid: ^uid}
+             }
+           ] = Shuttle.RuntimeStore.list_running(runtime_store_path)
+  after
+    cleanup_runtime_store_paths()
+  end
+
   test "poller drops runtime store records whose tmux session disappeared while daemon was down" do
     fiber_id = "tests/runtime-rehydrate-missing"
     runtime_store_path = runtime_store_path()

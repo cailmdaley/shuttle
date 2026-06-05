@@ -67,7 +67,9 @@ defmodule Shuttle.RuntimeStore do
     exec!(path, sql)
   end
 
-  @spec list_running(path()) :: [%{fiber_id: String.t(), metadata: map()}]
+  @spec list_running(path()) :: [
+          %{fiber_id: String.t(), runtime_key: String.t(), metadata: map()}
+        ]
   def list_running(path) when is_binary(path) do
     init(path)
 
@@ -79,17 +81,14 @@ defmodule Shuttle.RuntimeStore do
 
     path
     |> query_lines(sql)
-    |> Enum.map(fn line ->
-      [fiber_id, metadata_json] = String.split(line, "\t", parts: 2)
-      %{"metadata" => metadata} = Jason.decode!(metadata_json)
-      %{fiber_id: fiber_id, metadata: decode_metadata(metadata)}
-    end)
+    |> Enum.map(&decode_runtime_row/1)
   end
 
   @spec upsert_running(path(), String.t(), map()) :: :ok
   def upsert_running(path, fiber_id, metadata) when is_binary(path) and is_binary(fiber_id) do
     init(path)
 
+    runtime_key = runtime_key(fiber_id, metadata)
     session = Map.fetch!(metadata, :session)
     agent_id = Map.get(metadata, :agent_id)
     state = Map.get(metadata, :state, "running")
@@ -100,7 +99,7 @@ defmodule Shuttle.RuntimeStore do
     updated_at = DateTime.utc_now() |> DateTime.to_iso8601()
 
     metadata_json =
-      %{metadata: encode_metadata(metadata)}
+      %{metadata: metadata |> put_address(fiber_id) |> encode_metadata()}
       |> Jason.encode!()
 
     sql = """
@@ -108,7 +107,7 @@ defmodule Shuttle.RuntimeStore do
       fiber_id, tmux_session, agent_id, state, run_id, run_kind,
       started_at, last_activity_at, metadata_json, updated_at
     ) VALUES (
-      #{sql_string(fiber_id)}, #{sql_string(session)}, #{sql_string(agent_id)},
+      #{sql_string(runtime_key)}, #{sql_string(session)}, #{sql_string(agent_id)},
       #{sql_string(state)}, #{sql_string(run_id)}, #{sql_string(run_kind)},
       #{sql_string(started_at)}, #{sql_string(last_activity_at)},
       #{sql_string(metadata_json)}, #{sql_string(updated_at)}
@@ -131,10 +130,16 @@ defmodule Shuttle.RuntimeStore do
   @spec delete_running(path(), String.t()) :: :ok
   def delete_running(path, fiber_id) when is_binary(path) and is_binary(fiber_id) do
     init(path)
-    exec!(path, "DELETE FROM running_workers WHERE fiber_id = #{sql_string(fiber_id)};")
+
+    exec!(
+      path,
+      "DELETE FROM running_workers WHERE #{runtime_row_matches("fiber_id", fiber_id)};"
+    )
   end
 
-  @spec list_retries(path()) :: [%{fiber_id: String.t(), metadata: map()}]
+  @spec list_retries(path()) :: [
+          %{fiber_id: String.t(), runtime_key: String.t(), metadata: map()}
+        ]
   def list_retries(path) when is_binary(path) do
     init(path)
 
@@ -146,17 +151,14 @@ defmodule Shuttle.RuntimeStore do
 
     path
     |> query_lines(sql)
-    |> Enum.map(fn line ->
-      [fiber_id, metadata_json] = String.split(line, "\t", parts: 2)
-      %{"metadata" => metadata} = Jason.decode!(metadata_json)
-      %{fiber_id: fiber_id, metadata: decode_metadata(metadata)}
-    end)
+    |> Enum.map(&decode_runtime_row/1)
   end
 
   @spec upsert_retry(path(), String.t(), map()) :: :ok
   def upsert_retry(path, fiber_id, metadata) when is_binary(path) and is_binary(fiber_id) do
     init(path)
 
+    runtime_key = runtime_key(fiber_id, metadata)
     attempt = Map.fetch!(metadata, :attempt)
     due_at_ms = Map.fetch!(metadata, :due_at_ms)
     delay_type = metadata |> Map.get(:delay_type, :failure) |> to_string()
@@ -164,14 +166,14 @@ defmodule Shuttle.RuntimeStore do
     updated_at = DateTime.utc_now() |> DateTime.to_iso8601()
 
     metadata_json =
-      %{metadata: encode_metadata(metadata)}
+      %{metadata: metadata |> put_address(fiber_id) |> encode_metadata()}
       |> Jason.encode!()
 
     sql = """
     INSERT INTO retry_queue (
       fiber_id, attempt, due_at_ms, delay_type, error, metadata_json, updated_at
     ) VALUES (
-      #{sql_string(fiber_id)}, #{attempt}, #{due_at_ms},
+      #{sql_string(runtime_key)}, #{attempt}, #{due_at_ms},
       #{sql_string(delay_type)}, #{sql_string(error)}, #{sql_string(metadata_json)},
       #{sql_string(updated_at)}
     )
@@ -190,10 +192,12 @@ defmodule Shuttle.RuntimeStore do
   @spec delete_retry(path(), String.t()) :: :ok
   def delete_retry(path, fiber_id) when is_binary(path) and is_binary(fiber_id) do
     init(path)
-    exec!(path, "DELETE FROM retry_queue WHERE fiber_id = #{sql_string(fiber_id)};")
+    exec!(path, "DELETE FROM retry_queue WHERE #{runtime_row_matches("fiber_id", fiber_id)};")
   end
 
-  @spec list_lifecycle(path()) :: [%{fiber_id: String.t(), metadata: map()}]
+  @spec list_lifecycle(path()) :: [
+          %{fiber_id: String.t(), runtime_key: String.t(), metadata: map()}
+        ]
   def list_lifecycle(path) when is_binary(path) do
     init(path)
 
@@ -205,11 +209,7 @@ defmodule Shuttle.RuntimeStore do
 
     path
     |> query_lines(sql)
-    |> Enum.map(fn line ->
-      [fiber_id, metadata_json] = String.split(line, "\t", parts: 2)
-      %{"metadata" => metadata} = Jason.decode!(metadata_json)
-      %{fiber_id: fiber_id, metadata: decode_metadata(metadata)}
-    end)
+    |> Enum.map(&decode_runtime_row/1)
   end
 
   @spec fetch_lifecycle(path(), String.t()) :: map() | nil
@@ -219,7 +219,7 @@ defmodule Shuttle.RuntimeStore do
     sql = """
     SELECT metadata_json
     FROM lifecycle_state
-    WHERE fiber_id = #{sql_string(fiber_id)}
+    WHERE #{runtime_row_matches("fiber_id", fiber_id)}
     LIMIT 1;
     """
 
@@ -247,8 +247,10 @@ defmodule Shuttle.RuntimeStore do
     review_json = Jason.encode!(Map.get(metadata, :review, %{}))
     updated_at = DateTime.utc_now() |> DateTime.to_iso8601()
 
+    runtime_key = runtime_key(fiber_id, metadata)
+
     metadata_json =
-      %{metadata: encode_metadata(metadata)}
+      %{metadata: metadata |> put_address(fiber_id) |> encode_metadata()}
       |> Jason.encode!()
 
     sql = """
@@ -256,7 +258,7 @@ defmodule Shuttle.RuntimeStore do
       fiber_id, kind, phase, run_id, run_kind, next_due_at, last_run_at,
       review_json, metadata_json, updated_at
     ) VALUES (
-      #{sql_string(fiber_id)}, #{sql_string(kind)}, #{sql_string(phase)},
+      #{sql_string(runtime_key)}, #{sql_string(kind)}, #{sql_string(phase)},
       #{sql_string(run_id)}, #{sql_string(run_kind)}, #{sql_string(next_due_at)},
       #{sql_string(last_run_at)}, #{sql_string(review_json)},
       #{sql_string(metadata_json)}, #{sql_string(updated_at)}
@@ -279,7 +281,11 @@ defmodule Shuttle.RuntimeStore do
   @spec delete_lifecycle(path(), String.t()) :: :ok
   def delete_lifecycle(path, fiber_id) when is_binary(path) and is_binary(fiber_id) do
     init(path)
-    exec!(path, "DELETE FROM lifecycle_state WHERE fiber_id = #{sql_string(fiber_id)};")
+
+    exec!(
+      path,
+      "DELETE FROM lifecycle_state WHERE #{runtime_row_matches("fiber_id", fiber_id)};"
+    )
   end
 
   defp exec!(path, sql) do
@@ -313,6 +319,67 @@ defmodule Shuttle.RuntimeStore do
 
   defp sql_string(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "''") <> "'"
+  end
+
+  defp runtime_row_matches(column, identifier) do
+    "#{column} = #{sql_string(identifier)} OR metadata_json LIKE #{sql_like_metadata_address(identifier)}"
+  end
+
+  defp sql_like_metadata_address(fiber_id) do
+    pattern =
+      fiber_id
+      |> Jason.encode!()
+      |> String.trim_leading("\"")
+      |> String.trim_trailing("\"")
+      |> String.replace("\\", "\\\\")
+      |> String.replace("%", "\\%")
+      |> String.replace("_", "\\_")
+
+    sql_string("%\"fiber_id\":\"#{pattern}\"%") <> " ESCAPE '\\'"
+  end
+
+  defp runtime_key(fiber_id, metadata) do
+    case Map.get(metadata, :uid) || Map.get(metadata, "uid") do
+      uid when is_binary(uid) and uid != "" -> uid
+      _ -> fiber_id
+    end
+  end
+
+  defp put_address(metadata, fiber_id) do
+    if Map.has_key?(metadata, :fiber_id) or Map.has_key?(metadata, "fiber_id") do
+      metadata
+    else
+      Map.put(metadata, :fiber_id, fiber_id)
+    end
+  end
+
+  defp decode_runtime_row(line) do
+    [runtime_key, metadata_json] = String.split(line, "\t", parts: 2)
+    %{"metadata" => metadata} = Jason.decode!(metadata_json)
+    metadata = decode_metadata(metadata)
+    address = metadata_address(metadata, runtime_key)
+    uid = metadata_uid(metadata)
+
+    %{
+      fiber_id: address,
+      runtime_key: runtime_key,
+      uid: uid,
+      metadata: metadata
+    }
+  end
+
+  defp metadata_address(metadata, fallback) do
+    case Map.get(metadata, :fiber_id) || Map.get(metadata, "fiber_id") do
+      fiber_id when is_binary(fiber_id) and fiber_id != "" -> fiber_id
+      _ -> fallback
+    end
+  end
+
+  defp metadata_uid(metadata) do
+    case Map.get(metadata, :uid) || Map.get(metadata, "uid") do
+      uid when is_binary(uid) and uid != "" -> uid
+      _ -> nil
+    end
   end
 
   defp encode_metadata(metadata) do
