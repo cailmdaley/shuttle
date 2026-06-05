@@ -222,6 +222,75 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
     refute Map.has_key?(hd(body["fibers"])["fiber"], "body")
   end
 
+  test "GET /api/v1/fibers emits frontmatter ULID as the logical fiber id", %{store: store} do
+    ulid = "01JZ0000000000000000000000"
+
+    write_fiber!(store, "tests/ulid", """
+    ---
+    id: #{ulid}
+    name: ULID fiber
+    status: active
+    shuttle:
+      enabled: true
+      host: test-host
+    ---
+
+    Body.
+    """)
+
+    conn = get(api_conn(), "/api/v1/fibers")
+    assert conn.status == 200
+
+    assert [
+             %{
+               "path" => "tests/ulid/ulid.md",
+               "fiber" => %{
+                 "id" => ^ulid,
+                 "slug" => "tests/ulid",
+                 "name" => "ULID fiber"
+               }
+             }
+           ] = Jason.decode!(conn.resp_body)["fibers"]
+  end
+
+  test "GET /api/v1/fibers/:id resolves frontmatter ULIDs and migration-era slugs",
+       %{store: store} do
+    ulid = "01JZ0000000000000000000001"
+
+    write_fiber!(store, "tests/ulid-show", """
+    ---
+    id: #{ulid}
+    name: ULID show
+    status: active
+    shuttle:
+      enabled: true
+      host: test-host
+    ---
+
+    Body.
+    """)
+
+    by_ulid = get(api_conn(), "/api/v1/fibers/#{ulid}")
+    assert by_ulid.status == 200
+
+    assert [
+             %{
+               "path" => "tests/ulid-show/ulid-show.md",
+               "fiber" => %{"id" => ^ulid, "slug" => "tests/ulid-show"}
+             }
+           ] = Jason.decode!(by_ulid.resp_body)["fibers"]
+
+    by_slug = get(api_conn(), "/api/v1/fibers/tests/ulid-show")
+    assert by_slug.status == 200
+
+    assert [
+             %{
+               "path" => "tests/ulid-show/ulid-show.md",
+               "fiber" => %{"id" => ^ulid, "slug" => "tests/ulid-show"}
+             }
+           ] = Jason.decode!(by_slug.resp_body)["fibers"]
+  end
+
   test "GET /api/v1/fibers/:id?body=true includes the felt body", %{store: store} do
     write_fiber!(store, "tests/single-body", """
     ---

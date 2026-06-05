@@ -120,7 +120,7 @@ defmodule Shuttle.FiberDocuments do
         {:ok, rows} -> rows
         _ -> []
       end)
-      |> Enum.find(&(&1.fiber["id"] == id))
+      |> Enum.find(&entry_matches_id?(&1, id))
 
     cond do
       match != nil -> {:ok, envelope(stores, [match])}
@@ -176,7 +176,9 @@ defmodule Shuttle.FiberDocuments do
   # gracefully (no speedup, no breakage). Non-shuttle due-dated todos are a
   # Portolan-local concern and never live on a remote, so this drops nothing the
   # kanban shows.
-  defp shuttle_fiber?(%{"shuttle" => shuttle}) when is_map(shuttle) and map_size(shuttle) > 0, do: true
+  defp shuttle_fiber?(%{"shuttle" => shuttle}) when is_map(shuttle) and map_size(shuttle) > 0,
+    do: true
+
   defp shuttle_fiber?(_), do: false
 
   defp entry_for(store, %{"id" => id} = fiber) when is_binary(id) and id != "" do
@@ -191,10 +193,18 @@ defmodule Shuttle.FiberDocuments do
     path = relative_felt_path(fiber)
     full_path = Path.join([store, ".felt", path])
 
+    canonical_id = canonical_id(full_path, id)
+    logical_id = logical_id(full_path, canonical_id)
+
+    fiber =
+      fiber
+      |> Map.put("id", logical_id)
+      |> put_slug(canonical_id)
+
     entry = %{
       felt_store: store,
       path: path,
-      fiber: Map.put(fiber, "id", canonical_id(full_path, id))
+      fiber: fiber
     }
 
     report_path = full_path |> Path.dirname() |> Path.join("report.html")
@@ -208,11 +218,49 @@ defmodule Shuttle.FiberDocuments do
 
   defp entry_for(_store, _fiber), do: []
 
+  defp entry_matches_id?(%{fiber: %{"id" => id}}, id), do: true
+  defp entry_matches_id?(%{fiber: %{"slug" => id}}, id), do: true
+  defp entry_matches_id?(_, _), do: false
+
+  defp put_slug(%{"id" => id} = fiber, id), do: fiber
+  defp put_slug(fiber, slug), do: Map.put(fiber, "slug", slug)
+
+  defp logical_id(full_path, fallback) do
+    case frontmatter_ulid(full_path) do
+      {:ok, id} -> id
+      :error -> canonical_id(full_path, fallback)
+    end
+  end
+
   defp canonical_id(full_path, fallback) do
     case Shuttle.FiberId.canonical_id(full_path) do
       {:ok, id} -> id
       {:error, _} -> fallback
     end
+  end
+
+  defp frontmatter_ulid(path) do
+    with {:ok, text} <- File.read(path),
+         {:ok, yaml} <- frontmatter_yaml(text),
+         {:ok, %{"id" => id}} when is_binary(id) <- YamlElixir.read_from_string(yaml),
+         true <- ulid?(id) do
+      {:ok, id}
+    else
+      _ -> :error
+    end
+  end
+
+  defp frontmatter_yaml("---\n" <> rest) do
+    case String.split(rest, "\n---\n", parts: 2) do
+      [yaml, _body] -> {:ok, yaml}
+      _ -> :error
+    end
+  end
+
+  defp frontmatter_yaml(_), do: :error
+
+  defp ulid?(value) do
+    String.match?(value, ~r/^[0-9A-HJKMNP-TV-Z]{26}$/)
   end
 
   defp relative_felt_path(%{"id" => id, "entry_point" => true}) do
