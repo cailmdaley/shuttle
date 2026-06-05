@@ -347,13 +347,20 @@ defmodule Shuttle.Dispatcher do
   @doc """
   Reads the most recent `--kind review-comment` event for `fiber_id` and
   renders it as a "From User · <relative time>" block for inclusion in
-  the dispatch prompt. Returns "" if there are no review-comment events
-  or the latest one has an empty summary.
+  the dispatch prompt. Returns "" if there are no review-comment events,
+  the latest one has an empty summary, or the latest one has already been
+  consumed by a prior run (see below).
 
-  Persistence semantics: the latest user message is shown to every
-  worker until a newer one is filed. There is no "consumed" flag — the
-  worker reads it alongside the editorial chain and decides whether
-  it's been addressed already.
+  Persistence semantics: the latest user message is shown until a worker
+  run completes after it was filed. "Consumed" is derived from the existing
+  editorial chain rather than a stored flag: workers append an editorial
+  (`event_type: "editorial"`) handoff event at every session boundary, so
+  if the most recent editorial event post-dates the latest review-comment,
+  a prior run has already seen the directive and the block is suppressed.
+  This stops a re-dispatch with no *new* comment from re-surfacing a stale,
+  already-implemented directive as if it were a fresh task. A directive that
+  has not yet been followed by any editorial event (the requeue-then-dispatch
+  case) still renders. See `consumed_by_later_handoff?/3`.
 
   Pass `felt_store:` to control which `.felt/` index is queried.
   """
@@ -364,20 +371,51 @@ defmodule Shuttle.Dispatcher do
         # felt stores `--summary` text under `payload.text`. Read that key;
         # `payload.summary` was a dispatcher-side misread, never written.
         summary = (get_in(event, ["payload", "text"]) || "") |> String.trim()
+        when_iso = Map.get(event, "occurred_at", "")
 
-        # Suppress the block for empty-text events. The kanban may write
-        # a review-comment carrying only `resume_mode` (no user message)
-        # to keep the latest `resume_mode` current; those events should
-        # not render a From User block.
-        if summary == "" do
-          ""
-        else
-          when_iso = Map.get(event, "occurred_at", "")
-          render_block("From User", relative_time(when_iso), summary)
+        cond do
+          # Empty-text events: the kanban may write a review-comment carrying
+          # only `resume_mode` (no user message) to keep the latest resume_mode
+          # current; those should not render a From User block.
+          summary == "" ->
+            ""
+
+          # Already consumed by a completed run — suppress so re-dispatch
+          # without a fresh comment doesn't replay an old directive.
+          consumed_by_later_handoff?(fiber_id, when_iso, opts) ->
+            ""
+
+          true ->
+            render_block("From User", relative_time(when_iso), summary)
         end
 
       _ ->
         ""
+    end
+  end
+
+  # True when the fiber has an editorial (worker handoff) event strictly newer
+  # than `comment_iso` — evidence the latest review-comment was already seen by
+  # a prior run. Editorial events are filed by workers at session boundaries
+  # (`felt history append` with no `--kind`), so one post-dating the directive
+  # means a worker has had its turn with it.
+  #
+  # Conservative on failure: a missing/blank/unparseable timestamp, or no
+  # editorial event at all, returns false (render) so a genuinely-fresh
+  # directive is never silently dropped.
+  defp consumed_by_later_handoff?(_fiber_id, comment_iso, _opts)
+       when not is_binary(comment_iso) or comment_iso == "",
+       do: false
+
+  defp consumed_by_later_handoff?(fiber_id, comment_iso, opts) do
+    with {:ok, comment_dt, _} <- DateTime.from_iso8601(comment_iso),
+         [event | _] <-
+           query_history(fiber_id, ["--kind", "editorial", "--last", "1", "--json"], opts),
+         editorial_iso when is_binary(editorial_iso) <- Map.get(event, "occurred_at"),
+         {:ok, editorial_dt, _} <- DateTime.from_iso8601(editorial_iso) do
+      DateTime.compare(editorial_dt, comment_dt) == :gt
+    else
+      _ -> false
     end
   end
 

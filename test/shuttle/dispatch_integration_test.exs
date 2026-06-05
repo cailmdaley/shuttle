@@ -959,6 +959,87 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert script =~ "Focus on the authentication layer first"
   end
 
+  # A review-comment already consumed by a prior run — i.e. followed by an
+  # editorial (worker handoff) event — is suppressed on re-dispatch, so a stale
+  # directive doesn't replay as a fresh task when the card is re-dispatched
+  # without a new comment. Regression for the round-4-comment-resurfaced bug.
+  test "review-comment older than the latest editorial event is suppressed", %{host: host} do
+    write_fiber(host, "tests/consumed-message", """
+    ---
+    name: Consumed message fiber
+    status: active
+    tags:
+      - constitution
+    shuttle:
+      enabled: true
+      kind: oneshot
+      agent: claude-sonnet
+    ---
+    A fiber whose directive was already implemented by a prior run.
+    """)
+
+    # User files a directive, a worker runs and hands off (editorial event),
+    # then the card is re-dispatched with no new comment.
+    append_review_comment(host, "tests/consumed-message",
+      summary: "Make the halo bigger",
+      resume_mode: "fresh"
+    )
+
+    append_worker_exit(host, "tests/consumed-message",
+      agent: "claude-sonnet",
+      session: "sess-consumed"
+    )
+
+    assert {:ok, _} =
+             Dispatcher.dispatch("tests/consumed-message",
+               runner: IntegrationRunner,
+               felt_store: host
+             )
+
+    script = read_run_script()
+    refute script =~ "From User"
+    refute script =~ "Make the halo bigger"
+  end
+
+  # The inverse: a review-comment filed *after* the last editorial event (the
+  # requeue-then-dispatch case) still renders — it hasn't been consumed yet.
+  test "review-comment newer than the latest editorial event still renders", %{host: host} do
+    write_fiber(host, "tests/fresh-after-handoff", """
+    ---
+    name: Fresh-after-handoff fiber
+    status: active
+    tags:
+      - constitution
+    shuttle:
+      enabled: true
+      kind: oneshot
+      agent: claude-sonnet
+    ---
+    A fiber with a prior run, then a brand-new directive.
+    """)
+
+    # A prior run handed off first, THEN the user filed a new directive.
+    append_worker_exit(host, "tests/fresh-after-handoff",
+      agent: "claude-sonnet",
+      session: "sess-prior"
+    )
+
+    append_review_comment(host, "tests/fresh-after-handoff",
+      summary: "Now restructure the talk order",
+      resume_mode: "fresh"
+    )
+
+    assert {:ok, _} =
+             Dispatcher.dispatch("tests/fresh-after-handoff",
+               runner: IntegrationRunner,
+               felt_store: host
+             )
+
+    script = read_run_script()
+    assert script =~ "From User"
+    assert script =~ "Now restructure the talk order"
+  end
+
   # No review-comment at all suppresses the From User block. The common case
   # for a fresh constitution that has never been requeued from the kanban.
   test "no review-comment event suppresses From User block", %{host: host} do
