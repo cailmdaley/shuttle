@@ -91,6 +91,9 @@ defmodule Shuttle.Poller do
       :auto_discover_felt_stores,
       :runner,
       poll_check_in_progress: false,
+      # Runtime/process registry. Keyed by intrinsic UID when known; metadata
+      # carries :fiber_id as the felt address used for CLI shell-outs and
+      # public API payloads.
       running: %{},
       claimed: MapSet.new(),
       retry_queue: %{},
@@ -471,7 +474,7 @@ defmodule Shuttle.Poller do
   end
 
   def handle_call({:worker_status, fiber_id}, _from, state) do
-    {:reply, Map.get(state.running, fiber_id), state}
+    {:reply, running_worker(state, fiber_id), state}
   end
 
   def handle_call({:dispatch, fiber_id, opts}, _from, state) do
@@ -479,7 +482,7 @@ defmodule Shuttle.Poller do
     session = Dispatcher.session_name(fiber_id)
 
     cond do
-      Map.has_key?(state.running, fiber_id) or MapSet.member?(state.claimed, fiber_id) ->
+      running_key(state, fiber_id) != nil or MapSet.member?(state.claimed, fiber_id) ->
         {:reply, {:error, :already_running}, state}
 
       already_running_session?(state, session) ->
@@ -659,7 +662,9 @@ defmodule Shuttle.Poller do
     now_ms = DateTime.to_unix(now, :millisecond)
 
     eligible =
-      Enum.map(state.running, fn {fiber_id, meta} ->
+      Enum.map(state.running, fn {_runtime_key, meta} ->
+        fiber_id = fiber_address(meta)
+
         %{
           fiber_id: fiber_id,
           uid: uid_for_fiber(state, fiber_id, meta),
@@ -879,6 +884,47 @@ defmodule Shuttle.Poller do
     uid_for_fiber(state, fiber_id, metadata) || fiber_id
   end
 
+  defp runtime_key_for_fiber(fiber) when is_map(fiber) do
+    fiber_id = fiber_address(fiber)
+    metadata_uid(fiber) || fiber_id
+  end
+
+  defp runtime_key_for_address(%State{} = state, fiber_id, metadata) do
+    uid_for_fiber(state, fiber_id, metadata) || fiber_id
+  end
+
+  defp fiber_address(metadata) when is_map(metadata) do
+    case Map.get(metadata, :fiber_id) || Map.get(metadata, "fiber_id") ||
+           Map.get(metadata, "id") || Map.get(metadata, :id) do
+      fiber_id when is_binary(fiber_id) and fiber_id != "" -> fiber_id
+      _ -> ""
+    end
+  end
+
+  defp running_key(%State{} = state, fiber_id) when is_binary(fiber_id) do
+    cond do
+      Map.has_key?(state.running, fiber_id) ->
+        fiber_id
+
+      true ->
+        Enum.find_value(state.running, fn {key, metadata} ->
+          address = fiber_address(metadata)
+          uid = metadata_uid(metadata)
+
+          if fiber_id in [address, uid], do: key
+        end)
+    end
+  end
+
+  defp running_key(_, _), do: nil
+
+  defp running_worker(%State{} = state, fiber_id) do
+    case running_key(state, fiber_id) do
+      nil -> nil
+      key -> Map.get(state.running, key)
+    end
+  end
+
   defp metadata_uid(metadata) when is_map(metadata) do
     case {Map.get(metadata, :uid), Map.get(metadata, "uid")} do
       {uid, _} when is_binary(uid) and uid != "" -> uid
@@ -1050,7 +1096,7 @@ defmodule Shuttle.Poller do
         state
 
       # Already tracking (a WorkerWatcher is alive for this fiber).
-      Map.has_key?(state.running, fiber_id) ->
+      running_key(state, fiber_id) != nil ->
         state
 
       # Retry already queued.
@@ -1373,7 +1419,7 @@ defmodule Shuttle.Poller do
           false
 
         # Must not already be running
-        Map.has_key?(state.running, fiber_id) ->
+        running_key(state, fiber_id) != nil ->
           false
 
         # Must not be claimed (retry queued)
@@ -1830,9 +1876,11 @@ defmodule Shuttle.Poller do
         {:ok, agent} = Shuttle.Agents.resolve_by_name(agent_name)
 
         now = DateTime.utc_now()
+        runtime_key = runtime_key_for_fiber(fiber)
 
         running_meta =
           %{
+            fiber_id: fiber_id,
             session: session,
             agent_id: agent.id,
             uid: Map.get(fiber, "uid"),
@@ -1843,7 +1891,7 @@ defmodule Shuttle.Poller do
 
         case start_watcher(state, fiber_id, running_meta) do
           {:ok, running_meta} ->
-            running = Map.put(state.running, fiber_id, running_meta)
+            running = Map.put(state.running, runtime_key, running_meta)
             persist_running(state, fiber_id, running_meta)
 
             state = %{
@@ -1917,13 +1965,15 @@ defmodule Shuttle.Poller do
   end
 
   defp reconcile_fiber_closures(%State{} = state) do
-    Enum.reduce(state.running, state, fn {fiber_id, meta}, state_acc ->
+    Enum.reduce(state.running, state, fn {runtime_key, meta}, state_acc ->
+      fiber_id = fiber_address(meta)
+
       case fetch_fiber_full(fiber_id, state_acc) do
         {:ok, fiber} ->
           if Map.get(fiber, "status") == "closed" do
             Logger.info("Fiber closed externally: #{fiber_id}; stopping watcher")
             stop_watcher(meta)
-            remove_running(state_acc, fiber_id)
+            remove_running(state_acc, runtime_key)
           else
             state_acc
           end
@@ -1958,7 +2008,9 @@ defmodule Shuttle.Poller do
   end
 
   defp reconcile_missing_running_sessions(%State{} = state) do
-    Enum.reduce(state.running, state, fn {fiber_id, %{session: session} = meta}, state_acc ->
+    Enum.reduce(state.running, state, fn {runtime_key, %{session: session} = meta}, state_acc ->
+      fiber_id = fiber_address(meta)
+
       if already_running_session?(state_acc, session) do
         state_acc
       else
@@ -1967,7 +2019,7 @@ defmodule Shuttle.Poller do
 
         state_acc
         |> record_orphaned_running_worker(fiber_id, meta)
-        |> remove_running(fiber_id)
+        |> remove_running(runtime_key)
       end
     end)
   end
@@ -2079,7 +2131,7 @@ defmodule Shuttle.Poller do
 
   defp rehydrate_retry_record(%State{} = state, fiber_id, metadata) do
     cond do
-      Map.has_key?(state.running, fiber_id) ->
+      running_key(state, fiber_id) != nil ->
         delete_persisted_retry(state, fiber_id)
 
       Map.has_key?(state.retry_queue, fiber_id) ->
@@ -2120,7 +2172,7 @@ defmodule Shuttle.Poller do
     session = Map.get(metadata, :session, Dispatcher.session_name(fiber_id))
 
     cond do
-      Map.has_key?(state.running, fiber_id) ->
+      running_key(state, fiber_id) != nil ->
         state
 
       not already_running_session?(state, session) ->
@@ -2148,10 +2200,11 @@ defmodule Shuttle.Poller do
               case start_watcher(state, fiber_id, metadata) do
                 {:ok, running_meta} ->
                   Logger.info("Rehydrated runtime worker: #{fiber_id} session=#{session}")
+                  runtime_key = runtime_key_for_address(state, fiber_id, running_meta)
 
                   %{
                     state
-                    | running: Map.put(state.running, fiber_id, running_meta),
+                    | running: Map.put(state.running, runtime_key, running_meta),
                       claimed: MapSet.put(state.claimed, fiber_id)
                   }
 
@@ -2189,6 +2242,7 @@ defmodule Shuttle.Poller do
           now = DateTime.utc_now()
 
           running_meta = %{
+            fiber_id: fiber_id,
             session: session,
             agent_id: agent.id,
             uid: Map.get(fiber, "uid"),
@@ -2198,7 +2252,8 @@ defmodule Shuttle.Poller do
 
           case start_watcher(state, fiber_id, running_meta) do
             {:ok, running_meta} ->
-              running = Map.put(state.running, fiber_id, running_meta)
+              runtime_key = runtime_key_for_fiber(fiber)
+              running = Map.put(state.running, runtime_key, running_meta)
               persist_running(state, fiber_id, running_meta)
 
               Logger.info("Adopted orphan session: #{session}")
@@ -2232,46 +2287,53 @@ defmodule Shuttle.Poller do
       {:worker_exited, fiber_id, reason}
     )
 
-    case Map.pop(state.running, fiber_id) do
-      {nil, _} ->
+    case running_key(state, fiber_id) do
+      nil ->
         state
 
-      {meta, running} ->
-        state = %{state | running: running}
+      runtime_key ->
+        case Map.pop(state.running, runtime_key) do
+          {nil, _} ->
+            state
 
-        # Re-read fiber to determine next action
-        case fetch_fiber_full(fiber_id, state) do
-          {:ok, fiber} ->
-            # Auto-log the worker exit to felt history with the session UUID,
-            # so users can browse history and find sessions to reattach or
-            # diagnose. Best-effort: failure to write history doesn't block
-            # the exit-handling state machine. Captured every exit path
-            # (clean kill, crash, abort, ghost cleanup) since we always
-            # come through here when the daemon notices the session ended.
-            log_worker_exit(fiber_id, fiber, meta, reason, state)
+          {meta, running} ->
+            state = %{state | running: running}
+            fiber_id = fiber_address(meta)
 
-            status = Map.get(fiber, "status", "")
+            # Re-read fiber to determine next action
+            case fetch_fiber_full(fiber_id, state) do
+              {:ok, fiber} ->
+                # Auto-log the worker exit to felt history with the session UUID,
+                # so users can browse history and find sessions to reattach or
+                # diagnose. Best-effort: failure to write history doesn't block
+                # the exit-handling state machine. Captured every exit path
+                # (clean kill, crash, abort, ghost cleanup) since we always
+                # come through here when the daemon notices the session ended.
+                log_worker_exit(fiber_id, fiber, meta, reason, state)
 
-            cond do
-              status == "closed" ->
-                # Work complete or blocked — release claim
-                release_claim(state, fiber_id)
+                status = Map.get(fiber, "status", "")
 
-              standing_role?(fiber, state) ->
-                state
-                |> remember_completed_standing_run(fiber_id, Map.get(meta, :run_id))
-                |> release_claim(fiber_id)
+                cond do
+                  status == "closed" ->
+                    # Work complete or blocked — release claim
+                    release_claim(state, fiber_id)
 
-              true ->
-                # Still active — schedule continuation retry
+                  standing_role?(fiber, state) ->
+                    state
+                    |> remember_completed_standing_run(fiber_id, Map.get(meta, :run_id))
+                    |> release_claim(fiber_id)
+
+                  true ->
+                    # Still active — schedule continuation retry
+                    attempt = next_retry_attempt(state, fiber_id)
+                    schedule_retry(state, fiber_id, attempt, %{delay_type: :continuation})
+                end
+
+              {:error, _} ->
+                # Can't read fiber — schedule failure retry
                 attempt = next_retry_attempt(state, fiber_id)
-                schedule_retry(state, fiber_id, attempt, %{delay_type: :continuation})
+                schedule_retry(state, fiber_id, attempt, %{error: "fiber read failed after exit"})
             end
-
-          {:error, _} ->
-            # Can't read fiber — schedule failure retry
-            attempt = next_retry_attempt(state, fiber_id)
-            schedule_retry(state, fiber_id, attempt, %{error: "fiber read failed after exit"})
         end
     end
   end
@@ -2289,24 +2351,29 @@ defmodule Shuttle.Poller do
   # drag→inFlight resolves to `pause` for a worker that no longer exists and the
   # matching invoke (which reconciles) 409s. (C1-adjacent.)
   defp live_running?(%State{} = state, fiber_id) do
-    case Map.get(state.running, fiber_id) do
+    case running_worker(state, fiber_id) do
       nil -> false
       %{session: session} -> already_running_session?(state, session)
     end
   end
 
   defp reconcile_running_fiber(%State{} = state, fiber_id) do
-    case Map.get(state.running, fiber_id) do
-      nil ->
+    case {running_key(state, fiber_id), running_worker(state, fiber_id)} do
+      {nil, _} ->
         state
 
-      %{session: session} = meta ->
+      {_, nil} ->
+        state
+
+      {runtime_key, %{session: session} = meta} ->
+        fiber_id = fiber_address(meta)
+
         if already_running_session?(state, session) do
           state
         else
           Logger.info("Clearing stale running worker: #{fiber_id} session=#{session}")
           stop_watcher(meta)
-          remove_running(state, fiber_id)
+          remove_running(state, runtime_key)
         end
     end
   end
@@ -2463,12 +2530,14 @@ defmodule Shuttle.Poller do
   defp cancel_waiter_timeout(_), do: :ok
 
   defp remove_running(%State{} = state, fiber_id) do
+    metadata = Map.get(state.running, fiber_id, %{})
+    address = fiber_address(metadata)
     delete_persisted_running(state, fiber_id)
 
     %{
       state
       | running: Map.delete(state.running, fiber_id),
-        claimed: MapSet.delete(state.claimed, fiber_id)
+        claimed: state.claimed |> MapSet.delete(fiber_id) |> MapSet.delete(address)
     }
   end
 
@@ -2835,7 +2904,7 @@ defmodule Shuttle.Poller do
   defp adopt_known_orphan_session(%State{} = state, lookup, session) do
     case Map.get(lookup, session) do
       {:adopt, fiber_id} ->
-        if Map.has_key?(state.running, fiber_id) do
+        if running_key(state, fiber_id) != nil do
           state
         else
           adopt_session(state, fiber_id)
@@ -2951,8 +3020,11 @@ defmodule Shuttle.Poller do
     snap = build_snapshot(state)
 
     running_detail =
-      Enum.map(state.running, fn {fiber_id, meta} ->
+      Enum.map(state.running, fn {runtime_key, meta} ->
+        fiber_id = fiber_address(meta)
+
         %{
+          runtime_key: runtime_key,
           fiber_id: fiber_id,
           pid: inspect(meta.pid),
           session: meta.session,

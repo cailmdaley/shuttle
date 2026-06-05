@@ -2199,6 +2199,10 @@ defmodule Shuttle.PollerTest do
              }
            ] = Shuttle.RuntimeStore.list_running(runtime_store_path)
 
+    state = :sys.get_state(poller)
+    assert Map.has_key?(state.running, uid)
+    refute Map.has_key?(state.running, fiber_id)
+
     snap = Poller.snapshot(poller)
 
     assert %{
