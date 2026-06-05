@@ -152,12 +152,13 @@ func ResolveFiberPath(fiberID string) (string, error) {
 	return ref.Path, nil
 }
 
-// ResolveFiberInHost resolves an ID/query relative to the given felt store and
-// returns the canonical felt-store / fiber-id pair plus the realpath'd md file.
+// ResolveFiberInHost resolves an address, intrinsic UID, or query relative to
+// the given felt store and returns the canonical felt-store / fiber-address pair
+// plus the realpath'd md file.
 //
 // Exact lookup checks the bare and directory layouts directly. When neither
-// exists it falls back to `felt -C <host> ls -j <query>` so prefix/alias
-// resolution still works.
+// exists it falls back to `felt -C <host> ls -j <query>` so prefix/alias and
+// UID resolution still work.
 func ResolveFiberInHost(host, idOrQuery string) (*FiberRef, error) {
 	normalizedHost, err := expandUserPath(host)
 	if err != nil {
@@ -204,14 +205,15 @@ func exactFiberPath(host, fiberID string) (string, bool) {
 }
 
 func resolveFiberIDViaFelt(host, query string) (string, error) {
-	cmd := exec.Command("felt", "-C", host, "ls", "-j", query)
+	cmd := exec.Command("felt", "-C", host, "ls", "-j", query, "--json-field", "id,uid")
 	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("fiber %q not found (felt ls error: %v)", query, err)
 	}
 
 	var results []struct {
-		ID string `json:"id"`
+		ID  string `json:"id"`
+		UID string `json:"uid"`
 	}
 	if err := json.Unmarshal(out, &results); err != nil {
 		return "", fmt.Errorf("parsing felt ls output: %w", err)
@@ -220,7 +222,8 @@ func resolveFiberIDViaFelt(host, query string) (string, error) {
 }
 
 func chooseResolvedFiberID(query string, results []struct {
-	ID string `json:"id"`
+	ID  string `json:"id"`
+	UID string `json:"uid"`
 }) (string, error) {
 	if len(results) == 0 {
 		return "", fmt.Errorf("fiber %q not found", query)
@@ -231,7 +234,7 @@ func chooseResolvedFiberID(query string, results []struct {
 		if result.ID == "" {
 			continue
 		}
-		if result.ID == query {
+		if result.ID == query || result.UID == query {
 			return result.ID, nil
 		}
 		ids = append(ids, result.ID)
