@@ -44,4 +44,48 @@ defmodule Shuttle.StandingRoleTest do
       assert StandingRole.state(role(%{"enabled" => false}), @now, true) == "running"
     end
   end
+
+  describe "dispatch_run_id — resume keeps the run id, fresh/accepted mints a new one" do
+    @resume_now ~U[2026-06-05 16:04:19Z]
+
+    test "a resumed run (preserved run_id, no accepted_run_id) keeps the awaiting run's id" do
+      # LifecycleStore.resume leaves review = {state: scheduled, run_id: <preserved>}
+      # and sets next_due_at = now. dispatch_run_id must return the preserved id,
+      # NOT strftime(next_due_at) — otherwise the run window excludes the resume
+      # directive and the dispatcher silently falls back to :fresh.
+      resumed =
+        role(%{
+          "review" => %{"state" => "scheduled", "run_id" => "20260605T070000+0000"},
+          "next_due_at" => "2026-06-05T16:04:19Z"
+        })
+
+      assert StandingRole.dispatch_run_id(resumed, @resume_now) == "20260605T070000+0000"
+    end
+
+    test "an accepted run (accepted_run_id == run_id) mints a fresh id from next_due_at" do
+      # accept advances the recurrence; the next run is genuinely new, so the id
+      # comes from next_due_at (the next cron occurrence), not the accepted run.
+      accepted =
+        role(%{
+          "review" => %{
+            "state" => "scheduled",
+            "run_id" => "20260605T070000+0000",
+            "accepted_run_id" => "20260605T070000+0000"
+          },
+          "next_due_at" => "2026-06-08T09:00:00+02:00"
+        })
+
+      assert StandingRole.dispatch_run_id(accepted, @resume_now) ==
+               StandingRole.next_run_id(accepted, @resume_now)
+
+      refute StandingRole.dispatch_run_id(accepted, @resume_now) == "20260605T070000+0000"
+    end
+
+    test "a fresh scheduled role (no run_id) mints from next_due_at" do
+      fresh = role(%{"review" => %{"state" => "scheduled"}, "next_due_at" => "2026-06-08T09:00:00+02:00"})
+
+      assert StandingRole.dispatch_run_id(fresh, @resume_now) ==
+               StandingRole.next_run_id(fresh, @resume_now)
+    end
+  end
 end

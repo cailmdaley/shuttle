@@ -67,7 +67,8 @@ start:
 	@if pgrep -f '$(PIDPATTERN)' >/dev/null; then \
 	  echo "shuttle already running (pid $$(pgrep -f '$(PIDPATTERN)'))"; exit 1; \
 	fi
-	@nohup bin/shuttle start > $(LOG) 2>&1 &
+	@echo "=== shuttle start $$(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> $(LOG)
+	@nohup bin/shuttle start >> $(LOG) 2>&1 &
 	@sleep 1
 	@if pgrep -f '$(PIDPATTERN)' >/dev/null; then \
 	  echo "shuttle started (pid $$(pgrep -f '$(PIDPATTERN)')); logs → $(LOG)"; \

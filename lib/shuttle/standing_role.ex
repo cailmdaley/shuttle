@@ -103,6 +103,35 @@ defmodule Shuttle.StandingRole do
     Calendar.strftime(now, "%Y%m%dT%H%M%S%z")
   end
 
+  @doc """
+  Run id for a *scheduled* (non-ad-hoc) standing dispatch.
+
+  A **resumed** run continues the awaiting run, so it must keep that run's id;
+  a fresh scheduled run mints a new one from `next_due_at`. The distinction is
+  written by the lifecycle verbs: `LifecycleStore.resume` preserves
+  `review.run_id` and leaves `accepted_run_id` nil (the run continues), whereas
+  `accept` sets `accepted_run_id == run_id` (the run is done — the next dispatch
+  is a genuinely new run).
+
+  Keeping the id on resume is load-bearing: the run id drives the review-comment
+  window (`Dispatcher.run_window_start`/`parse_run_id`). `resume` sets
+  `next_due_at = now`, so minting the id from `next_due_at` would put the window
+  start *after* the `resume_mode: previous` directive that the same gesture filed
+  a beat earlier — it falls outside its own run window and `check_resume_intent`
+  silently falls back to `:fresh`. (That made the kanban Resume button behave
+  exactly like New session — see gotcha-standing-role-resume-button-grayed.)
+  """
+  @spec dispatch_run_id(t(), DateTime.t()) :: String.t()
+  def dispatch_run_id(%__MODULE__{run_id: run_id, review: review} = role, now) do
+    accepted = review && review["accepted_run_id"]
+
+    if is_binary(run_id) and run_id != "" and (is_nil(accepted) or accepted == "") do
+      run_id
+    else
+      next_run_id(role, now)
+    end
+  end
+
   @spec ad_hoc_run_id(DateTime.t()) :: String.t()
   def ad_hoc_run_id(%DateTime{} = now) do
     "adhoc-#{DateTime.to_unix(now, :millisecond)}"

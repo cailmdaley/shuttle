@@ -56,7 +56,7 @@ defmodule Shuttle.Poller do
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   @default_max_retry_backoff_ms 300_000
-  @felt_shuttle_projection_fields "id,status,created_at,shuttle,depends_on,tempered"
+  @felt_shuttle_projection_fields "id,uid,status,created_at,shuttle,depends_on,tempered"
 
   defmodule State do
     @moduledoc false
@@ -104,6 +104,12 @@ defmodule Shuttle.Poller do
       # poll cycle and by host_for_fiber/2 on demand. Entries are never evicted
       # automatically; call bust_fiber_host_cache/1 when a fiber moves hosts.
       fiber_host_cache: %{},
+      # %{fiber_id => uid} — intrinsic frontmatter identity from felt's JSON
+      # projection. The poller still addresses fibers by slug-shaped
+      # fiber_id until the full dispatcher/session cutover carries path
+      # resolution everywhere; uid is exposed on runtime surfaces as the join
+      # key for document cards.
+      fiber_uid_cache: %{},
       # %{fiber_id => %{reason: term, attempted_at: DateTime.t, attempts:
       # pos_integer}} — fibers the dispatcher rejected with an error other
       # than :already_running. Surfaced in the snapshot's `blocked` list so
@@ -868,8 +874,15 @@ defmodule Shuttle.Poller do
   # down with the Task.
   defp poll_reads(%State{} = state) do
     state = refresh_felt_stores(state)
-    {:ok, candidates, host_map} = discover_candidates(state)
-    {:ok, %{felt_stores: state.felt_stores, candidates: candidates, host_map: host_map}}
+    {:ok, candidates, host_map, uid_map} = discover_candidates(state)
+
+    {:ok,
+     %{
+       felt_stores: state.felt_stores,
+       candidates: candidates,
+       host_map: host_map,
+       uid_map: uid_map
+     }}
   rescue
     error ->
       {:error, Exception.format(:error, error, __STACKTRACE__)}
@@ -889,7 +902,8 @@ defmodule Shuttle.Poller do
   defp apply_poll_cycle(%State{} = state, %{
          felt_stores: felt_stores,
          candidates: candidates,
-         host_map: new_host_map
+         host_map: new_host_map,
+         uid_map: new_uid_map
        }) do
     state = reconcile(%{state | felt_stores: felt_stores})
 
@@ -901,6 +915,7 @@ defmodule Shuttle.Poller do
     state = %{
       state
       | fiber_host_cache: Map.merge(new_host_map, state.fiber_host_cache),
+        fiber_uid_cache: Map.merge(new_uid_map, state.fiber_uid_cache),
         standing_roles: standing_roles,
         lifecycle: lifecycle,
         dispatch_failures: evict_stale_dispatch_failures(state.dispatch_failures, candidates)
@@ -1044,9 +1059,10 @@ defmodule Shuttle.Poller do
   # shuttle: frontmatter block. No tag predicate — the block is the source of
   # truth, matching the same shuttle-block contract every other surface reads.
   #
-  # Returns {:ok, fibers, host_map} where:
-  #   fibers   — [%{"id" => id, "status" => status}] across all hosts
+  # Returns {:ok, fibers, host_map, uid_map} where:
+  #   fibers   — [%{"id" => id, "uid" => uid, "status" => status}] across all hosts
   #   host_map — %{fiber_id => felt_store} for host resolution
+  #   uid_map  — %{fiber_id => uid} for the intrinsic identity read surface
   #
   # ## Symlink discipline
   #
@@ -1090,8 +1106,8 @@ defmodule Shuttle.Poller do
   # cases (hard links, etc.) where two physically-distinct paths point at
   # the same inode and both pass the symlink filter.
   defp discover_candidates(state) do
-    {all_fibers, host_map} =
-      Enum.reduce(state.felt_stores, {[], %{}}, fn host, {acc_fibers, acc_map} ->
+    {all_fibers, host_map, uid_map} =
+      Enum.reduce(state.felt_stores, {[], %{}, %{}}, fn host, {acc_fibers, acc_map, acc_uids} ->
         owned_ids = owned_fiber_ids(host)
 
         case list_shuttle_fibers(host, owned_ids, state) do
@@ -1102,15 +1118,27 @@ defmodule Shuttle.Poller do
                 Map.put(hm, id, host)
               end)
 
+            new_uids =
+              Enum.reduce(fibers, %{}, fn fiber, uids ->
+                case {Map.get(fiber, "id"), Map.get(fiber, "uid")} do
+                  {id, uid} when is_binary(id) and id != "" and is_binary(uid) and uid != "" ->
+                    Map.put(uids, id, uid)
+
+                  _ ->
+                    uids
+                end
+              end)
+
             merged_map = Map.merge(new_map, acc_map)
-            {acc_fibers ++ fibers, merged_map}
+            merged_uids = Map.merge(new_uids, acc_uids)
+            {acc_fibers ++ fibers, merged_map, merged_uids}
 
           {:error, _} ->
-            {acc_fibers, acc_map}
+            {acc_fibers, acc_map, acc_uids}
         end
       end)
 
-    {:ok, all_fibers, host_map}
+    {:ok, all_fibers, host_map, uid_map}
   end
 
   # Walk <host>/.felt/ and return the set of fiber IDs physically rooted in
@@ -2610,7 +2638,10 @@ defmodule Shuttle.Poller do
           if Keyword.get(opts, :ad_hoc, false) do
             {:standing_run, StandingRole.ad_hoc_run_id(now), :ad_hoc}
           else
-            {:standing_run, StandingRole.next_run_id(role, now)}
+            # A resumed run keeps the awaiting run's id so the review-comment
+            # window covers the just-filed resume directive; only a fresh
+            # scheduled run mints a new id. See StandingRole.dispatch_run_id.
+            {:standing_run, StandingRole.dispatch_run_id(role, now)}
           end
         else
           :constitution
