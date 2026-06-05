@@ -30,6 +30,11 @@ ssh candide "cd ~/Documents/projects/shuttle && git pull && make all"
 ssh cineca  "cd ~/Documents/projects/shuttle && git pull && make all"
 ```
 
+After a remote deploy, verify both `/api/v1/version` and one behavior-shaped
+payload. A new `git_short_sha` only proves `BuildInfo` was rebuilt; if the live
+payload still has old semantics, run `make clean && make build`, then let the
+respawn loop restart the daemon from the clean escript.
+
 Candide: OTP 27.3.4.12 pinned in `~/.tool-versions` (OTP 28.0.2 had a compilation crash — do not upgrade to 28.0.x). Daemon log: `~/.shuttle/shuttle.log`. Respawn loop in tmux session `shuttle-daemon`; `make stop` lets it auto-restart with the new binary.
 
 **Two artifacts, two languages, two release cadences.** The Elixir daemon

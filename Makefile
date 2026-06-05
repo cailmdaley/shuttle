@@ -13,7 +13,10 @@
 # never implies rebuilding the other; `make all` does both.
 
 LOG := $(HOME)/Library/Logs/shuttle.log
-PIDPATTERN := bin/shuttle -B .* -extra bin/shuttle start
+# Match both the local `bin/shuttle ... -extra bin/shuttle start` shape and
+# remote respawn-loop `./bin/shuttle ... -extra ./bin/shuttle start` shape.
+# `[b]in` prevents pgrep from matching its own shell command.
+PIDPATTERN := [b]in/shuttle -B .* -extra \.?/?bin/shuttle start
 CLI_DEST := $(HOME)/go/bin/shuttle-ctl
 
 .PHONY: all build cli start stop restart logs status clean help
