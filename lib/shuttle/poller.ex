@@ -719,7 +719,11 @@ defmodule Shuttle.Poller do
   defp runtime_by_fiber(%State{} = state, snap, now) do
     state.lifecycle
     |> Enum.reduce(%{}, fn {fiber_id, metadata}, acc ->
-      Map.put(acc, fiber_id, lifecycle_runtime(fiber_id, metadata, state))
+      Map.put(
+        acc,
+        runtime_entry_key(state, fiber_id, metadata),
+        lifecycle_runtime(fiber_id, metadata, state)
+      )
     end)
     |> merge_running_runtime(snap.eligible, state)
     |> merge_retry_runtime(snap.retrying, state)
@@ -747,8 +751,9 @@ defmodule Shuttle.Poller do
   defp merge_running_runtime(runtime, running, state) do
     Enum.reduce(running, runtime, fn worker, acc ->
       fiber_id = worker.fiber_id
+      runtime_key = runtime_entry_key(state, fiber_id, worker)
 
-      Map.update(acc, fiber_id, running_runtime(worker, state), fn existing ->
+      Map.update(acc, runtime_key, running_runtime(worker, state), fn existing ->
         existing
         |> Map.merge(running_runtime(worker, state))
         |> Map.put(:phase, "running")
@@ -775,8 +780,9 @@ defmodule Shuttle.Poller do
   defp merge_retry_runtime(runtime, retrying, state) do
     Enum.reduce(retrying, runtime, fn retry, acc ->
       fiber_id = retry.fiber_id
+      runtime_key = runtime_entry_key(state, fiber_id, retry)
 
-      Map.update(acc, fiber_id, retry_runtime(retry, state), fn existing ->
+      Map.update(acc, runtime_key, retry_runtime(retry, state), fn existing ->
         existing
         |> Map.merge(retry_runtime(retry, state))
         |> Map.put(:phase, "retrying")
@@ -801,8 +807,9 @@ defmodule Shuttle.Poller do
   defp merge_standing_runtime(runtime, standing_roles, now, state) do
     Enum.reduce(standing_roles, runtime, fn role, acc ->
       fiber_id = role.fiber_id
+      runtime_key = runtime_entry_key(state, fiber_id)
 
-      Map.update(acc, fiber_id, standing_runtime(role, now, state), fn existing ->
+      Map.update(acc, runtime_key, standing_runtime(role, now, state), fn existing ->
         existing
         |> Map.merge(standing_runtime(role, now, state))
         |> preserve_active_phase()
@@ -866,6 +873,10 @@ defmodule Shuttle.Poller do
       uid when is_binary(uid) and uid != "" -> uid
       _ -> nil
     end
+  end
+
+  defp runtime_entry_key(%State{} = state, fiber_id, metadata \\ %{}) do
+    uid_for_fiber(state, fiber_id, metadata) || fiber_id
   end
 
   defp metadata_uid(metadata) when is_map(metadata) do

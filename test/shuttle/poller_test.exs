@@ -2198,6 +2198,17 @@ defmodule Shuttle.PollerTest do
                metadata: %{fiber_id: ^fiber_id, uid: ^uid}
              }
            ] = Shuttle.RuntimeStore.list_running(runtime_store_path)
+
+    snap = Poller.snapshot(poller)
+
+    assert %{
+             fiber_id: ^fiber_id,
+             uid: ^uid,
+             phase: "running",
+             running: true
+           } = Map.fetch!(snap.runtime, uid)
+
+    refute Map.has_key?(snap.runtime, fiber_id)
   after
     cleanup_runtime_store_paths()
   end

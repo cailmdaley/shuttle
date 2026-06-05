@@ -610,14 +610,21 @@ defmodule ShuttleWeb.APIControllerTest do
     # Availability is the daemon's running-branch set (no reopen/dispatch-ad-hoc).
     avail_conn = get(api_conn(), "/api/v1/actions/#{fiber_id}")
     assert avail_conn.status == 200
-    available_ids = avail_conn.resp_body |> Jason.decode!() |> Map.fetch!("actions") |> Enum.map(& &1["id"])
+
+    available_ids =
+      avail_conn.resp_body |> Jason.decode!() |> Map.fetch!("actions") |> Enum.map(& &1["id"])
+
     # Sanity: a running fiber's set is pause + close-*, never reopen.
     assert "pause" in available_ids
     refute "reopen" in available_ids
 
     for target <- ["drafts", "inFlight", "awaitingReview", "tempered", "composted"] do
       resolve_conn =
-        post(api_conn(), "/api/v1/actions/resolve", Jason.encode!(%{fiber_id: fiber_id, target: target}))
+        post(
+          api_conn(),
+          "/api/v1/actions/resolve",
+          Jason.encode!(%{fiber_id: fiber_id, target: target})
+        )
 
       assert resolve_conn.status == 200, "resolve #{target} should 200 for a running owned fiber"
       action_id = resolve_conn.resp_body |> Jason.decode!() |> get_in(["action", "id"])
@@ -903,10 +910,12 @@ defmodule ShuttleWeb.APIControllerTest do
     assert body["host"] != nil
     assert is_list(body["eligible"])
     assert is_list(body["running_detail"])
-    assert body["runtime"]["tests/state"]["phase"] == "running"
-    assert body["runtime"]["tests/state"]["uid"] == uid
+    assert body["runtime"][uid]["fiber_id"] == "tests/state"
+    assert body["runtime"][uid]["phase"] == "running"
+    assert body["runtime"][uid]["uid"] == uid
+    refute Map.has_key?(body["runtime"], "tests/state")
     assert [%{"fiber_id" => "tests/state", "uid" => ^uid}] = body["eligible"]
-    assert body["runtime"]["tests/state"]["tmux_session"] == "state-shuttle"
+    assert body["runtime"][uid]["tmux_session"] == "state-shuttle"
     assert is_list(body["reservations"])
     assert is_list(body["waiters"])
   end
