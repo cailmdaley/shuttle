@@ -889,7 +889,8 @@ defmodule ShuttleWeb.APIControllerTest do
   # ── GET /api/v1/state ──
 
   test "state returns full orchestrator state" do
-    fiber = make_fiber("tests/state")
+    uid = "01KTCA2CWXBSNHETE66MXKPVE7"
+    fiber = make_fiber("tests/state", %{"uid" => uid})
     MockRunner.set_fiber("tests/state", fiber)
     MockRunner.set_shuttle("tests/state", @oneshot_shuttle)
 
@@ -903,6 +904,8 @@ defmodule ShuttleWeb.APIControllerTest do
     assert is_list(body["eligible"])
     assert is_list(body["running_detail"])
     assert body["runtime"]["tests/state"]["phase"] == "running"
+    assert body["runtime"]["tests/state"]["uid"] == uid
+    assert [%{"fiber_id" => "tests/state", "uid" => ^uid}] = body["eligible"]
     assert body["runtime"]["tests/state"]["tmux_session"] == "state-shuttle"
     assert is_list(body["reservations"])
     assert is_list(body["waiters"])

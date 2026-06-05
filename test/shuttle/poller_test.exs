@@ -466,7 +466,7 @@ defmodule Shuttle.PollerTest do
                    "--has-field",
                    "shuttle",
                    "--json-field",
-                   "id,status,created_at,shuttle,depends_on,tempered"
+                   "id,uid,status,created_at,shuttle,depends_on,tempered"
                  ]
              end)
            end)

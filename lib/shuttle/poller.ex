@@ -213,7 +213,11 @@ defmodule Shuttle.Poller do
           keyword()
         ) :: {:ok, String.t()} | {:error, term()}
   def lifecycle_transition(server, verb, fiber_id, opts) do
-    GenServer.call(server, {:lifecycle_transition, verb, fiber_id, opts}, @dispatch_call_timeout_ms)
+    GenServer.call(
+      server,
+      {:lifecycle_transition, verb, fiber_id, opts},
+      @dispatch_call_timeout_ms
+    )
   end
 
   @spec wait_for_tempered(String.t(), non_neg_integer(), keyword()) ::
@@ -658,6 +662,7 @@ defmodule Shuttle.Poller do
       Enum.map(state.running, fn {fiber_id, meta} ->
         %{
           fiber_id: fiber_id,
+          uid: uid_for_fiber(state, fiber_id, meta),
           felt_store: Map.get(state.fiber_host_cache, fiber_id),
           tmux_session: meta.session,
           agent: meta.agent_id,
@@ -673,6 +678,7 @@ defmodule Shuttle.Poller do
       Enum.map(state.retry_queue, fn {fiber_id, retry} ->
         %{
           fiber_id: fiber_id,
+          uid: uid_for_fiber(state, fiber_id),
           attempt: retry.attempt,
           due_in_ms: max(0, retry.due_at_ms - now_ms),
           error: Map.get(retry, :error)
@@ -683,6 +689,7 @@ defmodule Shuttle.Poller do
       Enum.map(state.dispatch_failures, fn {fiber_id, entry} ->
         %{
           fiber_id: fiber_id,
+          uid: uid_for_fiber(state, fiber_id),
           reason: format_block_reason(entry.reason),
           attempts: entry.attempts,
           attempted_at: DateTime.to_unix(entry.attempted_at, :millisecond),
@@ -701,7 +708,7 @@ defmodule Shuttle.Poller do
       blocked: blocked,
       orphans: state.orphans,
       retrying: retrying,
-      standing_roles: standing_role_snapshots(state.standing_roles, state.running, now),
+      standing_roles: standing_role_snapshots(state.standing_roles, state.running, now, state),
       claimed_count: MapSet.size(state.claimed),
       max_concurrent: state.max_concurrent_workers
     }
@@ -712,18 +719,19 @@ defmodule Shuttle.Poller do
   defp runtime_by_fiber(%State{} = state, snap, now) do
     state.lifecycle
     |> Enum.reduce(%{}, fn {fiber_id, metadata}, acc ->
-      Map.put(acc, fiber_id, lifecycle_runtime(fiber_id, metadata))
+      Map.put(acc, fiber_id, lifecycle_runtime(fiber_id, metadata, state))
     end)
-    |> merge_running_runtime(snap.eligible)
-    |> merge_retry_runtime(snap.retrying)
-    |> merge_standing_runtime(snap.standing_roles, now)
+    |> merge_running_runtime(snap.eligible, state)
+    |> merge_retry_runtime(snap.retrying, state)
+    |> merge_standing_runtime(snap.standing_roles, now, state)
   end
 
-  defp lifecycle_runtime(fiber_id, metadata) do
+  defp lifecycle_runtime(fiber_id, metadata, state) do
     review = stringify_keys(Map.get(metadata, :review, %{}))
 
     %{
       fiber_id: fiber_id,
+      uid: uid_for_fiber(state, fiber_id, metadata),
       kind: Map.get(metadata, :kind, "oneshot"),
       phase: Map.get(metadata, :phase) || Map.get(review, "state") || "scheduled",
       run_id: Map.get(metadata, :run_id),
@@ -736,21 +744,22 @@ defmodule Shuttle.Poller do
     |> compact_runtime()
   end
 
-  defp merge_running_runtime(runtime, running) do
+  defp merge_running_runtime(runtime, running, state) do
     Enum.reduce(running, runtime, fn worker, acc ->
       fiber_id = worker.fiber_id
 
-      Map.update(acc, fiber_id, running_runtime(worker), fn existing ->
+      Map.update(acc, fiber_id, running_runtime(worker, state), fn existing ->
         existing
-        |> Map.merge(running_runtime(worker))
+        |> Map.merge(running_runtime(worker, state))
         |> Map.put(:phase, "running")
       end)
     end)
   end
 
-  defp running_runtime(worker) do
+  defp running_runtime(worker, state) do
     %{
       fiber_id: worker.fiber_id,
+      uid: uid_for_fiber(state, worker.fiber_id, worker),
       phase: "running",
       running: true,
       tmux_session: worker.tmux_session,
@@ -763,21 +772,22 @@ defmodule Shuttle.Poller do
     |> compact_runtime()
   end
 
-  defp merge_retry_runtime(runtime, retrying) do
+  defp merge_retry_runtime(runtime, retrying, state) do
     Enum.reduce(retrying, runtime, fn retry, acc ->
       fiber_id = retry.fiber_id
 
-      Map.update(acc, fiber_id, retry_runtime(retry), fn existing ->
+      Map.update(acc, fiber_id, retry_runtime(retry, state), fn existing ->
         existing
-        |> Map.merge(retry_runtime(retry))
+        |> Map.merge(retry_runtime(retry, state))
         |> Map.put(:phase, "retrying")
       end)
     end)
   end
 
-  defp retry_runtime(retry) do
+  defp retry_runtime(retry, state) do
     %{
       fiber_id: retry.fiber_id,
+      uid: uid_for_fiber(state, retry.fiber_id, retry),
       phase: "retrying",
       retry: %{
         attempt: retry.attempt,
@@ -788,21 +798,22 @@ defmodule Shuttle.Poller do
     |> compact_runtime()
   end
 
-  defp merge_standing_runtime(runtime, standing_roles, now) do
+  defp merge_standing_runtime(runtime, standing_roles, now, state) do
     Enum.reduce(standing_roles, runtime, fn role, acc ->
       fiber_id = role.fiber_id
 
-      Map.update(acc, fiber_id, standing_runtime(role, now), fn existing ->
+      Map.update(acc, fiber_id, standing_runtime(role, now, state), fn existing ->
         existing
-        |> Map.merge(standing_runtime(role, now))
+        |> Map.merge(standing_runtime(role, now, state))
         |> preserve_active_phase()
       end)
     end)
   end
 
-  defp standing_runtime(role, now) do
+  defp standing_runtime(role, now, state) do
     %{
       fiber_id: role.fiber_id,
+      uid: uid_for_fiber(state, role.fiber_id),
       kind: "standing",
       phase: standing_phase(role),
       state: role.state,
@@ -849,6 +860,23 @@ defmodule Shuttle.Poller do
   defp unix_ms(%DateTime{} = datetime), do: DateTime.to_unix(datetime, :millisecond)
   defp unix_ms(value) when is_integer(value), do: value
   defp unix_ms(_), do: nil
+
+  defp uid_for_fiber(%State{} = state, fiber_id, metadata \\ %{}) do
+    case metadata_uid(metadata) || Map.get(state.fiber_uid_cache, fiber_id) do
+      uid when is_binary(uid) and uid != "" -> uid
+      _ -> nil
+    end
+  end
+
+  defp metadata_uid(metadata) when is_map(metadata) do
+    case {Map.get(metadata, :uid), Map.get(metadata, "uid")} do
+      {uid, _} when is_binary(uid) and uid != "" -> uid
+      {_, uid} when is_binary(uid) and uid != "" -> uid
+      _ -> nil
+    end
+  end
+
+  defp metadata_uid(_), do: nil
 
   # Stringifies dispatch-failure reasons for the snapshot. Atoms become their
   # name (':missing_session_id' is more useful in the UI than the raw atom);
@@ -917,7 +945,7 @@ defmodule Shuttle.Poller do
       | fiber_host_cache: Map.merge(new_host_map, state.fiber_host_cache),
         fiber_uid_cache: Map.merge(new_uid_map, state.fiber_uid_cache),
         standing_roles: standing_roles,
-        lifecycle: lifecycle,
+        lifecycle: Map.merge(state.lifecycle, lifecycle),
         dispatch_failures: evict_stale_dispatch_failures(state.dispatch_failures, candidates)
     }
 
@@ -1796,6 +1824,7 @@ defmodule Shuttle.Poller do
           %{
             session: session,
             agent_id: agent.id,
+            uid: Map.get(fiber, "uid"),
             started_at: now,
             last_activity_at: now
           }
@@ -1986,7 +2015,11 @@ defmodule Shuttle.Poller do
   defp overlay_runtime_lifecycle(fiber, fiber_id, %State{} = state) do
     case Map.get(fiber, "shuttle") do
       shuttle when is_map(shuttle) ->
-        Map.put(fiber, "shuttle", merge_lifecycle_overlay(shuttle, runtime_lifecycle(state, fiber_id)))
+        Map.put(
+          fiber,
+          "shuttle",
+          merge_lifecycle_overlay(shuttle, runtime_lifecycle(state, fiber_id))
+        )
 
       _ ->
         fiber
@@ -2147,6 +2180,7 @@ defmodule Shuttle.Poller do
           running_meta = %{
             session: session,
             agent_id: agent.id,
+            uid: Map.get(fiber, "uid"),
             started_at: now,
             last_activity_at: now
           }
@@ -2717,9 +2751,11 @@ defmodule Shuttle.Poller do
 
   defp stringify_keys(_), do: %{}
 
-  defp standing_role_snapshots(roles, running, now) do
+  defp standing_role_snapshots(roles, running, now, state) do
     Enum.map(roles, fn role ->
-      StandingRole.to_snapshot(role, now, Map.has_key?(running, role.fiber_id))
+      role
+      |> StandingRole.to_snapshot(now, Map.has_key?(running, role.fiber_id))
+      |> Map.put(:uid, uid_for_fiber(state, role.fiber_id))
     end)
   end
 
@@ -2749,7 +2785,7 @@ defmodule Shuttle.Poller do
   end
 
   defp candidate_session_lookup(%State{} = state) do
-    {:ok, candidates, _host_map} = discover_candidates(state)
+    {:ok, candidates, _host_map, _uid_map} = discover_candidates(state)
 
     candidates
     |> Enum.reduce(%{}, fn fiber, acc ->
