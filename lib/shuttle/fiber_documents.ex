@@ -185,16 +185,14 @@ defmodule Shuttle.FiberDocuments do
     # `path` (and thus the physical file location) is derived from felt's
     # traversal id *before* we overwrite `id` — it stays store-relative so
     # remote clients open the file via `felt_store` + `path`. The card's logical
-    # `id`, by contrast, is canonicalized: realpath → enclosing .felt → slug,
-    # the one rule shared with /state runtime keying. For a fiber physically
-    # rooted in this store the two coincide; for a symlink-traversed fiber (loom
-    # walking through `loom/.felt/shapepipe → project/.felt`) the canonical id
-    # drops the store prefix to match the project-relative runtime key.
+    # `id`, by contrast, prefers felt's intrinsic frontmatter `uid` when present,
+    # with the migration-era markdown/frontmatter read and canonical slug as
+    # fallbacks for older felt binaries and unbackfilled fibers.
     path = relative_felt_path(fiber)
     full_path = Path.join([store, ".felt", path])
 
     canonical_id = canonical_id(full_path, id)
-    logical_id = logical_id(full_path, canonical_id)
+    logical_id = logical_id(fiber, full_path, canonical_id)
 
     fiber =
       fiber
@@ -225,7 +223,17 @@ defmodule Shuttle.FiberDocuments do
   defp put_slug(%{"id" => id} = fiber, id), do: fiber
   defp put_slug(fiber, slug), do: Map.put(fiber, "slug", slug)
 
-  defp logical_id(full_path, fallback) do
+  defp logical_id(fiber, full_path, fallback) do
+    case Map.get(fiber, "uid") do
+      uid when is_binary(uid) ->
+        if ulid?(uid), do: uid, else: logical_id_from_file(full_path, fallback)
+
+      _ ->
+        logical_id_from_file(full_path, fallback)
+    end
+  end
+
+  defp logical_id_from_file(full_path, fallback) do
     case frontmatter_ulid(full_path) do
       {:ok, id} -> id
       :error -> canonical_id(full_path, fallback)
