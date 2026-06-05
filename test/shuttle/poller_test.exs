@@ -1651,6 +1651,124 @@ defmodule Shuttle.PollerTest do
     cleanup_runtime_store_paths()
   end
 
+  test "poller keeps retry queue under intrinsic uid when present" do
+    fiber_id = "tests/retry-uid-keyed"
+    uid = "01KTCA2CWXBSNHETE66MXKPVE7"
+    runtime_store_path = runtime_store_path()
+
+    fiber = make_fiber(fiber_id, %{"uid" => uid})
+    MockRunner.set_fiber(fiber_id, fiber)
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_retry_uid_keyed,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"],
+        runtime_store_path: runtime_store_path
+      )
+
+    assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, [])
+
+    MockRunner.remove_tmux_session(session)
+    send(poller, {:worker_exited, fiber_id, :normal_exit, false})
+
+    assert wait_until(fn ->
+             Poller.snapshot(poller).retrying
+             |> Enum.any?(&(&1.fiber_id == fiber_id and &1.uid == uid))
+           end)
+
+    state = :sys.get_state(poller)
+    assert Map.has_key?(state.retry_queue, uid)
+    refute Map.has_key?(state.retry_queue, fiber_id)
+    assert MapSet.member?(state.claimed, fiber_id)
+
+    assert [
+             %{
+               fiber_id: ^fiber_id,
+               runtime_key: ^uid,
+               uid: ^uid,
+               metadata: %{fiber_id: ^fiber_id, uid: ^uid, delay_type: :continuation}
+             }
+           ] = Shuttle.RuntimeStore.list_retries(runtime_store_path)
+
+    snap = Poller.snapshot(poller)
+
+    assert %{
+             fiber_id: ^fiber_id,
+             uid: ^uid,
+             phase: "retrying"
+           } = Map.fetch!(snap.runtime, uid)
+
+    refute Map.has_key?(snap.runtime, fiber_id)
+  after
+    cleanup_runtime_store_paths()
+  end
+
+  test "poller keeps standing lifecycle cache under intrinsic uid when present" do
+    fiber_id = "tests/standing-lifecycle-uid-keyed"
+    uid = "01KTCA2CWXBSNHETE66MXKPVE7"
+    runtime_store_path = runtime_store_path()
+
+    fiber = make_fiber(fiber_id, %{"uid" => uid, "tags" => ["constitution", "standing"]})
+    MockRunner.set_fiber(fiber_id, fiber)
+
+    MockRunner.set_shuttle(
+      fiber_id,
+      """
+      enabled: true
+      kind: standing
+      schedule:
+        expr: "0 9 * * 1"
+        tz: Europe/Paris
+      review:
+        state: scheduled
+      """
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_lifecycle_uid_keyed,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"],
+        runtime_store_path: runtime_store_path
+      )
+
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             Poller.snapshot(poller).standing_roles
+             |> Enum.any?(&(&1.fiber_id == fiber_id and &1.uid == uid))
+           end)
+
+    state = :sys.get_state(poller)
+    assert Map.has_key?(state.lifecycle, uid)
+    refute Map.has_key?(state.lifecycle, fiber_id)
+
+    assert [
+             %{
+               fiber_id: ^fiber_id,
+               runtime_key: ^uid,
+               uid: ^uid,
+               metadata: %{fiber_id: ^fiber_id, uid: ^uid, kind: "standing"}
+             }
+           ] = Shuttle.RuntimeStore.list_lifecycle(runtime_store_path)
+
+    snap = Poller.snapshot(poller)
+
+    assert %{
+             fiber_id: ^fiber_id,
+             uid: ^uid,
+             kind: "standing"
+           } = Map.fetch!(snap.runtime, uid)
+
+    refute Map.has_key?(snap.runtime, fiber_id)
+  after
+    cleanup_runtime_store_paths()
+  end
+
   test "force-dispatch honors resume_mode: previous review-comment (unified resume path)" do
     # The old kanban-modal flow had two separate paths: "New session"
     # (ad-hoc, force-fresh) and "Resume" (a special accept-then-dispatch

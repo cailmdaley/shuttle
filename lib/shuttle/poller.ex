@@ -680,10 +680,12 @@ defmodule Shuttle.Poller do
       end)
 
     retrying =
-      Enum.map(state.retry_queue, fn {fiber_id, retry} ->
+      Enum.map(state.retry_queue, fn {_runtime_key, retry} ->
+        fiber_id = fiber_address(retry)
+
         %{
           fiber_id: fiber_id,
-          uid: uid_for_fiber(state, fiber_id),
+          uid: uid_for_fiber(state, fiber_id, retry),
           attempt: retry.attempt,
           due_in_ms: max(0, retry.due_at_ms - now_ms),
           error: Map.get(retry, :error)
@@ -922,6 +924,54 @@ defmodule Shuttle.Poller do
     case running_key(state, fiber_id) do
       nil -> nil
       key -> Map.get(state.running, key)
+    end
+  end
+
+  defp retry_key(%State{} = state, fiber_id) when is_binary(fiber_id) do
+    cond do
+      Map.has_key?(state.retry_queue, fiber_id) ->
+        fiber_id
+
+      true ->
+        Enum.find_value(state.retry_queue, fn {key, metadata} ->
+          address = fiber_address(metadata)
+          uid = metadata_uid(metadata)
+
+          if fiber_id in [address, uid], do: key
+        end)
+    end
+  end
+
+  defp retry_key(_, _), do: nil
+
+  defp retry_record(%State{} = state, fiber_id) do
+    case retry_key(state, fiber_id) do
+      nil -> nil
+      key -> Map.get(state.retry_queue, key)
+    end
+  end
+
+  defp lifecycle_key(%State{} = state, fiber_id) when is_binary(fiber_id) do
+    cond do
+      Map.has_key?(state.lifecycle, fiber_id) ->
+        fiber_id
+
+      true ->
+        Enum.find_value(state.lifecycle, fn {key, metadata} ->
+          address = fiber_address(metadata)
+          uid = metadata_uid(metadata)
+
+          if fiber_id in [address, uid], do: key
+        end)
+    end
+  end
+
+  defp lifecycle_key(_, _), do: nil
+
+  defp lifecycle_record(%State{} = state, fiber_id) do
+    case lifecycle_key(state, fiber_id) do
+      nil -> nil
+      key -> Map.get(state.lifecycle, key)
     end
   end
 
@@ -1667,9 +1717,14 @@ defmodule Shuttle.Poller do
       case standing_role_from_fiber(fiber, state) do
         {:ok, role} ->
           if StandingRole.standing?(role) do
-            metadata = lifecycle_metadata_from_role(role)
+            metadata =
+              role
+              |> lifecycle_metadata_from_role()
+              |> Map.put(:uid, Map.get(fiber, "uid"))
+
             persist_lifecycle(state, role.fiber_id, metadata)
-            {[role | roles], Map.put(lifecycle, role.fiber_id, metadata)}
+            runtime_key = runtime_key_for_address(state, role.fiber_id, metadata)
+            {[role | roles], Map.put(lifecycle, runtime_key, metadata)}
           else
             {roles, lifecycle}
           end
@@ -1687,7 +1742,7 @@ defmodule Shuttle.Poller do
     case Map.get(fiber, "shuttle") do
       shuttle when is_map(shuttle) ->
         shuttle
-        |> merge_lifecycle_overlay(Map.get(state.lifecycle, fiber_id))
+        |> merge_lifecycle_overlay(lifecycle_record(state, fiber_id))
         |> then(&StandingRole.from_map(fiber_id, &1))
 
       _ ->
@@ -1909,6 +1964,7 @@ defmodule Shuttle.Poller do
 
             state =
               schedule_retry(state, fiber_id, 1, %{
+                uid: Map.get(fiber, "uid"),
                 error: "watcher start failed: #{inspect(reason)}"
               })
 
@@ -2056,14 +2112,17 @@ defmodule Shuttle.Poller do
     lifecycle =
       state.runtime_store_path
       |> RuntimeStore.list_lifecycle()
-      |> Map.new(fn %{fiber_id: fiber_id, metadata: metadata} -> {fiber_id, metadata} end)
+      |> Map.new(fn %{fiber_id: fiber_id, runtime_key: runtime_key, metadata: metadata} ->
+        {runtime_key, metadata |> Map.put_new(:fiber_id, fiber_id)}
+      end)
 
     %{state | lifecycle: lifecycle}
   end
 
   defp runtime_lifecycle(%State{} = state, fiber_id) do
     RuntimeStore.fetch_lifecycle(state.runtime_store_path, fiber_id) ||
-      Map.get(state.lifecycle, fiber_id, %{})
+      lifecycle_record(state, fiber_id) ||
+      %{}
   end
 
   # Overlay daemon-owned runtime lifecycle (review state, next_due_at, …) onto a
@@ -2096,10 +2155,21 @@ defmodule Shuttle.Poller do
   defp refresh_lifecycle_entry(%State{} = state, fiber_id) do
     case RuntimeStore.fetch_lifecycle(state.runtime_store_path, fiber_id) do
       metadata when is_map(metadata) ->
-        %{state | lifecycle: Map.put(state.lifecycle, fiber_id, metadata)}
+        runtime_key = runtime_key_for_address(state, fiber_id, metadata)
+
+        %{
+          state
+          | lifecycle:
+              state.lifecycle
+              |> Map.delete(fiber_id)
+              |> Map.put(runtime_key, metadata)
+        }
 
       _ ->
-        %{state | lifecycle: Map.delete(state.lifecycle, fiber_id)}
+        case lifecycle_key(state, fiber_id) do
+          nil -> state
+          runtime_key -> %{state | lifecycle: Map.delete(state.lifecycle, runtime_key)}
+        end
     end
   end
 
@@ -2134,7 +2204,7 @@ defmodule Shuttle.Poller do
       running_key(state, fiber_id) != nil ->
         delete_persisted_retry(state, fiber_id)
 
-      Map.has_key?(state.retry_queue, fiber_id) ->
+      retry_key(state, fiber_id) != nil ->
         state
 
       true ->
@@ -2148,6 +2218,8 @@ defmodule Shuttle.Poller do
         timer_ref = Process.send_after(state.self_ref, {:retry, fiber_id, retry_token}, delay_ms)
 
         retry = %{
+          fiber_id: fiber_id,
+          uid: Map.get(metadata, :uid),
           attempt: attempt,
           timer_ref: timer_ref,
           retry_token: retry_token,
@@ -2156,13 +2228,15 @@ defmodule Shuttle.Poller do
           delay_type: Map.get(metadata, :delay_type, :failure)
         }
 
+        runtime_key = runtime_key_for_address(state, fiber_id, retry)
+
         Logger.info(
           "Rehydrated retry: fiber_id=#{fiber_id} in #{delay_ms}ms (attempt #{attempt})"
         )
 
         %{
           state
-          | retry_queue: Map.put(state.retry_queue, fiber_id, retry),
+          | retry_queue: Map.put(state.retry_queue, runtime_key, retry),
             claimed: MapSet.put(state.claimed, fiber_id)
         }
     end
@@ -2326,13 +2400,21 @@ defmodule Shuttle.Poller do
                   true ->
                     # Still active — schedule continuation retry
                     attempt = next_retry_attempt(state, fiber_id)
-                    schedule_retry(state, fiber_id, attempt, %{delay_type: :continuation})
+
+                    schedule_retry(state, fiber_id, attempt, %{
+                      uid: metadata_uid(meta),
+                      delay_type: :continuation
+                    })
                 end
 
               {:error, _} ->
                 # Can't read fiber — schedule failure retry
                 attempt = next_retry_attempt(state, fiber_id)
-                schedule_retry(state, fiber_id, attempt, %{error: "fiber read failed after exit"})
+
+                schedule_retry(state, fiber_id, attempt, %{
+                  uid: metadata_uid(meta),
+                  error: "fiber read failed after exit"
+                })
             end
         end
     end
@@ -2408,7 +2490,9 @@ defmodule Shuttle.Poller do
   end
 
   defp schedule_retry(%State{} = state, fiber_id, attempt, metadata) when is_map(metadata) do
-    previous = Map.get(state.retry_queue, fiber_id, %{attempt: 0})
+    previous_key = retry_key(state, fiber_id)
+    previous = if previous_key, do: Map.get(state.retry_queue, previous_key), else: nil
+    previous = previous || %{attempt: 0}
     next_attempt = if is_integer(attempt), do: attempt, else: previous.attempt + 1
     delay_ms = retry_delay(next_attempt, metadata, state.max_retry_backoff_ms)
     retry_token = make_ref()
@@ -2436,17 +2520,26 @@ defmodule Shuttle.Poller do
       "Retry scheduled: fiber_id=#{fiber_id} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}"
     )
 
+    retry = %{
+      fiber_id: fiber_id,
+      uid: Map.get(metadata, :uid) || Map.get(state.fiber_uid_cache, fiber_id),
+      attempt: next_attempt,
+      timer_ref: timer_ref,
+      retry_token: retry_token,
+      due_at_ms: due_at_ms,
+      error: error,
+      delay_type: delay_type
+    }
+
+    runtime_key = runtime_key_for_address(state, fiber_id, retry)
+
     retry_queue =
-      Map.put(state.retry_queue, fiber_id, %{
-        attempt: next_attempt,
-        timer_ref: timer_ref,
-        retry_token: retry_token,
-        due_at_ms: due_at_ms,
-        error: error,
-        delay_type: delay_type
-      })
+      state.retry_queue
+      |> maybe_delete_key(previous_key)
+      |> Map.put(runtime_key, retry)
 
     persist_retry(state, fiber_id, %{
+      uid: Map.get(retry, :uid),
       attempt: next_attempt,
       due_at_ms: due_at_ms,
       error: error,
@@ -2459,12 +2552,16 @@ defmodule Shuttle.Poller do
   end
 
   defp pop_retry(%State{} = state, fiber_id, retry_token) when is_reference(retry_token) do
-    case Map.get(state.retry_queue, fiber_id) do
+    key = retry_key(state, fiber_id)
+
+    case key && Map.get(state.retry_queue, key) do
       %{retry_token: ^retry_token} = retry ->
+        fiber_id = fiber_address(retry)
+
         state =
           state
           |> delete_persisted_retry(fiber_id)
-          |> Map.put(:retry_queue, Map.delete(state.retry_queue, fiber_id))
+          |> Map.put(:retry_queue, Map.delete(state.retry_queue, key))
 
         {:ok, retry, state}
 
@@ -2483,7 +2580,7 @@ defmodule Shuttle.Poller do
   end
 
   defp next_retry_attempt(state, fiber_id) do
-    case Map.get(state.retry_queue, fiber_id) do
+    case retry_record(state, fiber_id) do
       %{attempt: attempt} when is_integer(attempt) and attempt > 0 -> attempt + 1
       _ -> 1
     end
@@ -2509,6 +2606,9 @@ defmodule Shuttle.Poller do
   defp release_claim(%State{} = state, fiber_id) do
     %{state | claimed: MapSet.delete(state.claimed, fiber_id)}
   end
+
+  defp maybe_delete_key(map, nil), do: map
+  defp maybe_delete_key(map, key), do: Map.delete(map, key)
 
   defp replace_matching_waiter(waiters, nil, nil), do: waiters
 
@@ -2777,7 +2877,7 @@ defmodule Shuttle.Poller do
     case fetch_shuttle_block(fiber_id, state) do
       {:ok, shuttle} ->
         shuttle
-        |> merge_lifecycle_overlay(Map.get(state.lifecycle, fiber_id))
+        |> merge_lifecycle_overlay(lifecycle_record(state, fiber_id))
         |> then(&StandingRole.from_map(fiber_id, &1))
 
       {:error, _} ->
@@ -2800,6 +2900,7 @@ defmodule Shuttle.Poller do
 
   defp lifecycle_metadata_from_role(%StandingRole{} = role) do
     %{
+      fiber_id: role.fiber_id,
       kind: role.mode || "standing",
       phase: role.review["state"] || "scheduled",
       run_id: role.run_id,
@@ -2832,9 +2933,13 @@ defmodule Shuttle.Poller do
   defp stringify_keys(_), do: %{}
 
   defp standing_role_snapshots(roles, running, now, state) do
+    state = %{state | running: running}
+
     Enum.map(roles, fn role ->
+      running? = running_key(state, role.fiber_id) != nil
+
       role
-      |> StandingRole.to_snapshot(now, Map.has_key?(running, role.fiber_id))
+      |> StandingRole.to_snapshot(now, running?)
       |> Map.put(:uid, uid_for_fiber(state, role.fiber_id))
     end)
   end
