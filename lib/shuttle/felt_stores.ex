@@ -53,19 +53,44 @@ defmodule Shuttle.FeltStores do
   the daemon must too — without it, host-routed lifecycle/actions verbs 400 with
   "fiber not found" on project-resident fibers.
   """
+  @type resolved_fiber :: %{
+          host: String.t(),
+          fiber_id: String.t(),
+          path: String.t(),
+          uid: String.t() | nil
+        }
+
   @spec host_for_fiber(String.t()) :: {:ok, String.t()} | {:error, :not_found}
   def host_for_fiber(fiber_id) do
-    hosts = configured_hosts()
-
-    with nil <- Enum.find(hosts, &exact_canonical_match?(&1, fiber_id)),
-         nil <- Enum.find(hosts, &nested_canonical_match?(&1, fiber_id)) do
-      {:error, :not_found}
-    else
-      host -> {:ok, host}
+    case resolve_fiber(fiber_id) do
+      {:ok, %{host: host}} -> {:ok, host}
+      {:error, :not_found} -> {:error, :not_found}
     end
   end
 
-  defp exact_canonical_match?(host, fiber_id) do
+  @doc """
+  Resolve a public fiber identifier to the felt address Shuttle can shell out to.
+
+  During the ULID migration, clients may send either the old slug-shaped felt
+  address or the intrinsic frontmatter `id`. The resolver prefers the cheap slug
+  path, then falls back to scanning configured stores for a matching ULID. It
+  returns both surfaces: `fiber_id` is the felt CLI address, while `uid` is the
+  intrinsic identity when present.
+  """
+  @spec resolve_fiber(String.t()) :: {:ok, resolved_fiber()} | {:error, :not_found}
+  def resolve_fiber(identifier) when is_binary(identifier) do
+    hosts = configured_hosts()
+
+    with nil <- Enum.find_value(hosts, &exact_canonical_resolution(&1, identifier)),
+         nil <- Enum.find_value(hosts, &nested_canonical_resolution(&1, identifier)),
+         nil <- Enum.find_value(hosts, &uid_resolution(&1, identifier)) do
+      {:error, :not_found}
+    else
+      resolved -> {:ok, resolved}
+    end
+  end
+
+  defp exact_canonical_resolution(host, fiber_id) do
     segments = String.split(fiber_id, "/")
     leaf = List.last(segments)
     felt_dir = Path.join(host, ".felt")
@@ -76,10 +101,10 @@ defmodule Shuttle.FeltStores do
       # flat: <.felt>/<segments>.md (covers both root-level and nested flat fibers)
       Path.join([felt_dir | segments]) <> ".md"
     ]
-    |> Enum.any?(&canonical_match?(&1, fiber_id))
+    |> Enum.find_value(&resolved_if_canonical(&1, host, fiber_id))
   end
 
-  defp nested_canonical_match?(host, fiber_id) do
+  defp nested_canonical_resolution(host, fiber_id) do
     leaf = fiber_id |> String.split("/") |> List.last()
     felt_dir = Path.join(host, ".felt")
 
@@ -88,15 +113,74 @@ defmodule Shuttle.FeltStores do
     # and both end in `<leaf>.md`, so one glob covers both layouts (and crosses
     # symlinked/automounted sub-stores). Each candidate is verified by canonical
     # id, so over-matches are rejected.
-    File.dir?(felt_dir) and
+    if File.dir?(felt_dir) do
       [felt_dir, "**", "#{leaf}.md"]
       |> Path.join()
       |> Path.wildcard(match_dot: true)
-      |> Enum.any?(&canonical_match?(&1, fiber_id))
+      |> Enum.find_value(&resolved_if_canonical(&1, host, fiber_id))
+    end
   end
 
-  defp canonical_match?(path, fiber_id) do
-    File.regular?(path) and Shuttle.FiberId.canonical_id(path) == {:ok, fiber_id}
+  defp resolved_if_canonical(path, host, fiber_id) do
+    with true <- File.regular?(path),
+         {:ok, ^fiber_id} <- Shuttle.FiberId.canonical_id(path) do
+      resolved(path, host, fiber_id)
+    else
+      _ -> nil
+    end
+  end
+
+  defp uid_resolution(host, uid) do
+    felt_dir = Path.join(host, ".felt")
+
+    if ulid?(uid) and File.dir?(felt_dir) do
+      [felt_dir, "**", "*.md"]
+      |> Path.join()
+      |> Path.wildcard(match_dot: true)
+      |> Enum.find_value(fn path ->
+        with {:ok, ^uid} <- frontmatter_uid(path),
+             {:ok, fiber_id} <- Shuttle.FiberId.canonical_id(path) do
+          resolved(path, host, fiber_id, uid)
+        else
+          _ -> nil
+        end
+      end)
+    end
+  end
+
+  defp resolved(path, host, fiber_id, uid \\ nil) do
+    %{host: host, fiber_id: fiber_id, path: path, uid: uid || uid_from_path(path)}
+  end
+
+  defp uid_from_path(path) do
+    case frontmatter_uid(path) do
+      {:ok, uid} -> uid
+      :error -> nil
+    end
+  end
+
+  defp frontmatter_uid(path) do
+    with {:ok, text} <- File.read(path),
+         {:ok, yaml} <- frontmatter_yaml(text),
+         {:ok, %{"id" => id}} when is_binary(id) <- YamlElixir.read_from_string(yaml),
+         true <- ulid?(id) do
+      {:ok, id}
+    else
+      _ -> :error
+    end
+  end
+
+  defp frontmatter_yaml("---\n" <> rest) do
+    case String.split(rest, "\n---\n", parts: 2) do
+      [yaml, _body] -> {:ok, yaml}
+      _ -> :error
+    end
+  end
+
+  defp frontmatter_yaml(_), do: :error
+
+  defp ulid?(value) when is_binary(value) do
+    String.match?(value, ~r/^[0-9A-HJKMNP-TV-Z]{26}$/)
   end
 
   @spec registered_hosts() :: host_list()

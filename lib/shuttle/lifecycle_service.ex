@@ -23,25 +23,29 @@ defmodule Shuttle.LifecycleService do
 
   @spec accept(String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
   def accept(fiber_id, opts \\ []) when is_binary(fiber_id) do
-    case transition(:accept, fiber_id, opts) do
-      {:ok, output} ->
-        record_history(fiber_id, output, "accepted standing-role run via daemon runtime store")
-        {:ok, output}
+    with {:ok, address} <- fiber_address(fiber_id) do
+      case transition(:accept, address, opts) do
+        {:ok, output} ->
+          record_history(address, output, "accepted standing-role run via daemon runtime store")
+          {:ok, output}
 
-      {:error, reason} ->
-        {:error, to_message(reason)}
+        {:error, reason} ->
+          {:error, to_message(reason)}
+      end
     end
   end
 
   @spec resume(String.t()) :: {:ok, String.t()} | {:error, String.t()}
   def resume(fiber_id) when is_binary(fiber_id) do
-    case transition(:resume, fiber_id, []) do
-      {:ok, output} ->
-        record_history(fiber_id, output, "resumed standing role via daemon runtime store")
-        {:ok, output}
+    with {:ok, address} <- fiber_address(fiber_id) do
+      case transition(:resume, address, []) do
+        {:ok, output} ->
+          record_history(address, output, "resumed standing role via daemon runtime store")
+          {:ok, output}
 
-      {:error, reason} ->
-        {:error, to_message(reason)}
+        {:error, reason} ->
+          {:error, to_message(reason)}
+      end
     end
   end
 
@@ -53,9 +57,11 @@ defmodule Shuttle.LifecycleService do
   # cycles, mirroring accept/resume.
   @spec reset_review(String.t()) :: {:ok, String.t()} | {:error, String.t()}
   def reset_review(fiber_id) when is_binary(fiber_id) do
-    case transition(:reset_review, fiber_id, []) do
-      {:ok, output} -> {:ok, output}
-      {:error, reason} -> {:error, to_message(reason)}
+    with {:ok, address} <- fiber_address(fiber_id) do
+      case transition(:reset_review, address, []) do
+        {:ok, output} -> {:ok, output}
+        {:error, reason} -> {:error, to_message(reason)}
+      end
     end
   end
 
@@ -75,6 +81,13 @@ defmodule Shuttle.LifecycleService do
   defp lifecycle_store_args(:accept, fiber_id, opts), do: [fiber_id, opts]
   defp lifecycle_store_args(:resume, fiber_id, _opts), do: [fiber_id]
   defp lifecycle_store_args(:reset_review, fiber_id, _opts), do: [fiber_id]
+
+  defp fiber_address(identifier) do
+    case FeltStores.resolve_fiber(identifier) do
+      {:ok, %{fiber_id: fiber_id}} -> {:ok, fiber_id}
+      {:error, :not_found} -> {:error, "fiber not found: #{identifier}"}
+    end
+  end
 
   defp record_history(fiber_id, output, fallback) do
     summary =

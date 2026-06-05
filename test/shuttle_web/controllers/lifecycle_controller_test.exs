@@ -64,6 +64,47 @@ defmodule ShuttleWeb.LifecycleControllerTest do
              "--felt-store\n#{store}\nset-interactive\ntests/interactive\nfalse\n"
   end
 
+  test "set-interactive accepts an intrinsic UID and delegates with the slug address" do
+    root =
+      System.tmp_dir!()
+      |> Path.join("shuttle-lifecycle-store-uid-#{System.unique_integer([:positive])}")
+
+    store = Path.join(root, "loom")
+    uid = "01KTCWNXD1JH4Z5GVMAG1T5P0H"
+    fiber_dir = Path.join([store, ".felt", "tests", "interactive-uid"])
+    File.mkdir_p!(fiber_dir)
+
+    File.write!(
+      Path.join(fiber_dir, "interactive-uid.md"),
+      "---\nid: #{uid}\nname: Interactive UID\n---\n\n"
+    )
+
+    args_file = install_fake_shuttle_ctl!()
+    old_loom_homes = System.get_env("LOOM_HOMES")
+    System.put_env("LOOM_HOMES", store)
+
+    on_exit(fn ->
+      restore_env("LOOM_HOMES", old_loom_homes)
+      File.rm_rf(root)
+    end)
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/lifecycle",
+        Jason.encode!(%{
+          "action" => "set-interactive",
+          "fiber" => uid,
+          "interactive" => false
+        })
+      )
+
+    assert conn.status == 200
+
+    assert File.read!(args_file) ==
+             "--felt-store\n#{store}\nset-interactive\ntests/interactive-uid\nfalse\n"
+  end
+
   test "accept for standing roles writes lifecycle store and evicts runtime frontmatter" do
     root =
       System.tmp_dir!()

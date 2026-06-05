@@ -53,6 +53,51 @@ defmodule ShuttleWeb.SessionControllerTest do
     File.rm_rf(root)
   end
 
+  test "session-set accepts an intrinsic UID and writes the slug address with UID metadata" do
+    root =
+      Path.join(System.tmp_dir!(), "shuttle-session-set-uid-#{System.unique_integer([:positive])}")
+
+    store = Path.join(root, "loom")
+    runtime_store = Path.join(root, "runtime.db")
+    uid = "01KTCWMQ8H8PHC2X38CFZ8AA1R"
+    path = write_fiber!(store, "tests/session-set-uid", legacy_session: "old-session", id: uid)
+
+    with_env(%{"LOOM_HOMES" => store, "SHUTTLE_RUNTIME_STORE" => runtime_store}, fn ->
+      conn =
+        post(
+          api_conn(),
+          "/api/v1/session",
+          Jason.encode!(%{
+            "action" => "set",
+            "fiber" => uid,
+            "session_id" => "new-session",
+            "agent" => "codex"
+          })
+        )
+
+      assert conn.status == 200
+      assert conn.resp_body == "session new-session stored for tests/session-set-uid\n"
+
+      frontmatter = path |> File.read!() |> frontmatter()
+      refute frontmatter =~ "session:"
+
+      assert [
+               %{
+                 fiber_id: "tests/session-set-uid",
+                 runtime_key: ^uid,
+                 metadata: %{
+                   uid: ^uid,
+                   kind: "oneshot",
+                   phase: "dispatched",
+                   session: %{"id" => "new-session", "agent" => "codex"}
+                 }
+               }
+             ] = RuntimeStore.list_lifecycle(runtime_store)
+    end)
+
+    File.rm_rf(root)
+  end
+
   test "session-clear removes runtime session and evicts legacy frontmatter session" do
     root =
       Path.join(System.tmp_dir!(), "shuttle-session-clear-#{System.unique_integer([:positive])}")
@@ -115,6 +160,7 @@ defmodule ShuttleWeb.SessionControllerTest do
 
     File.write!(path, """
     ---
+    #{id_field(opts)}
     name: Session test
     status: active
     shuttle:
@@ -126,6 +172,13 @@ defmodule ShuttleWeb.SessionControllerTest do
     """)
 
     path
+  end
+
+  defp id_field(opts) do
+    case Keyword.get(opts, :id) do
+      nil -> ""
+      id -> "id: #{id}\n"
+    end
   end
 
   defp api_conn do

@@ -12,8 +12,8 @@ defmodule ShuttleWeb.FeltHistoryController do
 
   def create(conn, %{"fiber_id" => fiber_id, "kind" => kind, "summary" => summary} = params)
       when is_binary(fiber_id) and is_binary(kind) and is_binary(summary) do
-    with {:ok, host} <- host_for_fiber(fiber_id),
-         {:ok, output} <- run(host, fiber_id, kind, summary, Map.get(params, "fields", %{})) do
+    with {:ok, host, address} <- host_for_fiber(fiber_id),
+         {:ok, output} <- run(host, address, kind, summary, Map.get(params, "fields", %{})) do
       conn
       |> put_resp_content_type("text/plain")
       |> send_resp(200, output)
@@ -37,32 +37,9 @@ defmodule ShuttleWeb.FeltHistoryController do
   end
 
   defp host_for_fiber(fiber_id) do
-    FeltStores.configured_hosts()
-    |> Enum.find(&fiber_exists?(&1, fiber_id))
-    |> case do
-      nil -> {:error, "fiber not found: #{fiber_id}"}
-      host -> {:ok, host}
-    end
-  end
-
-  defp fiber_exists?(host, fiber_id) do
-    case exact_fiber_path(host, fiber_id) do
-      {:ok, _path} -> true
-      {:error, _} -> false
-    end
-  end
-
-  defp exact_fiber_path(host, fiber_id) do
-    segments = String.split(fiber_id, "/")
-    basename = List.last(segments)
-    felt_dir = Path.join(host, ".felt")
-    bare_path = Path.join(felt_dir, "#{basename}.md")
-    dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
-
-    cond do
-      not String.contains?(fiber_id, "/") and File.exists?(bare_path) -> {:ok, bare_path}
-      File.exists?(dir_path) -> {:ok, dir_path}
-      true -> {:error, :not_found}
+    case FeltStores.resolve_fiber(fiber_id) do
+      {:ok, %{host: host, fiber_id: address}} -> {:ok, host, address}
+      {:error, :not_found} -> {:error, "fiber not found: #{fiber_id}"}
     end
   end
 

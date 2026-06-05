@@ -16,20 +16,21 @@ defmodule Shuttle.SessionStore do
           {:ok, String.t()} | {:error, String.t()}
   def set(fiber_id, session_id, agent_id \\ nil, opts \\ [])
       when is_binary(fiber_id) and is_binary(session_id) do
-    with {:ok, path, frontmatter, body} <- read_fiber(fiber_id, opts),
+    with {:ok, address, uid, path, frontmatter, body} <- read_fiber(fiber_id, opts),
          {:ok, shuttle} <- shuttle_block(frontmatter),
-         {:ok, lifecycle} <- build_set_lifecycle(fiber_id, shuttle, session_id, agent_id),
-         :ok <- write_lifecycle_and_fiber(fiber_id, lifecycle, path, frontmatter, body) do
-      {:ok, "session #{session_id} stored for #{fiber_id}\n"}
+         {:ok, lifecycle} <- build_set_lifecycle(address, uid, shuttle, session_id, agent_id),
+         :ok <- write_lifecycle_and_fiber(address, lifecycle, path, frontmatter, body) do
+      {:ok, "session #{session_id} stored for #{address}\n"}
     end
   end
 
-  defp build_set_lifecycle(fiber_id, shuttle, session_id, agent_id) do
+  defp build_set_lifecycle(fiber_id, uid, shuttle, session_id, agent_id) do
     now = DateTime.utc_now()
 
     lifecycle =
       fiber_id
-      |> lifecycle_metadata(shuttle)
+      |> lifecycle_metadata(uid, shuttle)
+      |> put_uid(uid)
       |> Map.put(:session, %{
         "id" => session_id,
         "agent" => agent_id || "",
@@ -43,12 +44,12 @@ defmodule Shuttle.SessionStore do
 
   @spec clear(String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
   def clear(fiber_id, opts \\ []) when is_binary(fiber_id) do
-    with {:ok, path, frontmatter, body} <- read_fiber(fiber_id, opts),
+    with {:ok, address, uid, path, frontmatter, body} <- read_fiber(fiber_id, opts),
          {:ok, shuttle} <- shuttle_block(frontmatter),
-         {:ok, lifecycle, had_session?} <- build_clear_lifecycle(fiber_id, shuttle),
+         {:ok, lifecycle, had_session?} <- build_clear_lifecycle(address, uid, shuttle),
          :ok <-
            write_clear_lifecycle_and_fiber(
-             fiber_id,
+             address,
              lifecycle,
              had_session?,
              path,
@@ -56,21 +57,22 @@ defmodule Shuttle.SessionStore do
              body
            ) do
       if had_session? or Map.has_key?(shuttle, "session") do
-        {:ok, "session cleared for #{fiber_id}\n"}
+        {:ok, "session cleared for #{address}\n"}
       else
-        {:ok, "#{fiber_id} has no session to clear\n"}
+        {:ok, "#{address} has no session to clear\n"}
       end
     end
   end
 
-  defp build_clear_lifecycle(fiber_id, shuttle) do
-    lifecycle = lifecycle_metadata(fiber_id, shuttle)
+  defp build_clear_lifecycle(fiber_id, uid, shuttle) do
+    lifecycle = lifecycle_metadata(fiber_id, uid, shuttle)
     had_session? = get_in(lifecycle, [:session, "id"]) not in [nil, ""]
 
     lifecycle =
       if had_session? do
         lifecycle
         |> Map.delete(:session)
+        |> put_uid(uid)
         |> Map.put_new(:kind, Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot")))
         |> Map.put_new(:phase, "scheduled")
       else
@@ -93,15 +95,15 @@ defmodule Shuttle.SessionStore do
     write_fiber(path, evict_runtime_keys(frontmatter), body)
   end
 
-  defp lifecycle_metadata(fiber_id, shuttle) do
+  defp lifecycle_metadata(fiber_id, uid, shuttle) do
     runtime_store_path()
-    |> RuntimeStore.list_lifecycle()
-    |> Enum.find_value(%{}, fn
-      %{fiber_id: ^fiber_id, metadata: metadata} -> metadata
-      _ -> nil
-    end)
+    |> RuntimeStore.fetch_lifecycle(uid || fiber_id)
+    |> Kernel.||(%{})
     |> merge_legacy_session(shuttle)
   end
+
+  defp put_uid(metadata, uid) when is_binary(uid) and uid != "", do: Map.put(metadata, :uid, uid)
+  defp put_uid(metadata, _), do: metadata
 
   defp merge_legacy_session(metadata, %{"session" => session}) when is_map(session) do
     Map.put_new(metadata, :session, session)
@@ -110,11 +112,11 @@ defmodule Shuttle.SessionStore do
   defp merge_legacy_session(metadata, _), do: metadata
 
   defp read_fiber(fiber_id, opts) do
-    with {:ok, path} <- resolve_fiber_path(fiber_id, opts),
+    with {:ok, address, uid, path} <- resolve_fiber_path(fiber_id, opts),
          {:ok, text} <- File.read(path),
          {:ok, frontmatter_yaml, body} <- split_frontmatter(text),
          {:ok, frontmatter} <- YamlElixir.read_from_string(frontmatter_yaml) do
-      {:ok, path, stringify_keys(frontmatter || %{}), body}
+      {:ok, address, uid, path, stringify_keys(frontmatter || %{}), body}
     else
       {:error, :not_found} -> {:error, "fiber not found: #{fiber_id}"}
       {:error, reason} when is_atom(reason) -> {:error, to_string(reason)}
@@ -124,24 +126,29 @@ defmodule Shuttle.SessionStore do
   end
 
   defp resolve_fiber_path(fiber_id, opts) do
-    opts
-    |> felt_stores()
-    |> Enum.find_value(fn host ->
-      case exact_fiber_path(host, fiber_id) do
-        {:ok, path} -> path
-        {:error, _} -> nil
-      end
-    end)
-    |> case do
-      nil -> {:error, :not_found}
-      path -> {:ok, path}
+    case Keyword.get(opts, :felt_store) do
+      store when is_binary(store) and store != "" ->
+        resolve_fiber_in_store(store, fiber_id)
+
+      _ ->
+        case FeltStores.resolve_fiber(fiber_id) do
+          {:ok, %{fiber_id: address, uid: uid, path: path}} -> {:ok, address, uid, path}
+          {:error, :not_found} -> {:error, :not_found}
+        end
     end
   end
 
-  defp felt_stores(opts) do
-    case Keyword.get(opts, :felt_store) do
-      store when is_binary(store) and store != "" -> [store]
-      _ -> FeltStores.configured_hosts()
+  defp resolve_fiber_in_store(store, fiber_id) do
+    with {:ok, %{host: host, fiber_id: address, uid: uid, path: path}} <-
+           FeltStores.resolve_fiber(fiber_id),
+         true <- Path.expand(host) == Path.expand(store) do
+      {:ok, address, uid, path}
+    else
+      _ ->
+        case exact_fiber_path(store, fiber_id) do
+          {:ok, path} -> {:ok, fiber_id, uid_from_frontmatter(path), path}
+          {:error, _} -> {:error, :not_found}
+        end
     end
   end
 
@@ -156,6 +163,17 @@ defmodule Shuttle.SessionStore do
       not String.contains?(fiber_id, "/") and File.exists?(bare_path) -> {:ok, bare_path}
       File.exists?(dir_path) -> {:ok, dir_path}
       true -> {:error, :not_found}
+    end
+  end
+
+  defp uid_from_frontmatter(path) do
+    with {:ok, text} <- File.read(path),
+         {:ok, frontmatter_yaml, _body} <- split_frontmatter(text),
+         {:ok, %{"id" => id}} when is_binary(id) <- YamlElixir.read_from_string(frontmatter_yaml),
+         true <- String.match?(id, ~r/^[0-9A-HJKMNP-TV-Z]{26}$/) do
+      id
+    else
+      _ -> nil
     end
   end
 

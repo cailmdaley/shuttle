@@ -474,10 +474,12 @@ defmodule Shuttle.Poller do
   end
 
   def handle_call({:worker_status, fiber_id}, _from, state) do
+    fiber_id = address_for_identifier(state, fiber_id)
     {:reply, running_worker(state, fiber_id), state}
   end
 
   def handle_call({:dispatch, fiber_id, opts}, _from, state) do
+    fiber_id = address_for_identifier(state, fiber_id)
     state = reconcile_running_fiber(state, fiber_id)
     session = Dispatcher.session_name(fiber_id)
 
@@ -518,6 +520,8 @@ defmodule Shuttle.Poller do
   end
 
   def handle_call({:actions, fiber_id, opts}, _from, state) do
+    fiber_id = address_for_identifier(state, fiber_id)
+
     case fetch_fiber_full(fiber_id, state) do
       {:ok, fiber} ->
         fiber = overlay_runtime_lifecycle(fiber, fiber_id, state)
@@ -530,6 +534,8 @@ defmodule Shuttle.Poller do
   end
 
   def handle_call({:resolve_action, fiber_id, target, opts}, _from, state) do
+    fiber_id = address_for_identifier(state, fiber_id)
+
     case fetch_fiber_full(fiber_id, state) do
       {:ok, fiber} ->
         fiber = overlay_runtime_lifecycle(fiber, fiber_id, state)
@@ -542,6 +548,8 @@ defmodule Shuttle.Poller do
   end
 
   def handle_call({:lifecycle_transition, verb, fiber_id, opts}, _from, state) do
+    fiber_id = address_for_identifier(state, fiber_id)
+
     result =
       case verb do
         :accept -> LifecycleStore.accept(fiber_id, opts)
@@ -560,6 +568,7 @@ defmodule Shuttle.Poller do
   end
 
   def handle_call({:wait, fiber_id, timeout_ms, opts}, _from, state) do
+    fiber_id = address_for_identifier(state, fiber_id)
     channel_topic = Keyword.get(opts, :channel_topic)
     notify_pid = Keyword.get(opts, :notify_pid)
     waiter_id = Keyword.get(opts, :waiter_id, make_ref())
@@ -893,6 +902,46 @@ defmodule Shuttle.Poller do
 
   defp runtime_key_for_address(%State{} = state, fiber_id, metadata) do
     uid_for_fiber(state, fiber_id, metadata) || fiber_id
+  end
+
+  defp address_for_identifier(%State{} = state, identifier) when is_binary(identifier) do
+    cond do
+      Map.has_key?(state.fiber_uid_cache, identifier) ->
+        identifier
+
+      true ->
+        address_from_runtime_maps(state, identifier) ||
+          address_from_uid_cache(state, identifier) ||
+          address_from_felt_stores(identifier) ||
+          identifier
+    end
+  end
+
+  defp address_for_identifier(_state, identifier), do: identifier
+
+  defp address_from_uid_cache(%State{} = state, uid) do
+    Enum.find_value(state.fiber_uid_cache, fn {fiber_id, cached_uid} ->
+      if cached_uid == uid, do: fiber_id
+    end)
+  end
+
+  defp address_from_runtime_maps(%State{} = state, identifier) do
+    [state.running, state.retry_queue, state.lifecycle]
+    |> Enum.find_value(fn records ->
+      Enum.find_value(records, fn {_key, metadata} ->
+        address = fiber_address(metadata)
+        uid = metadata_uid(metadata)
+
+        if identifier in [address, uid], do: address
+      end)
+    end)
+  end
+
+  defp address_from_felt_stores(identifier) do
+    case Shuttle.FeltStores.resolve_fiber(identifier) do
+      {:ok, %{fiber_id: fiber_id}} -> fiber_id
+      {:error, :not_found} -> nil
+    end
   end
 
   defp fiber_address(metadata) when is_map(metadata) do

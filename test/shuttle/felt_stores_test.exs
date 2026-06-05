@@ -84,6 +84,20 @@ defmodule Shuttle.FeltStoresTest do
       assert Path.expand(host) == Path.expand(loom)
     end
 
+    test "resolves an intrinsic UID to the felt address and host" do
+      loom = tmp_dir()
+      uid = "01KTCWJ8F2DF0VY3E6W92Q7H8M"
+      write_fiber(Path.join(loom, ".felt"), ["tests", "uid-card"], id: uid)
+      System.put_env("LOOM_HOMES", loom)
+
+      assert {:ok, %{host: host, fiber_id: "tests/uid-card", uid: ^uid, path: path}} =
+               FeltStores.resolve_fiber(uid)
+
+      assert Path.expand(host) == Path.expand(loom)
+      assert path =~ "uid-card.md"
+      assert {:ok, ^host} = FeltStores.host_for_fiber(uid)
+    end
+
     test "returns :not_found for an unknown fiber" do
       loom = tmp_dir()
       File.mkdir_p!(Path.join(loom, ".felt"))
@@ -93,12 +107,19 @@ defmodule Shuttle.FeltStoresTest do
     end
   end
 
-  defp write_fiber(felt_dir, slug_segments) do
+  defp write_fiber(felt_dir, slug_segments, opts \\ []) do
     leaf = List.last(slug_segments)
     dir = Path.join([felt_dir | slug_segments])
     File.mkdir_p!(dir)
     path = Path.join(dir, "#{leaf}.md")
-    File.write!(path, "---\nname: #{leaf}\n---\n\nBody.\n")
+
+    id_field =
+      case Keyword.get(opts, :id) do
+        nil -> ""
+        id -> "id: #{id}\n"
+      end
+
+    File.write!(path, "---\n#{id_field}name: #{leaf}\n---\n\nBody.\n")
     path
   end
 

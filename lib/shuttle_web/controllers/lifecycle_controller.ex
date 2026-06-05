@@ -38,25 +38,35 @@ defmodule ShuttleWeb.LifecycleController do
   defp action(_), do: {:error, "missing lifecycle action"}
 
   defp execute("accept", %{"fiber" => fiber} = params) do
-    LifecycleService.accept(fiber, keep_outcome: truthy?(params["keep_outcome"]))
-  end
-
-  defp execute("resume", %{"fiber" => fiber}) do
-    case LifecycleService.resume(fiber) do
-      {:ok, output} -> {:ok, output}
-      {:error, _reason} -> args_for("resume", %{"fiber" => fiber}) |> then(&run_elem/1)
+    with {:ok, fiber_id} <- fiber_address(fiber) do
+      LifecycleService.accept(fiber_id, keep_outcome: truthy?(params["keep_outcome"]))
     end
   end
 
-  # reset-review is daemon-runtime-only: it clears the standing role's runtime
-  # lifecycle row (the frontmatter half is owned by the Go close/reopen writer
-  # that calls us). There is no shuttle-ctl fallback verb — the runtime store is
-  # the daemon's exclusively. The Go side treats a transport error as
-  # "no daemon, nothing to clear" and proceeds on the frontmatter reset alone.
+  defp execute("resume", %{"fiber" => fiber}) do
+    with {:ok, fiber_id} <- fiber_address(fiber) do
+      case LifecycleService.resume(fiber_id) do
+        {:ok, output} -> {:ok, output}
+        {:error, _reason} -> args_for("resume", %{"fiber" => fiber_id}) |> then(&run_elem/1)
+      end
+    end
+  end
+
   defp execute("reset-review", %{"fiber" => fiber}) do
-    case LifecycleService.reset_review(fiber) do
-      {:ok, output} -> {:ok, output}
-      {:error, reason} -> {:error, reason}
+    with {:ok, fiber_id} <- fiber_address(fiber) do
+      case LifecycleService.reset_review(fiber_id) do
+        {:ok, output} -> {:ok, output}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  defp execute(action, %{"fiber" => fiber} = params)
+       when action in ~w(pause set-model set-interactive uninstall) do
+    with {:ok, fiber_id} <- fiber_address(fiber) do
+      action
+      |> args_for(%{params | "fiber" => fiber_id})
+      |> run_elem()
     end
   end
 
@@ -64,6 +74,13 @@ defmodule ShuttleWeb.LifecycleController do
     action
     |> args_for(params)
     |> run_elem()
+  end
+
+  defp fiber_address(identifier) do
+    case FeltStores.resolve_fiber(identifier) do
+      {:ok, %{fiber_id: fiber_id}} -> {:ok, fiber_id}
+      {:error, :not_found} -> {:error, "fiber not found: #{identifier}"}
+    end
   end
 
   defp run_elem({:ok, args}), do: run(args)
