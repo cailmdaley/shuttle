@@ -258,6 +258,7 @@ func listShuttleFibers(host string) ([]shuttleEntry, error) {
 	var raw []struct {
 		FiberID string          `json:"id"`
 		Status  string          `json:"status"`
+		Path    string          `json:"path"`
 		Shuttle json.RawMessage `json:"shuttle"`
 	}
 	if err := json.Unmarshal(out, &raw); err != nil {
@@ -274,19 +275,27 @@ func listShuttleFibers(host string) ([]shuttleEntry, error) {
 		if err := json.Unmarshal(fiber.Shuttle, &block); err != nil {
 			continue
 		}
-		ref, err := schema.ResolveFiberInHost(host, fiber.FiberID)
-		if err != nil {
+		// felt carries the physical path in the bulk listing; canonicalize from
+		// it directly (symlink-resolve, re-derive store + id from the real
+		// .felt/ root) instead of a per-fiber resolution round-trip.
+		id := fiber.FiberID
+		if fiber.Path != "" {
+			if _, canonical, err := schema.FiberRefFromPath(fiber.Path); err == nil {
+				id = canonical
+			}
+		}
+		if seen[id] {
 			continue
 		}
-		if seen[ref.ID] {
-			continue
-		}
-		seen[ref.ID] = true
-		entries = append(entries, shuttleEntry{FiberID: ref.ID, Status: fiber.Status, Block: &block})
+		seen[id] = true
+		entries = append(entries, shuttleEntry{FiberID: id, Status: fiber.Status, Block: &block})
 	}
 	return entries, nil
 }
 
+// projectedShuttleFiberListing requests the full felt record (no `--json-field`
+// projection) so felt's carried `path` survives — the projector cannot emit
+// `path`, which is injected at the read chokepoint, not a frontmatter field.
 func projectedShuttleFiberListing(host string) ([]byte, error) {
 	return exec.Command(
 		"felt",
@@ -295,7 +304,6 @@ func projectedShuttleFiberListing(host string) ([]byte, error) {
 		"-s", "all",
 		"--json",
 		"--has-field", "shuttle",
-		"--json-field", "id,status,shuttle",
 	).Output()
 }
 

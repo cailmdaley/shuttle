@@ -156,109 +156,106 @@ func ResolveFiberPath(fiberID string) (string, error) {
 // the given felt store and returns the canonical felt-store / fiber-address pair
 // plus the realpath'd md file.
 //
-// Exact lookup checks the bare and directory layouts directly. When neither
-// exists it falls back to `felt -C <host> ls -j <query>` so prefix/alias and
-// UID resolution still work.
+// Resolution is a single `felt -C <host> ls -j <query>` call: felt answers with
+// each matching fiber's `id`, `uid`, and physical `path`. The chooser picks the
+// winning candidate (exact id/uid, then unique suffix, then sole result) and
+// Shuttle reads its felt-carried `path` directly — it never guesses
+// flat-vs-directory layouts. The path is then canonicalized (symlinks resolved,
+// store + id re-derived from the real `.felt/` root) so symlinked project views
+// map back to Shuttle's dispatch identity.
 func ResolveFiberInHost(host, idOrQuery string) (*FiberRef, error) {
 	normalizedHost, err := expandUserPath(host)
 	if err != nil {
 		return nil, fmt.Errorf("resolving felt store %q: %w", host, err)
 	}
 
-	if path, ok := exactFiberPath(normalizedHost, idOrQuery); ok {
-		return canonicalizeFiberPath(path)
-	}
-
-	resolvedID, err := resolveFiberIDViaFelt(normalizedHost, idOrQuery)
+	candidates, err := feltFibers(normalizedHost, idOrQuery)
 	if err != nil {
 		return nil, err
 	}
 
-	path, ok := exactFiberPath(normalizedHost, resolvedID)
-	if !ok {
-		return nil, fmt.Errorf("fiber %q resolved to ID %q but file not found", idOrQuery, resolvedID)
-	}
-	return canonicalizeFiberPath(path)
-}
-
-func exactFiberPath(host, fiberID string) (string, bool) {
-	segments := strings.Split(fiberID, "/")
-	basename := segments[len(segments)-1]
-	feltDir := filepath.Join(host, ".felt")
-
-	// Flat layout: <.felt>/<fiberID>.md — covers both root-level (`foo.md`) and
-	// nested (`sp_validation/sp-validation-restructuring.md`) flat fibers. The
-	// nested-flat case is what made a dragged flat fiber 400/422 "file not
-	// found": felt resolved the id (`sp_validation/sp-validation-restructuring`)
-	// but the old reconstruction only built the dir layout below.
-	flat := filepath.Join(feltDir, filepath.FromSlash(fiberID)+".md")
-	if _, err := os.Stat(flat); err == nil {
-		return flat, true
-	}
-
-	// Dir-contained layout: <.felt>/<fiberID>/<leaf>.md
-	dir := filepath.Join(feltDir, filepath.FromSlash(fiberID), basename+".md")
-	if _, err := os.Stat(dir); err == nil {
-		return dir, true
-	}
-	return "", false
-}
-
-func resolveFiberIDViaFelt(host, query string) (string, error) {
-	cmd := exec.Command("felt", "-C", host, "ls", "-j", query, "--json-field", "id,uid")
-	out, err := cmd.Output()
+	chosen, err := chooseResolvedFiber(idOrQuery, candidates)
 	if err != nil {
-		return "", fmt.Errorf("fiber %q not found (felt ls error: %v)", query, err)
+		return nil, err
 	}
-
-	var results []struct {
-		ID  string `json:"id"`
-		UID string `json:"uid"`
+	if chosen.Path == "" {
+		return nil, fmt.Errorf("fiber %q resolved to ID %q but felt carried no path", idOrQuery, chosen.ID)
 	}
-	if err := json.Unmarshal(out, &results); err != nil {
-		return "", fmt.Errorf("parsing felt ls output: %w", err)
-	}
-	return chooseResolvedFiberID(query, results)
+	return canonicalizeFiberPath(chosen.Path)
 }
 
-func chooseResolvedFiberID(query string, results []struct {
-	ID  string `json:"id"`
-	UID string `json:"uid"`
-}) (string, error) {
-	if len(results) == 0 {
-		return "", fmt.Errorf("fiber %q not found", query)
+// feltFiber is the slice of a `felt ls -j` record this package reads. felt
+// carries `path` (the absolute, symlink-resolved on-disk location of the
+// fiber's markdown file) at its read chokepoint, so Shuttle reads it directly
+// rather than reconstructing it from the id.
+type feltFiber struct {
+	ID   string `json:"id"`
+	UID  string `json:"uid"`
+	Path string `json:"path"`
+}
+
+// feltFibers runs `felt -C <host> ls -j <query>` (no `--json-field` filter, so
+// the carried `path` survives) and decodes the candidate records.
+func feltFibers(host, query string) ([]feltFiber, error) {
+	out, err := exec.Command("felt", "-C", host, "ls", "-j", query).Output()
+	if err != nil {
+		return nil, fmt.Errorf("fiber %q not found (felt ls error: %v)", query, err)
 	}
 
-	var ids []string
+	var results []feltFiber
+	if err := json.Unmarshal(out, &results); err != nil {
+		return nil, fmt.Errorf("parsing felt ls output: %w", err)
+	}
+	return results, nil
+}
+
+// chooseResolvedFiber selects the winning candidate from a `felt ls` result set
+// using the same precedence as before (exact id/uid match, then unique suffix
+// match, then sole result), carrying through felt's id/uid/path so the caller
+// reads the path rather than reconstructing it.
+func chooseResolvedFiber(query string, results []feltFiber) (feltFiber, error) {
+	if len(results) == 0 {
+		return feltFiber{}, fmt.Errorf("fiber %q not found", query)
+	}
+
+	var candidates []feltFiber
 	for _, result := range results {
 		if result.ID == "" {
 			continue
 		}
 		if result.ID == query || result.UID == query {
-			return result.ID, nil
+			return result, nil
 		}
-		ids = append(ids, result.ID)
+		candidates = append(candidates, result)
 	}
-	if len(ids) == 0 {
-		return "", fmt.Errorf("fiber %q not found", query)
+	if len(candidates) == 0 {
+		return feltFiber{}, fmt.Errorf("fiber %q not found", query)
 	}
 
-	var suffixMatches []string
-	for _, id := range ids {
-		if strings.HasSuffix(id, "/"+query) {
-			suffixMatches = append(suffixMatches, id)
+	var suffixMatches []feltFiber
+	for _, c := range candidates {
+		if strings.HasSuffix(c.ID, "/"+query) {
+			suffixMatches = append(suffixMatches, c)
 		}
 	}
 	if len(suffixMatches) == 1 {
 		return suffixMatches[0], nil
 	}
 	if len(suffixMatches) > 1 {
-		return "", fmt.Errorf("fiber %q is ambiguous; matches: %s", query, strings.Join(suffixMatches, ", "))
+		return feltFiber{}, fmt.Errorf("fiber %q is ambiguous; matches: %s", query, joinFiberIDs(suffixMatches))
 	}
-	if len(ids) == 1 {
-		return ids[0], nil
+	if len(candidates) == 1 {
+		return candidates[0], nil
 	}
-	return "", fmt.Errorf("fiber %q is ambiguous; matches: %s", query, strings.Join(ids, ", "))
+	return feltFiber{}, fmt.Errorf("fiber %q is ambiguous; matches: %s", query, joinFiberIDs(candidates))
+}
+
+func joinFiberIDs(fibers []feltFiber) string {
+	ids := make([]string, 0, len(fibers))
+	for _, f := range fibers {
+		ids = append(ids, f.ID)
+	}
+	return strings.Join(ids, ", ")
 }
 
 func canonicalizeFiberPath(path string) (*FiberRef, error) {

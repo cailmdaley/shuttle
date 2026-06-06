@@ -65,8 +65,10 @@ func TestResolveFiberInHost_FlatFiberInSymlinkedStore(t *testing.T) {
 	// project's own .felt, mounted into loom as a symlinked sub-store. Queried by
 	// its loom-traversal id (`sp_validation/sp-validation-restructuring` — what
 	// felt returns for the bare leaf), the path is the flat `<sub>/<leaf>.md`.
-	// Before the fix, exactFiberPath only built the dir layout for multi-segment
-	// ids, so this 422'd "resolved to ID … but file not found".
+	// This used to require guessing flat-vs-dir layouts (a multi-segment id was
+	// wrongly assumed dir-contained, 422'ing "resolved to ID … but file not
+	// found"). Now the path is read straight from felt's carried `path`, so the
+	// flat shape resolves with no layout guessing.
 	loom := t.TempDir()
 	project := t.TempDir()
 

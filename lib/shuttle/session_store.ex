@@ -138,42 +138,16 @@ defmodule Shuttle.SessionStore do
     end
   end
 
+  # Scope resolution to the explicit `store` by resolving against that single
+  # store rather than the globally-configured hosts. This honors the explicit-
+  # store contract (the caller — e.g. the codex session-capture path — passes a
+  # store that may not be globally configured) while still asking felt for the
+  # answer: `resolve_fiber/2` reads felt's carried `path`/`id`/`uid` from the
+  # named store, never reconstructing a path from the id.
   defp resolve_fiber_in_store(store, fiber_id) do
-    with {:ok, %{host: host, fiber_id: address, uid: uid, path: path}} <-
-           FeltStores.resolve_fiber(fiber_id),
-         true <- Path.expand(host) == Path.expand(store) do
-      {:ok, address, uid, path}
-    else
-      _ ->
-        case exact_fiber_path(store, fiber_id) do
-          {:ok, path} -> {:ok, fiber_id, uid_from_frontmatter(path), path}
-          {:error, _} -> {:error, :not_found}
-        end
-    end
-  end
-
-  defp exact_fiber_path(host, fiber_id) do
-    segments = String.split(fiber_id, "/")
-    basename = List.last(segments)
-    felt_dir = Path.join(host, ".felt")
-    bare_path = Path.join(felt_dir, "#{basename}.md")
-    dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
-
-    cond do
-      not String.contains?(fiber_id, "/") and File.exists?(bare_path) -> {:ok, bare_path}
-      File.exists?(dir_path) -> {:ok, dir_path}
-      true -> {:error, :not_found}
-    end
-  end
-
-  defp uid_from_frontmatter(path) do
-    with {:ok, text} <- File.read(path),
-         {:ok, frontmatter_yaml, _body} <- split_frontmatter(text),
-         {:ok, %{"id" => id}} when is_binary(id) <- YamlElixir.read_from_string(frontmatter_yaml),
-         true <- String.match?(id, ~r/^[0-9A-HJKMNP-TV-Z]{26}$/) do
-      id
-    else
-      _ -> nil
+    case FeltStores.resolve_fiber(fiber_id, [store]) do
+      {:ok, %{fiber_id: address, uid: uid, path: path}} -> {:ok, address, uid, path}
+      {:error, :not_found} -> {:error, :not_found}
     end
   end
 

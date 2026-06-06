@@ -61,18 +61,24 @@ defmodule ShuttleWeb.FiberControllerTest do
 
     assert %{"id" => "tests/create-me", "path" => path} = Jason.decode!(conn.resp_body)
     assert conn.status == 200
-    assert path == Path.join([tmp, ".felt", "tests", "create-me", "create-me.md"])
+    # felt owns placement and returns its carried (symlink-canonicalized) path.
+    assert_felt_path(path, tmp, ["tests", "create-me", "create-me.md"])
 
-    assert {:ok,
-            %{
-              "name" => "Create me",
-              "status" => "active",
-              "shuttle" => %{"host" => "test-host", "project_dir" => ^tmp}
-            }} =
+    assert {:ok, %{"id" => uid} = parsed} =
              path
              |> File.read!()
              |> frontmatter()
              |> YamlElixir.read_from_string()
+
+    # felt mints an intrinsic ULID on `add`, so POST-created fibers are born
+    # with a real identity instead of a uid-less raw write.
+    assert is_binary(uid) and String.match?(uid, ~r/^[0-9A-HJKMNP-TV-Z]{26}$/)
+
+    assert %{
+             "name" => "Create me",
+             "status" => "active",
+             "shuttle" => %{"host" => "test-host", "project_dir" => ^tmp}
+           } = parsed
   end
 
   test "POST /api/v1/fiber/create writes under shuttle.project_dir when it differs from daemon root", %{
@@ -105,9 +111,10 @@ defmodule ShuttleWeb.FiberControllerTest do
 
     assert %{"id" => "tests/project-local", "path" => path} = Jason.decode!(conn.resp_body)
     assert conn.status == 200
-    assert path == Path.join([project_dir, ".felt", "tests", "project-local", "project-local.md"])
+
+    assert_felt_path(path, project_dir, ["tests", "project-local", "project-local.md"])
+
     refute File.exists?(Path.join([daemon_root, ".felt", "tests", "project-local", "project-local.md"]))
-    assert File.exists?(path)
   end
 
   test "POST /api/v1/fiber/create rejects enabled fibers without project_dir" do
@@ -156,6 +163,17 @@ defmodule ShuttleWeb.FiberControllerTest do
   defp frontmatter(content) do
     [_, frontmatter | _] = String.split(content, "---\n", parts: 3)
     frontmatter
+  end
+
+  # felt carries the symlink-canonicalized absolute path (on macOS the tmp root
+  # resolves /var/... -> /private/var/...). The store-relative tail is stable, so
+  # assert on that plus on-disk existence rather than the symlink-prefixed root.
+  defp assert_felt_path(path, root, segments) do
+    tail = Path.join([".felt"] ++ segments)
+    assert String.ends_with?(path, tail), "#{path} does not end with #{tail}"
+    assert File.exists?(path)
+    # The carried path resolves back to the expected store-relative location.
+    assert File.exists?(Path.join([root, ".felt"] ++ segments))
   end
 
   defp restore_env(key, nil), do: System.delete_env(key)

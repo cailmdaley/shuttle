@@ -152,30 +152,9 @@ defmodule Shuttle.LifecycleStore do
   end
 
   defp resolve_fiber_path(fiber_id) do
-    FeltStores.configured_hosts()
-    |> Enum.find_value(fn host ->
-      case exact_fiber_path(host, fiber_id) do
-        {:ok, path} -> path
-        {:error, _} -> nil
-      end
-    end)
-    |> case do
-      nil -> {:error, :not_found}
-      path -> {:ok, path}
-    end
-  end
-
-  defp exact_fiber_path(host, fiber_id) do
-    segments = String.split(fiber_id, "/")
-    basename = List.last(segments)
-    felt_dir = Path.join(host, ".felt")
-    bare_path = Path.join(felt_dir, "#{basename}.md")
-    dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
-
-    cond do
-      not String.contains?(fiber_id, "/") and File.exists?(bare_path) -> {:ok, bare_path}
-      File.exists?(dir_path) -> {:ok, dir_path}
-      true -> {:error, :not_found}
+    case FeltStores.resolve_fiber(fiber_id) do
+      {:ok, %{path: path}} -> {:ok, path}
+      {:error, :not_found} -> {:error, :not_found}
     end
   end
 

@@ -146,12 +146,11 @@ defmodule ShuttleWeb.LifecycleController do
     e in ErlangError -> {:error, Exception.message(e)}
   end
 
-  # Resolve the felt store owning `fiber_id` via the one canonical-id rule
-  # (FeltStores.host_for_fiber → Shuttle.FiberId), the same derivation
-  # /api/v1/fibers advertises — so a host-routed lifecycle verb resolves the
-  # exact id the kanban sent, including project-resident ("prefix-drop") fibers
-  # whose canonical id is a bare leaf. Keeps the user-facing "fiber not found"
-  # message on a genuine miss.
+  # Resolve the felt store owning `fiber_id` by asking felt for the carried path
+  # (FeltStores.host_for_fiber), the same resolution /api/v1/fibers advertises —
+  # so a host-routed lifecycle verb resolves the exact id the kanban sent,
+  # including project-resident ("prefix-drop") fibers whose addressable id is a
+  # bare leaf. Keeps the user-facing "fiber not found" message on a genuine miss.
   defp host_for_fiber(fiber_id) do
     case FeltStores.host_for_fiber(fiber_id) do
       {:ok, host} -> {:ok, host}

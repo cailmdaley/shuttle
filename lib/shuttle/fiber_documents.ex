@@ -182,17 +182,25 @@ defmodule Shuttle.FiberDocuments do
   defp shuttle_fiber?(_), do: false
 
   defp entry_for(store, %{"id" => id} = fiber) when is_binary(id) and id != "" do
-    # `path` (and thus the physical file location) is derived from felt's
-    # traversal id *before* we overwrite `id` — it stays store-relative so
-    # remote clients open the file via `felt_store` + `path`. The card's logical
-    # `id`, by contrast, prefers felt's intrinsic frontmatter `uid` when present,
-    # with the migration-era markdown/frontmatter read and canonical slug as
-    # fallbacks for older felt binaries and unbackfilled fibers.
-    path = relative_felt_path(fiber)
-    full_path = Path.join([store, ".felt", path])
-
-    canonical_id = canonical_id(full_path, id)
-    logical_id = logical_id(fiber, full_path, canonical_id)
+    # Three values, all read from felt, none reverse-derived or guessed by Shuttle:
+    #
+    #   * The wire `path` is the SERVED-store-relative address Portolan opens the
+    #     file by (`felt_store` + `path`). Portolan's `loomRelativeWirePath`
+    #     depends on this served-relative shape, so it stays served-relative —
+    #     but it is now READ from felt's carried `path` (its leaf shape) joined
+    #     under felt's traversal `id` prefix, never guessed from `entry_point`.
+    #     See `served_wire_path/1`.
+    #
+    #   * The card's `slug`/canonical id is the REALPATH store-relative slug
+    #     (`review-ngmix`, where the bytes physically root), read from felt's
+    #     carried absolute `path` — the same id `/state` keys the runtime by, so
+    #     the kanban join matches.
+    #
+    #   * The card's logical `id` prefers felt's intrinsic `uid`, falling back to
+    #     that canonical slug.
+    wire_path = served_wire_path(fiber)
+    canonical_id = canonical_id_from_path(fiber) || id
+    logical_id = logical_id(fiber, canonical_id)
 
     fiber =
       fiber
@@ -201,16 +209,23 @@ defmodule Shuttle.FiberDocuments do
 
     entry = %{
       felt_store: store,
-      path: path,
+      path: wire_path,
       fiber: fiber
     }
 
-    report_path = full_path |> Path.dirname() |> Path.join("report.html")
+    # report.html is a filesystem sibling of the fiber's `.md` — universally,
+    # with no flat-vs-dir branch and no `entry_point` dependency. Read it from
+    # the directory felt carries (`dirname(felt.path)`), the one path concept.
+    # felt's `path` is symlink-canonicalized and already absolute, exactly the
+    # form Portolan serves over /project-file/<originId><absPath>.
+    case report_sibling(fiber) do
+      {:ok, report_path} ->
+        if File.exists?(report_path),
+          do: [Map.put(entry, :report_path, report_path)],
+          else: [entry]
 
-    if File.exists?(report_path) do
-      [Map.put(entry, :report_path, Path.expand(report_path))]
-    else
-      [entry]
+      :error ->
+        [entry]
     end
   end
 
@@ -223,60 +238,79 @@ defmodule Shuttle.FiberDocuments do
   defp put_slug(%{"id" => id} = fiber, id), do: fiber
   defp put_slug(fiber, slug), do: Map.put(fiber, "slug", slug)
 
-  defp logical_id(fiber, full_path, fallback) do
+  # Served-store-relative wire path, the address Portolan opens the file by
+  # (`felt_store` + `path`). The PREFIX comes from felt's traversal `id` (which
+  # carries the served-store prefix a symlink-traversed fiber's realpath drops);
+  # the LEAF SHAPE — flat `<leaf>.md` vs dir-contained `<leaf>/<leaf>.md` — comes
+  # from felt's carried `path`, not from an `entry_point` guess. The leaf shape
+  # is symlink-invariant (the symlink swaps the prefix, never the leaf), so the
+  # realpath tail and the served file agree on it. Falls back to the dir-contained
+  # shape only when felt carries no usable `path` (older binaries).
+  defp served_wire_path(%{"id" => id} = fiber) do
+    leaf = Path.basename(id)
+    prefix = Path.dirname(id)
+    leaf_file = leaf_shape(fiber, leaf)
+
+    if prefix == ".", do: leaf_file, else: Path.join(prefix, leaf_file)
+  end
+
+  # `<leaf>/<leaf>.md` when felt's carried path is dir-contained, else `<leaf>.md`.
+  defp leaf_shape(%{"path" => path}, leaf) when is_binary(path) and path != "" do
+    parent = path |> Path.dirname() |> Path.basename()
+    if parent == leaf, do: Path.join(leaf, "#{leaf}.md"), else: "#{leaf}.md"
+  end
+
+  defp leaf_shape(_fiber, leaf), do: Path.join(leaf, "#{leaf}.md")
+
+  # report.html beside the fiber file: `dirname(felt.path)/report.html`. felt's
+  # `path` is absolute and symlink-canonicalized, so this is the real fiber dir
+  # in every topology (dir-contained, symlinked-flat substore, entry point) with
+  # no served-store-prefix coupling. `:error` when felt carries no `path`.
+  defp report_sibling(%{"path" => path}) when is_binary(path) and path != "" do
+    {:ok, Path.join(Path.dirname(Path.expand(path)), "report.html")}
+  end
+
+  defp report_sibling(_fiber), do: :error
+
+  # Canonical (realpath store-relative) id from felt's carried absolute `path`:
+  # the tail after the physically-enclosing `.felt/`, minus the `<leaf>.md`
+  # filename for dir-contained fibers. For a symlink-traversed fiber this drops
+  # the served-store prefix felt's traversal `id` carries, recovering the slug
+  # the owning store (and `/state`) addresses. nil when felt carries no `path`
+  # (older binaries) — the caller falls back to felt's traversal `id`.
+  defp canonical_id_from_path(%{"path" => path}) when is_binary(path) and path != "" do
+    case String.split(path, "/.felt/", parts: 2) do
+      [_prefix, tail] when tail != "" -> canonical_id_from_tail(tail)
+      _ -> nil
+    end
+  end
+
+  defp canonical_id_from_path(_), do: nil
+
+  # `<slug>/<leaf>.md` (dir-contained) → `<slug>`; `<leaf>.md` (flat) → `<leaf>`.
+  defp canonical_id_from_tail(tail) do
+    leaf = tail |> Path.basename() |> String.replace_suffix(".md", "")
+    parent = tail |> Path.dirname()
+
+    cond do
+      parent == "." -> leaf
+      Path.basename(parent) == leaf -> parent
+      true -> Path.join(parent, leaf)
+    end
+  end
+
+  defp logical_id(fiber, fallback) do
     case Map.get(fiber, "uid") do
       uid when is_binary(uid) ->
-        if ulid?(uid), do: uid, else: logical_id_from_file(full_path, fallback)
+        if ulid?(uid), do: uid, else: fallback
 
       _ ->
-        logical_id_from_file(full_path, fallback)
+        fallback
     end
   end
-
-  defp logical_id_from_file(full_path, fallback) do
-    case frontmatter_ulid(full_path) do
-      {:ok, id} -> id
-      :error -> canonical_id(full_path, fallback)
-    end
-  end
-
-  defp canonical_id(full_path, fallback) do
-    case Shuttle.FiberId.canonical_id(full_path) do
-      {:ok, id} -> id
-      {:error, _} -> fallback
-    end
-  end
-
-  defp frontmatter_ulid(path) do
-    with {:ok, text} <- File.read(path),
-         {:ok, yaml} <- frontmatter_yaml(text),
-         {:ok, %{"id" => id}} when is_binary(id) <- YamlElixir.read_from_string(yaml),
-         true <- ulid?(id) do
-      {:ok, id}
-    else
-      _ -> :error
-    end
-  end
-
-  defp frontmatter_yaml("---\n" <> rest) do
-    case String.split(rest, "\n---\n", parts: 2) do
-      [yaml, _body] -> {:ok, yaml}
-      _ -> :error
-    end
-  end
-
-  defp frontmatter_yaml(_), do: :error
 
   defp ulid?(value) do
     String.match?(value, ~r/^[0-9A-HJKMNP-TV-Z]{26}$/)
-  end
-
-  defp relative_felt_path(%{"id" => id, "entry_point" => true}) do
-    "#{Path.basename(id)}.md"
-  end
-
-  defp relative_felt_path(%{"id" => id}) do
-    Path.join(id, "#{Path.basename(id)}.md")
   end
 
   defp store_errors({:ok, _rows}), do: []

@@ -34,24 +34,8 @@ defmodule Shuttle.FeltStores do
 
   @doc """
   Resolve which configured felt store owns `fiber_id`, as `{:ok, host}` or
-  `{:error, :not_found}`.
-
-  The match criterion is the ONE canonical rule — `Shuttle.FiberId.canonical_id`
-  (realpath → outermost `.felt` → slug) — the same derivation `/api/v1/fibers`
-  and the runtime keying use, so id resolution never disagrees across daemon
-  surfaces. Candidate files are generated cheaply (exact store path first; a
-  glob-by-leaf only when that misses) and each candidate is *verified* by
-  canonical id, so a leaf collision across stores still resolves to the right
-  one.
-
-  The glob fallback covers the "prefix-drop" topology: a project's `.felt`
-  symlinked into loom (`loom/.felt/shapepipe → shapepipe/.felt`) makes the
-  canonical id a bare leaf (`review-ngmix-v2-pr740`) while the file lives under
-  the loom path (`shapepipe/review-ngmix-v2-pr740/...`). Exact construction from
-  the leaf misses; the file is still discoverable by leaf and confirmed by
-  canonical id. `felt` and the Go CLI's `resolveFiber` already resolve these, so
-  the daemon must too — without it, host-routed lifecycle/actions verbs 400 with
-  "fiber not found" on project-resident fibers.
+  `{:error, :not_found}`. Thin wrapper over `resolve_fiber/1` returning just the
+  owning store root.
   """
   @type resolved_fiber :: %{
           host: String.t(),
@@ -61,8 +45,11 @@ defmodule Shuttle.FeltStores do
         }
 
   @spec host_for_fiber(String.t()) :: {:ok, String.t()} | {:error, :not_found}
-  def host_for_fiber(fiber_id) do
-    case resolve_fiber(fiber_id) do
+  def host_for_fiber(fiber_id), do: host_for_fiber(fiber_id, configured_hosts())
+
+  @spec host_for_fiber(String.t(), host_list()) :: {:ok, String.t()} | {:error, :not_found}
+  def host_for_fiber(fiber_id, hosts) do
+    case resolve_fiber(fiber_id, hosts) do
       {:ok, %{host: host}} -> {:ok, host}
       {:error, :not_found} -> {:error, :not_found}
     end
@@ -71,117 +58,199 @@ defmodule Shuttle.FeltStores do
   @doc """
   Resolve a public fiber identifier to the felt address Shuttle can shell out to.
 
-  During the ULID migration, clients may send either the old slug-shaped felt
-  address or the intrinsic frontmatter `id`. The resolver prefers the cheap slug
-  path, then falls back to scanning configured stores for a matching ULID. It
-  returns both surfaces: `fiber_id` is the felt CLI address, while `uid` is the
-  intrinsic identity when present.
+  Resolution asks felt for the answer — it never reconstructs the path from the
+  id. For a slug address (the common case, including the symlinked "prefix-drop"
+  topology) `felt show -j <addr>` resolves the fiber and carries its physical
+  `path`, addressable `id`, and intrinsic `uid` directly. For a bare intrinsic
+  ULID — which `felt show` cannot address — we scan each store's `felt ls -j`
+  for the matching `uid` and read the carried `path` from that row. Either way
+  the values come from felt's read chokepoint, not from guessing filesystem
+  layouts.
+
+  Returns `%{host, fiber_id, path, uid}` where `host` is the owning store root
+  (for shelling subsequent felt commands), `fiber_id` is felt's addressable
+  slug, `path` is the absolute on-disk file, and `uid` is the intrinsic identity
+  when felt carries one.
   """
   @spec resolve_fiber(String.t()) :: {:ok, resolved_fiber()} | {:error, :not_found}
-  def resolve_fiber(identifier) when is_binary(identifier) do
-    hosts = configured_hosts()
+  def resolve_fiber(identifier) when is_binary(identifier),
+    do: resolve_fiber(identifier, configured_hosts())
 
-    with nil <- Enum.find_value(hosts, &exact_canonical_resolution(&1, identifier)),
-         nil <- Enum.find_value(hosts, &nested_canonical_resolution(&1, identifier)),
-         nil <- Enum.find_value(hosts, &uid_resolution(&1, identifier)) do
+  @doc """
+  As `resolve_fiber/1`, but resolves against an explicit `hosts` store list
+  rather than the globally-configured stores. The Poller passes its own
+  `state.felt_stores` so cold-path host resolution honors the exact store set
+  that daemon instance is configured for (which may differ from the global
+  `configured_hosts/0`, e.g. in tests or multi-store overrides).
+  """
+  @spec resolve_fiber(String.t(), host_list()) :: {:ok, resolved_fiber()} | {:error, :not_found}
+  def resolve_fiber(identifier, hosts) when is_binary(identifier) and is_list(hosts) do
+    with nil <- show_resolution(hosts, identifier),
+         nil <- uid_resolution(hosts, identifier) do
       {:error, :not_found}
     else
       resolved -> {:ok, resolved}
     end
   end
 
-  defp exact_canonical_resolution(host, fiber_id) do
-    segments = String.split(fiber_id, "/")
-    leaf = List.last(segments)
-    felt_dir = Path.join(host, ".felt")
+  # Ask felt to resolve the address and carry the physical path, then assign
+  # ownership by that path — NOT by which store happened to address it. felt's
+  # JSON carries `path` (absolute, symlink-resolved), so the same physical file
+  # resolves to the same path from every symlink view; the owning store is the
+  # one whose realpath `.felt/` physically contains it. Re-querying felt against
+  # the owner yields the owner-relative `id` (the address subsequent
+  # `felt -C <owner>` commands need), instead of a symlink-view alias.
+  defp show_resolution(hosts, identifier) do
+    Enum.find_value(hosts, fn host ->
+      case felt_show_json(host, identifier) do
+        {:ok, %{"path" => path} = fiber} when is_binary(path) and path != "" ->
+          owner = owning_store(hosts, path) || host
+          owner_fiber = if owner == host, do: fiber, else: felt_for_path(owner, identifier, fiber)
+          resolved_from(owner, owner_fiber)
 
-    [
-      # dir-contained: <.felt>/<segments>/<leaf>.md
-      Path.join([felt_dir | segments] ++ ["#{leaf}.md"]),
-      # flat: <.felt>/<segments>.md (covers both root-level and nested flat fibers)
-      Path.join([felt_dir | segments]) <> ".md"
-    ]
-    |> Enum.find_value(&resolved_if_canonical(&1, host, fiber_id))
+        _ ->
+          nil
+      end
+    end)
   end
 
-  defp nested_canonical_resolution(host, fiber_id) do
-    leaf = fiber_id |> String.split("/") |> List.last()
-    felt_dir = Path.join(host, ".felt")
+  # `felt show` addresses fibers by slug, not by intrinsic ULID, so a bare UID
+  # falls through to scanning each store's `felt ls -j` for a matching `uid`,
+  # reading the carried `path`, and assigning ownership by that path. Skipped
+  # entirely for non-ULID identifiers (those resolve via `show_resolution`).
+  defp uid_resolution(hosts, uid) do
+    if ulid?(uid) do
+      Enum.find_value(hosts, fn host ->
+        case felt_ls_json(host) do
+          {:ok, rows} when is_list(rows) ->
+            Enum.find_value(rows, fn
+              %{"uid" => ^uid, "path" => path} = fiber when is_binary(path) and path != "" ->
+                owner = owning_store(hosts, path) || host
+                resolved_from(owner, fiber)
 
-    # Match the fiber file by leaf anywhere under .felt. A felt fiber is always
-    # `<leaf>.md` — flat (`<leaf>.md`) or dir-contained (`<leaf>/<leaf>.md`) —
-    # and both end in `<leaf>.md`, so one glob covers both layouts (and crosses
-    # symlinked/automounted sub-stores). Each candidate is verified by canonical
-    # id, so over-matches are rejected.
-    if File.dir?(felt_dir) do
-      [felt_dir, "**", "#{leaf}.md"]
-      |> Path.join()
-      |> Path.wildcard(match_dot: true)
-      |> Enum.find_value(&resolved_if_canonical(&1, host, fiber_id))
-    end
-  end
+              _ ->
+                nil
+            end)
 
-  defp resolved_if_canonical(path, host, fiber_id) do
-    with true <- File.regular?(path),
-         {:ok, ^fiber_id} <- Shuttle.FiberId.canonical_id(path) do
-      resolved(path, host, fiber_id)
-    else
-      _ -> nil
-    end
-  end
-
-  defp uid_resolution(host, uid) do
-    felt_dir = Path.join(host, ".felt")
-
-    if ulid?(uid) and File.dir?(felt_dir) do
-      [felt_dir, "**", "*.md"]
-      |> Path.join()
-      |> Path.wildcard(match_dot: true)
-      |> Enum.find_value(fn path ->
-        with {:ok, ^uid} <- frontmatter_uid(path),
-             {:ok, fiber_id} <- Shuttle.FiberId.canonical_id(path) do
-          resolved(path, host, fiber_id, uid)
-        else
-          _ -> nil
+          _ ->
+            nil
         end
       end)
     end
   end
 
-  defp resolved(path, host, fiber_id, uid \\ nil) do
-    %{host: host, fiber_id: fiber_id, path: path, uid: uid || uid_from_path(path)}
+  defp resolved_from(host, %{"id" => id, "path" => path} = fiber)
+       when is_binary(id) and id != "" and is_binary(path) and path != "" do
+    resolved(path, host, id, ulid_or_nil(Map.get(fiber, "uid")))
   end
 
-  defp uid_from_path(path) do
-    case frontmatter_uid(path) do
-      {:ok, uid} -> uid
-      :error -> nil
+  defp resolved_from(_host, _fiber), do: nil
+
+  # The configured store that physically roots `path`: the one whose realpath
+  # `.felt/` is a prefix of felt's carried (symlink-resolved) path. nil when no
+  # configured store owns it (the caller keeps the queried store as a fallback).
+  defp owning_store(hosts, path) do
+    Enum.find(hosts, fn host ->
+      String.starts_with?(path, store_felt_realpath(host) <> "/")
+    end)
+  end
+
+  # Re-query the owner store so the returned `id` is owner-relative. Falls back
+  # to the original fiber JSON if the owner can't address the identifier (it
+  # always can for a physically-rooted fiber, but we degrade safely).
+  defp felt_for_path(owner, identifier, fallback) do
+    case felt_show_json(owner, identifier) do
+      {:ok, %{"path" => _} = fiber} -> fiber
+      _ -> fallback
     end
   end
 
-  defp frontmatter_uid(path) do
-    with {:ok, text} <- File.read(path),
-         {:ok, yaml} <- frontmatter_yaml(text),
-         {:ok, %{"id" => id}} when is_binary(id) <- YamlElixir.read_from_string(yaml),
-         true <- ulid?(id) do
-      {:ok, id}
-    else
-      _ -> :error
+  defp store_felt_realpath(host) do
+    felt_dir = host |> Path.join(".felt") |> Path.expand()
+
+    case resolve_realpath(felt_dir) do
+      {:ok, resolved} -> resolved
+      {:error, _} -> felt_dir
     end
   end
 
-  defp frontmatter_yaml("---\n" <> rest) do
-    case String.split(rest, "\n---\n", parts: 2) do
-      [yaml, _body] -> {:ok, yaml}
-      _ -> :error
+  @max_symlink_hops 40
+
+  defp resolve_realpath(path) do
+    case Path.split(Path.expand(path)) do
+      ["/" | rest] -> resolve_realpath_segments("/", rest, 0)
+      [first | rest] -> resolve_realpath_segments(first, rest, 0)
+      [] -> {:error, :empty_path}
     end
   end
 
-  defp frontmatter_yaml(_), do: :error
+  defp resolve_realpath_segments(current, [], _hops), do: {:ok, current}
+
+  defp resolve_realpath_segments(_current, _segments, hops) when hops > @max_symlink_hops,
+    do: {:error, :symlink_loop}
+
+  defp resolve_realpath_segments(current, [segment | rest], hops) do
+    candidate = Path.join(current, segment)
+
+    case :file.read_link(String.to_charlist(candidate)) do
+      {:ok, target} ->
+        target_path = List.to_string(target)
+
+        expanded_target =
+          case Path.type(target_path) do
+            :absolute -> Path.expand(target_path)
+            _ -> Path.expand(target_path, Path.dirname(candidate))
+          end
+
+        case Path.split(expanded_target) do
+          ["/" | target_rest] -> resolve_realpath_segments("/", target_rest ++ rest, hops + 1)
+          [first | target_rest] -> resolve_realpath_segments(first, target_rest ++ rest, hops + 1)
+          [] -> {:error, :empty_target}
+        end
+
+      {:error, _} ->
+        resolve_realpath_segments(candidate, rest, hops)
+    end
+  end
+
+  defp felt_show_json(host, identifier) do
+    # Never fold stderr into stdout: felt prints "no felt found matching …" to
+    # stderr and JSON to stdout. A miss exits non-zero with empty stdout.
+    case System.cmd("felt", ["-C", host, "show", identifier, "-j"], stderr_to_stdout: false) do
+      {output, 0} -> Jason.decode(output)
+      {_output, _status} -> {:error, :not_found}
+    end
+  rescue
+    _ -> {:error, :not_found}
+  end
+
+  # `-s all` so a UID pointing at a closed/composted fiber still resolves; the
+  # default `ls` filters to open/active. felt walks the tree and carries `uid`
+  # and `path` per row, so no index build is required.
+  defp felt_ls_json(host) do
+    case System.cmd("felt", ["-C", host, "ls", "-j", "-s", "all"], stderr_to_stdout: false) do
+      {output, 0} -> Jason.decode(output)
+      {_output, _status} -> {:error, :not_found}
+    end
+  rescue
+    _ -> {:error, :not_found}
+  end
+
+  defp resolved(path, host, fiber_id, uid) do
+    %{host: host, fiber_id: fiber_id, path: path, uid: uid}
+  end
+
+  defp ulid_or_nil(value) when is_binary(value) do
+    if ulid?(value), do: value, else: nil
+  end
+
+  defp ulid_or_nil(_), do: nil
 
   defp ulid?(value) when is_binary(value) do
     String.match?(value, ~r/^[0-9A-HJKMNP-TV-Z]{26}$/)
   end
+
+  defp ulid?(_), do: false
 
   @spec registered_hosts() :: host_list()
   def registered_hosts do

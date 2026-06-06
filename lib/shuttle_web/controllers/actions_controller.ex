@@ -157,10 +157,11 @@ defmodule ShuttleWeb.ActionsController do
   end
 
   # Resolve the felt store owning `fiber_id` (so shuttle-ctl verbs get the right
-  # `--felt-store`) via the one canonical-id rule — the same Shuttle.FiberId
-  # derivation /api/v1/fibers uses, so resolution never disagrees with the id we
-  # advertised (including project-resident "prefix-drop" fibers, whose canonical
-  # id is a bare leaf the old naive path construction couldn't resolve).
+  # `--felt-store`) by asking felt for the carried path and assigning ownership
+  # by that path — the same resolution /api/v1/fibers uses, so it never disagrees
+  # with the id we advertised (including project-resident "prefix-drop" fibers,
+  # whose addressable id is a bare leaf the old naive path construction couldn't
+  # resolve).
   defp host_for_fiber(fiber_id), do: FeltStores.host_for_fiber(fiber_id)
 
   # pause / reopen / close shell the Go frontmatter writer with

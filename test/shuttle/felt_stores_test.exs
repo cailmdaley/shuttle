@@ -26,14 +26,19 @@ defmodule Shuttle.FeltStoresTest do
       assert Path.expand(host) == Path.expand(loom)
     end
 
-    test "does NOT match a nested loom fiber by its bare leaf (canonical id is the full slug)" do
+    test "resolves a nested fiber by its full slug, and felt fuzzy-matches the bare leaf" do
       loom = tmp_dir()
-      # Canonical id of this file is "a/b" — NOT "b".
       write_fiber(Path.join(loom, ".felt"), ["a", "b"])
       System.put_env("LOOM_HOMES", loom)
 
       assert {:ok, _} = FeltStores.host_for_fiber("a/b")
-      assert {:error, :not_found} = FeltStores.host_for_fiber("b")
+
+      # Resolution now asks felt, and `felt show b` fuzzy-matches the bare leaf
+      # to its addressable slug `a/b` (basename match) — the same fiber every
+      # other felt surface resolves `b` to. The resolver therefore returns the
+      # real fiber's address and physical path rather than the old daemon-strict
+      # `:not_found`. A looser match, never a wrong-fiber one.
+      assert {:ok, %{fiber_id: "a/b"}} = FeltStores.resolve_fiber("b")
     end
 
     # The candide topology: a project's .felt symlinked into loom as a sub-path.

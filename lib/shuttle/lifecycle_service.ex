@@ -103,43 +103,13 @@ defmodule Shuttle.LifecycleService do
   end
 
   defp append_history(fiber_id, summary) do
-    with {:ok, host} <- host_for_fiber(fiber_id) do
+    with {:ok, %{host: host}} <- FeltStores.resolve_fiber(fiber_id) do
       System.cmd("felt", ["-C", host, "history", "append", fiber_id, "--summary", summary],
         stderr_to_stdout: true
       )
     end
   rescue
     _ -> nil
-  end
-
-  defp host_for_fiber(fiber_id) do
-    FeltStores.configured_hosts()
-    |> Enum.find(&fiber_exists?(&1, fiber_id))
-    |> case do
-      nil -> {:error, "fiber not found: #{fiber_id}"}
-      host -> {:ok, host}
-    end
-  end
-
-  defp fiber_exists?(host, fiber_id) do
-    case exact_fiber_path(host, fiber_id) do
-      {:ok, _path} -> true
-      {:error, _} -> false
-    end
-  end
-
-  defp exact_fiber_path(host, fiber_id) do
-    segments = String.split(fiber_id, "/")
-    basename = List.last(segments)
-    felt_dir = Path.join(host, ".felt")
-    bare_path = Path.join(felt_dir, "#{basename}.md")
-    dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
-
-    cond do
-      not String.contains?(fiber_id, "/") and File.exists?(bare_path) -> {:ok, bare_path}
-      File.exists?(dir_path) -> {:ok, dir_path}
-      true -> {:error, :not_found}
-    end
   end
 
   defp to_message(reason) when is_binary(reason), do: reason

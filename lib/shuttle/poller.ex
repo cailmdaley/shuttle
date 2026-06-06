@@ -38,7 +38,6 @@ defmodule Shuttle.Poller do
   alias Shuttle.{
     Actions,
     Dispatcher,
-    FiberId,
     LifecycleStore,
     RuntimeStore,
     StandingRole,
@@ -56,7 +55,6 @@ defmodule Shuttle.Poller do
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   @default_max_retry_backoff_ms 300_000
-  @felt_shuttle_projection_fields "id,uid,status,created_at,shuttle,depends_on,tempered"
 
   defmodule State do
     @moduledoc false
@@ -638,8 +636,8 @@ defmodule Shuttle.Poller do
   def handle_call({:resolve_fiber_host, fiber_id}, _from, state) do
     case host_for_fiber(fiber_id, state) do
       {:ok, host} ->
-        # Cache the result so subsequent calls and file-stat probes within
-        # the same daemon lifetime return quickly.
+        # Cache the result so subsequent resolutions within the same daemon
+        # lifetime skip the felt shell-out.
         new_state = %{state | fiber_host_cache: Map.put(state.fiber_host_cache, fiber_id, host)}
         {:reply, {:ok, host}, new_state}
 
@@ -1244,62 +1242,45 @@ defmodule Shuttle.Poller do
     Map.filter(failures, fn {fiber_id, _entry} -> MapSet.member?(active_ids, fiber_id) end)
   end
 
-  # Discovers candidate fibers by walking <host>/.felt/ for files that carry a
-  # shuttle: frontmatter block. No tag predicate — the block is the source of
-  # truth, matching the same shuttle-block contract every other surface reads.
+  # Discovers candidate fibers by asking felt (`felt ls --has-field shuttle`)
+  # per configured store and keeping the ones physically rooted in that store.
+  # No tag predicate — the shuttle: block is the source of truth, matching the
+  # same contract every other surface reads.
   #
   # Returns {:ok, fibers, host_map, uid_map} where:
-  #   fibers   — [%{"id" => id, "uid" => uid, "status" => status}] across all hosts
+  #   fibers   — [%{"id" => id, "uid" => uid, "status" => status, "path" => …}] across all hosts
   #   host_map — %{fiber_id => felt_store} for host resolution
   #   uid_map  — %{fiber_id => uid} for the intrinsic identity read surface
   #
   # ## Symlink discipline
   #
-  # The same physical fiber file is often reachable from multiple felt
-  # hosts via symlinks. Two cases that occur in practice:
+  # The same physical fiber file is often reachable from multiple felt hosts via
+  # symlinks. Two cases that occur in practice:
   #
   # 1. A project host (`~/work/project-a`) whose `.felt/` is a symlink into
-  #    `~/loom/.felt/work/project-a/`. The same `task-board.md` is reachable
-  #    as `task-board` (project view) and `work/project-a/task-board`
-  #    (loom view).
+  #    `~/loom/.felt/work/project-a/`. The same `task-board.md` is reachable as
+  #    `task-board` (project view) and `work/project-a/task-board` (loom view).
   #
-  # 2. A project-canonical felt store (lightcone) whose own `.felt/` is a
-  #    real directory, with loom symlinking *into* it at
-  #    `~/loom/.felt/ai-futures/lightcone -> ~/lightcone/.felt`. The same
-  #    fiber is reachable as `lightcone-ui/...` (lightcone view) and
+  # 2. A project-canonical felt store (lightcone) whose own `.felt/` is a real
+  #    directory, with loom symlinking *into* it at
+  #    `~/loom/.felt/ai-futures/lightcone -> ~/lightcone/.felt`. The same fiber
+  #    is reachable as `lightcone-ui/...` (lightcone view) and
   #    `ai-futures/lightcone/lightcone-ui/...` (loom view).
   #
-  # If we enumerate both views, dispatch races: each "different" id passes
-  # `tmux has-session` independently → multiple workers on the same file.
-  # Worse, the wrong host may win — loom's `index.db` doesn't contain the
-  # lightcone fiber under the loom-relative id, so `felt -C ~/loom show
-  # ai-futures/lightcone/...` fails and dispatch silently never happens.
+  # If both views were enumerated, dispatch would race: each "different" id
+  # passes `tmux has-session` independently → multiple workers on one file.
   #
-  # **Rule: a fiber should be enumerated only by the host where it is
-  # physically rooted** — i.e. reachable from `<host>/.felt/` without
-  # traversing any symlinks. We enforce this two ways:
-  #
-  # - `owned_fiber_ids/1` skips the host entirely if `<host>/.felt/`
-  #   itself is a symlink (case 1: project-cities-on-loom).
-  #
-  # - `do_walk_felt_dir/1` skips subdirectories that are symlinks (case 2:
-  #   loom symlinking into a project-canonical host).
-  #
-  # Once we know which IDs are physically rooted in a host, felt becomes the
-  # sole reader: `list_shuttle_fibers/3` shells out once per host to a narrow
-  # `felt ls --json --has-field shuttle --json-field ...` projection, then
-  # filters that JSON payload down to the owned IDs that actually carry a
-  # `shuttle:` block.
-  #
-  # The `file_identity` MapSet below is belt-and-suspenders for esoteric
-  # cases (hard links, etc.) where two physically-distinct paths point at
-  # the same inode and both pass the symlink filter.
+  # **Rule: a fiber is enumerated only by the host where it is physically
+  # rooted.** `list_shuttle_fibers/2` enforces this by reading felt's carried
+  # `path` (absolute, symlink-resolved) and keeping a fiber iff that path lives
+  # under `realpath(host)/.felt/` — so case 2's loom view drops the fiber (its
+  # realpath roots in lightcone) and the lightcone store claims it. A store
+  # whose own `.felt/` is a symlink (case 1) owns nothing; the target store
+  # enumerates it. Ownership is read from felt's path, never reverse-derived.
   defp discover_candidates(state) do
     {all_fibers, host_map, uid_map} =
       Enum.reduce(state.felt_stores, {[], %{}, %{}}, fn host, {acc_fibers, acc_map, acc_uids} ->
-        owned_ids = owned_fiber_ids(host)
-
-        case list_shuttle_fibers(host, owned_ids, state) do
+        case list_shuttle_fibers(host, state) do
           {:ok, fibers} ->
             new_map =
               Enum.reduce(fibers, %{}, fn fiber, hm ->
@@ -1330,158 +1311,146 @@ defmodule Shuttle.Poller do
     {:ok, all_fibers, host_map, uid_map}
   end
 
-  # Walk <host>/.felt/ and return the set of fiber IDs physically rooted in
-  # this host (no symlink traversal). Skips the host entirely if
-  # `<host>/.felt/` is itself a symlink.
-  defp owned_fiber_ids(host) do
+  # Read one host's shuttle fibers via felt's JSON, keeping only those
+  # PHYSICALLY ROOTED in this host. Ownership is read from felt's carried
+  # `path` (absolute, symlink-resolved) — a fiber belongs to `host` iff its
+  # path lives under `realpath(host)/.felt/`. felt enumerates symlink-traversed
+  # fibers too (loom listing a project whose `.felt` is symlinked in), so the
+  # path-prefix check is what keeps each fiber owned by exactly the store that
+  # physically roots it — the discipline the old filesystem walk + canonical-id
+  # match enforced, now read from felt rather than reverse-derived. A store
+  # whose own `.felt/` is a symlink owns nothing here: the target store
+  # enumerates it canonically.
+  defp list_shuttle_fibers(host, state) do
     felt_dir = Path.join(host, ".felt")
-    canonical_host = FiberId.canonical_host_path(host)
 
     case File.lstat(felt_dir) do
       {:ok, %File.Stat{type: :symlink}} ->
-        # Host's .felt/ is a symlink — its content is owned by the host
-        # where .felt is physically rooted. That host enumerates canonically.
-        MapSet.new()
+        {:ok, []}
+
+      {:ok, %File.Stat{type: :directory}} ->
+        # An empty store has nothing to enumerate; skip the felt shell-out so a
+        # store with no fibers costs nothing (and so a daemon polling an empty
+        # configured store doesn't shell felt every tick).
+        if empty_dir?(felt_dir) do
+          {:ok, []}
+        else
+          run_shuttle_listing(host, state)
+        end
 
       _ ->
-        felt_dir
-        |> do_walk_felt_dir()
-        |> Enum.filter(&String.ends_with?(&1, ".md"))
-        |> Enum.reduce({MapSet.new(), MapSet.new()}, fn path, {ids, seen} ->
-          ident = file_identity(path)
-
-          cond do
-            ident != nil and MapSet.member?(seen, ident) ->
-              {ids, seen}
-
-            true ->
-              next_seen = if ident, do: MapSet.put(seen, ident), else: seen
-
-              case FiberId.ref_from_path(path) do
-                {:ok, %{host: ^canonical_host, id: fiber_id}} ->
-                  {MapSet.put(ids, fiber_id), next_seen}
-
-                _ ->
-                  {ids, next_seen}
-              end
-          end
-        end)
-        |> elem(0)
+        {:ok, []}
     end
   end
 
-  # Read one host's candidate fibers via felt's JSON output, then keep only
-  # physically-rooted IDs with a shuttle block. Felt is the canonical reader;
-  # the filesystem walk above only determines ownership across hosts.
-  defp list_shuttle_fibers(host, owned_ids, state) do
-    if MapSet.size(owned_ids) == 0 do
-      {:ok, []}
-    else
-      case run_felt_ls_for_shuttle(host, state) do
-        {:ok, output} ->
-          with {:ok, fibers} when is_list(fibers) <- Jason.decode(output) do
-            kept =
-              Enum.filter(fibers, fn fiber ->
-                id = Map.get(fiber, "id", "")
-                MapSet.member?(owned_ids, id) and is_map(Map.get(fiber, "shuttle"))
-              end)
-
-            {:ok, kept}
-          else
-            _ -> {:error, :invalid_json}
-          end
-
-        {:error, reason} ->
-          {:error, reason}
-      end
+  defp empty_dir?(dir) do
+    case File.ls(dir) do
+      {:ok, entries} -> entries == []
+      _ -> true
     end
   end
+
+  defp run_shuttle_listing(host, state) do
+    case run_felt_ls_for_shuttle(host, state) do
+      {:ok, output} ->
+        with {:ok, fibers} when is_list(fibers) <- Jason.decode(output) do
+          owned_prefix = store_felt_realpath(host) <> "/"
+
+          kept =
+            Enum.filter(fibers, fn fiber ->
+              is_map(Map.get(fiber, "shuttle")) and owned_by_store?(fiber, owned_prefix)
+            end)
+
+          {:ok, kept}
+        else
+          _ -> {:error, :invalid_json}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # A fiber is owned by this store iff felt's carried physical `path` lives
+  # under `realpath(host)/.felt/`. No `path` (older felt) means we cannot
+  # confirm ownership, so the fiber is conservatively dropped — the owning
+  # store, where felt does carry a matching path, enumerates it.
+  defp owned_by_store?(%{"path" => path}, owned_prefix) when is_binary(path) and path != "" do
+    String.starts_with?(path, owned_prefix)
+  end
+
+  defp owned_by_store?(_, _), do: false
 
   defp run_felt_ls_for_shuttle(host, state) do
-    projected_args = [
-      "ls",
-      "--json",
-      "--has-field",
-      "shuttle",
-      "--json-field",
-      @felt_shuttle_projection_fields
-    ]
-
-    case run_felt(host, state.runner, projected_args) do
+    # The full `--has-field shuttle` listing (no `--json-field` projection):
+    # felt populates the carried `path` only on its full marshal, not the
+    # projected one, and ownership now reads that path. `--has-field shuttle`
+    # already narrows to the kanban-relevant subset and suppresses parse
+    # warnings for non-matching files, so the payload stays small and stdout
+    # stays clean JSON.
+    case run_felt(host, state.runner, ["ls", "--json", "--has-field", "shuttle"]) do
       {:ok, output} ->
         {:ok, output}
 
       {:error, reason} ->
         Logger.warning(
-          "projected felt ls failed for #{host}; falling back to legacy broad listing: #{inspect(reason)}"
+          "shuttle felt ls failed for #{host}; falling back to broad listing: #{inspect(reason)}"
         )
 
         run_felt(host, state.runner, ["ls", "--json"])
     end
   end
 
-  # `(major_device, inode)` from `File.stat` (follows symlinks) uniquely
-  # identifies a physical file regardless of which symlink path you used
-  # to reach it. Returns nil on stat failure so the caller can fall back
-  # to keeping the entry un-deduped.
-  defp file_identity(path) do
-    case File.stat(path) do
-      {:ok, %File.Stat{major_device: dev, inode: inode}} -> {dev, inode}
-      {:error, _} -> nil
+  # Realpath of `<host>/.felt`, resolving symlinks along the path so the
+  # ownership prefix matches felt's symlink-resolved `path`. Resolves segment by
+  # segment via `:file.read_link`; falls back to `Path.expand` for any segment
+  # that isn't a symlink. Self-contained so the poller carries no cross-module
+  # realpath dependency.
+  defp store_felt_realpath(host) do
+    felt_dir = host |> Path.join(".felt") |> Path.expand()
+
+    case resolve_realpath(felt_dir) do
+      {:ok, resolved} -> resolved
+      {:error, _} -> felt_dir
     end
   end
 
-  defp do_walk_felt_dir(dir) do
-    case File.ls(dir) do
-      {:ok, entries} ->
-        Enum.flat_map(entries, fn entry ->
-          path = Path.join(dir, entry)
+  @max_symlink_hops 40
 
-          # `lstat` (does NOT follow symlinks) lets us distinguish symlinked
-          # directories from physical ones. We never traverse a symlink — the
-          # host where the target is physically rooted enumerates it instead
-          # (see the symlink-discipline note on `discover_candidates/1`).
-          case File.lstat(path) do
-            {:ok, %File.Stat{type: :symlink}} ->
-              []
+  defp resolve_realpath(path) do
+    case Path.split(Path.expand(path)) do
+      ["/" | rest] -> resolve_realpath_segments("/", rest, 0)
+      [first | rest] -> resolve_realpath_segments(first, rest, 0)
+      [] -> {:error, :empty_path}
+    end
+  end
 
-            {:ok, %File.Stat{type: :directory}} ->
-              if String.starts_with?(entry, ".") do
-                # Hidden subdirectories (e.g. .obsidian) — skip.
-                []
-              else
-                do_walk_felt_dir(path)
-              end
+  defp resolve_realpath_segments(current, [], _hops), do: {:ok, current}
 
-            {:ok, _} ->
-              [path]
+  defp resolve_realpath_segments(_current, _segments, hops) when hops > @max_symlink_hops,
+    do: {:error, :symlink_loop}
 
-            {:error, _} ->
-              []
+  defp resolve_realpath_segments(current, [segment | rest], hops) do
+    candidate = Path.join(current, segment)
+
+    case :file.read_link(String.to_charlist(candidate)) do
+      {:ok, target} ->
+        target_path = List.to_string(target)
+
+        expanded_target =
+          case Path.type(target_path) do
+            :absolute -> Path.expand(target_path)
+            _ -> Path.expand(target_path, Path.dirname(candidate))
           end
-        end)
+
+        case Path.split(expanded_target) do
+          ["/" | target_rest] -> resolve_realpath_segments("/", target_rest ++ rest, hops + 1)
+          [first | target_rest] -> resolve_realpath_segments(first, target_rest ++ rest, hops + 1)
+          [] -> {:error, :empty_target}
+        end
 
       {:error, _} ->
-        []
-    end
-  end
-
-  defp exact_fiber_path(host, fiber_id) do
-    segments = String.split(fiber_id, "/")
-    basename = List.last(segments)
-    felt_dir = Path.join(host, ".felt")
-    bare_path = Path.join(felt_dir, "#{basename}.md")
-    dir_path = Path.join([felt_dir | segments] ++ ["#{basename}.md"])
-
-    cond do
-      not String.contains?(fiber_id, "/") and File.exists?(bare_path) ->
-        {:ok, bare_path}
-
-      File.exists?(dir_path) ->
-        {:ok, dir_path}
-
-      true ->
-        {:error, :not_found}
+        resolve_realpath_segments(candidate, rest, hops)
     end
   end
 
@@ -1814,15 +1783,19 @@ defmodule Shuttle.Poller do
     |> put_if_missing("session", stringify_keys(Map.get(lifecycle, :session, %{})))
   end
 
-  # Resolves which configured felt store owns `fiber_id`.
+  # Resolves which configured felt store owns `fiber_id` — the store root used
+  # to shell subsequent felt commands, NOT the shuttle.host dispatch-affinity
+  # field.
   #
   # Resolution order:
   # 1. State cache (fast; populated by discover_candidates/1 each poll cycle)
-  # 2. Exact-path probe across each configured host, followed by canonical-store
-  #    validation so symlinked project views do not claim loom-owned fibers.
+  # 2. Ask felt: `FeltStores.resolve_fiber/2` (against THIS daemon's
+  #    `state.felt_stores`) shells `felt show -j` (or a uid scan) and reports the
+  #    owning store directly, reading felt's carried path rather than
+  #    reconstructing or globbing candidate files.
   #
-  # Returns {:ok, host} for the first-configured host that canonically owns the
-  # fiber, or {:error, :not_found} when no host claims it.
+  # Returns {:ok, host} for the store that owns the fiber, or {:error,
+  # :not_found} when no configured store claims it.
   #
   # Cache updates are the caller's responsibility (discover_candidates/1 does
   # it for the whole poll cycle; handle_call(:resolve_fiber_host) returns the
@@ -1834,21 +1807,9 @@ defmodule Shuttle.Poller do
         {:ok, host}
 
       nil ->
-        found =
-          Enum.find_value(state.felt_stores, fn host ->
-            canonical_host = FiberId.canonical_host_path(host)
-
-            with {:ok, path} <- exact_fiber_path(host, fiber_id),
-                 {:ok, %{host: ^canonical_host, id: ^fiber_id}} <- FiberId.ref_from_path(path) do
-              host
-            else
-              _ -> nil
-            end
-          end)
-
-        case found do
-          nil -> {:error, :not_found}
-          host -> {:ok, host}
+        case Shuttle.FeltStores.resolve_fiber(fiber_id, state.felt_stores) do
+          {:ok, %{host: host}} -> {:ok, host}
+          {:error, :not_found} -> {:error, :not_found}
         end
     end
   end
@@ -2946,7 +2907,7 @@ defmodule Shuttle.Poller do
   end
 
   # Fetch a fiber's full JSON representation via the felt CLI. Routes to the
-  # fiber's owning host via host_for_fiber/2 (cache → file-stat probe).
+  # fiber's owning host via host_for_fiber/2 (cache → felt resolution).
   defp fetch_fiber_full(fiber_id, state) do
     host =
       case host_for_fiber(fiber_id, state) do

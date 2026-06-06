@@ -59,10 +59,28 @@ defmodule ShuttleWeb.FeltHistoryControllerTest do
     bin = Path.join(bin_dir, "felt")
     args_file = Path.join(root, "felt-args")
 
+    # `FeltStores.resolve_fiber` now asks felt for the fiber's carried path
+    # (`felt show -j`) instead of globbing the filesystem, so the fake must
+    # answer a `show -j` with felt-shaped JSON (id + absolute path). Every other
+    # invocation (the `history append` under test) records its args and prints
+    # `ok`, unchanged.
     File.write!(bin, """
     #!/bin/sh
-    printf '%s\\n' "$@" > "$FELT_ARGS_FILE"
-    printf 'ok\\n'
+    case " $* " in
+      *" show "*" -j "*|*" show "*" -j")
+        store=""
+        next=0
+        for a in "$@"; do
+          if [ "$next" = 1 ]; then store="$a"; next=0; fi
+          if [ "$a" = "-C" ]; then next=1; fi
+        done
+        printf '{"id":"tests/remote-directive","path":"%s/.felt/tests/remote-directive/remote-directive.md"}\\n' "$store"
+        ;;
+      *)
+        printf '%s\\n' "$@" > "$FELT_ARGS_FILE"
+        printf 'ok\\n'
+        ;;
+    esac
     """)
 
     File.chmod!(bin, 0o755)

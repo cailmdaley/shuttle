@@ -45,7 +45,22 @@ defmodule Shuttle.PollerTest do
       end)
     end
 
-    def set_fiber(id, fiber), do: Agent.update(__MODULE__, &put_in(&1.fibers[id], fiber))
+    # Carry a felt-style absolute `path` so the poller's store-ownership check
+    # (which reads felt's `path`) sees the fiber as rooted in `/tmp`. Preserves
+    # an existing path when `set_shuttle` already wrote one, and synthesizes the
+    # canonical `<id>/<leaf>.md` shape otherwise, mirroring real felt's output.
+    def set_fiber(id, fiber) do
+      Agent.update(__MODULE__, fn state ->
+        existing_path = get_in(state.fibers, [id, "path"])
+        path = Map.get(fiber, "path") || existing_path || synth_path(id)
+        put_in(state.fibers[id], Map.put(fiber, "path", path))
+      end)
+    end
+
+    defp synth_path(id) do
+      leaf = id |> String.split("/") |> List.last()
+      realpath(Path.join(["/tmp/.felt", id, "#{leaf}.md"]))
+    end
 
     # Write a real .md file carrying the given shuttle: block and felt status so
     # the poller can discover host ownership from the filesystem while reading
@@ -75,6 +90,12 @@ defmodule Shuttle.PollerTest do
       indented = yaml |> String.trim() |> String.split("\n") |> Enum.map_join("\n", &("  " <> &1))
       File.write!(dir_path, "---\nstatus: #{status}\nshuttle:\n#{indented}\n---\nbody\n")
 
+      # Mirror real felt: carry the absolute, symlink-resolved on-disk `path`.
+      # The poller reads this `path` to decide store ownership instead of
+      # walking the filesystem, so the mock's `felt ls`/`felt show` JSON must
+      # expose it the same way the real CLI now does.
+      carried_path = realpath(dir_path)
+
       shuttle_block =
         case YamlElixir.read_from_string(yaml) do
           {:ok, data} when is_map(data) -> data
@@ -92,12 +113,22 @@ defmodule Shuttle.PollerTest do
           })
           |> Map.put("status", status)
           |> Map.put("shuttle", shuttle_block)
+          |> Map.put("path", carried_path)
 
         state
         |> put_in([:shuttle, id], yaml)
         |> put_in([:fibers, id], fiber)
       end)
     end
+
+    # Absolute, symlink-resolved path of a written fiber file. macOS resolves
+    # `/tmp` and `/var` to `/private/...`; mirror that so the carried path
+    # matches the store realpath the poller computes for ownership.
+    defp realpath(path), do: resolve_tmp_symlink(Path.expand(path))
+
+    defp resolve_tmp_symlink("/tmp/" <> rest), do: "/private/tmp/" <> rest
+    defp resolve_tmp_symlink("/var/" <> rest), do: "/private/var/" <> rest
+    defp resolve_tmp_symlink(path), do: path
 
     # Kept for backward compat; no longer consulted by discover_candidates
     # (discovery now walks files for shuttle: blocks).  Still used by the
@@ -510,7 +541,7 @@ defmodule Shuttle.PollerTest do
     end
   end
 
-  test "poller uses projected felt listing for shuttle discovery" do
+  test "poller uses the shuttle felt listing for discovery" do
     fiber = make_fiber("tests/projected-discovery")
     MockRunner.set_fiber("tests/projected-discovery", fiber)
     MockRunner.set_shuttle("tests/projected-discovery", @oneshot_shuttle)
@@ -525,17 +556,12 @@ defmodule Shuttle.PollerTest do
 
     send(poller, :run_poll_cycle)
 
+    # The `--json-field` projection is gone: felt populates the carried `path`
+    # only on its full marshal, and the poller now reads that path to decide
+    # store ownership. `--has-field shuttle` keeps the payload narrow.
     assert wait_until(fn ->
              Enum.any?(MockRunner.commands(), fn {cmd, args} ->
-               cmd == "felt" and
-                 args == [
-                   "ls",
-                   "--json",
-                   "--has-field",
-                   "shuttle",
-                   "--json-field",
-                   "id,uid,status,created_at,shuttle,depends_on,tempered"
-                 ]
+               cmd == "felt" and args == ["ls", "--json", "--has-field", "shuttle"]
              end)
            end)
   end
@@ -1084,9 +1110,13 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
-    # Spawn a worker so the fiber is in state.running.
-    assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, force: true)
-    assert session == Dispatcher.session_name(fiber_id)
+    # Let the initial poll auto-dispatch the eligible fiber and settle, so the
+    # worker is in state.running and no further poll cycle is queued behind the
+    # read legs below. (Driving dispatch via `force:` here instead would race
+    # the initial poll's reconcile, which — landing after the kill — would
+    # re-dispatch the fiber and re-create a live session.)
+    session = Dispatcher.session_name(fiber_id)
+    assert wait_until(fn -> Poller.worker_status(poller, fiber_id) != nil end)
 
     # While the session is live, the running branch is read: inFlight → pause.
     assert {:ok, %{id: "pause"}} = Poller.resolve_action(poller, fiber_id, "inFlight", [])

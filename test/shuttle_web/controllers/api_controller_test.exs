@@ -53,7 +53,25 @@ defmodule ShuttleWeb.APIControllerTest do
       end)
     end
 
-    def set_fiber(id, fiber), do: Agent.update(__MODULE__, &put_in(&1.fibers[id], fiber))
+    # Carry a felt-style absolute `path` so the poller's store-ownership check
+    # (which reads felt's `path`) sees the fiber as rooted in `/tmp`. Mirrors
+    # real felt, which now emits `path` on every listed/shown fiber.
+    def set_fiber(id, fiber) do
+      Agent.update(__MODULE__, fn state ->
+        existing_path = get_in(state.fibers, [id, "path"])
+        path = Map.get(fiber, "path") || existing_path || synth_path(id)
+        put_in(state.fibers[id], Map.put(fiber, "path", path))
+      end)
+    end
+
+    defp synth_path(id) do
+      leaf = id |> String.split("/") |> List.last()
+      resolve_tmp_symlink(Path.expand(Path.join(["/tmp/.felt", id, "#{leaf}.md"])))
+    end
+
+    defp resolve_tmp_symlink("/tmp/" <> rest), do: "/private/tmp/" <> rest
+    defp resolve_tmp_symlink("/var/" <> rest), do: "/private/var/" <> rest
+    defp resolve_tmp_symlink(path), do: path
 
     # Write a real .md file carrying the given shuttle: block and felt status so
     # that walk_shuttle_fibers (the file-walk discovery path) can find it.
@@ -82,6 +100,8 @@ defmodule ShuttleWeb.APIControllerTest do
           _ -> %{}
         end
 
+      carried_path = synth_path(id)
+
       Agent.update(__MODULE__, fn state ->
         fiber =
           state.fibers
@@ -93,6 +113,7 @@ defmodule ShuttleWeb.APIControllerTest do
           })
           |> Map.put("status", status)
           |> Map.put("shuttle", shuttle_block)
+          |> Map.put("path", carried_path)
 
         state
         |> put_in([:shuttle, id], yaml)

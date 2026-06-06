@@ -45,8 +45,12 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
     Body.
     """)
 
-    report = Path.join([store, ".felt", "tests", "document", "report.html"])
-    File.write!(report, "<p>report</p>\n")
+    File.write!(Path.join([store, ".felt", "tests", "document", "report.html"]), "<p>report</p>\n")
+
+    # report_path is `dirname(felt.path)/report.html` — felt's carried path is
+    # symlink-canonicalized (on macOS the tmp store's /var → /private/var), and
+    # Portolan serves it as an absolute path, so assert against that realpath.
+    report = real_report_path(store, "tests/document")
 
     conn = get(api_conn(), "/api/v1/fibers")
 
@@ -165,6 +169,58 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
     assert entry["felt_store"] == store
   end
 
+  test "GET /api/v1/fibers serves the flat symlinked-substore root (lightcone shape)",
+       %{store: store} do
+    # The case the old `entry_point`-guessing path-deriver got WRONG. loom's
+    # `.felt/lightcone` symlinks into a project store whose ROOT fiber is FLAT —
+    # `lightcone.md` directly in `.felt/`, not `lightcone/lightcone.md`. felt's
+    # traversal id is `lightcone/lightcone` (served-store prefix), but the file
+    # is flat. The old deriver produced `lightcone/lightcone/lightcone.md` (a
+    # path that does not exist) and a `report.html` one directory too deep. The
+    # leaf shape is now READ from felt's carried path, so both come out right.
+    root = Path.dirname(store)
+    project = Path.join(root, "lightcone")
+
+    # Flat root fiber: the .md lives directly under the project's .felt/.
+    File.mkdir_p!(Path.join(project, ".felt"))
+
+    File.write!(Path.join([project, ".felt", "lightcone.md"]), """
+    ---
+    name: Lightcone root
+    status: active
+    shuttle:
+      enabled: true
+      host: test-host
+    ---
+
+    Body.
+    """)
+
+    File.write!(Path.join([project, ".felt", "report.html"]), "<p>flat report</p>\n")
+
+    File.mkdir_p!(Path.join(store, ".felt"))
+    File.ln_s!(Path.join(project, ".felt"), Path.join([store, ".felt", "lightcone"]))
+
+    conn = get(api_conn(), "/api/v1/fibers")
+    assert conn.status == 200
+
+    entry =
+      Jason.decode!(conn.resp_body)["fibers"]
+      |> Enum.find(&(&1["fiber"]["name"] == "Lightcone root"))
+
+    # Wire path stays served-store-relative and FLAT — the served file at
+    # `<store>/.felt/lightcone/lightcone.md` (via the symlink) actually exists.
+    assert entry["path"] == "lightcone/lightcone.md"
+    assert File.exists?(Path.join([store, ".felt", entry["path"]]))
+
+    # report.html is the sibling of the flat .md in the real project store, NOT
+    # one directory deeper. Asserted via the realpath felt carries.
+    {realdir, 0} = System.cmd("realpath", [Path.join(project, ".felt")])
+    expected_report = Path.join(String.trim(realdir), "report.html")
+    assert entry["report_path"] == expected_report
+    assert File.exists?(entry["report_path"])
+  end
+
   test "GET /api/v1/fibers survives stray non-fiber .md files in a store", %{store: store} do
     # A store with a SPEC.md (no frontmatter) makes `felt ls` print a stderr
     # warning while still emitting valid JSON on stdout. Folding stderr into
@@ -200,8 +256,8 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
     Body text.
     """)
 
-    report = Path.join([store, ".felt", "tests", "single", "report.html"])
-    File.write!(report, "<p>report</p>\n")
+    File.write!(Path.join([store, ".felt", "tests", "single", "report.html"]), "<p>report</p>\n")
+    report = real_report_path(store, "tests/single")
 
     conn = get(api_conn(), "/api/v1/fibers/tests/single")
 
@@ -367,6 +423,16 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
     dir = Path.join([store, ".felt" | segments])
     File.mkdir_p!(dir)
     File.write!(Path.join(dir, "#{basename}.md"), content)
+  end
+
+  # The report_path the endpoint emits: `dirname(felt.path)/report.html`, where
+  # felt's `path` is symlink-canonicalized. Mirror that by realpath'ing the
+  # report file's directory so the assertion is robust to macOS's /var symlink.
+  defp real_report_path(store, fiber_id) do
+    segments = String.split(fiber_id, "/")
+    dir = Path.join([store, ".felt" | segments])
+    {realdir, 0} = System.cmd("realpath", [dir])
+    Path.join(String.trim(realdir), "report.html")
   end
 
   defp api_conn do

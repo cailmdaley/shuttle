@@ -614,16 +614,35 @@ defmodule Shuttle.Dispatcher do
 
   @doc false
   @spec prompt_fiber_id(String.t(), String.t(), String.t()) :: String.t()
-  def prompt_fiber_id(fiber_id, work_dir, felt_store) do
-    with {:ok, project_felt} <- realpath(Path.join(work_dir, ".felt")),
-         {:ok, fiber_path} <- exact_fiber_path(felt_store, fiber_id),
-         {:ok, real_fiber_path} <- realpath(fiber_path),
-         true <- path_inside?(real_fiber_path, project_felt),
-         {:ok, local_id} <- fiber_id_from_project_path(real_fiber_path, project_felt) do
-      local_id
-    else
-      _ -> fiber_id
+  # The worker runs `felt show <id>` from inside `work_dir`, whose `.felt`
+  # symlinks into a sub-store view of the loom — so the id it sees is
+  # project-local (e.g. global `ai-futures/shuttle/X` → local `constitution/X`).
+  # felt already computes that local address: `felt -C work_dir show <id> -j`
+  # resolves the fiber against the worker's felt view and carries its
+  # view-relative `id`. Read it directly rather than reconstructing it from a
+  # globbed path. On any felt miss/error fall back to the global `fiber_id`,
+  # preserving the previous safe-fail. `_felt_store` is retained for signature
+  # stability; the worker's view is `work_dir`, not the configured store root.
+  def prompt_fiber_id(fiber_id, work_dir, _felt_store) do
+    case felt_show_id(work_dir, fiber_id) do
+      {:ok, local_id} -> local_id
+      :error -> fiber_id
     end
+  end
+
+  defp felt_show_id(work_dir, fiber_id) do
+    case System.cmd("felt", ["-C", work_dir, "show", fiber_id, "-j"], stderr_to_stdout: false) do
+      {output, 0} ->
+        case Jason.decode(output) do
+          {:ok, %{"id" => id}} when is_binary(id) and id != "" -> {:ok, id}
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
+  rescue
+    _ -> :error
   end
 
   # Shared composition for all top-level prompts: a per-prompt orientation
@@ -1162,65 +1181,6 @@ defmodule Shuttle.Dispatcher do
   end
 
   defp render_context_prompt(fiber_id, _, opts), do: render_prompt(fiber_id, opts)
-
-  defp exact_fiber_path(felt_store, fiber_id) do
-    felt_dir = Path.join(felt_store, ".felt")
-    leaf = fiber_id |> String.trim_trailing("/") |> String.split("/") |> List.last()
-
-    candidates =
-      if String.contains?(fiber_id, "/") do
-        [Path.join([felt_dir, fiber_id, leaf <> ".md"])]
-      else
-        [
-          Path.join([felt_dir, fiber_id, leaf <> ".md"]),
-          Path.join(felt_dir, leaf <> ".md")
-        ]
-      end
-
-    case Enum.find(candidates, &File.regular?/1) do
-      nil -> {:error, :not_found}
-      path -> {:ok, path}
-    end
-  end
-
-  defp realpath(path) do
-    case :file.read_link_all(String.to_charlist(path)) do
-      {:ok, real} ->
-        {:ok, List.to_string(real)}
-
-      {:error, :einval} ->
-        if File.exists?(path), do: {:ok, Path.expand(path)}, else: {:error, :enoent}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  defp path_inside?(path, ancestor) do
-    relative = Path.relative_to(path, ancestor)
-    relative != path and relative != "." and not String.starts_with?(relative, "..")
-  end
-
-  defp fiber_id_from_project_path(path, project_felt) do
-    relative = Path.relative_to(path, project_felt)
-    parts = Path.split(relative)
-    file = List.last(parts)
-    leaf = Path.basename(file, ".md")
-
-    cond do
-      Path.extname(file) != ".md" ->
-        {:error, :not_markdown}
-
-      length(parts) == 1 ->
-        {:ok, leaf}
-
-      List.last(Enum.drop(parts, -1)) == leaf ->
-        {:ok, parts |> Enum.drop(-1) |> Path.join()}
-
-      true ->
-        {:ok, parts |> List.replace_at(-1, leaf) |> Path.join()}
-    end
-  end
 
   @doc false
   # Public for tests. Builds the bash script that wraps the harness command
