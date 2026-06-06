@@ -2179,6 +2179,40 @@ defmodule Shuttle.PollerTest do
     cleanup_runtime_store_paths()
   end
 
+  test "poller resurrects orphaned oneshot from dispatched lifecycle without captured session" do
+    fiber_id = "tests/orphan-runtime-dispatched-no-session"
+    runtime_store_path = runtime_store_path()
+
+    MockRunner.set_shuttle(fiber_id, """
+    enabled: true
+    kind: oneshot
+    """)
+
+    Shuttle.RuntimeStore.upsert_lifecycle(runtime_store_path, fiber_id, %{
+      kind: "oneshot",
+      phase: "dispatched"
+    })
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_resurrect_runtime_dispatched_no_session,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"],
+        runtime_store_path: runtime_store_path
+      )
+
+    assert wait_until(fn ->
+             snap = Poller.snapshot(poller)
+             Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id))
+           end)
+
+    snap = Poller.snapshot(poller)
+    assert %{attempt: 1} = Enum.find(snap.retrying, &(&1.fiber_id == fiber_id))
+  after
+    cleanup_runtime_store_paths()
+  end
+
   # Regression for the 2026-05-30 incident: a cineca/candide restart resurrected
   # Mac-owned Portolan constitutions locally because the orphan-resurrection
   # path never read `host`. The cutover routes resurrection through the same

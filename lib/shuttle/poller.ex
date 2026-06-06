@@ -1213,7 +1213,9 @@ defmodule Shuttle.Poller do
     status = Map.get(fiber, "status", "")
     kind = Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot"))
 
+    lifecycle = runtime_lifecycle(state, fiber_id)
     session_id = stored_session_id(state, fiber_id, fiber)
+    lifecycle_dispatched? = Map.get(lifecycle, :phase) == "dispatched"
 
     cond do
       # Only the owning daemon may resurrect. A fiber owned by another host
@@ -1233,8 +1235,11 @@ defmodule Shuttle.Poller do
       kind == "standing" ->
         state
 
-      # Never dispatched — nothing to resurrect.
-      session_id == nil ->
+      # Never dispatched — nothing to resurrect. A runtime row with
+      # phase=dispatched is also a dispatch marker: session capture is
+      # best-effort, and if it failed we still need to move the dead launch into
+      # retry instead of leaving the card in "dispatched" forever.
+      session_id == nil and not lifecycle_dispatched? ->
         state
 
       # Closed — work is done.
