@@ -35,6 +35,26 @@ defmodule Shuttle.FiberDocuments do
   end
 
   @doc """
+  Builds the wire entry for one felt JSON fiber.
+
+  The poller uses this for its document cache so cached `/api/v1/fibers`
+  responses preserve the same path, slug, logical-id, and report sibling
+  semantics as the direct felt-list path.
+  """
+  @spec entries_for_fiber(String.t(), map()) :: [entry()]
+  def entries_for_fiber(store, fiber), do: entry_for(store, fiber)
+
+  @spec envelope([String.t()], [entry()]) :: map()
+  def envelope(stores, entries) do
+    %{
+      host: own_host_id(),
+      felt_stores: stores,
+      generated_at: DateTime.to_iso8601(DateTime.utc_now()),
+      fibers: entries
+    }
+  end
+
+  @doc """
   Resolve a SINGLE fiber by its canonical id without dragging in the whole
   store. This is the per-fiber dual of `list/1`: Portolan resolves a remote
   fiber's content/owner (kanban card → vellum view) through this instead of
@@ -127,15 +147,6 @@ defmodule Shuttle.FiberDocuments do
       errors != [] -> {:error, errors}
       true -> {:ok, envelope(stores, [])}
     end
-  end
-
-  defp envelope(stores, entries) do
-    %{
-      host: own_host_id(),
-      felt_stores: stores,
-      generated_at: DateTime.to_iso8601(DateTime.utc_now()),
-      fibers: entries
-    }
   end
 
   defp list_store(store, with_body?, shuttle_only?) do

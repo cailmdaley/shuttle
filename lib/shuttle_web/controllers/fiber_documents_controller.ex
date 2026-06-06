@@ -24,7 +24,7 @@ defmodule ShuttleWeb.FiberDocumentsController do
     with_body? = Map.get(params, "body") in ["1", "true", true]
     shuttle_only? = Map.get(params, "shuttle") in ["1", "true", true]
 
-    case Shuttle.FiberDocuments.list(with_body: with_body?, shuttle_only: shuttle_only?) do
+    case list_fibers(with_body?, shuttle_only?) do
       {:ok, body} ->
         json(conn, body)
 
@@ -56,5 +56,22 @@ defmodule ShuttleWeb.FiberDocumentsController do
         |> put_status(:service_unavailable)
         |> json(%{error: "felt_show_failed", stores: errors})
     end
+  end
+
+  defp list_fibers(false, true) do
+    case Process.whereis(Shuttle.Poller) do
+      nil ->
+        Shuttle.FiberDocuments.list(with_body: false, shuttle_only: true)
+
+      _pid ->
+        case Shuttle.Poller.cached_fiber_documents() do
+          {:ok, body} -> {:ok, body}
+          {:error, _reason} -> Shuttle.FiberDocuments.list(with_body: false, shuttle_only: true)
+        end
+    end
+  end
+
+  defp list_fibers(with_body?, shuttle_only?) do
+    Shuttle.FiberDocuments.list(with_body: with_body?, shuttle_only: shuttle_only?)
   end
 end

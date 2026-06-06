@@ -111,6 +111,13 @@ defmodule Shuttle.Poller do
       # resolution everywhere; uid is exposed on runtime surfaces as the join
       # key for document cards.
       fiber_uid_cache: %{},
+      # %{uid_or_fiber_id => %{modified_at: String.t() | nil, entry: map()}} —
+      # daemon-local document cache for the Portolan kanban feed. The poll task
+      # diffs the cheap shuttle projection's modified_at against this cache and
+      # runs full `felt show --json` only for cold or changed fibers.
+      document_cache: %{},
+      document_cache_stats: %{hits: 0, misses: 0, evictions: 0, entries: 0},
+      document_cache_ready: false,
       # %{fiber_id => %{reason: term, attempted_at: DateTime.t, attempts:
       # pos_integer}} — fibers the dispatcher rejected with an error other
       # than :already_running. Surfaced in the snapshot's `blocked` list so
@@ -141,6 +148,19 @@ defmodule Shuttle.Poller do
   @spec snapshot(GenServer.server(), non_neg_integer()) :: map()
   def snapshot(server, timeout_ms) when is_integer(timeout_ms) and timeout_ms >= 0 do
     GenServer.call(server, :snapshot, timeout_ms)
+  end
+
+  @spec cached_fiber_documents(keyword() | GenServer.server()) :: {:ok, map()} | {:error, term()}
+  def cached_fiber_documents(opts_or_server \\ [])
+
+  def cached_fiber_documents(opts) when is_list(opts),
+    do: cached_fiber_documents(__MODULE__, opts)
+
+  def cached_fiber_documents(server), do: cached_fiber_documents(server, [])
+
+  @spec cached_fiber_documents(GenServer.server(), keyword()) :: {:ok, map()} | {:error, term()}
+  def cached_fiber_documents(server, opts) do
+    GenServer.call(server, {:cached_fiber_documents, opts}, @orchestrator_state_call_timeout_ms)
   end
 
   # ── Agent-API Client ──
@@ -471,6 +491,21 @@ defmodule Shuttle.Poller do
     {:reply, build_snapshot(state), state}
   end
 
+  def handle_call({:cached_fiber_documents, opts}, _from, state) do
+    if state.document_cache_ready do
+      entries =
+        state.document_cache
+        |> Map.values()
+        |> Enum.map(& &1.entry)
+        |> Enum.sort_by(&get_in(&1, [:fiber, "id"]))
+
+      stores = Keyword.get(opts, :felt_stores, state.felt_stores)
+      {:reply, {:ok, Shuttle.FiberDocuments.envelope(stores, entries)}, state}
+    else
+      {:reply, {:error, :cold_document_cache}, state}
+    end
+  end
+
   def handle_call({:worker_status, fiber_id}, _from, state) do
     fiber_id = address_for_identifier(state, fiber_id)
     {:reply, running_worker(state, fiber_id), state}
@@ -724,7 +759,8 @@ defmodule Shuttle.Poller do
       retrying: retrying,
       standing_roles: standing_role_snapshots(state.standing_roles, state.running, now, state),
       claimed_count: MapSet.size(state.claimed),
-      max_concurrent: state.max_concurrent_workers
+      max_concurrent: state.max_concurrent_workers,
+      document_cache: stringify_keys(state.document_cache_stats)
     }
 
     Map.put(snap, :runtime, runtime_by_fiber(state, snap, now))
@@ -1057,13 +1093,16 @@ defmodule Shuttle.Poller do
   defp poll_reads(%State{} = state) do
     state = refresh_felt_stores(state)
     {:ok, candidates, host_map, uid_map} = discover_candidates(state)
+    {document_cache, document_cache_stats} = refresh_document_cache(state, candidates, host_map)
 
     {:ok,
      %{
        felt_stores: state.felt_stores,
        candidates: candidates,
        host_map: host_map,
-       uid_map: uid_map
+       uid_map: uid_map,
+       document_cache: document_cache,
+       document_cache_stats: document_cache_stats
      }}
   rescue
     error ->
@@ -1085,7 +1124,9 @@ defmodule Shuttle.Poller do
          felt_stores: felt_stores,
          candidates: candidates,
          host_map: new_host_map,
-         uid_map: new_uid_map
+         uid_map: new_uid_map,
+         document_cache: document_cache,
+         document_cache_stats: document_cache_stats
        }) do
     state = reconcile(%{state | felt_stores: felt_stores})
 
@@ -1103,6 +1144,9 @@ defmodule Shuttle.Poller do
       state
       | fiber_host_cache: Map.merge(new_host_map, state.fiber_host_cache),
         fiber_uid_cache: Map.merge(new_uid_map, state.fiber_uid_cache),
+        document_cache: document_cache,
+        document_cache_stats: document_cache_stats,
+        document_cache_ready: true,
         standing_roles: standing_roles,
         lifecycle: Map.merge(state.lifecycle, lifecycle),
         dispatch_failures: evict_stale_dispatch_failures(state.dispatch_failures, candidates)
@@ -1309,6 +1353,74 @@ defmodule Shuttle.Poller do
       end)
 
     {:ok, all_fibers, host_map, uid_map}
+  end
+
+  defp refresh_document_cache(%State{} = state, candidates, host_map) do
+    previous = state.document_cache
+
+    {cache, stats} =
+      Enum.reduce(candidates, {%{}, %{hits: 0, misses: 0}}, fn candidate, {cache_acc, stats} ->
+        key = document_cache_key(candidate)
+        modified_at = Map.get(candidate, "modified_at")
+        cached = Map.get(previous, key)
+
+        if reusable_document_cache_entry?(cached, modified_at) do
+          {Map.put(cache_acc, key, cached), Map.update!(stats, :hits, &(&1 + 1))}
+        else
+          case fetch_document_cache_entry(state, candidate, host_map) do
+            {:ok, entry} ->
+              cached = %{modified_at: modified_at, entry: entry}
+              {Map.put(cache_acc, key, cached), Map.update!(stats, :misses, &(&1 + 1))}
+
+            {:error, reason} ->
+              Logger.warning(
+                "document cache refresh skipped #{Map.get(candidate, "id", "(unknown)")}: #{inspect(reason)}"
+              )
+
+              if cached do
+                {Map.put(cache_acc, key, cached), Map.update!(stats, :hits, &(&1 + 1))}
+              else
+                {cache_acc, Map.update!(stats, :misses, &(&1 + 1))}
+              end
+          end
+        end
+      end)
+
+    stats =
+      stats
+      |> Map.put(:evictions, max(map_size(previous) - map_size(cache), 0))
+      |> Map.put(:entries, map_size(cache))
+
+    {cache, stats}
+  end
+
+  defp document_cache_key(candidate) do
+    case Map.get(candidate, "uid") do
+      uid when is_binary(uid) and uid != "" -> uid
+      _ -> Map.get(candidate, "id", "")
+    end
+  end
+
+  defp reusable_document_cache_entry?(%{modified_at: modified_at, entry: entry}, modified_at)
+       when is_map(entry),
+       do: true
+
+  defp reusable_document_cache_entry?(_, _), do: false
+
+  defp fetch_document_cache_entry(state, candidate, host_map) do
+    with id when is_binary(id) and id != "" <- Map.get(candidate, "id"),
+         store when is_binary(store) <- Map.get(host_map, id),
+         {:ok, output} <- run_felt(store, state.runner, ["show", id, "--json"]),
+         {:ok, %{} = fiber} <- Jason.decode(output),
+         [entry | _] <- Shuttle.FiberDocuments.entries_for_fiber(store, Map.delete(fiber, "body")) do
+      {:ok, entry}
+    else
+      nil -> {:error, :missing_store}
+      "" -> {:error, :missing_id}
+      {:error, error} -> {:error, error}
+      [] -> {:error, :invalid_entry}
+      _ -> {:error, :invalid_json}
+    end
   end
 
   # Read one host's shuttle fibers via felt's JSON, keeping only those

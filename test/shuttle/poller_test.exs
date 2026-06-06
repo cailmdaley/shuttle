@@ -288,6 +288,12 @@ defmodule Shuttle.PollerTest do
     end
   end
 
+  defp felt_show_count do
+    Enum.count(MockRunner.commands(), fn {cmd, args} ->
+      cmd == "felt" and Enum.take(args, 1) == ["show"]
+    end)
+  end
+
   defp runtime_store_path do
     Path.join(
       System.tmp_dir!(),
@@ -571,6 +577,71 @@ defmodule Shuttle.PollerTest do
                  ]
              end)
            end)
+  end
+
+  test "poller caches document entries by uid and modified_at" do
+    uid = "01JZ00000000000000000000CA"
+
+    fiber =
+      make_fiber("tests/cached-document", %{
+        "uid" => uid,
+        "modified_at" => "2026-06-06T01:00:00Z",
+        "outcome" => "first"
+      })
+
+    MockRunner.set_fiber("tests/cached-document", fiber)
+    MockRunner.set_shuttle("tests/cached-document", @oneshot_shuttle)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_document_cache,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        max_concurrent_workers: 0,
+        felt_stores: ["/tmp"]
+      )
+
+    assert wait_until(fn ->
+             get_in(Poller.snapshot(poller), [:document_cache, "entries"]) == 1
+           end)
+
+    first_stats = Poller.snapshot(poller)[:document_cache]
+    first_show_count = felt_show_count()
+
+    assert %{"hits" => 0, "misses" => 1, "entries" => 1} = first_stats
+    assert first_show_count == 1
+
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             stats = Poller.snapshot(poller)[:document_cache]
+             stats["hits"] == 1 and stats["misses"] == 0
+           end)
+
+    assert felt_show_count() == first_show_count
+
+    assert {:ok, body} = Poller.cached_fiber_documents(poller)
+    assert [%{fiber: %{"id" => ^uid, "slug" => "tests/cached-document"}}] = body.fibers
+
+    changed_fiber =
+      make_fiber("tests/cached-document", %{
+        "uid" => uid,
+        "modified_at" => "2026-06-06T01:05:00Z",
+        "name" => "changed document",
+        "shuttle" => %{"enabled" => true, "kind" => "oneshot", "host" => "test-host"}
+      })
+
+    MockRunner.set_fiber("tests/cached-document", changed_fiber)
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             stats = Poller.snapshot(poller)[:document_cache]
+             stats["hits"] == 0 and stats["misses"] == 1
+           end)
+
+    assert felt_show_count() == first_show_count + 1
+    assert {:ok, body} = Poller.cached_fiber_documents(poller)
+    assert [%{fiber: %{"id" => ^uid, "name" => "changed document"}}] = body.fibers
   end
 
   test "snapshot remains responsive while poll cycle is reading felt" do
