@@ -556,12 +556,19 @@ defmodule Shuttle.PollerTest do
 
     send(poller, :run_poll_cycle)
 
-    # The `--json-field` projection is gone: felt populates the carried `path`
-    # only on its full marshal, and the poller now reads that path to decide
-    # store ownership. `--has-field shuttle` keeps the payload narrow.
+    # The poller uses felt's cheap path-carrying projection; broad listing is
+    # only a fallback for older remote felt binaries.
     assert wait_until(fn ->
              Enum.any?(MockRunner.commands(), fn {cmd, args} ->
-               cmd == "felt" and args == ["ls", "--json", "--has-field", "shuttle"]
+               cmd == "felt" and
+                 args == [
+                   "ls",
+                   "--json",
+                   "--has-field",
+                   "shuttle",
+                   "--json-field",
+                   "id,uid,status,shuttle,path,modified_at"
+                 ]
              end)
            end)
   end

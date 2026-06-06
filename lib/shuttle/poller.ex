@@ -1242,7 +1242,7 @@ defmodule Shuttle.Poller do
     Map.filter(failures, fn {fiber_id, _entry} -> MapSet.member?(active_ids, fiber_id) end)
   end
 
-  # Discovers candidate fibers by asking felt (`felt ls --has-field shuttle`)
+  # Discovers candidate fibers by asking felt for a narrow shuttle projection
   # per configured store and keeping the ones physically rooted in that store.
   # No tag predicate — the shuttle: block is the source of truth, matching the
   # same contract every other surface reads.
@@ -1382,13 +1382,18 @@ defmodule Shuttle.Poller do
   defp owned_by_store?(_, _), do: false
 
   defp run_felt_ls_for_shuttle(host, state) do
-    # The full `--has-field shuttle` listing (no `--json-field` projection):
-    # felt populates the carried `path` only on its full marshal, not the
-    # projected one, and ownership now reads that path. `--has-field shuttle`
-    # already narrows to the kanban-relevant subset and suppresses parse
-    # warnings for non-matching files, so the payload stays small and stdout
-    # stays clean JSON.
-    case run_felt(host, state.runner, ["ls", "--json", "--has-field", "shuttle"]) do
+    # Cheap projection: felt filters by raw top-level frontmatter first, then
+    # emits only fields the poller needs for eligibility, ownership, and identity.
+    # Keep the broad fallback so a not-yet-upgraded remote felt fails soft
+    # instead of hiding every card on that city.
+    case run_felt(host, state.runner, [
+           "ls",
+           "--json",
+           "--has-field",
+           "shuttle",
+           "--json-field",
+           "id,uid,status,shuttle,path,modified_at"
+         ]) do
       {:ok, output} ->
         {:ok, output}
 

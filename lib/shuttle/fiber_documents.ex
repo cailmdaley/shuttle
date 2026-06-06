@@ -139,8 +139,7 @@ defmodule Shuttle.FiberDocuments do
   end
 
   defp list_store(store, with_body?, shuttle_only?) do
-    args = ["ls", "-s", "all", "-j"]
-    args = if with_body?, do: args ++ ["--body"], else: args
+    args = list_args(with_body?, shuttle_only?)
 
     # Do NOT fold stderr into stdout: felt prints `warning: failed to parse …`
     # for stray non-fiber `.md` files (SPEC.md, README.md) to stderr while still
@@ -156,6 +155,47 @@ defmodule Shuttle.FiberDocuments do
         {:error, %{felt_store: store, status: status, error: String.trim(output)}}
     end
   end
+
+  defp list_args(true, _shuttle_only?) do
+    ["ls", "-s", "all", "-j", "--body"]
+  end
+
+  defp list_args(false, true) do
+    [
+      "ls",
+      "-s",
+      "all",
+      "-j",
+      "--has-field",
+      "shuttle",
+      "--json-field",
+      Enum.join(
+        [
+          "id",
+          "uid",
+          "name",
+          "status",
+          "tags",
+          "created_at",
+          "closed_at",
+          "modified_at",
+          "outcome",
+          "due",
+          "horizon",
+          "cold",
+          "kind",
+          "priority",
+          "depends_on",
+          "tempered",
+          "shuttle",
+          "path"
+        ],
+        ","
+      )
+    ]
+  end
+
+  defp list_args(false, false), do: ["ls", "-s", "all", "-j"]
 
   defp decode_store(store, output, shuttle_only?) do
     with {:ok, decoded} when is_list(decoded) <- Jason.decode(output) do
