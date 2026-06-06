@@ -2715,7 +2715,10 @@ defmodule Shuttle.Poller do
             new_state
           else
             Logger.debug("Retry no longer eligible: #{fiber_id}")
-            release_claim(state, fiber_id)
+
+            state
+            |> clear_stale_orphan_lifecycle(fiber_id, retry)
+            |> release_claim(fiber_id)
           end
 
         {:noreply, state}
@@ -2723,6 +2726,20 @@ defmodule Shuttle.Poller do
       {:error, _} ->
         Logger.debug("Retry fiber not found: #{fiber_id}")
         {:noreply, release_claim(state, fiber_id)}
+    end
+  end
+
+  defp clear_stale_orphan_lifecycle(%State{} = state, fiber_id, retry) do
+    lifecycle = runtime_lifecycle(state, fiber_id)
+    kind = Map.get(lifecycle, :kind, "oneshot")
+
+    if Map.get(retry, :delay_type) == :continuation and kind == "oneshot" and
+         Map.get(lifecycle, :phase) == "dispatched" do
+      Logger.info("Clearing stale orphan dispatch lifecycle: fiber_id=#{fiber_id}")
+      RuntimeStore.delete_lifecycle(state.runtime_store_path, fiber_id)
+      refresh_lifecycle_entry(state, fiber_id)
+    else
+      state
     end
   end
 
