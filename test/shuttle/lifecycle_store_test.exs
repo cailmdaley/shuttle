@@ -129,6 +129,42 @@ defmodule Shuttle.LifecycleStoreTest do
     end
   end
 
+  describe "mark_awaiting/1 — the standing-exit writer (active → closed, untempered)" do
+    test "flips status:active → closed with closed-at, no verdict, and reads as doc-awaiting" do
+      with_doc_awaiting_role(
+        fn fiber_id, path ->
+          assert {:ok, message} = LifecycleStore.mark_awaiting(fiber_id)
+          assert message =~ "awaiting review"
+
+          fm = read_frontmatter(path)
+          assert fm["status"] == "closed"
+          assert is_binary(fm["closed-at"])
+          refute Map.has_key?(fm, "tempered")
+        end,
+        status: "active"
+      )
+    end
+
+    test "the full exit → accept cycle re-arms the role straight from the document" do
+      with_doc_awaiting_role(
+        fn fiber_id, path ->
+          # Worker exits → awaiting review (status:closed, untempered).
+          assert {:ok, _} = LifecycleStore.mark_awaiting(fiber_id)
+          assert read_frontmatter(path)["status"] == "closed"
+
+          # Human accepts → re-armed from the doc schedule (status:active, verdict
+          # and closed-at cleared). The active → closed → active cycle is real.
+          assert {:ok, _} = LifecycleStore.accept(fiber_id)
+          fm = read_frontmatter(path)
+          assert fm["status"] == "active"
+          refute Map.has_key?(fm, "tempered")
+          refute Map.has_key?(fm, "closed-at")
+        end,
+        status: "active"
+      )
+    end
+  end
+
   # Builds a real on-disk felt fiber (resolvable by the felt CLI) in the
   # new-model awaiting shape, points LOOM_HOMES + SHUTTLE_RUNTIME_STORE at the
   # fixtures, and runs `fun.(fiber_id, path)`.

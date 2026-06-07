@@ -866,6 +866,61 @@ defmodule Shuttle.PollerTest do
     cleanup_runtime_store_paths()
   end
 
+  # Slice-1 wedge clear: dispatch is gated by the felt DOCUMENT (status:active +
+  # schedule), not by the runtime review overlay. A role whose document is armed
+  # but whose stale runtime row still says `awaiting` (the live daily-practice
+  # shape — accept landed on another key, this row never advanced) must dispatch
+  # when past due. Before the cutover, review.state=awaiting made `due?` false and
+  # the role was wedged: armed by the human, refused by the daemon.
+  test "a status:active standing role with a stale awaiting overlay still dispatches (wedge clear)" do
+    fiber_id = "tests/standing-wedge"
+    runtime_store_path = runtime_store_path()
+    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
+    MockRunner.set_fiber(fiber_id, fiber)
+
+    # Frontmatter carries NO review block: the document is the authority and it
+    # says status:active (armed).
+    MockRunner.set_shuttle(
+      fiber_id,
+      """
+      enabled: true
+      kind: standing
+      agent: claude-sonnet
+      schedule:
+        expr: "0 8 * * *"
+        tz: Europe/Paris
+      """
+    )
+
+    # The stale runtime row says awaiting. An ad-hoc run_id keeps an
+    # awaiting+next_due row valid (the daily-practice case), so the wedge is
+    # exercised rather than masked by a validation error.
+    Shuttle.RuntimeStore.upsert_lifecycle(runtime_store_path, fiber_id, %{
+      kind: "standing",
+      phase: "awaiting",
+      run_id: "adhoc-1",
+      next_due_at: ~U[2000-01-03 08:00:00Z],
+      last_run_at: nil,
+      review: %{"state" => "awaiting", "run_id" => "adhoc-1"}
+    })
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_standing_wedge,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"],
+        runtime_store_path: runtime_store_path
+      )
+
+    send(poller, :run_poll_cycle)
+    Process.sleep(100)
+
+    assert [%{fiber_id: ^fiber_id, state: "running"}] = Poller.snapshot(poller).eligible
+  after
+    cleanup_runtime_store_paths()
+  end
+
   # Regression: standing-role review state lives in the runtime store, not the
   # frontmatter (LifecycleStore evicts it). Action resolution must overlay it,
   # or `accept-run` on an awaiting role is wrongly rejected as

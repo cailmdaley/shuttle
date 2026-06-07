@@ -90,6 +90,25 @@ defmodule Shuttle.StandingRole do
 
   def due?(_, _), do: false
 
+  @doc """
+  Schedule-only due check for the **dispatch** path: a valid role whose
+  `next_due_at` has arrived. Unlike `due?/2`, it does NOT consult
+  `review.state` — the slice-1 cutover moved the dispatch gate to the felt
+  document's `status`/`tempered` (the poller checks those before calling this),
+  so the runtime review overlay no longer gates dispatch. `due?/2` keeps the
+  review gate for the kanban **display** path (`state/3`) until the overlay is
+  deleted in slice 4.
+  """
+  @spec due_by_schedule?(t(), DateTime.t()) :: boolean()
+  def due_by_schedule?(
+        %__MODULE__{next_due_at: %DateTime{} = next_due_at} = role,
+        %DateTime{} = now
+      ) do
+    valid?(role) and DateTime.compare(next_due_at, now) != :gt
+  end
+
+  def due_by_schedule?(_, _), do: false
+
   @spec valid?(t()) :: boolean()
   def valid?(%__MODULE__{validation_errors: []}), do: true
   def valid?(_), do: false

@@ -45,6 +45,41 @@ defmodule Shuttle.StandingRoleTest do
     end
   end
 
+  describe "due_by_schedule? — the slice-1 dispatch gate, schedule-only" do
+    test "a past-due scheduled role is due" do
+      assert StandingRole.due_by_schedule?(role(%{}), @now)
+    end
+
+    test "a future-due role is not due" do
+      refute StandingRole.due_by_schedule?(role(%{"next_due_at" => "2099-01-01T00:00:00Z"}), @now)
+    end
+
+    test "ignores review.state — an awaiting role that is past due is still due" do
+      # This is the wedge-clearing semantic: dispatch is gated by the felt
+      # document (the poller checks status/tempered), NOT by review.state. So a
+      # role whose stale runtime overlay still says `awaiting` must read as due
+      # once its document is armed and the schedule has passed. `due?/2` (the
+      # display path) returns false here because it still consults review.state.
+      awaiting =
+        role(%{
+          "review" => %{"state" => "awaiting", "run_id" => "adhoc-1"},
+          "next_due_at" => "2020-01-01T00:00:00Z"
+        })
+
+      assert StandingRole.due_by_schedule?(awaiting, @now)
+      refute StandingRole.due?(awaiting, @now)
+    end
+
+    test "an invalid role is never due" do
+      # mode must be standing; a oneshot block fails validation.
+      refute StandingRole.due_by_schedule?(role(%{"kind" => "oneshot"}), @now)
+    end
+
+    test "a role with no next_due_at is not due" do
+      refute StandingRole.due_by_schedule?(role(%{"next_due_at" => nil}), @now)
+    end
+  end
+
   describe "dispatch_run_id — resume keeps the run id, fresh/accepted mints a new one" do
     @resume_now ~U[2026-06-05 16:04:19Z]
 

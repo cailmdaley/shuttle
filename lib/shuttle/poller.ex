@@ -1635,7 +1635,7 @@ defmodule Shuttle.Poller do
         # Standing roles have additional preconditions; oneshots go to dep check.
         # Support both new-format (kind:) and old-format (mode:) shuttle blocks.
         Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot")) == "standing" ->
-          standing_role_due?(fiber_id, state)
+          standing_role_due?(fiber, state)
 
         # Dependencies must be satisfied
         true ->
@@ -2641,6 +2641,15 @@ defmodule Shuttle.Poller do
                     release_claim(state, fiber_id)
 
                   standing_role?(fiber, state) ->
+                    # New model: a standing worker's exit makes the role
+                    # awaiting review by writing `status: closed` (untempered)
+                    # to the felt document — the don't-re-fire gate and the
+                    # human's accept anchor, both now doc-representable. Write
+                    # BEFORE release_claim so the document reflects awaiting
+                    # before the claim frees (a re-poll racing the release then
+                    # reads `status: closed` and skips re-dispatch).
+                    mark_standing_awaiting(fiber_id)
+
                     state
                     |> remember_completed_standing_run(fiber_id, Map.get(meta, :run_id))
                     |> release_claim(fiber_id)
@@ -2665,6 +2674,22 @@ defmodule Shuttle.Poller do
                 })
             end
         end
+    end
+  end
+
+  # Write the standing-role awaiting marker (`status: closed`, untempered) to the
+  # felt document on worker exit. Best-effort: a failed felt write must not crash
+  # the exit-handling state machine (the worker is already gone; the dead-orphan
+  # reconciler is the backstop), so we log and continue. The felt-history exit
+  # event is written separately by `log_worker_exit`.
+  defp mark_standing_awaiting(fiber_id) do
+    case LifecycleStore.mark_awaiting(fiber_id) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Failed to mark standing role #{fiber_id} awaiting on exit: #{reason}")
+        :error
     end
   end
 
@@ -3092,10 +3117,23 @@ defmodule Shuttle.Poller do
     end
   end
 
-  defp standing_role_due?(fiber_id, state) do
-    with true <- dependencies_satisfied?(fiber_id, state),
+  # Standing dispatch is gated by the FELT DOCUMENT, not the runtime review
+  # overlay (the slice-1 cutover). A role dispatches iff its document says
+  # `status: active` with no verdict (`tempered` unset) AND the schedule says
+  # it is due. `status: closed` (untempered) is the awaiting-review /
+  # don't-re-fire signal — eligible?'s `status == "closed"` clause already
+  # excludes it before this is reached, but the doc gate here is what replaces
+  # the old `review.state in [scheduled, accepted]` precondition. The runtime
+  # review overlay still drives the kanban *display* (StandingRole.state) until
+  # it is removed in slice 4; it no longer drives dispatch.
+  defp standing_role_due?(fiber, state) do
+    fiber_id = Map.get(fiber, "id", "")
+
+    with true <- Map.get(fiber, "status", "") == "active",
+         true <- is_nil(Map.get(fiber, "tempered")),
+         true <- dependencies_satisfied?(fiber_id, state),
          {:ok, role} <- fetch_standing_role(fiber_id, state) do
-      StandingRole.due?(role, DateTime.utc_now()) and
+      StandingRole.due_by_schedule?(role, DateTime.utc_now()) and
         not completed_standing_run?(
           state,
           fiber_id,

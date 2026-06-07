@@ -164,6 +164,39 @@ defmodule Shuttle.LifecycleStore do
   end
 
   @doc """
+  Standing-worker exit writer: mark a role awaiting review by writing
+  `status: closed` (untempered) straight to the felt document — the new-model
+  awaiting signal, recognized by `accept`/`resume` (`doc_awaiting?`), the
+  poller's `eligible?` gate, and the kanban classifier. It is also the
+  don't-re-fire gate: a closed role is never dispatch-eligible, so the
+  `active → closed → active` cycle encodes "already ran this occurrence."
+
+  Deliberately does NOT touch `review` or the runtime row: awaiting is fully
+  doc-representable, and routing through `shuttle-ctl close` would run
+  `resetStandingReview`/`clearRuntimeReviewLifecycle` and erase the marker. This
+  is the mirror of `update_document` (the accept re-arm) — it sets
+  `status: closed` where accept sets `status: active`. Atomic via `write_fiber!`
+  (tmp + rename). A no-op-shaped error (not standing / unreadable) returns
+  `{:error, _}` so the caller can log without crashing the exit path.
+  """
+  @spec mark_awaiting(String.t()) :: {:ok, String.t()} | {:error, String.t()}
+  def mark_awaiting(fiber_id) when is_binary(fiber_id) do
+    with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
+         {:ok, shuttle} <- shuttle_block(frontmatter),
+         :ok <- require_standing(shuttle) do
+      frontmatter =
+        frontmatter
+        |> Map.put("status", "closed")
+        |> Map.put("closed-at", DateTime.to_iso8601(DateTime.utc_now()))
+        |> Map.delete("tempered")
+
+      write_fiber!(path, evict_runtime_keys(frontmatter), body)
+
+      {:ok, "marked #{fiber_id} awaiting review (status: closed, untempered)\n"}
+    end
+  end
+
+  @doc """
   Clear a standing role's runtime lifecycle state on close/reopen.
 
   Close and reopen are lifecycle transitions just like accept/resume — they
