@@ -18,27 +18,65 @@ defmodule Shuttle.LifecycleStore do
 
     with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
-         shuttle <- merge_lifecycle_overlay(fiber_id, shuttle),
-         :ok <- require_standing(shuttle),
-         {:ok, review} <- require_review_state(shuttle, "awaiting"),
+         :ok <- require_standing(shuttle) do
+      # New-model awaiting is `status: closed` + untempered in the document
+      # itself — no `review.state`. Recognize it directly from the doc and
+      # re-arm from the doc schedule. The legacy review-overlay path stays for
+      # roles still carrying a runtime `review.state` (pre-cutover).
+      if doc_awaiting?(frontmatter) do
+        accept_from_doc(fiber_id, path, frontmatter, body, shuttle, keep_outcome?)
+      else
+        accept_from_review(fiber_id, path, frontmatter, body, shuttle, keep_outcome?)
+      end
+    end
+  end
+
+  defp accept_from_doc(fiber_id, path, frontmatter, body, shuttle, keep_outcome?) do
+    with {:ok, schedule} <- require_schedule(shuttle),
+         {:ok, next_due_at} <- Cron.next_occurrence(schedule, DateTime.utc_now()),
+         {:ok, frontmatter} <- update_document(frontmatter, keep_outcome?) do
+      lifecycle =
+        %{
+          kind: "standing",
+          phase: "scheduled",
+          run_id: "",
+          next_due_at: next_due_at,
+          last_run_at: nil,
+          review: %{"state" => "scheduled"}
+        }
+        |> stamp_uid(fiber_id)
+
+      RuntimeStore.upsert_lifecycle(runtime_store_path(), fiber_id, lifecycle)
+      write_fiber!(path, evict_runtime_keys(frontmatter), body)
+
+      {:ok, "accepted run for #{fiber_id}\n  next due: #{DateTime.to_iso8601(next_due_at)}\n"}
+    end
+  end
+
+  defp accept_from_review(fiber_id, path, frontmatter, body, shuttle, keep_outcome?) do
+    shuttle = merge_lifecycle_overlay(fiber_id, shuttle)
+
+    with {:ok, review} <- require_review_state(shuttle, "awaiting"),
          {:ok, schedule} <- require_schedule(shuttle),
          {:ok, next_due_at} <- accepted_next_due_at(schedule, shuttle, review),
          {:ok, frontmatter} <- update_document(frontmatter, keep_outcome?) do
       run_id = Map.get(review, "run_id") || ""
       ad_hoc? = StandingRole.ad_hoc_run_id?(run_id)
 
-      lifecycle = %{
-        kind: "standing",
-        phase: "scheduled",
-        run_id: run_id,
-        next_due_at: next_due_at,
-        last_run_at: parse_datetime(Map.get(shuttle, "last_run_at")),
-        review: %{
-          "state" => "scheduled",
-          "run_id" => run_id,
-          "accepted_run_id" => run_id
+      lifecycle =
+        %{
+          kind: "standing",
+          phase: "scheduled",
+          run_id: run_id,
+          next_due_at: next_due_at,
+          last_run_at: parse_datetime(Map.get(shuttle, "last_run_at")),
+          review: %{
+            "state" => "scheduled",
+            "run_id" => run_id,
+            "accepted_run_id" => run_id
+          }
         }
-      }
+        |> stamp_uid(fiber_id)
 
       RuntimeStore.upsert_lifecycle(runtime_store_path(), fiber_id, lifecycle)
       write_fiber!(path, evict_runtime_keys(frontmatter), body)
@@ -58,22 +96,58 @@ defmodule Shuttle.LifecycleStore do
   def resume(fiber_id) when is_binary(fiber_id) do
     with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
-         shuttle <- merge_lifecycle_overlay(fiber_id, shuttle),
-         :ok <- require_standing(shuttle),
-         {:ok, review} <- require_any_review_state(shuttle, ["awaiting", "review", "in_review"]),
+         :ok <- require_standing(shuttle) do
+      if doc_awaiting?(frontmatter) do
+        resume_from_doc(fiber_id, path, frontmatter, body)
+      else
+        resume_from_review(fiber_id, path, frontmatter, body, shuttle)
+      end
+    end
+  end
+
+  defp resume_from_doc(fiber_id, path, frontmatter, body) do
+    now = DateTime.utc_now()
+    {:ok, frontmatter} = update_document(frontmatter, true)
+
+    lifecycle =
+      %{
+        kind: "standing",
+        phase: "scheduled",
+        run_id: nil,
+        next_due_at: now,
+        last_run_at: nil,
+        review: %{"state" => "scheduled"}
+      }
+      |> stamp_uid(fiber_id)
+
+    RuntimeStore.upsert_lifecycle(runtime_store_path(), fiber_id, lifecycle)
+    write_fiber!(path, evict_runtime_keys(frontmatter), body)
+
+    {:ok,
+     "resumed #{fiber_id} (standing role; re-queued for immediate dispatch)\n" <>
+       "  next_due_at:  #{DateTime.to_iso8601(now)} (immediate)\n" <>
+       "  note: use 'accept' to advance the recurrence instead\n"}
+  end
+
+  defp resume_from_review(fiber_id, path, frontmatter, body, shuttle) do
+    shuttle = merge_lifecycle_overlay(fiber_id, shuttle)
+
+    with {:ok, review} <- require_any_review_state(shuttle, ["awaiting", "review", "in_review"]),
          {:ok, frontmatter} <- update_document(frontmatter, true) do
       prior_state = Map.get(review, "state")
       run_id = Map.get(review, "run_id") || ""
       now = DateTime.utc_now()
 
-      lifecycle = %{
-        kind: "standing",
-        phase: "scheduled",
-        run_id: empty_to_nil(run_id),
-        next_due_at: now,
-        last_run_at: parse_datetime(Map.get(shuttle, "last_run_at")),
-        review: %{"state" => "scheduled"} |> put_if_present("run_id", run_id)
-      }
+      lifecycle =
+        %{
+          kind: "standing",
+          phase: "scheduled",
+          run_id: empty_to_nil(run_id),
+          next_due_at: now,
+          last_run_at: parse_datetime(Map.get(shuttle, "last_run_at")),
+          review: %{"state" => "scheduled"} |> put_if_present("run_id", run_id)
+        }
+        |> stamp_uid(fiber_id)
 
       RuntimeStore.upsert_lifecycle(runtime_store_path(), fiber_id, lifecycle)
       write_fiber!(path, evict_runtime_keys(frontmatter), body)
@@ -169,6 +243,32 @@ defmodule Shuttle.LifecycleStore do
 
   defp shuttle_block(%{"shuttle" => shuttle}) when is_map(shuttle), do: {:ok, shuttle}
   defp shuttle_block(_), do: {:error, "fiber has no shuttle: block"}
+
+  # New-model awaiting, read straight from the document: `status: closed` with
+  # no verdict (`tempered` unset). `tempered: false` (composted) and
+  # `tempered: true` are termini, not awaiting.
+  defp doc_awaiting?(frontmatter) do
+    Map.get(frontmatter, "status") == "closed" and is_nil(Map.get(frontmatter, "tempered"))
+  end
+
+  # Key the runtime row by the fiber's intrinsic uid, like the poller does, so
+  # accept/resume never births a second address-keyed row for a fiber the poller
+  # already tracks under its uid. This dual-writer-two-keys split is the exact
+  # root of the daily-practice wedge (finding-live-wedge-anatomy). Falls back to
+  # address-keying when felt can't resolve a uid (legacy/test fibers).
+  defp stamp_uid(lifecycle, fiber_id) do
+    case resolve_uid(fiber_id) do
+      uid when is_binary(uid) and uid != "" -> Map.put(lifecycle, :uid, uid)
+      _ -> lifecycle
+    end
+  end
+
+  defp resolve_uid(fiber_id) do
+    case FeltStores.resolve_fiber(fiber_id) do
+      {:ok, %{uid: uid}} -> uid
+      _ -> nil
+    end
+  end
 
   defp merge_lifecycle_overlay(fiber_id, shuttle) do
     case RuntimeStore.fetch_lifecycle(runtime_store_path(), fiber_id) do

@@ -20,15 +20,43 @@ defmodule Shuttle.ActionsTest do
              Actions.resolve_transition(fiber, "inFlight")
   end
 
-  test "closed standing-role must reopen before dispatching" do
+  test "closed + untempered standing role is awaiting: re-arm or compost, not reopen" do
+    # New-model awaiting: `status: closed` + no `tempered` on a standing role.
+    # The verdict gestures re-arm (accept-run) or reject (close-composted); this
+    # closed role does NOT collapse to reopen the way a oneshot does.
     fiber = %{standing("scheduled") | "status" => "closed"}
 
+    assert {:ok, %{id: "accept-run", invocation: %{verb: "accept"}}} =
+             Actions.resolve_transition(fiber, "inFlight")
+
+    assert {:ok, %{id: "accept-run", invocation: %{verb: "accept"}}} =
+             Actions.resolve_transition(fiber, "tempered")
+
+    assert {:ok, %{id: "close-composted", invocation: %{verb: "close", tempered: false}}} =
+             Actions.resolve_transition(fiber, "composted")
+
+    assert {:ok, %{id: "close-composted"}} = Actions.resolve_transition(fiber, "drafts")
+
+    assert {:ok, %{id: "close-awaiting-review"}} =
+             Actions.resolve_transition(fiber, "awaitingReview")
+
+    # Every resolved action is in the available set (drag-safety invariant).
     actions = Actions.actions_for(fiber)
-    assert Enum.any?(actions, &(&1.id == "reopen"))
-    refute Enum.any?(actions, &(&1.id == "dispatch-ad-hoc"))
+    assert Enum.any?(actions, &(&1.id == "accept-run"))
+    refute Enum.any?(actions, &(&1.id == "reopen"))
+  end
+
+  test "closed + composted standing role (tempered:false) is a terminus, reopen to revive" do
+    # A rejected standing role carries a verdict (`tempered: false`), so it is
+    # NOT awaiting — it falls through to the generic closed clauses: reopen to
+    # revive, close columns re-close with a verdict.
+    fiber = Map.merge(standing("scheduled"), %{"status" => "closed", "tempered" => false})
 
     assert {:ok, %{id: "reopen", invocation: %{verb: "reopen"}}} =
              Actions.resolve_transition(fiber, "inFlight")
+
+    assert {:ok, %{id: "close-tempered", invocation: %{verb: "close", tempered: true}}} =
+             Actions.resolve_transition(fiber, "tempered")
   end
 
   test "oneshot transition vocabulary stays lifecycle-shaped" do
@@ -190,19 +218,20 @@ defmodule Shuttle.ActionsTest do
                end)
     end
 
-    test "closed standing role with stale awaiting review resolves verdicts to their close verbs, not accept/reopen" do
-      # Regression for the C4 cond-ordering bug. A standing role can reach
-      # status=closed while its runtime store still holds review.state=awaiting
-      # (close never reset it before the lifecycle-reset fix). The matrix test
-      # above only proves resolve ⊆ availability — it cannot catch a
-      # semantically-wrong-but-available resolution. Here the closed clause used
-      # to omit tempered/composted, so they fell through to the standing-awaiting
-      # clauses: `tempered` → accept-run (re-arming a CLOSED role's schedule,
-      # dropping the user's verdict), while `composted` happened to land on
-      # close-composted by luck — an asymmetric, corrupt contract.
+    test "a CLOSED standing role WITH A VERDICT (tempered set) resolves to close/reopen, never accept-run" do
+      # The verdict-protection invariant in new-model terms. Awaiting is now
+      # `status: closed` + tempered UNSET; the moment a verdict lands (`tempered`
+      # present, true or false) the role is a terminus, not awaiting, so the
+      # awaiting re-arm clauses must NOT fire. This pins the entanglement guard:
+      # accept-run is reserved for genuinely-awaiting (untempered) closed roles;
+      # a role the user already ruled on falls through to the generic closed
+      # clauses (reopen to revive, close columns re-close with a verdict). A
+      # stale `review.state: awaiting` in frontmatter must not override the
+      # verdict — `tempered` presence wins.
       fiber = %{
-        "id" => "work/closed-stale-awaiting",
+        "id" => "work/closed-verdict",
         "status" => "closed",
+        "tempered" => false,
         "shuttle" => %{"enabled" => true, "kind" => "standing", "review" => %{"state" => "awaiting"}}
       }
 
@@ -213,7 +242,7 @@ defmodule Shuttle.ActionsTest do
                Actions.resolve_transition(fiber, "composted")
 
       # The open-lifecycle columns still reopen (clears closed_at / tempered);
-      # accept-run must NOT appear for a closed role.
+      # accept-run must NOT appear for a closed role that already has a verdict.
       for target <- ~w(drafts inFlight awaitingReview) do
         assert {:ok, %{id: "reopen"}} = Actions.resolve_transition(fiber, target)
       end

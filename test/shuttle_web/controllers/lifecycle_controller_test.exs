@@ -416,10 +416,15 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     File.mkdir_p!(fiber_dir)
     path = Path.join(fiber_dir, "standing-accept-overlay.md")
 
+    # The realistic legacy awaiting shape: `status: active` with the review
+    # evicted from frontmatter and living in the runtime overlay (this is
+    # daily-practice's live shape). accept reads review/timing back from the
+    # overlay. (New-model awaiting — `status: closed` + untempered — re-arms
+    # straight from the doc instead; covered in lifecycle_store_test.)
     File.write!(path, """
     ---
     name: Standing accept overlay
-    status: closed
+    status: active
     outcome: digest
     shuttle:
       enabled: true

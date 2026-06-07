@@ -77,6 +77,116 @@ defmodule Shuttle.LifecycleStoreTest do
     end
   end
 
+  describe "accept/resume recognize new-model awaiting (status:closed + untempered)" do
+    test "accept re-arms a closed+untempered standing role from the doc schedule" do
+      with_doc_awaiting_role(fn fiber_id, path ->
+        assert {:ok, message} = LifecycleStore.accept(fiber_id)
+        assert message =~ "accepted run for #{fiber_id}"
+        assert message =~ "next due:"
+
+        # Document re-armed straight from the doc: status:active, verdict cleared.
+        fm = read_frontmatter(path)
+        assert fm["status"] == "active"
+        refute Map.has_key?(fm, "tempered")
+
+        # A scheduled runtime row exists with a FUTURE next_due (cron.next(now)),
+        # not the past — the morning-post-drift anchor-on-now rule.
+        row = RuntimeStore.fetch_lifecycle(runtime_store_path(), fiber_id)
+        assert row.phase == "scheduled"
+        assert %DateTime{} = row.next_due_at
+        assert DateTime.compare(row.next_due_at, DateTime.utc_now()) == :gt
+      end)
+    end
+
+    test "resume re-arms a closed+untempered standing role to immediate" do
+      with_doc_awaiting_role(fn fiber_id, path ->
+        assert {:ok, message} = LifecycleStore.resume(fiber_id)
+        assert message =~ "re-queued for immediate dispatch"
+
+        fm = read_frontmatter(path)
+        assert fm["status"] == "active"
+        refute Map.has_key?(fm, "tempered")
+
+        row = RuntimeStore.fetch_lifecycle(runtime_store_path(), fiber_id)
+        assert row.phase == "scheduled"
+        # Immediate: next_due is ~now (resume re-queues right away).
+        assert %DateTime{} = row.next_due_at
+        assert DateTime.diff(DateTime.utc_now(), row.next_due_at) |> abs() < 5
+      end)
+    end
+
+    test "a tempered:false (composted) standing role is NOT awaiting — accept refuses" do
+      with_doc_awaiting_role(
+        fn fiber_id, _path ->
+          # Composted is a verdict, not awaiting: it has no runtime review row,
+          # so the legacy review path is consulted and rejects.
+          assert {:error, reason} = LifecycleStore.accept(fiber_id)
+          assert reason =~ "review"
+        end,
+        status: "closed",
+        tempered: false
+      )
+    end
+  end
+
+  # Builds a real on-disk felt fiber (resolvable by the felt CLI) in the
+  # new-model awaiting shape, points LOOM_HOMES + SHUTTLE_RUNTIME_STORE at the
+  # fixtures, and runs `fun.(fiber_id, path)`.
+  defp with_doc_awaiting_role(fun, opts \\ []) do
+    status = Keyword.get(opts, :status, "closed")
+    tempered = Keyword.get(opts, :tempered, nil)
+
+    loom = Path.join(System.tmp_dir!(), "shuttle-lifecycle-doc-test-#{System.unique_integer([:positive])}")
+    felt_dir = Path.join([loom, ".felt", "life", "french", "practice"])
+    File.mkdir_p!(felt_dir)
+    path = Path.join(felt_dir, "practice.md")
+
+    tempered_line = if is_nil(tempered), do: "", else: "tempered: #{tempered}\n"
+
+    File.write!(path, """
+    ---
+    name: Daily French practice
+    status: #{status}
+    #{tempered_line}shuttle:
+      enabled: true
+      kind: standing
+      host: testhost
+      agent: claude-sonnet
+      schedule:
+        expr: "0 8 * * *"
+        tz: Europe/Paris
+    ---
+
+    Body.
+    """)
+
+    runtime = Path.join(loom, "runtime.db")
+
+    prev_loom = System.get_env("LOOM_HOMES")
+    prev_runtime = System.get_env("SHUTTLE_RUNTIME_STORE")
+    System.put_env("LOOM_HOMES", loom)
+    System.put_env("SHUTTLE_RUNTIME_STORE", runtime)
+    RuntimeStore.init(runtime)
+
+    try do
+      fun.("life/french/practice", path)
+    after
+      restore_env("LOOM_HOMES", prev_loom)
+      restore_env("SHUTTLE_RUNTIME_STORE", prev_runtime)
+      File.rm_rf(loom)
+    end
+  end
+
+  defp read_frontmatter(path) do
+    [_, fm, _] = File.read!(path) |> String.split("---", parts: 3)
+    YamlElixir.read_from_string!(fm)
+  end
+
+  defp runtime_store_path, do: System.get_env("SHUTTLE_RUNTIME_STORE")
+
+  defp restore_env(key, nil), do: System.delete_env(key)
+  defp restore_env(key, value), do: System.put_env(key, value)
+
   defp with_runtime_store(fun) do
     path =
       Path.join(

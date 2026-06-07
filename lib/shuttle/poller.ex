@@ -1609,6 +1609,17 @@ defmodule Shuttle.Poller do
         not project_dir_available?(shuttle) ->
           false
 
+        # Closed is the awaiting-review / anti-oscillation gate. A closed fiber
+        # is never dispatch-eligible — a oneshot terminus, or (new model) a
+        # standing role that ran this cycle and is `status: closed` + untempered
+        # pending a human verdict. Re-arming is an explicit accept that writes
+        # `status: active`; until then closed stays dormant. Made explicit (not
+        # only implied by `status in [open, active]` below) so a tempered fiber
+        # can never oscillate back to dispatching on a later poll — the
+        # citation-audit-skill tempered-never-reverts invariant.
+        status == "closed" ->
+          false
+
         # Must be committed to active work
         status not in ["open", "active"] ->
           false

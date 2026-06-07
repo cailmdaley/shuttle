@@ -92,23 +92,37 @@ defmodule Shuttle.Actions do
       running? and target == "composted" ->
         :close_composted
 
+      # A CLOSED standing role with no verdict (`tempered` unset) is the
+      # new-model AWAITING signal: status:closed + untempered = "ran this cycle,
+      # pending a human verdict" — felt-native, no `review.state`. Only a
+      # STANDING role re-arms (a oneshot closes for good). The verdict gestures:
+      # inFlight/tempered = keep it (accept-run → advance the schedule),
+      # drafts/composted = reject (close-composted), awaitingReview = no-op (a
+      # same-column drop stays in review). This clause MUST precede the generic
+      # `status == "closed"` clauses below — those resolve a closed fiber to
+      # reopen/close, which would TERMINATE the role instead of re-arming it
+      # (the slice-1 entanglement). Tempered-true and composted (tempered:false)
+      # closed roles are termini and fall through to the generic clauses.
+      status == "closed" and standing?(shuttle) and untempered?(fiber) and
+          target in ["inFlight", "tempered"] ->
+        :accept_run
+
+      status == "closed" and standing?(shuttle) and untempered?(fiber) and
+          target in ["drafts", "composted"] ->
+        :close_composted
+
+      status == "closed" and standing?(shuttle) and untempered?(fiber) and
+          target == "awaitingReview" ->
+        :close_awaiting_review
+
       # A closed fiber's only forward move is reopen (which clears closed_at /
       # tempered); shuttle-ctl refuses a direct pause/close on an already-closed
       # fiber. Portolan's un-temper sequence drags through inFlight first for
       # the other open-lifecycle targets, so every non-close target collapses to
-      # reopen here. The close columns re-close with the chosen verdict.
-      #
-      # The verdict columns are split out from the open-lifecycle group (rather
-      # than left to fall through to the standing-awaiting clauses below). A
-      # CLOSED standing role can carry a stale `review.state: awaiting` in its
-      # runtime store (close never reset it before the lifecycle-reset fix); if
-      # `tempered`/`composted` fell through, c6/c7 would catch them — `tempered`
-      # → accept-run, which re-arms a *closed* role's schedule (status forced
-      # active, next_due_at in the future), silently dropping the user's
-      # verdict. Resolving the verdict columns to their close verbs here keeps
-      # the contract symmetric (tempered → close-tempered, composted →
-      # close-composted) regardless of any leftover review state, and the
-      # rendered set stays drag-safe by construction.
+      # reopen here. The close columns re-close with the chosen verdict. This
+      # group now catches oneshot termini and tempered/composted standing
+      # termini; the awaiting (closed + untempered + standing) case is handled
+      # above and never reaches here.
       status == "closed" and target in ["drafts", "inFlight", "awaitingReview"] ->
         :reopen
 
@@ -210,6 +224,11 @@ defmodule Shuttle.Actions do
 
   defp enabled?(shuttle), do: Map.get(shuttle, "enabled") == true
   defp standing?(shuttle), do: Map.get(shuttle, "kind", Map.get(shuttle, "mode")) == "standing"
+
+  # `tempered` absent (nil) is the no-verdict state — the awaiting signal for a
+  # closed fiber. `tempered: true` (accepted oneshot terminus) and
+  # `tempered: false` (composted) both have a verdict and are NOT awaiting.
+  defp untempered?(fiber), do: is_nil(Map.get(fiber, "tempered"))
 
   defp review_state(shuttle) do
     case Map.get(shuttle, "review") do
