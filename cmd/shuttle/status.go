@@ -92,10 +92,18 @@ Other flags:
 		seenSessions := map[string]bool{}
 
 		for _, entry := range shuttleFibers {
-			session := schema.TmuxSessionName(entry.FiberID)
-			live := liveSessions[session] && sessionOwners[session] == entry.FiberID
-			if live {
-				seenSessions[session] = true
+			// The canonical (uid-keyed) name is the row's display session, but
+			// liveness recognizes either name form so a worker launched before
+			// the uid-keyed cutover still reads as running.
+			session := schema.TmuxSessionName(entry.FiberID, entry.UID)
+			live := false
+			for _, candidate := range schema.TmuxSessionNames(entry.FiberID, entry.UID) {
+				if liveSessions[candidate] && sessionOwners[candidate] == entry.FiberID {
+					live = true
+					session = candidate
+					seenSessions[candidate] = true
+					break
+				}
 			}
 
 			state := computeState(entry.Block, live)
@@ -204,6 +212,7 @@ var psCmd = &cobra.Command{
 
 type shuttleEntry struct {
 	FiberID string
+	UID     string
 	Status  string
 	Block   *schema.Block
 }
@@ -257,6 +266,7 @@ func listShuttleFibers(host string) ([]shuttleEntry, error) {
 
 	var raw []struct {
 		FiberID string          `json:"id"`
+		UID     string          `json:"uid"`
 		Status  string          `json:"status"`
 		Path    string          `json:"path"`
 		Shuttle json.RawMessage `json:"shuttle"`
@@ -288,7 +298,7 @@ func listShuttleFibers(host string) ([]shuttleEntry, error) {
 			continue
 		}
 		seen[id] = true
-		entries = append(entries, shuttleEntry{FiberID: id, Status: fiber.Status, Block: &block})
+		entries = append(entries, shuttleEntry{FiberID: id, UID: fiber.UID, Status: fiber.Status, Block: &block})
 	}
 	return entries, nil
 }
@@ -314,6 +324,11 @@ func statusHosts() ([]string, error) {
 	return schema.FeltStores()
 }
 
+// sessionOwnerMap maps every session-name form a fiber could carry — both the
+// uid-keyed canonical name and the legacy leaf-only name — back to its fiber.
+// The uid-keyed names are collision-free; the legacy leaf-only names keep the
+// existing collision guard (two open fibers sharing a leaf drop out of the map
+// rather than mis-attributing a live worker).
 func sessionOwnerMap(entries []shuttleEntry) map[string]string {
 	owners := map[string]string{}
 	collisions := map[string]bool{}
@@ -321,14 +336,15 @@ func sessionOwnerMap(entries []shuttleEntry) map[string]string {
 		if entry.Status == "closed" {
 			continue
 		}
-		session := schema.TmuxSessionName(entry.FiberID)
-		if existing, ok := owners[session]; ok && existing != entry.FiberID {
-			delete(owners, session)
-			collisions[session] = true
-			continue
-		}
-		if !collisions[session] {
-			owners[session] = entry.FiberID
+		for _, session := range schema.TmuxSessionNames(entry.FiberID, entry.UID) {
+			if existing, ok := owners[session]; ok && existing != entry.FiberID {
+				delete(owners, session)
+				collisions[session] = true
+				continue
+			}
+			if !collisions[session] {
+				owners[session] = entry.FiberID
+			}
 		}
 	}
 	return owners

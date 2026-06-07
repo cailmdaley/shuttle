@@ -63,9 +63,10 @@ defmodule Shuttle.Dispatcher do
     force = Keyword.get(opts, :force, false)
 
     with {:ok, fiber} <- fetch_fiber(fiber_id, runner, felt_store: felt_store),
+         uid = Map.get(fiber, "uid"),
          :ok <- check_not_closed(fiber, force),
          :ok <- maybe_reopen_on_force(fiber_id, fiber, force, runner, felt_store),
-         :ok <- check_not_running(fiber_id, runner),
+         :ok <- check_not_running(fiber_id, uid, runner),
          {:ok, agent} <- resolve_agent(fiber),
          :ok <- validate_agent(agent) do
       # Human-worker no-op: when the fiber's agent is `human`, the user is
@@ -95,6 +96,7 @@ defmodule Shuttle.Dispatcher do
           resume_intent ->
             create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent,
               felt_store: felt_store,
+              uid: uid,
               shuttle: Map.get(fiber, "shuttle")
             )
         end
@@ -681,10 +683,31 @@ defmodule Shuttle.Dispatcher do
   end
 
   @doc """
-  tmux session name for a fiber ID.
+  Canonical tmux session name for a fiber, keyed by its uid.
 
-  Uses the fiber leaf so tmux/kitty titles stay legible from the left edge
-  when truncated.
+  The form is `<leaf>-<uid>-shuttle`: the human-readable leaf keeps tmux/kitty
+  titles legible from the left edge when truncated, and the uid (the fiber's
+  intrinsic ULID) makes the name collision-free and rename-safe — two fibers
+  sharing a leaf no longer collide, and renaming a fiber leaves the running
+  worker's session addressable by the uid that does not change.
+
+  When `uid` is `nil` or empty (legacy/test callers without a resolved uid),
+  falls back to the leaf-only `<leaf>-shuttle` form.
+  """
+  @spec session_name(String.t(), String.t() | nil) :: String.t()
+  def session_name(fiber_id, uid) when is_binary(uid) and uid != "" do
+    fiber_leaf(fiber_id) <> "-" <> uid <> "-shuttle"
+  end
+
+  def session_name(fiber_id, _uid), do: session_name(fiber_id)
+
+  @doc """
+  Legacy leaf-only tmux session name (`<leaf>-shuttle`).
+
+  Retained for **dual-recognition** during the uid-keyed cutover: live workers
+  launched under the old scheme carry this name, and matching/adoption paths
+  that lack a uid still recognize them. New sessions are launched under
+  `session_name/2`.
   """
   @spec session_name(String.t()) :: String.t()
   def session_name(fiber_id) do
@@ -692,7 +715,23 @@ defmodule Shuttle.Dispatcher do
   end
 
   @doc """
+  Both tmux session-name forms for a fiber — the uid-keyed canonical name and
+  the legacy leaf-only name — so recognition/adoption matches a live worker
+  regardless of which scheme launched it. Returns `[new, legacy]` when a uid is
+  available, or just `[legacy]` when it is not.
+  """
+  @spec session_names(String.t(), String.t() | nil) :: [String.t()]
+  def session_names(fiber_id, uid) when is_binary(uid) and uid != "" do
+    [session_name(fiber_id, uid), session_name(fiber_id)]
+  end
+
+  def session_names(fiber_id, _uid), do: [session_name(fiber_id)]
+
+  @doc """
   Returns true when a tmux session name belongs to a Shuttle worker.
+
+  Both name forms — `<leaf>-<uid>-shuttle` and the legacy `<leaf>-shuttle` —
+  end in `-shuttle`, so the suffix test recognizes either.
   """
   @spec shuttle_session?(String.t()) :: boolean()
   def shuttle_session?(session_name) do
@@ -805,14 +844,22 @@ defmodule Shuttle.Dispatcher do
     status == "active" and enabled and is_nil(tempered) and is_nil(closed_at)
   end
 
-  defp check_not_running(fiber_id, runner) do
-    session = session_name(fiber_id)
-
-    case runner.cmd("tmux", ["has-session", "-t", exact_tmux_target(session)],
-           stderr_to_stdout: true
-         ) do
-      {_, 0} -> {:error, :already_running}
-      {_, _} -> :ok
+  # Dual-recognition: a live worker under either the uid-keyed name or the
+  # legacy leaf-only name blocks a fresh dispatch.
+  defp check_not_running(fiber_id, uid, runner) do
+    fiber_id
+    |> session_names(uid)
+    |> Enum.any?(fn session ->
+      case runner.cmd("tmux", ["has-session", "-t", exact_tmux_target(session)],
+             stderr_to_stdout: true
+           ) do
+        {_, 0} -> true
+        {_, _} -> false
+      end
+    end)
+    |> case do
+      true -> {:error, :already_running}
+      false -> :ok
     end
   end
 
@@ -845,7 +892,7 @@ defmodule Shuttle.Dispatcher do
   # Dispatch: fresh worker (new session) or resume previous.
   # `resume_intent` is `:fresh | {:previous, session_id}` from check_resume_intent/3.
   defp create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent, opts) do
-    session = session_name(fiber_id)
+    session = session_name(fiber_id, Keyword.get(opts, :uid))
     felt_store = Keyword.get(opts, :felt_store, default_felt_store())
     worker_fiber_id = prompt_fiber_id(fiber_id, work_dir, felt_store)
 

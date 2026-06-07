@@ -936,7 +936,7 @@ defmodule ShuttleWeb.APIControllerTest do
     assert body["runtime"][uid]["uid"] == uid
     refute Map.has_key?(body["runtime"], "tests/state")
     assert [%{"fiber_id" => "tests/state", "uid" => ^uid}] = body["eligible"]
-    assert body["runtime"][uid]["tmux_session"] == "state-shuttle"
+    assert body["runtime"][uid]["tmux_session"] == "state-#{uid}-shuttle"
     assert is_list(body["reservations"])
     assert is_list(body["waiters"])
   end

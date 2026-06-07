@@ -584,7 +584,9 @@ shuttle:
 
 Body.
 `)
-	session := schema.TmuxSessionName("pause-me")
+	// These temp-store fibers carry no felt uid, so the command resolves an
+	// empty uid and pause targets the legacy leaf-only session name.
+	session := schema.TmuxSessionName("pause-me", "")
 	killed := withStubbedTmux(t, map[string]bool{session: true})
 
 	cmd := newPauseCmd()
@@ -603,6 +605,68 @@ Body.
 	}
 	if got := strings.Join(*killed, ","); got != session {
 		t.Fatalf("expected killed session %q, got %q", session, got)
+	}
+}
+
+func TestPauseCmd_KillsUIDKeyedSession(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	uid := "01KTHDNZS287ZSSG8X8V59XKWB"
+	writeFiber(t, host, "pause-uid", `---
+name: Pause uid
+status: active
+uid: `+uid+`
+shuttle:
+  enabled: true
+  kind: oneshot
+---
+
+Body.
+`)
+	// felt surfaces the frontmatter uid, so pause computes the uid-keyed
+	// session name and kills exactly that.
+	session := schema.TmuxSessionName("pause-uid", uid)
+	killed := withStubbedTmux(t, map[string]bool{session: true})
+
+	cmd := newPauseCmd()
+	cmd.SetArgs([]string{"pause-uid"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if got := strings.Join(*killed, ","); got != session {
+		t.Fatalf("expected killed uid-keyed session %q, got %q", session, got)
+	}
+}
+
+func TestPauseCmd_KillsLegacyNamedWorkerForUIDFiber(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	uid := "01KTHDNZS287ZSSG8X8V59XKWB"
+	writeFiber(t, host, "pause-legacy", `---
+name: Pause legacy
+status: active
+uid: `+uid+`
+shuttle:
+  enabled: true
+  kind: oneshot
+---
+
+Body.
+`)
+	// A worker launched before the uid-keyed cutover is live under the legacy
+	// leaf-only name; dual-recognition still finds and kills it.
+	legacy := schema.TmuxSessionName("pause-legacy", "")
+	killed := withStubbedTmux(t, map[string]bool{legacy: true})
+
+	cmd := newPauseCmd()
+	cmd.SetArgs([]string{"pause-legacy"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if got := strings.Join(*killed, ","); got != legacy {
+		t.Fatalf("expected killed legacy session %q, got %q", legacy, got)
 	}
 }
 
@@ -655,7 +719,7 @@ shuttle:
 
 Body.
 `)
-	session := schema.TmuxSessionName("let-finish")
+	session := schema.TmuxSessionName("let-finish", "")
 	sessions := map[string]bool{session: true}
 	killed := withStubbedTmux(t, sessions)
 

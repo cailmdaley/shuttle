@@ -71,9 +71,18 @@ func loadAgents() *schema.AgentRegistry {
 	return reg
 }
 
-// resolveFiber resolves a fiber ID/query to its canonical host/id/path triple;
-// exits on error.
+// resolveFiber resolves a fiber ID/query to its canonical (path, id, host)
+// triple; exits on error. Callers that also need the intrinsic uid (e.g. to
+// compute the uid-keyed tmux session name) use resolveFiberRef.
 func resolveFiber(idOrQuery string) (string, string, string) {
+	ref := resolveFiberRef(idOrQuery)
+	return ref.Path, ref.ID, ref.Host
+}
+
+// resolveFiberRef resolves a fiber ID/query to its full canonical reference
+// (path, id, uid, host); exits on error. The uid keys the rename-safe tmux
+// session name.
+func resolveFiberRef(idOrQuery string) *schema.FiberRef {
 	host := feltHostFlag
 	if host == "" {
 		defaultStore, err := schema.FeltStore()
@@ -89,7 +98,7 @@ func resolveFiber(idOrQuery string) (string, string, string) {
 		fmt.Fprintf(os.Stderr, "shuttle: %v\n", err)
 		os.Exit(1)
 	}
-	return ref.Path, ref.ID, ref.Host
+	return ref
 }
 
 // readFiber reads a fiber; exits on error.

@@ -2185,6 +2185,53 @@ defmodule Shuttle.PollerTest do
     assert hd(snap.eligible).fiber_id == "tests/orphan"
   end
 
+  test "poller adopts a uid-carrying fiber's worker under the new uid-keyed session" do
+    fiber_id = "tests/orphan-uid"
+    uid = "01KTHDNZS287ZSSG8X8V59XKWB"
+    MockRunner.set_fiber(fiber_id, make_fiber(fiber_id, %{"uid" => uid}))
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+    MockRunner.add_tmux_session(Dispatcher.session_name(fiber_id, uid))
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_orphan_uid,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    Process.sleep(100)
+
+    snap = Poller.snapshot(poller)
+    assert Enum.any?(snap.eligible, &(&1.fiber_id == fiber_id and &1.state == "running"))
+  end
+
+  test "poller adopts a uid-carrying fiber's LEGACY-named worker (dual-recognition)" do
+    # A worker launched before the uid-keyed cutover is live under the legacy
+    # leaf-only name. The owning daemon must still recognize and adopt it after
+    # an upgrade, so the deploy order is safe and live legacy workers aren't
+    # abandoned.
+    fiber_id = "tests/orphan-legacy"
+    uid = "01KTHDNZS287ZSSG8X8V59XKWC"
+    MockRunner.set_fiber(fiber_id, make_fiber(fiber_id, %{"uid" => uid}))
+    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
+    # Live session carries the LEGACY name, not the uid-keyed one.
+    MockRunner.add_tmux_session(Dispatcher.session_name(fiber_id))
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_orphan_legacy,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    Process.sleep(100)
+
+    snap = Poller.snapshot(poller)
+    assert Enum.any?(snap.eligible, &(&1.fiber_id == fiber_id and &1.state == "running"))
+  end
+
   test "poller resurrects orphaned oneshot when shuttle.session.id is set but tmux session is dead" do
     # Simulates: oneshot was dispatched (so shuttle.session.id is in the fiber
     # file), the worker exited while the daemon was down (so no worker_exited

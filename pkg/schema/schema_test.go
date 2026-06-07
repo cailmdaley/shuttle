@@ -139,16 +139,51 @@ func TestNextOccurrence(t *testing.T) {
 	}
 }
 
-func TestTmuxSessionNameUsesFiberLeafAndSuffix(t *testing.T) {
+func TestTmuxSessionNameUsesFiberLeafUIDAndSuffix(t *testing.T) {
+	uid := "01KTHDNZS287ZSSG8X8V59XKWB"
 	cases := map[string]string{
-		"tests/haiku":              "haiku-shuttle",
-		"ai-futures/foo/bar":       "bar-shuttle",
-		"constitution-single-name": "constitution-single-name-shuttle",
+		"tests/haiku":              "haiku-" + uid + "-shuttle",
+		"ai-futures/foo/bar":       "bar-" + uid + "-shuttle",
+		"constitution-single-name": "constitution-single-name-" + uid + "-shuttle",
 	}
 
 	for fiberID, want := range cases {
-		if got := TmuxSessionName(fiberID); got != want {
-			t.Fatalf("TmuxSessionName(%q) = %q, want %q", fiberID, got, want)
+		if got := TmuxSessionName(fiberID, uid); got != want {
+			t.Fatalf("TmuxSessionName(%q, %q) = %q, want %q", fiberID, uid, got, want)
+		}
+	}
+}
+
+func TestTmuxSessionNameEmptyUIDFallsBackToLegacy(t *testing.T) {
+	cases := map[string]string{
+		"tests/haiku":        "haiku-shuttle",
+		"ai-futures/foo/bar": "bar-shuttle",
+	}
+	for fiberID, want := range cases {
+		if got := TmuxSessionName(fiberID, ""); got != want {
+			t.Fatalf("TmuxSessionName(%q, \"\") = %q, want %q (legacy)", fiberID, got, want)
+		}
+	}
+}
+
+func TestTmuxSessionNamesDualRecognition(t *testing.T) {
+	uid := "01KTHDNZS287ZSSG8X8V59XKWB"
+	got := TmuxSessionNames("tests/haiku", uid)
+	want := []string{"haiku-" + uid + "-shuttle", "haiku-shuttle"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("TmuxSessionNames(haiku, uid) = %v, want %v", got, want)
+	}
+
+	// No uid → only the legacy form.
+	got = TmuxSessionNames("tests/haiku", "")
+	if len(got) != 1 || got[0] != "haiku-shuttle" {
+		t.Fatalf("TmuxSessionNames(haiku, \"\") = %v, want [haiku-shuttle]", got)
+	}
+
+	// Both forms are recognized by IsTmuxSessionName.
+	for _, name := range TmuxSessionNames("tests/haiku", uid) {
+		if !IsTmuxSessionName(name) {
+			t.Fatalf("IsTmuxSessionName(%q) = false, want true", name)
 		}
 	}
 }

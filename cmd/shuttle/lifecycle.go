@@ -77,7 +77,8 @@ This makes pause the single-writer transition for the Kanban's Drafts target.`,
 			if err != nil {
 				return err
 			}
-			path, fiberID, _ := resolveFiber(args[0])
+			ref := resolveFiberRef(args[0])
+			path := ref.Path
 			f := readFiber(path)
 			if f.Block == nil {
 				return fmt.Errorf("fiber %s has no shuttle: block", args[0])
@@ -107,9 +108,17 @@ This makes pause the single-writer transition for the Kanban's Drafts target.`,
 				return nil
 			}
 
-			session := schema.TmuxSessionName(fiberID)
-			if !tmuxSessionExists(session) {
-				fmt.Printf("  worker: no live session %s\n", session)
+			// Dual-recognition: kill whichever session form is live (a worker
+			// launched before the uid-keyed cutover carries the legacy name).
+			session := ""
+			for _, candidate := range schema.TmuxSessionNames(ref.ID, ref.UID) {
+				if tmuxSessionExists(candidate) {
+					session = candidate
+					break
+				}
+			}
+			if session == "" {
+				fmt.Printf("  worker: no live session %s\n", schema.TmuxSessionName(ref.ID, ref.UID))
 				return nil
 			}
 			if err := killTmuxSession(session); err != nil {

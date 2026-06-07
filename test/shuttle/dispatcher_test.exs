@@ -67,6 +67,12 @@ defmodule Shuttle.DispatcherTest do
         status: "active",
         tags: ["constitution", "pi"],
         shuttle: %{"enabled" => true, "kind" => "oneshot", "agent" => "claude-opus"}
+      },
+      "tests/uid-fiber" => %{
+        status: "active",
+        tags: ["constitution"],
+        uid: "01KTHDNZS287ZSSG8X8V59XKWB",
+        shuttle: %{"enabled" => true, "kind" => "oneshot", "agent" => "claude-sonnet"}
       }
     }
 
@@ -130,6 +136,7 @@ defmodule Shuttle.DispatcherTest do
               "modified_at" => "2026-04-28T00:00:00Z"
             }
             |> maybe_put("shuttle", fiber.shuttle)
+            |> maybe_put("uid", Map.get(fiber, :uid))
 
           {Jason.encode!(payload), 0}
 
@@ -273,9 +280,35 @@ defmodule Shuttle.DispatcherTest do
     refute prompt =~ "Fiber: ai-futures/shuttle/constitution-shuttle-ctl-ux-fixes"
   end
 
-  test "session_name uses fiber leaf plus shuttle suffix" do
+  test "session_name/2 keys the canonical name by uid (rename-safe, collision-free)" do
+    uid = "01KTHDNZS287ZSSG8X8V59XKWB"
+    assert Dispatcher.session_name("tests/haiku", uid) == "haiku-#{uid}-shuttle"
+    assert Dispatcher.session_name("a/b/c", uid) == "c-#{uid}-shuttle"
+  end
+
+  test "session_name/2 falls back to the legacy leaf-only name when uid is absent" do
+    assert Dispatcher.session_name("tests/haiku", nil) == "haiku-shuttle"
+    assert Dispatcher.session_name("tests/haiku", "") == "haiku-shuttle"
+  end
+
+  test "session_name/1 is the legacy leaf-only form (retained for dual-recognition)" do
     assert Dispatcher.session_name("tests/haiku") == "haiku-shuttle"
     assert Dispatcher.session_name("a/b/c") == "c-shuttle"
+  end
+
+  test "session_names/2 returns both forms for dual-recognition" do
+    uid = "01KTHDNZS287ZSSG8X8V59XKWB"
+
+    assert Dispatcher.session_names("tests/haiku", uid) == [
+             "haiku-#{uid}-shuttle",
+             "haiku-shuttle"
+           ]
+
+    # No uid → only the legacy form is recognizable.
+    assert Dispatcher.session_names("tests/haiku", nil) == ["haiku-shuttle"]
+
+    # Both forms are Shuttle sessions.
+    assert Enum.all?(Dispatcher.session_names("tests/haiku", uid), &Dispatcher.shuttle_session?/1)
   end
 
   test "dispatch creates tmux session for eligible fiber" do
@@ -287,6 +320,26 @@ defmodule Shuttle.DispatcherTest do
     assert Enum.any?(commands, fn {cmd, args} ->
              cmd == "tmux" and hd(args) == "new-session"
            end)
+  end
+
+  test "dispatch launches the worker under the uid-keyed session name" do
+    uid = "01KTHDNZS287ZSSG8X8V59XKWB"
+    expected = "uid-fiber-#{uid}-shuttle"
+    assert {:ok, ^expected} = Dispatcher.dispatch("tests/uid-fiber", runner: MockRunner)
+
+    # The new-session tmux command targets the uid-keyed name.
+    assert Enum.any?(MockRunner.commands(), fn
+             {"tmux", args} -> hd(args) == "new-session" and expected in args
+             _ -> false
+           end)
+  end
+
+  test "dispatch refuses when a live worker exists under the legacy name (dual-recognition)" do
+    # A worker launched before the uid-keyed cutover carries the legacy
+    # leaf-only name; check_not_running must still see it and refuse a
+    # duplicate dispatch for the uid-carrying fiber.
+    MockRunner.add_tmux_session("uid-fiber-shuttle")
+    assert {:error, :already_running} = Dispatcher.dispatch("tests/uid-fiber", runner: MockRunner)
   end
 
   test "dispatch refuses closed fiber" do

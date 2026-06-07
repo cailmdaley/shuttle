@@ -25,11 +25,22 @@ Resolves the fiber ID to Shuttle's canonical tmux session name and executes
 tmux attach. Exits with a clear error if no session exists.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		_, fiberID, _ := resolveFiber(args[0])
-		session := schema.TmuxSessionName(fiberID)
+		ref := resolveFiberRef(args[0])
 
-		if !tmuxSessionExists(session) {
-			return fmt.Errorf("no tmux session %q — fiber %s has no live worker\n(run 'shuttle ps' to list active workers)", session, args[0])
+		// Dual-recognition: a worker may be live under either the uid-keyed
+		// name or the legacy leaf-only name. Attach to whichever exists,
+		// preferring the uid-keyed canonical form.
+		session := ""
+		for _, candidate := range schema.TmuxSessionNames(ref.ID, ref.UID) {
+			if tmuxSessionExists(candidate) {
+				session = candidate
+				break
+			}
+		}
+
+		if session == "" {
+			want := schema.TmuxSessionName(ref.ID, ref.UID)
+			return fmt.Errorf("no tmux session %q — fiber %s has no live worker\n(run 'shuttle ps' to list active workers)", want, args[0])
 		}
 
 		tmux, err := exec.LookPath("tmux")

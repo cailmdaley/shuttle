@@ -15,6 +15,7 @@ import (
 type FiberRef struct {
 	Host string
 	ID   string
+	UID  string
 	Path string
 }
 
@@ -181,7 +182,15 @@ func ResolveFiberInHost(host, idOrQuery string) (*FiberRef, error) {
 	if chosen.Path == "" {
 		return nil, fmt.Errorf("fiber %q resolved to ID %q but felt carried no path", idOrQuery, chosen.ID)
 	}
-	return canonicalizeFiberPath(chosen.Path)
+	ref, err := canonicalizeFiberPath(chosen.Path)
+	if err != nil {
+		return nil, err
+	}
+	// felt carries the intrinsic uid in the resolution result; the canonical
+	// path re-derivation cannot recover it, so carry it through here. It keys
+	// the rename-safe tmux session name.
+	ref.UID = chosen.UID
+	return ref, nil
 }
 
 // feltFiber is the slice of a `felt ls -j` record this package reads. felt
@@ -372,14 +381,42 @@ func fiberLeaf(fiberID string) string {
 	return fiberID
 }
 
-// TmuxSessionName returns the canonical tmux session name for a fiber ID.
-func TmuxSessionName(fiberID string) string {
-	// Shuttle workers use the fiber leaf so tmux/kitty titles stay legible from
-	// the left edge when truncated.
+// TmuxSessionName returns the canonical tmux session name for a fiber, keyed by
+// its uid: <leaf>-<uid>-shuttle. The human-readable leaf keeps tmux/kitty titles
+// legible from the left edge when truncated, and the uid (the fiber's intrinsic
+// ULID) makes the name collision-free and rename-safe — two fibers sharing a
+// leaf no longer collide, and renaming a fiber leaves the running worker's
+// session addressable by the uid that does not change.
+//
+// When uid is empty (legacy/test callers without a resolved uid), it falls back
+// to the legacy leaf-only <leaf>-shuttle form.
+func TmuxSessionName(fiberID, uid string) string {
+	if uid == "" {
+		return legacyTmuxSessionName(fiberID)
+	}
+	return fiberLeaf(fiberID) + "-" + uid + "-shuttle"
+}
+
+// legacyTmuxSessionName returns the pre-cutover leaf-only session name
+// (<leaf>-shuttle). Retained for dual-recognition: live workers launched under
+// the old scheme carry this name.
+func legacyTmuxSessionName(fiberID string) string {
 	return fiberLeaf(fiberID) + "-shuttle"
 }
 
+// TmuxSessionNames returns both tmux session-name forms for a fiber — the
+// uid-keyed canonical name and the legacy leaf-only name — so recognition
+// matches a live worker regardless of which scheme launched it. Returns
+// [new, legacy] when a uid is available, or just [legacy] when it is not.
+func TmuxSessionNames(fiberID, uid string) []string {
+	if uid == "" {
+		return []string{legacyTmuxSessionName(fiberID)}
+	}
+	return []string{TmuxSessionName(fiberID, uid), legacyTmuxSessionName(fiberID)}
+}
+
 // IsTmuxSessionName reports whether a tmux session name belongs to Shuttle.
+// Both name forms end in -shuttle, so the suffix test recognizes either.
 func IsTmuxSessionName(sessionName string) bool {
 	return strings.HasSuffix(sessionName, "-shuttle")
 }

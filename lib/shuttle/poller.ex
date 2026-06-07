@@ -517,13 +517,13 @@ defmodule Shuttle.Poller do
   def handle_call({:dispatch, fiber_id, opts}, _from, state) do
     fiber_id = address_for_identifier(state, fiber_id)
     state = reconcile_running_fiber(state, fiber_id)
-    session = Dispatcher.session_name(fiber_id)
+    session = Dispatcher.session_name(fiber_id, uid_for_fiber(state, fiber_id))
 
     cond do
       running_key(state, fiber_id) != nil or MapSet.member?(state.claimed, fiber_id) ->
         {:reply, {:error, :already_running}, state}
 
-      already_running_session?(state, session) ->
+      fiber_session_live?(state, fiber_id) ->
         {:reply, {:error, :already_running}, state}
 
       true ->
@@ -1261,9 +1261,12 @@ defmodule Shuttle.Poller do
       MapSet.member?(state.claimed, fiber_id) ->
         state
 
-      # tmux session for this fiber is live — `adopt_orphans` /
-      # `reconcile_orphaned_sessions` will pick it up; not our problem.
-      MapSet.member?(live_sessions, Dispatcher.session_name(fiber_id)) ->
+      # tmux session for this fiber is live (either name form) — `adopt_orphans`
+      # / `reconcile_orphaned_sessions` will pick it up; not our problem.
+      Enum.any?(
+        Dispatcher.session_names(fiber_id, Map.get(fiber, "uid")),
+        &MapSet.member?(live_sessions, &1)
+      ) ->
         state
 
       true ->
@@ -2531,7 +2534,9 @@ defmodule Shuttle.Poller do
   end
 
   defp rehydrate_running_record(%State{} = state, fiber_id, runtime_key, metadata) do
-    session = Map.get(metadata, :session, Dispatcher.session_name(fiber_id))
+    session =
+      Map.get(metadata, :session) ||
+        Dispatcher.session_name(fiber_id, uid_for_fiber(state, fiber_id, metadata))
     existing_key = running_key(state, fiber_id)
 
     cond do
@@ -2606,8 +2611,15 @@ defmodule Shuttle.Poller do
     end)
   end
 
-  defp adopt_session(state, fiber_id) do
-    session = Dispatcher.session_name(fiber_id)
+  # `session` is the *live* tmux session name to adopt. Callers that discovered
+  # a live orphan pass its exact name (which may be the legacy leaf-only form on
+  # a worker launched before the uid-keyed cutover); the default picks whichever
+  # of the fiber's name forms is actually live (preferring the uid-keyed name),
+  # for callers that only have the fiber identity.
+  defp adopt_session(state, fiber_id, session \\ nil) do
+    session =
+      session || live_session_for_fiber(state, fiber_id) ||
+        Dispatcher.session_name(fiber_id, uid_for_fiber(state, fiber_id))
 
     case fetch_fiber_full(fiber_id, state) do
       {:ok, fiber} ->
@@ -2937,6 +2949,21 @@ defmodule Shuttle.Poller do
       {_, 0} -> true
       {_, _} -> false
     end
+  end
+
+  # Dual-recognition liveness: a fiber is running if a live tmux session exists
+  # under either its uid-keyed name or the legacy leaf-only name. Used wherever
+  # the caller has the fiber identity but not a stored session name.
+  defp fiber_session_live?(%State{} = state, fiber_id) do
+    live_session_for_fiber(state, fiber_id) != nil
+  end
+
+  # The fiber's *live* tmux session name (either form), preferring the uid-keyed
+  # canonical name when both happen to exist. Returns nil when neither is live.
+  defp live_session_for_fiber(%State{} = state, fiber_id) do
+    fiber_id
+    |> Dispatcher.session_names(uid_for_fiber(state, fiber_id))
+    |> Enum.find(&already_running_session?(state, &1))
   end
 
   defp exact_tmux_target(session), do: "=" <> session
@@ -3330,6 +3357,12 @@ defmodule Shuttle.Poller do
     end
   end
 
+  # Maps every live tmux session name a candidate could carry — both the
+  # uid-keyed canonical name and the legacy leaf-only name — back to its fiber,
+  # so orphan adoption recognizes a worker launched under either scheme. The
+  # uid-keyed entries are inherently collision-free; the legacy leaf-only
+  # entries keep the existing ambiguity guard (two fibers sharing a leaf resolve
+  # to `:ambiguous` and are skipped rather than mis-adopted).
   defp candidate_session_lookup(%State{} = state) do
     {:ok, candidates, _host_map, _uid_map} = discover_candidates(state)
 
@@ -3337,11 +3370,14 @@ defmodule Shuttle.Poller do
     |> Enum.reduce(%{}, fn fiber, acc ->
       case {Map.get(fiber, "id"), Map.get(fiber, "status")} do
         {fiber_id, status} when is_binary(fiber_id) and fiber_id != "" ->
-          session = Dispatcher.session_name(fiber_id)
           bucket = if(status == "closed", do: :closed, else: :open)
 
-          Map.update(acc, session, %{open: MapSet.new(), closed: MapSet.new()}, fn grouped ->
-            Map.update!(grouped, bucket, &MapSet.put(&1, fiber_id))
+          fiber_id
+          |> Dispatcher.session_names(Map.get(fiber, "uid"))
+          |> Enum.reduce(acc, fn session, acc2 ->
+            Map.update(acc2, session, %{open: MapSet.new(), closed: MapSet.new()}, fn grouped ->
+              Map.update!(grouped, bucket, &MapSet.put(&1, fiber_id))
+            end)
           end)
 
         _ ->
@@ -3373,7 +3409,7 @@ defmodule Shuttle.Poller do
         if running_key(state, fiber_id) != nil do
           state
         else
-          adopt_session(state, fiber_id)
+          adopt_session(state, fiber_id, session)
         end
 
       {:kill_closed, fiber_id} ->
