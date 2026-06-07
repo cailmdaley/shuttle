@@ -844,6 +844,106 @@ defmodule Shuttle.DispatchIntegrationTest do
            "expected blocked entry to evict after fiber closed"
   end
 
+  # Slice-1 standing dead-orphan reconciler. A standing worker that exits while
+  # the daemon is DOWN never fires handle_worker_exit, so the armed document
+  # would re-fire on the next poll. On restart, the daemon rehydrates the dead
+  # running entry (its tmux session is gone), and the reconciler writes
+  # `status: closed` (untempered) to the document — the new-model awaiting
+  # marker — so the active→closed→active cycle still encodes "already ran this
+  # occurrence." Keyed on the running-worker entry: a role with NO running
+  # entry (the live daily-practice wedge) is left armed, proven by the sibling
+  # fiber below.
+  test "a dead standing running entry on an armed doc is marked awaiting; one without is left armed",
+       %{host: host} do
+    runtime_store_path = Path.join(host, "runtime.db")
+
+    # The dead worker's role — armed, with a stale running entry whose session
+    # is gone.
+    write_fiber(host, "tests/standing-dead", """
+    ---
+    name: Standing dead-orphan
+    status: active
+    tags:
+      - constitution
+      - standing
+    shuttle:
+      enabled: true
+      kind: standing
+      agent: claude-sonnet
+      host: test-host
+      schedule:
+        expr: "0 8 * * *"
+        tz: Europe/Paris
+    ---
+    A standing role whose worker died while the daemon was down.
+    """)
+
+    # The control — armed, NO running entry (the daily-practice shape). Must be
+    # left untouched: nothing dispatched it, so there is no dead worker.
+    write_fiber(host, "tests/standing-armed", """
+    ---
+    name: Standing armed (no running entry)
+    status: active
+    tags:
+      - constitution
+      - standing
+    shuttle:
+      enabled: true
+      kind: standing
+      agent: claude-sonnet
+      host: test-host
+      schedule:
+        expr: "0 8 * * *"
+        tz: Europe/Paris
+    ---
+    A standing role that has not been dispatched this cycle.
+    """)
+
+    dead_session = Dispatcher.session_name("tests/standing-dead")
+
+    RuntimeStore.upsert_running(runtime_store_path, "tests/standing-dead", %{
+      fiber_id: "tests/standing-dead",
+      session: dead_session,
+      agent_id: "claude-sonnet",
+      run_id: "adhoc-1",
+      started_at: ~U[2026-05-01 08:00:00Z],
+      last_activity_at: ~U[2026-05-01 08:00:00Z]
+    })
+
+    # mark_awaiting resolves the fiber through FeltStores (LOOM_HOMES), not the
+    # injected runner — point it at the temp store for the duration.
+    prev_loom = System.get_env("LOOM_HOMES")
+    System.put_env("LOOM_HOMES", host)
+
+    try do
+      {:ok, _poller} =
+        Poller.start_link(
+          name: :test_poller_standing_dead_orphan,
+          runner: IntegrationRunner,
+          poll_interval_ms: 600_000,
+          felt_stores: [host],
+          runtime_store_path: runtime_store_path
+        )
+
+      # The dead role flips to awaiting (status:closed, untempered, closed-at).
+      assert eventually(fn ->
+               fm = read_frontmatter(host, "tests/standing-dead")
+               fm["status"] == "closed"
+             end),
+             "expected the dead standing role to be marked awaiting (status:closed)"
+
+      dead_fm = read_frontmatter(host, "tests/standing-dead")
+      refute Map.has_key?(dead_fm, "tempered")
+      assert is_binary(dead_fm["closed-at"])
+
+      # The control role, with no running entry, stays armed — the reconciler
+      # cannot regress a role it never saw dispatched.
+      assert read_frontmatter(host, "tests/standing-armed")["status"] == "active"
+    after
+      if prev_loom, do: System.put_env("LOOM_HOMES", prev_loom), else: System.delete_env("LOOM_HOMES")
+    end
+  end
+
   # review-comment with resume_mode=fresh explicitly requests a new session
   # even when a prior session UUID is stored.
   test "resume_mode=fresh takes fresh path even with stored session.id", %{host: host} do
@@ -1088,6 +1188,16 @@ defmodule Shuttle.DispatchIntegrationTest do
     dir = Path.join([host, ".felt"] ++ parts)
     File.mkdir_p!(dir)
     File.write!(Path.join(dir, "#{basename}.md"), String.trim(content) <> "\n")
+  end
+
+  # Reads back a fiber's frontmatter from disk (host/.felt/<id>/<basename>.md),
+  # the surface a daemon write like mark_awaiting lands on.
+  defp read_frontmatter(host, id) do
+    parts = String.split(id, "/")
+    basename = List.last(parts)
+    path = Path.join([host, ".felt"] ++ parts ++ ["#{basename}.md"])
+    [_, fm, _] = File.read!(path) |> String.split("---", parts: 3)
+    YamlElixir.read_from_string!(fm)
   end
 
   defp write_resume_fiber(host, id, opts) do

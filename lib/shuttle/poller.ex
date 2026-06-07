@@ -1191,10 +1191,12 @@ defmodule Shuttle.Poller do
   # was dispatched. Mirrors what `handle_worker_exit` would have done if the
   # daemon had been up.
   #
-  # Standing roles are excluded: they use runtime review state for lifecycle,
-  # not session.id presence. A standing role's session.id is the historical
-  # marker for the most recent run, not a signal that a worker should still
-  # be running now.
+  # Standing roles are excluded *here* because their dead-worker outcome is not
+  # resurrection (a continuation retry) but awaiting review: the document flips
+  # to `status: closed`. That mark is written upstream, in
+  # `record_orphaned_running_worker`, the moment the dead running entry is
+  # detected — so by the time this pass runs the role is already closed and the
+  # `status == "closed"` clause below leaves it alone.
   defp reconcile_dispatched_dead_fibers(%State{} = state, candidates) do
     # list_shuttle_sessions returns {:ok, []} on tmux-server-absent today (never
     # errors), so this match is total; if it ever grows an error tuple, the
@@ -1231,7 +1233,9 @@ defmodule Shuttle.Poller do
       not project_dir_available?(shuttle) ->
         state
 
-      # Standing roles use review.state, not session.id, for lifecycle.
+      # Standing roles don't resurrect — a dead standing worker becomes
+      # awaiting review (status:closed), written in
+      # `record_orphaned_running_worker` before this pass. Never retry one.
       kind == "standing" ->
         state
 
@@ -2229,6 +2233,19 @@ defmodule Shuttle.Poller do
   end
 
   defp record_orphaned_running_worker(%State{} = state, fiber_id, meta) do
+    # Daemon-down analog of handle_worker_exit's standing branch. Both callers
+    # — `rehydrate_running_record` (init, the daemon was down when the worker
+    # died) and `reconcile_missing_running_sessions` (runtime, the watcher
+    # missed the exit) — land here for a running entry whose tmux session is
+    # gone. For an ordinary oneshot that's just an orphan to record; for a
+    # standing role it is the exit that `handle_worker_exit` never got to run,
+    # so the armed document would re-fire on the next poll. Mark it awaiting
+    # (status:closed, untempered) here, keyed on the running-worker entry — a
+    # role that never dispatched this cycle (e.g. a stale awaiting overlay with
+    # no running row, like the live daily-practice wedge) never reaches this
+    # path and cannot be regressed.
+    mark_dead_standing_role_awaiting(state, fiber_id)
+
     orphan = %{
       fiber_id: fiber_id,
       tmux_session: Map.get(meta, :session),
@@ -2239,6 +2256,40 @@ defmodule Shuttle.Poller do
 
     %{state | orphans: [orphan | state.orphans]}
   end
+
+  # Write `status: closed` (untempered) to a standing role's document when its
+  # worker died unobserved and the document is still armed. Only an owned,
+  # armed (status:active, no verdict) standing role is touched; oneshots, roles
+  # this daemon doesn't own, and already-closed/tempered roles are left alone.
+  # The mark is idempotent: once status flips to closed the running entry is
+  # gone (the caller removes it) and the `status == "active"` guard short-
+  # circuits any later pass.
+  defp mark_dead_standing_role_awaiting(%State{} = state, fiber_id) do
+    with {:ok, fiber} <- fetch_fiber_full(fiber_id, state),
+         shuttle when is_map(shuttle) <- Map.get(fiber, "shuttle"),
+         true <- host_owned?(shuttle, state.own_host_id),
+         true <- standing_block?(shuttle),
+         "active" <- Map.get(fiber, "status", ""),
+         true <- is_nil(Map.get(fiber, "tempered")) do
+      Logger.info(
+        "Standing role #{fiber_id} worker died unobserved (daemon-down or unwatched " <>
+          "exit); marking awaiting (status:closed) so the armed document does not re-fire"
+      )
+
+      mark_standing_awaiting(fiber_id)
+    else
+      _ -> :ok
+    end
+  end
+
+  # Direct read of the standing signal from a shuttle: block, with no lifecycle
+  # overlay merge (unlike `standing_role?/2`). Supports both the new `kind:` and
+  # legacy `mode:` shapes.
+  defp standing_block?(shuttle) when is_map(shuttle) do
+    Map.get(shuttle, "kind", Map.get(shuttle, "mode")) == "standing"
+  end
+
+  defp standing_block?(_), do: false
 
   defp rehydrate_runtime_store(%State{} = state) do
     state.runtime_store_path
