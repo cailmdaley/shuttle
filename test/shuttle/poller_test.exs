@@ -725,6 +725,11 @@ defmodule Shuttle.PollerTest do
     fiber = make_fiber("tests/standing-sleeping", %{"tags" => ["constitution", "standing"]})
     MockRunner.set_fiber("tests/standing-sleeping", fiber)
 
+    # Slice 2: the dispatch gate is the cron schedule vs now (the stored
+    # next_due_at no longer gates). A weekday-09:00 Paris schedule fires no tick
+    # inside the poll window during a test run, so the role is not due. The future
+    # next_due_at remains only to keep the display path (`due?`) reading
+    # `scheduled`.
     MockRunner.set_shuttle(
       "tests/standing-sleeping",
       """
@@ -879,7 +884,8 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_fiber(fiber_id, fiber)
 
     # Frontmatter carries NO review block: the document is the authority and it
-    # says status:active (armed).
+    # says status:active (armed). Slice 2: due-ness is cron-computed, so an
+    # every-minute schedule is reliably due now regardless of wall-clock.
     MockRunner.set_shuttle(
       fiber_id,
       """
@@ -887,14 +893,16 @@ defmodule Shuttle.PollerTest do
       kind: standing
       agent: claude-sonnet
       schedule:
-        expr: "0 8 * * *"
+        expr: "* * * * *"
         tz: Europe/Paris
       """
     )
 
     # The stale runtime row says awaiting. An ad-hoc run_id keeps an
     # awaiting+next_due row valid (the daily-practice case), so the wedge is
-    # exercised rather than masked by a validation error.
+    # exercised rather than masked by a validation error. The stored next_due_at
+    # is deliberately stale-and-past: slice 2 no longer reads it for the gate, so
+    # the role still dispatches off the cron schedule.
     Shuttle.RuntimeStore.upsert_lifecycle(runtime_store_path, fiber_id, %{
       kind: "standing",
       phase: "awaiting",
@@ -1458,6 +1466,9 @@ defmodule Shuttle.PollerTest do
     fiber = make_fiber("tests/standing-due", %{"tags" => ["constitution", "standing"]})
     MockRunner.set_fiber("tests/standing-due", fiber)
 
+    # Slice 2: due-ness is computed from the cron schedule + now, not a stored
+    # next_due_at. `* * * * *` fires every minute, so a tick always lands inside
+    # the poll window → the role is due now, deterministically.
     MockRunner.set_shuttle(
       "tests/standing-due",
       """
@@ -1465,11 +1476,10 @@ defmodule Shuttle.PollerTest do
       kind: standing
       agent: claude-sonnet
       schedule:
-        expr: "0 9 * * 1-5"
+        expr: "* * * * *"
         tz: Europe/Paris
       review:
         state: scheduled
-      next_due_at: "2000-01-03T09:00:00+01:00"
       """
     )
 
@@ -1488,6 +1498,28 @@ defmodule Shuttle.PollerTest do
              Poller.snapshot(poller).eligible
 
     assert is_binary(run_id)
+
+    # Simulate the worker exit. In production the exit handler's standing branch
+    # writes status:closed to the felt document (mark_standing_awaiting) BEFORE it
+    # releases the claim, so no poll after the exit ever sees the role armed. The
+    # MockRunner's `felt ls` reads its in-memory map, not the on-disk write
+    # mark_awaiting performs, so mirror that document close here — atomically with
+    # the exit — to reproduce the production ordering. With an every-minute cron,
+    # this closed-state is the ONLY thing preventing immediate re-dispatch (slice
+    # 2 dropped the completed_standing_runs MapSet): the `active → closed → active`
+    # document transition is the sole per-cycle gate.
+    MockRunner.set_shuttle(
+      "tests/standing-due",
+      """
+      enabled: true
+      kind: standing
+      agent: claude-sonnet
+      schedule:
+        expr: "* * * * *"
+        tz: Europe/Paris
+      """,
+      "closed"
+    )
 
     MockRunner.remove_tmux_session(Dispatcher.session_name("tests/standing-due"))
     send(poller, {:worker_exited, "tests/standing-due", :normal_exit, false})

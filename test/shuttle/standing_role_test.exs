@@ -45,38 +45,81 @@ defmodule Shuttle.StandingRoleTest do
     end
   end
 
-  describe "due_by_schedule? — the slice-1 dispatch gate, schedule-only" do
-    test "a past-due scheduled role is due" do
-      assert StandingRole.due_by_schedule?(role(%{}), @now)
+  describe "due_by_cron? — the slice-2 dispatch gate, cron-computed and stateless" do
+    @window_ms 90_000
+
+    # An every-minute schedule always fires a tick inside any non-trivial window,
+    # so it is the deterministic "due now" role independent of wall-clock.
+    defp cron_role(expr, overrides \\ %{}) do
+      base = %{
+        "kind" => "standing",
+        "schedule" => %{"expr" => expr, "tz" => "UTC"},
+        "review" => %{"state" => "scheduled"}
+      }
+
+      {:ok, role} = StandingRole.from_map("f", Map.merge(base, overrides))
+      role
     end
 
-    test "a future-due role is not due" do
-      refute StandingRole.due_by_schedule?(role(%{"next_due_at" => "2099-01-01T00:00:00Z"}), @now)
+    test "a role whose tick fired inside the window is due" do
+      now = ~U[2026-06-02 10:00:30Z]
+      # `* * * * *` fires every minute → a tick at 10:00:00 sits in the window.
+      assert StandingRole.due_by_cron?(cron_role("* * * * *"), now, @window_ms)
     end
 
-    test "ignores review.state — an awaiting role that is past due is still due" do
-      # This is the wedge-clearing semantic: dispatch is gated by the felt
-      # document (the poller checks status/tempered), NOT by review.state. So a
-      # role whose stale runtime overlay still says `awaiting` must read as due
-      # once its document is armed and the schedule has passed. `due?/2` (the
-      # display path) returns false here because it still consults review.state.
+    test "a role whose next tick is in the future (no tick in window) is not due" do
+      # The window opens at 09:58:30 and closes at 10:00:00; the daily 09:00 tick
+      # already fell before the window, and the next is tomorrow 09:00 — neither
+      # is inside the window, so the role is not due (missed ticks are skipped).
+      now = ~U[2026-06-02 10:00:00Z]
+      refute StandingRole.due_by_cron?(cron_role("0 9 * * *"), now, @window_ms)
+    end
+
+    test "ignores review.state — the gate is cron + the doc, not review" do
+      # A stale awaiting overlay does not change due-ness: the poller checks the
+      # document's status/tempered, and this checks the cron window. `due?/2`
+      # (the display path) still consults review.state and so differs here.
+      now = ~U[2026-06-02 10:00:30Z]
+
       awaiting =
-        role(%{
-          "review" => %{"state" => "awaiting", "run_id" => "adhoc-1"},
-          "next_due_at" => "2020-01-01T00:00:00Z"
-        })
+        cron_role("* * * * *", %{"review" => %{"state" => "awaiting", "run_id" => "adhoc-1"}})
 
-      assert StandingRole.due_by_schedule?(awaiting, @now)
-      refute StandingRole.due?(awaiting, @now)
+      assert StandingRole.due_by_cron?(awaiting, now, @window_ms)
+      refute StandingRole.due?(awaiting, now)
+    end
+
+    test "a missed tick (daemon down across it) is not replayed" do
+      # The 10:00 tick fired five minutes before now; with a 90s window it is
+      # outside the window and is skipped rather than replayed.
+      now = ~U[2026-06-02 10:05:00Z]
+      refute StandingRole.due_by_cron?(cron_role("0 10 * * *"), now, @window_ms)
     end
 
     test "an invalid role is never due" do
       # mode must be standing; a oneshot block fails validation.
-      refute StandingRole.due_by_schedule?(role(%{"kind" => "oneshot"}), @now)
+      now = ~U[2026-06-02 10:00:30Z]
+      refute StandingRole.due_by_cron?(cron_role("* * * * *", %{"kind" => "oneshot"}), now, @window_ms)
     end
 
-    test "a role with no next_due_at is not due" do
-      refute StandingRole.due_by_schedule?(role(%{"next_due_at" => nil}), @now)
+    test "a role with an unparseable schedule is not due" do
+      now = ~U[2026-06-02 10:00:30Z]
+      refute StandingRole.due_by_cron?(cron_role("not a cron"), now, @window_ms)
+    end
+  end
+
+  describe "next_due_from_cron — display next_due is cron.next(now)" do
+    test "returns the next scheduled occurrence after now" do
+      now = ~U[2026-06-02 10:00:00Z]
+      role = role(%{"schedule" => %{"expr" => "0 9 * * 1-5", "tz" => "UTC"}})
+      # Next weekday 09:00 UTC after 2026-06-02 10:00 is 2026-06-03 09:00.
+      assert %DateTime{} = next = StandingRole.next_due_from_cron(role, now)
+      assert DateTime.compare(next, ~U[2026-06-03 09:00:00Z]) == :eq
+    end
+
+    test "returns nil for an unparseable schedule" do
+      now = ~U[2026-06-02 10:00:00Z]
+      role = role(%{"schedule" => %{"expr" => "garbage", "tz" => "UTC"}})
+      assert StandingRole.next_due_from_cron(role, now) == nil
     end
   end
 

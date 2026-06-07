@@ -47,6 +47,10 @@ defmodule Shuttle.Poller do
   @pubsub_topic "shuttle:snapshot"
 
   @default_poll_interval_ms 30_000
+  # Floor for the standing cron due-window so a fast test poll interval still
+  # catches a tick that fired a beat before the poll. Cron resolution is one
+  # minute, so the window must comfortably exceed it.
+  @min_due_window_ms 90_000
   @default_max_concurrent_workers 10
   @default_heartbeat_interval_ms 5_000
   @default_stall_timeout_ms 300_000
@@ -97,7 +101,6 @@ defmodule Shuttle.Poller do
       retry_queue: %{},
       waiters: %{},
       reservations: %{},
-      completed_standing_runs: MapSet.new(),
       standing_roles: [],
       lifecycle: %{},
       orphans: [],
@@ -2701,9 +2704,7 @@ defmodule Shuttle.Poller do
                     # reads `status: closed` and skips re-dispatch).
                     mark_standing_awaiting(fiber_id)
 
-                    state
-                    |> remember_completed_standing_run(fiber_id, Map.get(meta, :run_id))
-                    |> release_claim(fiber_id)
+                    release_claim(state, fiber_id)
 
                   true ->
                     # Still active — schedule continuation retry
@@ -3169,14 +3170,16 @@ defmodule Shuttle.Poller do
   end
 
   # Standing dispatch is gated by the FELT DOCUMENT, not the runtime review
-  # overlay (the slice-1 cutover). A role dispatches iff its document says
-  # `status: active` with no verdict (`tempered` unset) AND the schedule says
-  # it is due. `status: closed` (untempered) is the awaiting-review /
-  # don't-re-fire signal — eligible?'s `status == "closed"` clause already
-  # excludes it before this is reached, but the doc gate here is what replaces
-  # the old `review.state in [scheduled, accepted]` precondition. The runtime
-  # review overlay still drives the kanban *display* (StandingRole.state) until
-  # it is removed in slice 4; it no longer drives dispatch.
+  # overlay (the slice-1 cutover) and not a stored `next_due_at` (the slice-2
+  # cutover). A role dispatches iff its document says `status: active` with no
+  # verdict (`tempered` unset) AND the cron schedule fired a tick inside the
+  # poll window ending at now. `status: closed` (untempered) is the
+  # awaiting-review / don't-re-fire signal — eligible?'s `status == "closed"`
+  # clause already excludes it before this is reached, and the
+  # `active → closed → active` document transition is the per-cycle "already ran
+  # this cycle" gate (replacing the old `completed_standing_runs` MapSet). The
+  # runtime review overlay still drives the kanban *display* (StandingRole.state)
+  # until it is removed in slice 4; it no longer drives dispatch.
   defp standing_role_due?(fiber, state) do
     fiber_id = Map.get(fiber, "id", "")
 
@@ -3184,16 +3187,21 @@ defmodule Shuttle.Poller do
          true <- is_nil(Map.get(fiber, "tempered")),
          true <- dependencies_satisfied?(fiber_id, state),
          {:ok, role} <- fetch_standing_role(fiber_id, state) do
-      StandingRole.due_by_schedule?(role, DateTime.utc_now()) and
-        not completed_standing_run?(
-          state,
-          fiber_id,
-          StandingRole.next_run_id(role, DateTime.utc_now())
-        )
+      StandingRole.due_by_cron?(role, DateTime.utc_now(), due_window_ms(state))
     else
       _ -> false
     end
   end
+
+  # The cron due-window: a standing tick is due if it fired inside
+  # `(now - window, now]`. Anchored to the poll interval (doubled for jitter
+  # slack, with a floor) so consecutive polls' windows overlap and no tick falls
+  # between them, while a tick that fired before the window — daemon down across
+  # it — is skipped, not replayed (the morning-post-drift rule).
+  defp due_window_ms(%State{poll_interval_ms: interval}) when is_integer(interval) and interval > 0,
+    do: max(interval * 2, @min_due_window_ms)
+
+  defp due_window_ms(_), do: @min_due_window_ms
 
   defp dispatch_prompt_context(fiber, state, opts) do
     fiber_id = Map.get(fiber, "id", "")
@@ -3239,19 +3247,6 @@ defmodule Shuttle.Poller do
     end
   end
 
-  defp remember_completed_standing_run(state, _fiber_id, nil), do: state
-
-  defp remember_completed_standing_run(state, fiber_id, run_id) do
-    %{
-      state
-      | completed_standing_runs: MapSet.put(state.completed_standing_runs, {fiber_id, run_id})
-    }
-  end
-
-  defp completed_standing_run?(state, fiber_id, run_id) do
-    MapSet.member?(state.completed_standing_runs, {fiber_id, run_id})
-  end
-
   defp lifecycle_metadata_from_role(%StandingRole{} = role) do
     %{
       fiber_id: role.fiber_id,
@@ -3294,8 +3289,20 @@ defmodule Shuttle.Poller do
 
       role
       |> StandingRole.to_snapshot(now, running?)
+      # Display next_due is computed cron.next(now): `active` means
+      # armed-for-the-next-occurrence, so the upcoming run is the schedule's next
+      # tick, not a stored timestamp (the slice-2 cutover). Falls back to the
+      # snapshot's stored value when the schedule won't parse.
+      |> put_computed_next_due(role, now)
       |> Map.put(:uid, uid_for_fiber(state, role.fiber_id))
     end)
+  end
+
+  defp put_computed_next_due(snapshot, %StandingRole{} = role, now) do
+    case StandingRole.next_due_from_cron(role, now) do
+      %DateTime{} = next -> Map.put(snapshot, :next_due_at, DateTime.to_unix(next, :millisecond))
+      _ -> snapshot
+    end
   end
 
   # Run a felt CLI command against an explicit host directory.

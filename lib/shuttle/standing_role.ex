@@ -91,23 +91,69 @@ defmodule Shuttle.StandingRole do
   def due?(_, _), do: false
 
   @doc """
-  Schedule-only due check for the **dispatch** path: a valid role whose
-  `next_due_at` has arrived. Unlike `due?/2`, it does NOT consult
-  `review.state` — the slice-1 cutover moved the dispatch gate to the felt
-  document's `status`/`tempered` (the poller checks those before calling this),
-  so the runtime review overlay no longer gates dispatch. `due?/2` keeps the
-  review gate for the kanban **display** path (`state/3`) until the overlay is
-  deleted in slice 4.
+  Cron-derived due check for the **dispatch** path: a valid role whose schedule
+  fired a tick inside the window `(now - window_ms, now]`.
+
+  This is the slice-2 cutover: due-ness is computed straight from the cron
+  `schedule` and `now`, NOT from a stored `next_due_at`. The window anchors on
+  `now` and is the poll interval (plus jitter slack), so a tick is caught by the
+  first poll after it fires and **missed ticks are skipped, not replayed** — a
+  tick that fell before the window (daemon down across it) is gone, exactly the
+  morning-post-drift rule. Once a role fires, its document flips
+  `active → closed`, and `eligible?` excludes closed, so it cannot re-fire within
+  the same cycle even though the cron tick stays inside the window for a poll or
+  two; the `active → closed → active` document transition is the per-cycle gate,
+  not a stored timestamp.
+
+  It does NOT consult `review.state` — the dispatch gate is the felt document's
+  `status`/`tempered` (the poller checks those before calling this). `due?/2`
+  keeps the review gate for the kanban **display** path (`state/3`) until the
+  overlay is deleted in slice 4.
   """
-  @spec due_by_schedule?(t(), DateTime.t()) :: boolean()
-  def due_by_schedule?(
-        %__MODULE__{next_due_at: %DateTime{} = next_due_at} = role,
-        %DateTime{} = now
-      ) do
-    valid?(role) and DateTime.compare(next_due_at, now) != :gt
+  @spec due_by_cron?(t(), DateTime.t(), pos_integer()) :: boolean()
+  def due_by_cron?(%__MODULE__{schedule: schedule} = role, %DateTime{} = now, window_ms)
+      when is_integer(window_ms) and window_ms > 0 do
+    window_start = DateTime.add(now, -window_ms, :millisecond)
+
+    dispatchable?(role) and
+      match?(
+        {:ok, %DateTime{}},
+        with {:ok, tick} <- Shuttle.Cron.next_occurrence(schedule, window_start),
+             true <- DateTime.compare(tick, now) != :gt do
+          {:ok, tick}
+        else
+          _ -> :no_tick
+        end
+      )
   end
 
-  def due_by_schedule?(_, _), do: false
+  def due_by_cron?(_, _, _), do: false
+
+  # Dispatch-path validity: a standing role with a parseable schedule. Slice 2
+  # deliberately does NOT gate dispatch on `valid?/1`, which still carries the
+  # legacy "scheduleable review state requires next_due_at" coupling — the live
+  # daily-practice role has no stored next_due_at and no review block, yet must
+  # dispatch off its cron. Those review/next_due validations only constrain the
+  # display path until the overlay is deleted in slice 4.
+  defp dispatchable?(%__MODULE__{mode: "standing", schedule: schedule}) do
+    match?({:ok, %DateTime{}}, Shuttle.Cron.next_occurrence(schedule, DateTime.utc_now()))
+  end
+
+  defp dispatchable?(_), do: false
+
+  @doc """
+  The next scheduled occurrence at or after `now`, for the kanban **display**
+  next_due. `active` means armed-for-the-next-occurrence, so the display next_due
+  is computed `cron.next(now)`, never a stored timestamp. Returns nil when the
+  role has no parseable schedule.
+  """
+  @spec next_due_from_cron(t(), DateTime.t()) :: DateTime.t() | nil
+  def next_due_from_cron(%__MODULE__{schedule: schedule}, %DateTime{} = now) do
+    case Shuttle.Cron.next_occurrence(schedule, now) do
+      {:ok, %DateTime{} = next} -> next
+      _ -> nil
+    end
+  end
 
   @spec valid?(t()) :: boolean()
   def valid?(%__MODULE__{validation_errors: []}), do: true
