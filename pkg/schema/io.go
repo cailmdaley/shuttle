@@ -110,6 +110,30 @@ func (f *FiberFile) SetTempered(value *bool) {
 	setMappingValue(mappingNode, "tempered", valueNode)
 }
 
+// Tempered returns the felt-native `tempered:` value as *bool, or nil when the
+// field is absent. Absent (nil) is the no-verdict state: combined with
+// `status: closed` it is the new-model awaiting signal. `true`/`false` are
+// verdicts (accepted oneshot terminus / composted).
+func (f *FiberFile) Tempered() *bool {
+	if f.fmNode == nil || len(f.fmNode.Content) == 0 {
+		return nil
+	}
+	node := findMappingValue(f.fmNode, "tempered")
+	if node == nil || node.Kind != yaml.ScalarNode {
+		return nil
+	}
+	switch node.Value {
+	case "true":
+		v := true
+		return &v
+	case "false":
+		v := false
+		return &v
+	default:
+		return nil
+	}
+}
+
 // SetClosedAtIfMissing sets `closed-at:` only when the field is currently
 // absent.
 func (f *FiberFile) SetClosedAtIfMissing(value string) {

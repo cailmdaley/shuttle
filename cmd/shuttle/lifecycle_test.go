@@ -1029,6 +1029,59 @@ Standing role body.
 	}
 }
 
+// TestAcceptCmd_DocAwaitingReArmsFromSchedule verifies the new-model awaiting
+// shape: a standing role at `status: closed` + untempered with NO review block
+// is recognized as awaiting and re-armed straight from the doc schedule
+// (felt-native), without resurrecting a review block. This is the offline
+// fallback path; the daemon's LifecycleStore.accept handles the same shape
+// over HTTP.
+func TestAcceptCmd_DocAwaitingReArmsFromSchedule(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "daily-report", `---
+name: Daily report
+status: closed
+closed-at: 2026-05-08T10:00:00Z
+outcome: stale digest
+shuttle:
+  enabled: true
+  kind: standing
+  schedule:
+    expr: "0 9 * * 1-5"
+    tz: Europe/Paris
+---
+
+Standing role body.
+`)
+
+	cmd := newAcceptCmd()
+	cmd.SetArgs([]string{"daily-report"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
+	text := string(raw)
+
+	if !strings.Contains(text, "status: active") {
+		t.Fatalf("accept should re-arm a doc-awaiting standing role:\n%s", text)
+	}
+	if strings.Contains(text, "tempered:") {
+		t.Fatalf("re-armed role must carry no verdict:\n%s", text)
+	}
+	if strings.Contains(text, "closed-at:") {
+		t.Fatalf("accept should clear closed-at:\n%s", text)
+	}
+	// Felt-native re-arm: no review block resurrected.
+	if strings.Contains(text, "review:") || strings.Contains(text, "state: scheduled") {
+		t.Fatalf("doc-awaiting accept must not write a review block:\n%s", text)
+	}
+}
+
 // TestAcceptCmd_ClearsSessionUUID verifies that accept clears the session
 // block, so any subsequent dispatch (next cron tick, manual ad-hoc, kanban
 // drag) starts a fresh worker rather than resuming the just-accepted run's

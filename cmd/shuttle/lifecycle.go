@@ -422,12 +422,21 @@ Appends a felt history event recording the acceptance.`,
 			if f.Block.Kind != "standing" {
 				return fmt.Errorf("accept only applies to standing roles (fiber has kind=%s)", f.Block.Kind)
 			}
-			if f.Block.Review == nil || f.Block.Review.State != "awaiting" {
+			// Awaiting has two representations during the slice-1 transition:
+			// the new-model felt-native shape (`status: closed` + untempered) and
+			// the legacy runtime-overlay shape (`review.state: awaiting`). Accept
+			// either; the daemon's LifecycleStore.accept (reached over HTTP below)
+			// recognizes both, and the offline fallback branches on which it is.
+			docAwaiting := f.Status() == "closed" && f.Tempered() == nil
+			reviewAwaiting := f.Block.Review != nil && f.Block.Review.State == "awaiting"
+			if !reviewAwaiting && !docAwaiting {
 				state := ""
 				if f.Block.Review != nil {
 					state = f.Block.Review.State
 				}
-				return fmt.Errorf("fiber %s is not awaiting review (state=%q)", args[0], state)
+				return fmt.Errorf(
+					"fiber %s is not awaiting review (status=%q tempered=%v review.state=%q)",
+					args[0], f.Status(), f.Tempered(), state)
 			}
 			if f.Block.Schedule == nil {
 				return fmt.Errorf("fiber %s has no schedule", args[0])
@@ -441,6 +450,31 @@ Appends a felt history event recording the acceptance.`,
 				return nil
 			} else if !isLifecycleTransportError(err) {
 				return err
+			}
+
+			// Offline fallback (daemon down). New-model awaiting re-arms straight
+			// from the doc schedule — felt-native, no review/next_due frontmatter
+			// (overlay-era fields the new model drops); the daemon recomputes
+			// due-ness from the schedule on its next poll.
+			if docAwaiting {
+				computedNext, err := schema.NextOccurrence(f.Block.Schedule, time.Now())
+				if err != nil {
+					return fmt.Errorf("computing next occurrence: %w", err)
+				}
+				f.Block.Enabled = true
+				f.SetStatus("active")
+				f.SetTempered(nil)
+				f.ClearClosedAt()
+				f.Block.Session = nil
+				if !keepOutcome {
+					f.SetOutcome("")
+				}
+				if err := f.WriteBlock(f.Block); err != nil {
+					return fmt.Errorf("writing fiber: %w", err)
+				}
+				_ = appendFeltHistory(host, fiberID, fmt.Sprintf("accepted run; next due %s", computedNext.Format(time.RFC3339)))
+				fmt.Printf("accepted run for %s\n  next due: %s\n", args[0], computedNext.Format(time.RFC3339))
+				return nil
 			}
 
 			runID := ""
