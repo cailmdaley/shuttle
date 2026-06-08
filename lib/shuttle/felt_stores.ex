@@ -18,8 +18,33 @@ defmodule Shuttle.FeltStores do
 
   @type host_list :: [String.t()]
 
+  @expanded_cache_key {__MODULE__, :expanded_hosts}
+  @expanded_cache_ttl_ms 30_000
+
   @spec configured_hosts() :: host_list()
   def configured_hosts do
+    base = base_hosts()
+    now = System.monotonic_time(:millisecond)
+
+    # Cache the symlink-following expansion by base config with a short TTL: the
+    # store set + symlink topology change rarely, but `configured_hosts/0` is hot
+    # (every poll, every fiber resolve), and a raw rescan costs ~20 ms on a
+    # many-store host. Recompute on a config change (base differs) or once the TTL
+    # lapses (so a newly-added substore symlink is picked up within 30 s without a
+    # restart). The expansion only does filesystem reads, so a stale entry is at
+    # worst 30 s out of date — never wrong, just late.
+    case :persistent_term.get(@expanded_cache_key, :none) do
+      {^base, expanded, cached_at} when now - cached_at < @expanded_cache_ttl_ms ->
+        expanded
+
+      _ ->
+        expanded = expand_with_symlinked_substores(base)
+        :persistent_term.put(@expanded_cache_key, {base, expanded, now})
+        expanded
+    end
+  end
+
+  defp base_hosts do
     case env_hosts() do
       [_ | _] = hosts ->
         hosts
@@ -31,6 +56,70 @@ defmodule Shuttle.FeltStores do
         end
     end
   end
+
+  @doc """
+  Expand a store list with the project roots of any **symlinked substores**
+  reachable from each store's `.felt/`.
+
+  A project-canonical substore — candide's
+  `~/loom/.felt/shapepipe -> /automnt/.../shapepipe/.felt` — is physically rooted
+  *outside* the store it is linked into. The poller enumerates a fiber only from
+  the store where its felt `path` physically roots (`run_shuttle_listing/2`'s
+  `store_felt_realpath` prefix check), so the loom store correctly drops those
+  fibers — and they vanish from the kanban unless the project root is *also* a
+  configured store. Following the symlink here makes configuring just `~/loom`
+  sufficient: the project root is auto-discovered, no per-substore config.
+
+  For each store, scan `<store>/.felt/` for symlinks resolving to an external real
+  `.felt/` directory and add its parent (the project root). Dedup is by
+  `store_felt_realpath/1` — the same canonicalization the ownership check uses —
+  so a store reached two ways (configured explicitly *and* discovered, or via two
+  path spellings of the same real dir) is listed once. That dedup is load-bearing:
+  two stores with the same `.felt` realpath would enumerate the same fibers and
+  reintroduce the dispatch race the physical-rooting rule exists to prevent.
+  Dangling symlinks and links resolving back inside the linking store are skipped.
+  """
+  @spec expand_with_symlinked_substores(host_list()) :: host_list()
+  def expand_with_symlinked_substores(stores) do
+    discovered = Enum.flat_map(stores, &symlinked_substore_roots/1)
+
+    (stores ++ discovered)
+    |> Enum.map(&Path.expand/1)
+    |> Enum.uniq_by(&store_felt_realpath/1)
+  end
+
+  # Project roots of symlinked substores under `<store>/.felt/`: each `.felt/`
+  # entry that is a symlink resolving to a real directory named `.felt` yields
+  # that `.felt`'s parent. A root that lands back inside the linking store is
+  # dropped (the store already enumerates it).
+  defp symlinked_substore_roots(store) do
+    felt_dir = Path.join(store, ".felt")
+
+    case File.ls(felt_dir) do
+      {:ok, entries} ->
+        store_real = store_felt_realpath(store)
+
+        entries
+        |> Enum.flat_map(fn entry ->
+          link = Path.join(felt_dir, entry)
+
+          with {:ok, %File.Stat{type: :symlink}} <- File.lstat(link),
+               {:ok, real} <- resolve_realpath(link),
+               ".felt" <- Path.basename(real),
+               true <- File.dir?(real),
+               false <- inside?(real, store_real) do
+            [Path.dirname(real)]
+          else
+            _ -> []
+          end
+        end)
+
+      _ ->
+        []
+    end
+  end
+
+  defp inside?(path, prefix), do: path == prefix or String.starts_with?(path, prefix <> "/")
 
   @doc """
   Resolve which configured felt store owns `fiber_id`, as `{:ok, host}` or

@@ -43,10 +43,11 @@ defmodule Shuttle.FeltStoresTest do
 
     # The candide topology: a project's .felt symlinked into loom as a sub-path.
     # The canonical id is the bare leaf (realpath lands in the project's .felt),
-    # while the file is reachable under loom only via the symlinked prefix. This
-    # is the case the old naive path construction 400'd on; it also proves the
-    # glob-by-leaf fallback descends through the symlink.
-    test "resolves a project-resident (prefix-drop) fiber by its bare-leaf canonical id" do
+    # while the file is reachable under loom only via the symlinked prefix. The
+    # project store is auto-discovered from the loom symlink, so the fiber is
+    # owned by its physically-rooting project store (where its felt history also
+    # lives) — not loom.
+    test "resolves a project-resident (prefix-drop) fiber to its project store" do
       loom = tmp_dir()
       project = tmp_dir()
       File.mkdir_p!(Path.join(loom, ".felt"))
@@ -55,7 +56,7 @@ defmodule Shuttle.FeltStoresTest do
       System.put_env("LOOM_HOMES", loom)
 
       assert {:ok, host} = FeltStores.host_for_fiber("review-ngmix-v2-pr740")
-      assert Path.expand(host) == Path.expand(loom)
+      assert same_dir?(host, project)
     end
 
     # Regression: a FLAT fiber (`<leaf>.md` directly in .felt, no enclosing
@@ -74,8 +75,8 @@ defmodule Shuttle.FeltStoresTest do
     end
 
     # The exact sp-validation-restructuring shape: a flat fiber inside a
-    # symlinked sub-store, resolved by its bare leaf.
-    test "resolves a flat fiber inside a symlinked store by its bare leaf" do
+    # symlinked sub-store, resolved by its bare leaf to its project store.
+    test "resolves a flat fiber inside a symlinked store to its project store" do
       loom = tmp_dir()
       project = tmp_dir()
       File.mkdir_p!(Path.join(loom, ".felt"))
@@ -86,7 +87,7 @@ defmodule Shuttle.FeltStoresTest do
       System.put_env("LOOM_HOMES", loom)
 
       assert {:ok, host} = FeltStores.host_for_fiber("sp-validation-restructuring")
-      assert Path.expand(host) == Path.expand(loom)
+      assert same_dir?(host, project)
     end
 
     test "resolves an intrinsic UID to the felt address and host" do
@@ -112,6 +113,67 @@ defmodule Shuttle.FeltStoresTest do
     end
   end
 
+  describe "configured_hosts/0 symlinked-substore discovery" do
+    # The candide topology: a project's `.felt` symlinked into loom. The poller
+    # enumerates a fiber only from the store it physically roots in, so the
+    # project root must be a store. Following the loom symlink auto-discovers it,
+    # so configuring just loom suffices.
+    test "auto-discovers a symlinked substore's project root from a configured loom" do
+      loom = tmp_dir()
+      project = tmp_dir()
+      File.mkdir_p!(Path.join(loom, ".felt"))
+      File.mkdir_p!(Path.join(project, ".felt"))
+      File.ln_s!(Path.join(project, ".felt"), Path.join([loom, ".felt", "shapepipe"]))
+      System.put_env("LOOM_HOMES", loom)
+
+      hosts = FeltStores.configured_hosts()
+
+      assert Enum.any?(hosts, &same_dir?(&1, loom))
+      assert Enum.any?(hosts, &same_dir?(&1, project))
+    end
+
+    test "skips a dangling substore symlink" do
+      loom = tmp_dir()
+      File.mkdir_p!(Path.join(loom, ".felt"))
+      File.ln_s!("/no/such/path/.felt", Path.join([loom, ".felt", "ghost"]))
+      System.put_env("LOOM_HOMES", loom)
+
+      assert FeltStores.configured_hosts() == [Path.expand(loom)]
+    end
+
+    test "skips a symlink to a non-.felt directory" do
+      loom = tmp_dir()
+      other = tmp_dir()
+      File.mkdir_p!(Path.join(loom, ".felt"))
+      File.ln_s!(other, Path.join([loom, ".felt", "not-a-substore"]))
+      System.put_env("LOOM_HOMES", loom)
+
+      assert FeltStores.configured_hosts() == [Path.expand(loom)]
+    end
+
+    # Realpath dedup is load-bearing: a store reached via two spellings of the
+    # same real dir must be listed once, or its fibers enumerate twice (dispatch
+    # race). Here `alias` is a symlink to `project`, and `project` is also
+    # discovered via loom's substore link — they share a `.felt` realpath.
+    test "dedups by realpath when the same store is reached two ways" do
+      loom = tmp_dir()
+      project = tmp_dir()
+      File.mkdir_p!(Path.join(loom, ".felt"))
+      File.mkdir_p!(Path.join(project, ".felt"))
+      File.ln_s!(Path.join(project, ".felt"), Path.join([loom, ".felt", "shapepipe"]))
+
+      alias_link = Path.join(tmp_dir(), "alias")
+      File.ln_s!(project, alias_link)
+      System.put_env("LOOM_HOMES", "#{loom},#{alias_link}")
+
+      hosts = FeltStores.configured_hosts()
+
+      # `alias_link` (explicit) and `project` (discovered via loom) are the same
+      # real dir, so exactly one survives the realpath dedup.
+      assert Enum.count(hosts, &same_dir?(&1, project)) == 1
+    end
+  end
+
   defp write_fiber(felt_dir, slug_segments, opts \\ []) do
     leaf = List.last(slug_segments)
     dir = Path.join([felt_dir | slug_segments])
@@ -133,5 +195,15 @@ defmodule Shuttle.FeltStoresTest do
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
     dir
+  end
+
+  # Same on-disk directory regardless of path spelling — robust to macOS's
+  # `/var -> /private/var` and to a store returned in realpath form.
+  defp same_dir?(a, b) do
+    with {:ok, sa} <- File.stat(a), {:ok, sb} <- File.stat(b) do
+      {sa.major_device, sa.minor_device, sa.inode} == {sb.major_device, sb.minor_device, sb.inode}
+    else
+      _ -> false
+    end
   end
 end
