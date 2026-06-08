@@ -61,16 +61,15 @@ func newPauseCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "pause <fiber>",
 		Short: "Pause dispatch, kill any live worker, and park a fiber in drafts",
-		Long: `Sets shuttle.enabled = false while preserving the schedule, then kills the
-canonical worker tmux session (<leaf>-shuttle) if one is running. When the fiber
-is currently closed, pause also reopens it to status: active and clears
-closed-at / tempered so the card lands in Drafts rather than Awaiting review.
-Open fibers keep their existing status (typically open).
+		Long: `Sets the felt-native status to "open" (the draft / paused state — the daemon
+never dispatches an open fiber) while preserving the schedule, then kills the
+worker tmux session if one is running. Clears tempered / closed-at so the card
+lands in Drafts rather than Awaiting review.
 
-Use --no-kill to preserve the old stop-scheduling-only behavior and let a live
-worker finish naturally.
+Use --no-kill to stop scheduling only and let a live worker finish naturally.
 
-This makes pause the single-writer transition for the Kanban's Drafts target.`,
+This makes pause the single-writer transition for the Kanban's Drafts target
+(status:open). There is no enabled flag (slice 5); status is the sole gate.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			noKill, err := cmd.Flags().GetBool("no-kill")
@@ -89,18 +88,17 @@ This makes pause the single-writer transition for the Kanban's Drafts target.`,
 			}
 
 			statusBefore := f.Status()
-			if statusBefore == "closed" {
-				f.SetStatus("active")
-			}
+			f.SetStatus("open")
 			f.SetTempered(nil)
 			f.ClearClosedAt()
-			f.Block.Enabled = false
 			if err := f.WriteBlock(f.Block); err != nil {
 				return fmt.Errorf("writing fiber: %w", err)
 			}
-			fmt.Printf("paused %s (enabled=false; schedule preserved)\n", args[0])
+			fmt.Printf("paused %s (status: open; schedule preserved)\n", args[0])
+			if statusBefore != "open" {
+				fmt.Printf("  status: %s → open\n", nonEmpty(statusBefore, "(missing)"))
+			}
 			if statusBefore == "closed" {
-				fmt.Println("  status: closed → active")
 				fmt.Println("  cleared: tempered, closed-at")
 			}
 			if noKill {
@@ -137,22 +135,18 @@ var pauseCmd = newPauseCmd()
 func newResumeCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "resume <fiber>",
-		Short: "Resume a paused fiber (enabled=true; ensures status: active)",
-		Long: `Sets shuttle.enabled = true and ensures the felt-native status field is
-"active" so the daemon's eligibility filter accepts the fiber on its next
-poll. A missing or non-dispatchable status would otherwise leave the fiber
-silently un-dispatched even with enabled=true.
+		Short: "Arm a paused fiber (status: active)",
+		Long: `Sets the felt-native status to "active" — the sole dispatch gate (slice 5:
+no enabled flag) — so the daemon dispatches the fiber on its next poll.
 
-For standing roles in awaiting/review state, resume re-queues the fiber for
-immediate dispatch rather than just flipping enabled. The daemon's eligibility
-check (StandingRole.due?) requires review.state ∈ {scheduled, accepted} — a
-fiber in awaiting state would be silently skipped. Resume transitions the block
-to scheduled with next_due_at=now so the daemon dispatches a fresh worker on
-its next poll. The previous run's id is preserved for reference; this is
-distinct from accept, which advances next_due_at to the next cron occurrence.
+For a standing role awaiting review (status: closed + untempered), resume
+re-arms it for immediate dispatch and routes to the owning daemon (which clears
+the awaiting marker and recomputes due-ness from the schedule). The previous
+run's session id, recorded in felt history, lets the next worker resume that
+transcript; this is distinct from accept, which advances the recurrence.
 
-Refuses if status is currently "closed" — use 'shuttle reopen' to requeue a
-closed fiber back into active work.`,
+A draft (status: open) is armed straight to status: active. Refuses on a
+tempered/composted close — use 'shuttle reopen' to requeue a finished fiber.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path, fiberID, host := resolveFiber(args[0])
@@ -165,38 +159,39 @@ closed fiber back into active work.`,
 				return err
 			}
 
-			// Standing roles in awaiting/review state need special handling: just
-			// enabling the fiber would leave it ineligible because the daemon's
-			// StandingRole.due? rejects review.state == "awaiting". Transition to
-			// scheduled with next_due_at=now so the daemon dispatches immediately.
-			if f.Block.Kind == "standing" && standingInReviewState(f.Block.Review) {
+			// A standing role awaiting review (status:closed + untempered) re-arms
+			// through the owning daemon, which clears the awaiting marker and
+			// recomputes due-ness from the schedule. Falls back to a local
+			// document write when the daemon is unreachable.
+			docAwaiting := f.Status() == "closed" && f.Tempered() == nil
+			if f.Block.Kind == "standing" && docAwaiting {
 				if output, err := postLifecycle("resume", map[string]any{"fiber": fiberID}); err == nil {
 					fmt.Print(output)
 					return nil
 				} else if !isLifecycleTransportError(err) {
 					return err
 				}
-				return resumeStandingFromReview(args[0], fiberID, host, f)
+				f.SetStatus("active")
+				f.SetTempered(nil)
+				f.ClearClosedAt()
+				if err := f.WriteBlock(f.Block); err != nil {
+					return fmt.Errorf("writing fiber: %w", err)
+				}
+				_ = appendFeltHistory(host, fiberID, "resumed; re-queued for immediate dispatch")
+				fmt.Printf("resumed %s (standing role; re-queued for immediate dispatch)\n", args[0])
+				return nil
 			}
 
-			// Mirror install: ensure status is dispatchable before flipping
-			// enabled. See lib/shuttle/poller.ex `eligible?/2` for the filter.
 			statusBefore := f.Status()
-			statusChanged := false
 			if statusBefore == "closed" {
 				return fmt.Errorf("fiber %s has status: closed; use 'shuttle reopen %s' to clear verdict fields and requeue it", args[0], args[0])
 			}
-			if statusBefore != "active" && statusBefore != "open" {
-				f.SetStatus("active")
-				statusChanged = true
-			}
-
-			f.Block.Enabled = true
+			f.SetStatus("active")
 			if err := f.WriteBlock(f.Block); err != nil {
 				return fmt.Errorf("writing fiber: %w", err)
 			}
-			fmt.Printf("resumed %s (enabled=true)\n", args[0])
-			if statusChanged {
+			fmt.Printf("resumed %s (status: active)\n", args[0])
+			if statusBefore != "active" {
 				if statusBefore == "" {
 					fmt.Println("  status: active (set; was missing)")
 				} else {
@@ -209,8 +204,7 @@ closed fiber back into active work.`,
 			// render_user_message_block/2 in the dispatcher suppresses the
 			// "From User" prompt block when the latest review-comment has
 			// empty text, so we keep `resume_mode: previous` in the payload
-			// without surfacing meaningless machinery (a stale session uuid)
-			// as a directive in the worker's prompt.
+			// without surfacing meaningless machinery as a directive.
 			if f.Block.Session != nil && f.Block.Session.ID != "" {
 				sessionID := f.Block.Session.ID
 				_ = appendFeltHistoryReviewComment(host, fiberID, "", "previous")
@@ -239,7 +233,7 @@ The shuttle block stays installed; closed fibers are ignored by the daemon
 until they are reopened.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		path, fiberID, _ := resolveFiber(args[0])
+		path, _, _ := resolveFiber(args[0])
 		f := readFiber(path)
 		if f.Block == nil {
 			return fmt.Errorf("fiber %s has no shuttle: block", args[0])
@@ -261,7 +255,6 @@ until they are reopened.`,
 		f.SetStatus("closed")
 		f.SetTempered(tempered)
 		f.SetClosedAtIfMissing(time.Now().UTC().Format("2006-01-02T15:04:05.000Z"))
-		reviewReset := resetStandingReview(f.Block)
 		if err := f.WriteBlock(f.Block); err != nil {
 			return fmt.Errorf("writing fiber: %w", err)
 		}
@@ -275,7 +268,6 @@ until they are reopened.`,
 		default:
 			fmt.Println("  tempered: false")
 		}
-		clearRuntimeReviewLifecycle(fiberID, reviewReset)
 		return nil
 	},
 }
@@ -283,14 +275,15 @@ until they are reopened.`,
 var reopenCmd = &cobra.Command{
 	Use:   "reopen <fiber>",
 	Short: "Requeue a closed or reviewed fiber back into active work",
-	Long: `Sets shuttle.enabled = true, status = active, and clears tempered /
-closed-at so a previously closed card re-enters the in-flight loop.
+	Long: `Sets status = active and clears tempered / closed-at so a previously closed
+card re-enters the in-flight loop. status:active is the sole dispatch gate
+(slice 5: no enabled flag).
 
 This is the canonical reopen path for Kanban requeues from Awaiting review,
 Tempered, or Composted back to In flight.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		path, fiberID, _ := resolveFiber(args[0])
+		path, _, _ := resolveFiber(args[0])
 		f := readFiber(path)
 		if f.Block == nil {
 			return fmt.Errorf("fiber %s has no shuttle: block", args[0])
@@ -304,20 +297,17 @@ Tempered, or Composted back to In flight.`,
 		f.SetStatus("active")
 		f.SetTempered(nil)
 		f.ClearClosedAt()
-		f.Block.Enabled = true
-		reviewReset := resetStandingReview(f.Block)
 		if err := f.WriteBlock(f.Block); err != nil {
 			return fmt.Errorf("writing fiber: %w", err)
 		}
 
-		fmt.Printf("reopened %s (enabled=true)\n", args[0])
+		fmt.Printf("reopened %s (status: active)\n", args[0])
 		if statusBefore == "" {
 			fmt.Println("  status: active (set; was missing)")
 		} else if statusBefore != "active" {
 			fmt.Printf("  status: %s → active\n", statusBefore)
 		}
 		fmt.Println("  cleared: tempered, closed-at")
-		clearRuntimeReviewLifecycle(fiberID, reviewReset)
 		return nil
 	},
 }
@@ -405,11 +395,12 @@ func newAcceptCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "accept <fiber>",
-		Short: "Accept a completed standing-role run and advance the schedule",
-		Long: `Flips shuttle.review.state to accepted/scheduled and advances next_due_at.
-
-The run_id from the current awaiting run becomes accepted_run_id, review.state
-is reset to scheduled, and next_due_at is advanced to the next occurrence.
+		Short: "Accept a completed standing-role run and re-arm it",
+		Long: `Re-arms a standing role awaiting review (status: closed + untempered) by
+writing status: active back to the document and clearing closed-at / tempered.
+Due-ness is recomputed cron.next(now) by the daemon — there is no stored
+next_due_at and no review block (slice 5: status + tempered is the whole
+lifecycle).
 
 Clears the outcome field so the next dispatch starts with a blank slate; the
 worker treats an empty outcome as "previous run was accepted, write fresh" and
@@ -417,7 +408,9 @@ a non-empty outcome as "prior runs unaccepted, append below." Pass
 --keep-outcome to preserve the existing outcome (rare; useful when accepting
 a run whose digest the next worker should still see).
 
-Appends a felt history event recording the acceptance.`,
+Routes to the owning daemon when reachable (a single in-process re-arm);
+falls back to a local document write when the daemon is down. Appends a felt
+history event recording the acceptance.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path, fiberID, host := resolveFiber(args[0])
@@ -431,21 +424,13 @@ Appends a felt history event recording the acceptance.`,
 			if f.Block.Kind != "standing" {
 				return fmt.Errorf("accept only applies to standing roles (fiber has kind=%s)", f.Block.Kind)
 			}
-			// Awaiting has two representations during the slice-1 transition:
-			// the new-model felt-native shape (`status: closed` + untempered) and
-			// the legacy runtime-overlay shape (`review.state: awaiting`). Accept
-			// either; the daemon's LifecycleStore.accept (reached over HTTP below)
-			// recognizes both, and the offline fallback branches on which it is.
-			docAwaiting := f.Status() == "closed" && f.Tempered() == nil
-			reviewAwaiting := f.Block.Review != nil && f.Block.Review.State == "awaiting"
-			if !reviewAwaiting && !docAwaiting {
-				state := ""
-				if f.Block.Review != nil {
-					state = f.Block.Review.State
-				}
+			// Awaiting is felt-native: status: closed + untempered (slice 5 — no
+			// review.state axis). Accept re-arms it; the daemon's
+			// LifecycleStore.accept (reached over HTTP below) does the same.
+			if !(f.Status() == "closed" && f.Tempered() == nil) {
 				return fmt.Errorf(
-					"fiber %s is not awaiting review (status=%q tempered=%v review.state=%q)",
-					args[0], f.Status(), f.Tempered(), state)
+					"fiber %s is not awaiting review (accept requires status:closed + untempered; status=%q tempered=%v)",
+					args[0], f.Status(), f.Tempered())
 			}
 			if f.Block.Schedule == nil {
 				return fmt.Errorf("fiber %s has no schedule", args[0])
@@ -461,102 +446,28 @@ Appends a felt history event recording the acceptance.`,
 				return err
 			}
 
-			// Offline fallback (daemon down). New-model awaiting re-arms straight
-			// from the doc schedule — felt-native, no review/next_due frontmatter
-			// (overlay-era fields the new model drops); the daemon recomputes
-			// due-ness from the schedule on its next poll.
-			if docAwaiting {
-				computedNext, err := schema.NextOccurrence(f.Block.Schedule, time.Now())
-				if err != nil {
-					return fmt.Errorf("computing next occurrence: %w", err)
-				}
-				f.Block.Enabled = true
-				f.SetStatus("active")
-				f.SetTempered(nil)
-				f.ClearClosedAt()
-				f.Block.Session = nil
-				if !keepOutcome {
-					f.SetOutcome("")
-				}
-				if err := f.WriteBlock(f.Block); err != nil {
-					return fmt.Errorf("writing fiber: %w", err)
-				}
-				_ = appendFeltHistory(host, fiberID, fmt.Sprintf("accepted run; next due %s", computedNext.Format(time.RFC3339)))
-				fmt.Printf("accepted run for %s\n  next due: %s\n", args[0], computedNext.Format(time.RFC3339))
-				return nil
+			// Offline fallback (daemon down). Re-arm straight from the doc
+			// schedule — felt-native, no review/next_due frontmatter; the daemon
+			// recomputes due-ness from the schedule on its next poll.
+			computedNext, err := schema.NextOccurrence(f.Block.Schedule, time.Now())
+			if err != nil {
+				return fmt.Errorf("computing next occurrence: %w", err)
 			}
-
-			runID := ""
-			if f.Block.Review.RunID != nil {
-				runID = *f.Block.Review.RunID
-			}
-
-			adHoc := strings.HasPrefix(runID, "adhoc-")
-			next := f.Block.NextDueAt
-			if !adHoc {
-				// Advance next_due_at from current or now.
-				from := time.Now()
-				if f.Block.NextDueAt != nil {
-					from = *f.Block.NextDueAt
-				}
-				computedNext, err := schema.NextOccurrence(f.Block.Schedule, from)
-				if err != nil {
-					return fmt.Errorf("computing next occurrence: %w", err)
-				}
-				next = &computedNext
-			}
-
-			f.Block.Review = &schema.Review{
-				State:         "scheduled",
-				RunID:         schema.StringPtr(runID),
-				AcceptedRunID: schema.StringPtr(runID),
-			}
-			f.Block.NextDueAt = next
-			f.Block.Enabled = true // ensure re-enabled after review
 			f.SetStatus("active")
 			f.SetTempered(nil)
 			f.ClearClosedAt()
-
-			// Clear the session block. The run we just accepted is finalized;
-			// the session UUID was a handle for resuming THAT run, and any
-			// subsequent dispatch (next cron tick, manual ad-hoc, kanban drag)
-			// is a NEW run that should start fresh. Leaving session.id set
-			// would let check_resume_intent/3 latch onto a stale UUID if a
-			// prior review-comment carried `resume_mode: previous`, landing
-			// the worker in a transcript whose last assistant turn was
-			// "Run accepted. Exiting" — they'd idle ("nothing new on the
-			// fiber") instead of running fresh. After accept, the cycle has
-			// rolled over.
+			// Clear the session block: the accepted run is finalized, and the
+			// next dispatch is a NEW run that should start fresh (resume reads
+			// felt history, not this block, post-slice-6).
 			f.Block.Session = nil
-
-			// Clear outcome unless --keep-outcome. The accepted digest's signal
-			// lives in the felt history event below; outcome is the live-state
-			// surface and should be empty so the next worker writes fresh into it.
 			if !keepOutcome {
 				f.SetOutcome("")
 			}
-
 			if err := f.WriteBlock(f.Block); err != nil {
 				return fmt.Errorf("writing fiber: %w", err)
 			}
-
-			// Append felt history event.
-			if adHoc {
-				nextText := "unchanged"
-				if next != nil {
-					nextText = next.Format(time.RFC3339)
-				}
-				_ = appendFeltHistory(host, fiberID, fmt.Sprintf("accepted ad-hoc run %s; next due %s", runID, nextText))
-
-				fmt.Printf("accepted ad-hoc run %s for %s\n", runID, args[0])
-				fmt.Printf("  next due: %s (unchanged)\n", nextText)
-				return nil
-			}
-
-			_ = appendFeltHistory(host, fiberID, fmt.Sprintf("accepted run %s; next due %s", runID, next.Format(time.RFC3339)))
-
-			fmt.Printf("accepted run %s for %s\n", runID, args[0])
-			fmt.Printf("  next due: %s\n", next.Format(time.RFC3339))
+			_ = appendFeltHistory(host, fiberID, fmt.Sprintf("accepted run; next due %s", computedNext.Format(time.RFC3339)))
+			fmt.Printf("accepted run for %s\n  next due: %s\n", args[0], computedNext.Format(time.RFC3339))
 			return nil
 		},
 	}
@@ -681,71 +592,6 @@ func joinIDs(ids []string) string {
 	return result
 }
 
-// resetStandingReview resets a standing role's frontmatter review.state back to
-// "scheduled" on close/reopen, clearing the finished run's cycle fields. Close
-// and reopen end (or restart) a review cycle, so the awaiting/review verdict
-// state must reset — the mirror of accept, which advances the cycle. Returns
-// the prior state when a reset actually happened (so the caller can log it and
-// decide whether to bother clearing the daemon's runtime row), or "" otherwise.
-//
-// Why this is load-bearing: the daemon's poll-path merge_lifecycle_overlay uses
-// frontmatter-precedence put_if_missing — a PRESENT frontmatter review.state
-// blocks the runtime store's value from being injected. Before this, close left
-// review.state=awaiting in frontmatter; the un-temper sequence (reopen →
-// re-resolve awaitingReview) then re-resolved to close-composted, silently
-// re-composting the card. Resetting to scheduled here makes the reopened role
-// resolve awaitingReview → close-awaiting-review (back into the review pile)
-// instead. Non-standing fibers and already-scheduled roles are untouched.
-func resetStandingReview(block *schema.Block) string {
-	if block == nil || block.Kind != "standing" || block.Review == nil {
-		return ""
-	}
-	prior := block.Review.State
-	if prior == "" || prior == "scheduled" {
-		return ""
-	}
-	block.Review = &schema.Review{State: "scheduled"}
-	return prior
-}
-
-// clearRuntimeReviewLifecycle clears the standing role's runtime-store lifecycle
-// row through the daemon. The frontmatter half is already done by
-// resetStandingReview; this clears the OTHER store (review state lives in both
-// for standing roles — see lib/shuttle/lifecycle_store.ex reset_review). Reviving
-// RuntimeStore.delete_lifecycle, which had no production caller: close/reopen
-// wrote only frontmatter, so a stale runtime awaiting row survived indefinitely
-// and re-injected on the next poll for any role lacking a frontmatter review key.
-//
-// Best-effort: a transport error (daemon offline / SHUTTLE_LIFECYCLE_OFFLINE)
-// means there is no runtime store to clear from here — the frontmatter reset
-// already blocks overlay re-injection — so we proceed silently. A real daemon
-// error (e.g. 4xx) is surfaced as a note but does not fail the close/reopen.
-// Skips entirely when no review reset happened (oneshots, already-scheduled).
-func clearRuntimeReviewLifecycle(fiberID, priorReviewState string) {
-	if priorReviewState == "" || fiberID == "" {
-		return
-	}
-	if _, err := postLifecycle("reset-review", map[string]any{"fiber": fiberID}); err != nil {
-		if !isLifecycleTransportError(err) {
-			fmt.Printf("  note: daemon reset-review failed (%v); frontmatter review reset still applied\n", err)
-		}
-		return
-	}
-	fmt.Printf("  review.state: %s → scheduled (runtime lifecycle cleared)\n", priorReviewState)
-}
-
-// standingInReviewState returns true when a standing role's review block is in
-// a state that withholds dispatch (awaiting, review, in_review). These states
-// are excluded by StandingRole.due?/2 in the Elixir daemon, so simply enabling
-// the fiber would leave it silently ineligible.
-func standingInReviewState(review *schema.Review) bool {
-	if review == nil {
-		return false
-	}
-	s := review.State
-	return s == "awaiting" || s == "review" || s == "in_review"
-}
-
 func isLifecycleTransportError(err error) bool {
 	if err == nil {
 		return false
@@ -755,55 +601,6 @@ func isLifecycleTransportError(err error) bool {
 	}
 	return strings.Contains(err.Error(), "reaching daemon") ||
 		strings.Contains(err.Error(), "SHUTTLE_LIFECYCLE_OFFLINE")
-}
-
-// resumeStandingFromReview re-queues a standing role that is in awaiting/review
-// state for immediate dispatch without advancing the recurrence schedule.
-//
-// The transition is: review.state → scheduled, next_due_at → now. This makes
-// StandingRole.due?/2 return true on the next daemon poll so a fresh worker is
-// dispatched. The prior run's id is preserved in review.run_id for reference —
-// the fresh worker can compare it to the run_id in the current outcome to
-// understand it is continuing an awaiting run rather than starting a new one.
-//
-// Contrast with accept: accept advances next_due_at to the next cron occurrence
-// and marks the run as successfully completed. Resume re-dispatches without
-// advancing the schedule, intended for addressing open questions from the
-// awaiting run before the next scheduled occurrence.
-func resumeStandingFromReview(fiberRef, fiberID, host string, f *schema.FiberFile) error {
-	priorState := f.Block.Review.State
-	prevRunID := ""
-	if f.Block.Review.RunID != nil {
-		prevRunID = *f.Block.Review.RunID
-	}
-
-	now := time.Now().UTC()
-	review := &schema.Review{State: "scheduled"}
-	if prevRunID != "" {
-		review.RunID = schema.StringPtr(prevRunID)
-	}
-	f.Block.Review = review
-	f.Block.NextDueAt = &now
-	f.Block.Enabled = true
-
-	if err := f.WriteBlock(f.Block); err != nil {
-		return fmt.Errorf("writing fiber: %w", err)
-	}
-
-	histSummary := fmt.Sprintf("resumed from %s state; re-queued for immediate dispatch", priorState)
-	if prevRunID != "" {
-		histSummary += fmt.Sprintf(" (prior run_id: %s)", prevRunID)
-	}
-	_ = appendFeltHistory(host, fiberID, histSummary)
-
-	fmt.Printf("resumed %s (standing role; re-queued for immediate dispatch)\n", fiberRef)
-	fmt.Printf("  review.state: %s → scheduled\n", priorState)
-	fmt.Printf("  next_due_at:  %s (immediate)\n", now.Format(time.RFC3339))
-	if prevRunID != "" {
-		fmt.Printf("  prior run_id: %s\n", prevRunID)
-	}
-	fmt.Println("  note: use 'accept' to advance the recurrence instead")
-	return nil
 }
 
 func init() {

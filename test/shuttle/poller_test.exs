@@ -1169,25 +1169,30 @@ defmodule Shuttle.PollerTest do
   end
 
   test "direct ad-hoc dispatch refuses a standing role awaiting review" do
+    # Awaiting is felt-native (slice 5): status:closed + untempered. An ad-hoc
+    # dispatch against it is refused with the awaiting marker; the completed
+    # timestamp comes from closed-at (the run id lives in felt history now).
     fiber_id = "tests/standing-awaiting-refuses-adhoc"
-    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
+
+    fiber =
+      make_fiber(fiber_id, %{
+        "status" => "closed",
+        "closed-at" => "2026-05-24T10:00:00Z",
+        "tags" => ["constitution", "standing"]
+      })
+
     MockRunner.set_fiber(fiber_id, fiber)
 
     MockRunner.set_shuttle(
       fiber_id,
       """
-      enabled: true
       kind: standing
       agent: claude-sonnet
       schedule:
         expr: "0 9 * * 1-5"
         tz: Europe/Paris
-      review:
-        state: awaiting
-        run_id: "adhoc-1778282769604"
-        completed_at: "2026-05-24T10:00:00Z"
-      next_due_at: "2999-01-01T09:00:00+01:00"
-      """
+      """,
+      "closed"
     )
 
     {:ok, poller} =
@@ -1198,7 +1203,7 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
-    assert {:error, {:awaiting_review, "adhoc-1778282769604", "2026-05-24T10:00:00Z"}} =
+    assert {:error, {:awaiting_review, nil, "2026-05-24T10:00:00Z"}} =
              Poller.dispatch_fiber(poller, fiber_id, force: true, ad_hoc: true)
 
     refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
@@ -1367,13 +1372,14 @@ defmodule Shuttle.PollerTest do
     assert session == Dispatcher.session_name(fiber_id)
   end
 
-  test "force-dispatch runs a disabled fiber (shuttle.enabled: false)" do
-    # A fiber that opted out of auto-dispatch (enabled: false) is still
-    # available for explicit manual launch — the click is the override.
+  test "force-dispatch runs a draft fiber (status: open)" do
+    # A draft (status: open) is not auto-dispatched (slice 5: status is the sole
+    # gate, no enabled flag) but is still available for explicit manual launch —
+    # the click is the override.
     fiber_id = "tests/disabled-force"
-    fiber = make_fiber(fiber_id)
+    fiber = make_fiber(fiber_id, %{"status" => "open"})
     MockRunner.set_fiber(fiber_id, fiber)
-    MockRunner.set_shuttle(fiber_id, "enabled: false\nkind: oneshot\nagent: claude-sonnet\n")
+    MockRunner.set_shuttle(fiber_id, "kind: oneshot\nagent: claude-sonnet\n", "open")
 
     {:ok, poller} =
       Poller.start_link(
@@ -1565,39 +1571,42 @@ defmodule Shuttle.PollerTest do
   # document facts the kanban classifier reads from status/tempered.
   test "snapshot standing state is schedule-derived, not review-derived" do
     sleeping = make_fiber("tests/standing-review", %{"tags" => ["constitution", "standing"]})
-    paused = make_fiber("tests/standing-accepted", %{"tags" => ["constitution", "standing"]})
+
+    paused =
+      make_fiber("tests/standing-accepted", %{
+        "status" => "open",
+        "tags" => ["constitution", "standing"]
+      })
+
     MockRunner.set_fiber("tests/standing-review", sleeping)
     MockRunner.set_fiber("tests/standing-accepted", paused)
 
-    # A leftover review block is ignored; the role reads scheduled (its next
-    # weekday-09:00 tick is in the future).
+    # A leftover review block is ignored (slice 5: no review axis); the role reads
+    # scheduled (its next weekday-09:00 tick is in the future).
     MockRunner.set_shuttle(
       "tests/standing-review",
       """
-      enabled: true
       mode: standing
       schedule:
         kind: cron
         expr: "0 9 * * 1-5"
         timezone: Europe/Paris
-      review:
-        state: awaiting
       """
     )
 
-    # A paused role reads dormant regardless of any review block.
+    # A draft role (status: open) still reads scheduled in the schedule-derived
+    # snapshot — paused/draft is a document fact (status), surfaced by the kanban
+    # classifier from the document, not a StandingRole phase (slice 5).
     MockRunner.set_shuttle(
       "tests/standing-accepted",
       """
-      enabled: false
       mode: standing
       schedule:
         kind: cron
         expr: "0 9 * * 1-5"
         timezone: Europe/Paris
-      review:
-        state: accepted
-      """
+      """,
+      "open"
     )
 
     {:ok, poller} =
@@ -1616,7 +1625,7 @@ defmodule Shuttle.PollerTest do
 
     roles = Poller.snapshot(poller).standing_roles
     assert Enum.find(roles, &(&1.fiber_id == "tests/standing-review")).state == "scheduled"
-    assert Enum.find(roles, &(&1.fiber_id == "tests/standing-accepted")).state == "dormant"
+    assert Enum.find(roles, &(&1.fiber_id == "tests/standing-accepted")).state == "scheduled"
   end
 
   test "poller respects dependency satisfaction" do
@@ -2325,10 +2334,15 @@ defmodule Shuttle.PollerTest do
     fiber_id = "tests/orphan-runtime-dispatched-disabled"
     runtime_store_path = runtime_store_path()
 
-    MockRunner.set_shuttle(fiber_id, """
-    enabled: false
-    kind: oneshot
-    """)
+    # A draft (status: open) is no longer eligible (slice 5: status is the gate),
+    # so the stale dispatched runtime row must be cleared rather than retried.
+    MockRunner.set_shuttle(
+      fiber_id,
+      """
+      kind: oneshot
+      """,
+      "open"
+    )
 
     Shuttle.RuntimeStore.upsert_lifecycle(runtime_store_path, fiber_id, %{
       kind: "oneshot",

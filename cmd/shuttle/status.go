@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/cailmdaley/shuttle/pkg/schema"
 	"github.com/spf13/cobra"
@@ -25,18 +24,16 @@ var (
 // `--remote` or `--all`) it carries the remote name (e.g. "candide")
 // — so JSON consumers can group/filter without re-deriving it.
 type FiberStatus struct {
-	FiberID     string `json:"fiber_id"`
-	Origin      string `json:"origin,omitempty"`
-	Kind        string `json:"kind,omitempty"`
-	Enabled     bool   `json:"enabled"`
-	Agent       string `json:"agent,omitempty"`
-	State       string `json:"state"`
-	Running     bool   `json:"running"`
-	Session     string `json:"session,omitempty"`
-	NextDueAt   string `json:"next_due_at,omitempty"`
-	LastRunAt   string `json:"last_run_at,omitempty"`
-	ReviewState string `json:"review_state,omitempty"`
-	Stale       bool   `json:"stale,omitempty"`
+	FiberID   string `json:"fiber_id"`
+	Origin    string `json:"origin,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	Agent     string `json:"agent,omitempty"`
+	State     string `json:"state"`
+	Running   bool   `json:"running"`
+	Session   string `json:"session,omitempty"`
+	NextDueAt string `json:"next_due_at,omitempty"`
+	LastRunAt string `json:"last_run_at,omitempty"`
+	Stale     bool   `json:"stale,omitempty"`
 }
 
 var statusCmd = &cobra.Command{
@@ -106,25 +103,15 @@ Other flags:
 				}
 			}
 
-			state := computeState(entry.Block, live)
+			state := computeState(entry.Block, entry.Status, live)
 
 			row := FiberStatus{
 				FiberID: entry.FiberID,
 				Kind:    entry.Block.Kind,
-				Enabled: entry.Block.Enabled,
 				Agent:   entry.Block.Agent,
 				State:   state,
 				Running: live,
 				Session: session,
-			}
-			if entry.Block.NextDueAt != nil {
-				row.NextDueAt = entry.Block.NextDueAt.Format(time.RFC3339)
-			}
-			if entry.Block.LastRunAt != nil {
-				row.LastRunAt = entry.Block.LastRunAt.Format(time.RFC3339)
-			}
-			if entry.Block.Review != nil {
-				row.ReviewState = entry.Block.Review.State
 			}
 			rows = append(rows, row)
 		}
@@ -366,28 +353,29 @@ func liveTmuxSessions() map[string]bool {
 	return result
 }
 
-func computeState(b *schema.Block, running bool) string {
+// computeState derives the display state from tmux liveness and the felt-native
+// status — the sole lifecycle axis (slice 5: no enabled flag, no review state).
+// "awaiting/accepted/composted" are status:closed facts; the closed-state
+// verdict (tempered) is a fiber field the bulk listing here doesn't carry, so
+// closed collapses to "closed" — the kanban (which has tempered) makes the
+// finer call.
+func computeState(b *schema.Block, status string, running bool) string {
 	if running {
 		return "running"
 	}
-	if !b.Enabled {
+	switch status {
+	case "open":
 		return "paused"
-	}
-	if b.Review != nil && b.Review.State != "" {
-		switch b.Review.State {
-		case "awaiting":
-			return "awaiting-review"
-		case "accepted":
-			return "accepted"
+	case "closed":
+		return "closed"
+	case "active":
+		if b.Kind == "standing" {
+			return "scheduled"
 		}
+		return "idle"
+	default:
+		return nonEmpty(status, "unknown")
 	}
-	if b.Kind == "standing" {
-		if b.NextDueAt != nil && b.NextDueAt.Before(time.Now()) {
-			return "due"
-		}
-		return "scheduled"
-	}
-	return "idle"
 }
 
 func printStatusTable(rows []FiberStatus) {

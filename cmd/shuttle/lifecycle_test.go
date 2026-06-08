@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cailmdaley/shuttle/pkg/schema"
 	"github.com/spf13/cobra"
@@ -198,8 +197,11 @@ Body.
 	if !strings.Contains(text, "project_dir: "+projectDir) {
 		t.Fatalf("project_dir not written:\n%s", text)
 	}
-	if !strings.Contains(text, "enabled: true") {
-		t.Fatalf("enabled block not written:\n%s", text)
+	if !strings.Contains(text, "status: active") {
+		t.Fatalf("armed install should set status: active:\n%s", text)
+	}
+	if strings.Contains(text, "enabled") {
+		t.Fatalf("slice 5: install must not write an enabled flag:\n%s", text)
 	}
 }
 
@@ -345,8 +347,8 @@ Body.
 				t.Fatalf("read fiber: %v", err)
 			}
 			text := string(raw)
-			if !strings.Contains(text, "enabled: false") {
-				t.Fatalf("--disabled should write to requested slug %q:\n%s", slug, text)
+			if !strings.Contains(text, "status: open") {
+				t.Fatalf("--disabled should land in drafts (status: open) for slug %q:\n%s", slug, text)
 			}
 			if !strings.Contains(text, "agent: codex") {
 				t.Fatalf("--model should be honored for requested slug %q:\n%s", slug, text)
@@ -396,11 +398,12 @@ func TestInstallCmd_IdempotentWhenBlockExistsNoFlags(t *testing.T) {
 	host, cleanup := withTempHost(t)
 	defer cleanup()
 
+	// An armed fiber (status: active) with a hand-written block. Idempotent
+	// install reports it as armed and never rewrites the file.
 	path := writeFiber(t, host, "already-installed", `---
 name: Already installed
-status: open
+status: active
 shuttle:
-  enabled: true
   kind: oneshot
   agent: codex
   project_dir: /tmp
@@ -509,18 +512,18 @@ Body.
 	}
 }
 
-// TestInstallCmd_BumpsMissingStatusEvenWhenBlockExists covers the "user
-// wrote block: enabled: true but forgot status: active" case. Without this
-// fix, install would error and leave the fiber undispatchable until the
-// user discovered the missing status separately. Now install bumps it.
-func TestInstallCmd_BumpsMissingStatusEvenWhenBlockExists(t *testing.T) {
+// TestInstallCmd_ReportsMissingStatusOnExistingBlock covers a hand-written
+// block with no status field. Slice 5: status is the dispatch gate, so a
+// missing status means undispatchable — idempotent install reports that and
+// points at resume, and does not auto-arm or rewrite the file (the user
+// decides draft vs armed).
+func TestInstallCmd_ReportsMissingStatusOnExistingBlock(t *testing.T) {
 	host, cleanup := withTempHost(t)
 	defer cleanup()
 
 	path := writeFiber(t, host, "missing-status", `---
 name: Missing status
 shuttle:
-  enabled: true
   kind: oneshot
   agent: codex
   project_dir: /tmp
@@ -528,6 +531,10 @@ shuttle:
 
 Body.
 `)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fiber: %v", err)
+	}
 
 	var stdout bytes.Buffer
 	cmd := newInstallCmd()
@@ -538,15 +545,15 @@ Body.
 		t.Fatalf("Execute: %v, output:\n%s", err, stdout.String())
 	}
 
-	raw, err := os.ReadFile(path)
+	after, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read fiber: %v", err)
 	}
-	if !strings.Contains(string(raw), "status: active") {
-		t.Fatalf("expected status: active to be written; got:\n%s", string(raw))
+	if !bytes.Equal(before, after) {
+		t.Fatalf("idempotent install must not auto-arm; before:\n%s\nafter:\n%s", before, after)
 	}
-	if !strings.Contains(stdout.String(), "bumped to") {
-		t.Fatalf("expected user-visible note about status bump; got:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "Status missing") {
+		t.Fatalf("expected a missing-status note; got:\n%s", stdout.String())
 	}
 }
 
@@ -600,8 +607,8 @@ Body.
 		t.Fatalf("read fiber: %v", err)
 	}
 	text := string(raw)
-	if !strings.Contains(text, "enabled: false") {
-		t.Fatalf("enabled should be false after pause:\n%s", text)
+	if !strings.Contains(text, "status: open") {
+		t.Fatalf("pause should set status: open:\n%s", text)
 	}
 	if got := strings.Join(*killed, ","); got != session {
 		t.Fatalf("expected killed session %q, got %q", session, got)
@@ -697,8 +704,8 @@ Body.
 		t.Fatalf("read fiber: %v", err)
 	}
 	text := string(raw)
-	if !strings.Contains(text, "enabled: false") {
-		t.Fatalf("enabled should be false after pause:\n%s", text)
+	if !strings.Contains(text, "status: open") {
+		t.Fatalf("pause should set status: open:\n%s", text)
 	}
 	if len(*killed) != 0 {
 		t.Fatalf("expected no kill calls, got %v", *killed)
@@ -734,8 +741,8 @@ Body.
 		t.Fatalf("read fiber: %v", err)
 	}
 	text := string(raw)
-	if !strings.Contains(text, "enabled: false") {
-		t.Fatalf("enabled should be false after pause:\n%s", text)
+	if !strings.Contains(text, "status: open") {
+		t.Fatalf("pause should set status: open:\n%s", text)
 	}
 	if len(*killed) != 0 {
 		t.Fatalf("expected no kill calls, got %v", *killed)
@@ -771,31 +778,27 @@ Body.
 	}
 }
 
-// TestResumeCmd_StandingAwaitingTransitionsToScheduled verifies that resume on
-// a standing role in awaiting state transitions review.state to scheduled and
-// sets next_due_at to now (making the fiber immediately eligible).
-func TestResumeCmd_StandingAwaitingTransitionsToScheduled(t *testing.T) {
+// TestResumeCmd_StandingAwaitingReArms verifies that resume on a standing role
+// awaiting review (status:closed + untempered) re-arms it to status:active and
+// clears the awaiting markers (slice 5: no review.state, no next_due_at).
+func TestResumeCmd_StandingAwaitingReArms(t *testing.T) {
 	host, cleanup := withTempHost(t)
 	defer cleanup()
 
 	path := writeFiber(t, host, "daily-report", `---
 name: Daily report
-status: active
+status: closed
+closed-at: 2026-06-01T09:30:00Z
 shuttle:
-  enabled: true
   kind: standing
   schedule:
     expr: "0 9 * * 1-5"
     tz: Europe/Paris
-  review:
-    state: awaiting
-    run_id: "20260506T090000+0200"
 ---
 
 Standing role body.
 `)
 
-	before := time.Now().UTC()
 	cmd := newResumeCmd()
 	cmd.SetArgs([]string{"daily-report"})
 	if err := cmd.Execute(); err != nil {
@@ -808,78 +811,40 @@ Standing role body.
 	}
 	text := string(raw)
 
-	// review.state must be scheduled
-	if !strings.Contains(text, "state: scheduled") {
-		t.Fatalf("expected review.state: scheduled, got:\n%s", text)
+	if !strings.Contains(text, "status: active") {
+		t.Fatalf("resume should re-arm to status: active:\n%s", text)
 	}
-	// awaiting must be gone
-	if strings.Contains(text, "state: awaiting") {
-		t.Fatalf("awaiting state still present:\n%s", text)
+	if strings.Contains(text, "closed-at:") {
+		t.Fatalf("resume should clear closed-at:\n%s", text)
 	}
-	// next_due_at must be present and parseable as a time >= before
-	if !strings.Contains(text, "next_due_at:") {
-		t.Fatalf("next_due_at not written:\n%s", text)
+	// Clean cutover: no review block, no enabled flag, no next_due_at.
+	if strings.Contains(text, "review") || strings.Contains(text, "enabled") ||
+		strings.Contains(text, "next_due_at") {
+		t.Fatalf("resume must not write review/enabled/next_due_at:\n%s", text)
 	}
-	// prior run_id must be preserved
-	if !strings.Contains(text, "20260506T090000+0200") {
-		t.Fatalf("prior run_id not preserved:\n%s", text)
-	}
-	// enabled must still be true
-	if !strings.Contains(text, "enabled: true") {
-		t.Fatalf("enabled should be true:\n%s", text)
-	}
-	// body must be preserved
 	if !strings.Contains(text, "Standing role body.") {
 		t.Fatalf("body lost:\n%s", text)
 	}
-
-	_ = before // verify next_due_at >= before if we want to parse the timestamp
 }
 
-// TestResumeCmd_StandingReviewStateVariants checks that all review-state aliases
-// (review, in_review) also trigger the standing-resume path.
-func TestResumeCmd_StandingReviewStateVariants(t *testing.T) {
-	for _, reviewState := range []string{"review", "in_review"} {
-		t.Run(reviewState, func(t *testing.T) {
-			host, cleanup := withTempHost(t)
-			defer cleanup()
-
-			content := "---\nname: Role\nstatus: active\nshuttle:\n  enabled: true\n  kind: standing\n  schedule:\n    expr: \"0 9 * * 1-5\"\n    tz: UTC\n  review:\n    state: " + reviewState + "\n    run_id: \"20260506T090000+0000\"\n---\n\nBody.\n"
-			path := writeFiber(t, host, "role", content)
-
-			cmd := newResumeCmd()
-			cmd.SetArgs([]string{"role"})
-			if err := cmd.Execute(); err != nil {
-				t.Fatalf("Execute (%s): %v", reviewState, err)
-			}
-
-			raw, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatalf("read fiber: %v", err)
-			}
-			text := string(raw)
-			if !strings.Contains(text, "state: scheduled") {
-				t.Fatalf("(%s) expected review.state: scheduled:\n%s", reviewState, text)
-			}
-			if !strings.Contains(text, "next_due_at:") {
-				t.Fatalf("(%s) next_due_at not written:\n%s", reviewState, text)
-			}
-		})
-	}
-}
-
-// TestResumeCmd_StandingScheduledFallsThrough verifies that resume on a standing
-// role that is NOT in review state (e.g. already scheduled) uses the regular
-// enable path rather than the standing-resume path.
-func TestResumeCmd_StandingScheduledFallsThrough(t *testing.T) {
+// TestResumeCmd_DraftArmsToActive verifies that resume on a draft (status: open)
+// arms it straight to status: active.
+func TestResumeCmd_DraftArmsToActive(t *testing.T) {
 	host, cleanup := withTempHost(t)
 	defer cleanup()
 
-	// A standing role that was paused (enabled=false) but not in review.
-	now := time.Now().UTC().Add(24 * time.Hour)
-	nextStr := now.Format(time.RFC3339)
-	content := "---\nname: Role\nstatus: active\nshuttle:\n  enabled: false\n  kind: standing\n  schedule:\n    expr: \"0 9 * * 1-5\"\n    tz: UTC\n  review:\n    state: scheduled\n  next_due_at: " + nextStr + "\n---\n\nBody.\n"
-	path := writeFiber(t, host, "role2", content)
+	path := writeFiber(t, host, "role2", `---
+name: Role
+status: open
+shuttle:
+  kind: standing
+  schedule:
+    expr: "0 9 * * 1-5"
+    tz: UTC
+---
+
+Body.
+`)
 
 	cmd := newResumeCmd()
 	cmd.SetArgs([]string{"role2"})
@@ -892,45 +857,11 @@ func TestResumeCmd_StandingScheduledFallsThrough(t *testing.T) {
 		t.Fatalf("read fiber: %v", err)
 	}
 	text := string(raw)
-	// enabled must flip to true
-	if !strings.Contains(text, "enabled: true") {
-		t.Fatalf("enabled should be true:\n%s", text)
+	if !strings.Contains(text, "status: active") {
+		t.Fatalf("resume should arm a draft to status: active:\n%s", text)
 	}
-	// review.state must remain scheduled (not changed to something else)
-	if !strings.Contains(text, "state: scheduled") {
-		t.Fatalf("review.state should remain scheduled:\n%s", text)
-	}
-	// next_due_at must NOT have been reset to now (still the future timestamp)
-	if !strings.Contains(text, nextStr[:16]) { // match at minute precision
-		t.Fatalf("next_due_at was unexpectedly changed:\n%s", text)
-	}
-}
-
-// TestStandingInReviewState exercises the helper directly.
-func TestStandingInReviewState(t *testing.T) {
-	cases := []struct {
-		state string
-		want  bool
-	}{
-		{"awaiting", true},
-		{"review", true},
-		{"in_review", true},
-		{"scheduled", false},
-		{"accepted", false},
-		{"", false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.state, func(t *testing.T) {
-			rev := &schema.Review{State: tc.state}
-			got := standingInReviewState(rev)
-			if got != tc.want {
-				t.Fatalf("standingInReviewState(%q) = %v, want %v", tc.state, got, tc.want)
-			}
-		})
-	}
-	// nil review
-	if standingInReviewState(nil) {
-		t.Fatal("standingInReviewState(nil) should be false")
+	if strings.Contains(text, "enabled") {
+		t.Fatalf("resume must not write an enabled flag:\n%s", text)
 	}
 }
 
@@ -941,23 +872,21 @@ func TestAcceptCmd_ClearsOutcomeByDefault(t *testing.T) {
 	host, cleanup := withTempHost(t)
 	defer cleanup()
 
+	// Awaiting is felt-native (slice 5): status:closed + untempered.
 	path := writeFiber(t, host, "daily-report", `---
 name: Daily report
-status: active
+status: closed
+closed-at: 2026-05-08T10:00:00Z
 outcome: |-
   2026-05-07 11:55 CEST | 8 reviewed | 16 archived | 1 fiber
 
   ### Action needed
   - Register on framadate
 shuttle:
-  enabled: true
   kind: standing
   schedule:
     expr: "0 9 * * 1-5"
     tz: Europe/Paris
-  review:
-    state: awaiting
-    run_id: "20260508T070000+0000"
 ---
 
 Standing role body.
@@ -975,12 +904,12 @@ Standing role body.
 	}
 	text := string(raw)
 
-	// The accept-state ratchet must have advanced.
-	if !strings.Contains(text, "state: scheduled") {
-		t.Fatalf("expected review.state: scheduled:\n%s", text)
+	// The role re-arms: status:active, no review block (slice 5).
+	if !strings.Contains(text, "status: active") {
+		t.Fatalf("accept should re-arm to status: active:\n%s", text)
 	}
-	if !strings.Contains(text, "accepted_run_id: 20260508T070000+0000") {
-		t.Fatalf("accepted_run_id not set:\n%s", text)
+	if strings.Contains(text, "review") {
+		t.Fatalf("accept must not write a review block:\n%s", text)
 	}
 
 	// Outcome must be empty (either an empty value or absent).
@@ -997,71 +926,22 @@ Standing role body.
 	}
 }
 
-func TestAcceptCmd_AdHocRunPreservesNextDueAt(t *testing.T) {
+func TestAcceptCmd_RefusesNonAwaitingRole(t *testing.T) {
 	host, cleanup := withTempHost(t)
 	defer cleanup()
 
-	path := writeFiber(t, host, "daily-report", `---
-name: Daily report
-status: active
-outcome: ad-hoc digest
-shuttle:
-  enabled: true
-  kind: standing
-  schedule:
-    expr: "0 9 * * 1-5"
-    tz: Europe/Paris
-  review:
-    state: awaiting
-    run_id: adhoc-1770000000000
-  next_due_at: "2026-05-11T09:00:00+02:00"
----
-
-Standing role body.
-`)
-
-	cmd := newAcceptCmd()
-	cmd.SetArgs([]string{"daily-report"})
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read fiber: %v", err)
-	}
-	text := string(raw)
-
-	if !strings.Contains(text, "accepted_run_id: adhoc-1770000000000") {
-		t.Fatalf("accepted_run_id not set for ad-hoc run:\n%s", text)
-	}
-	if !strings.Contains(text, "next_due_at: 2026-05-11T09:00:00+02:00") {
-		t.Fatalf("ad-hoc accept should preserve next_due_at:\n%s", text)
-	}
-	if strings.Contains(text, "ad-hoc digest") {
-		t.Fatalf("outcome digest survived accept:\n%s", text)
-	}
-}
-
-func TestAcceptCmd_ReactivatesClosedStandingRole(t *testing.T) {
-	host, cleanup := withTempHost(t)
-	defer cleanup()
-
-	path := writeFiber(t, host, "daily-report", `---
+	// A tempered (status:closed + tempered:true) role is a terminus, not
+	// awaiting — accept must refuse it (only status:closed + untempered re-arms).
+	writeFiber(t, host, "daily-report", `---
 name: Daily report
 status: closed
 tempered: true
 closed-at: 2026-05-08T10:00:00Z
-outcome: stale digest
 shuttle:
-  enabled: true
   kind: standing
   schedule:
     expr: "0 9 * * 1-5"
     tz: Europe/Paris
-  review:
-    state: awaiting
-    run_id: "20260508T070000+0000"
 ---
 
 Standing role body.
@@ -1069,27 +949,12 @@ Standing role body.
 
 	cmd := newAcceptCmd()
 	cmd.SetArgs([]string{"daily-report"})
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("Execute: %v", err)
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected accept on a tempered role to fail")
 	}
-
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read fiber: %v", err)
-	}
-	text := string(raw)
-
-	if !strings.Contains(text, "status: active") {
-		t.Fatalf("accept should reactivate standing roles:\n%s", text)
-	}
-	if strings.Contains(text, "tempered:") {
-		t.Fatalf("accept should clear tempered marker:\n%s", text)
-	}
-	if strings.Contains(text, "closed-at:") {
-		t.Fatalf("accept should clear closed-at marker:\n%s", text)
-	}
-	if !strings.Contains(text, "state: scheduled") {
-		t.Fatalf("expected review.state: scheduled:\n%s", text)
+	if !strings.Contains(err.Error(), "not awaiting review") {
+		t.Fatalf("expected 'not awaiting review' error, got %v", err)
 	}
 }
 
@@ -1109,7 +974,6 @@ status: closed
 closed-at: 2026-05-08T10:00:00Z
 outcome: stale digest
 shuttle:
-  enabled: true
   kind: standing
   schedule:
     expr: "0 9 * * 1-5"
@@ -1158,17 +1022,14 @@ func TestAcceptCmd_ClearsSessionUUID(t *testing.T) {
 
 	path := writeFiber(t, host, "daily-report", `---
 name: Daily report
-status: active
+status: closed
+closed-at: 2026-05-08T07:30:00Z
 outcome: digest
 shuttle:
-  enabled: true
   kind: standing
   schedule:
     expr: "0 9 * * 1-5"
     tz: Europe/Paris
-  review:
-    state: awaiting
-    run_id: "20260508T070000+0000"
   session:
     id: 11111111-2222-3333-4444-555555555555
     agent: claude-opus
@@ -1190,9 +1051,9 @@ Standing role body.
 	}
 	text := string(raw)
 
-	// State must have advanced.
-	if !strings.Contains(text, "state: scheduled") {
-		t.Fatalf("expected review.state: scheduled:\n%s", text)
+	// The role re-arms (status: active).
+	if !strings.Contains(text, "status: active") {
+		t.Fatalf("accept should re-arm to status: active:\n%s", text)
 	}
 	// The session uuid must not survive — it's the trigger for stale-resume.
 	if strings.Contains(text, "11111111-2222-3333-4444-555555555555") {
@@ -1212,19 +1073,16 @@ func TestAcceptCmd_KeepOutcomeFlag_PreservesOutcome(t *testing.T) {
 
 	path := writeFiber(t, host, "daily-report", `---
 name: Daily report
-status: active
+status: closed
+closed-at: 2026-05-08T07:30:00Z
 outcome: |-
   2026-05-07 11:55 CEST | 8 reviewed
   Worth keeping across the boundary.
 shuttle:
-  enabled: true
   kind: standing
   schedule:
     expr: "0 9 * * 1-5"
     tz: Europe/Paris
-  review:
-    state: awaiting
-    run_id: "20260508T070000+0000"
 ---
 
 Body.
@@ -1242,9 +1100,9 @@ Body.
 	}
 	text := string(raw)
 
-	// Accept-state ratchet still advances.
-	if !strings.Contains(text, "state: scheduled") {
-		t.Fatalf("expected review.state: scheduled:\n%s", text)
+	// The role re-arms (status: active).
+	if !strings.Contains(text, "status: active") {
+		t.Fatalf("accept should re-arm to status: active:\n%s", text)
 	}
 	// Outcome content survives.
 	if !strings.Contains(text, "Worth keeping across the boundary.") {
@@ -1258,17 +1116,14 @@ func TestAcceptCmd_UsesDaemonLifecycleWhenAvailable(t *testing.T) {
 
 	path := writeFiber(t, host, "daily-report", `---
 name: Daily report
-status: active
+status: closed
+closed-at: 2026-05-08T07:30:00Z
 outcome: digest
 shuttle:
-  enabled: true
   kind: standing
   schedule:
     expr: "0 9 * * 1-5"
     tz: Europe/Paris
-  review:
-    state: awaiting
-    run_id: "20260508T070000+0000"
   session:
     id: stale-session
 ---
@@ -1287,7 +1142,7 @@ Body.
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatalf("decode payload: %v", err)
 		}
-		_, _ = w.Write([]byte("accepted run 20260508T070000+0000 for daily-report\n"))
+		_, _ = w.Write([]byte("accepted run for daily-report\n"))
 	}))
 	defer srv.Close()
 	enableDaemonLifecycle(t, srv.URL)
@@ -1319,17 +1174,14 @@ func TestAcceptCmd_DaemonLifecycleErrorDoesNotFallbackToFrontmatter(t *testing.T
 
 	path := writeFiber(t, host, "daily-report", `---
 name: Daily report
-status: active
+status: closed
+closed-at: 2026-05-08T07:30:00Z
 outcome: digest
 shuttle:
-  enabled: true
   kind: standing
   schedule:
     expr: "0 9 * * 1-5"
     tz: Europe/Paris
-  review:
-    state: awaiting
-    run_id: "20260508T070000+0000"
 ---
 
 Body.
@@ -1370,18 +1222,14 @@ func TestResumeCmd_StandingReviewUsesDaemonLifecycleWhenAvailable(t *testing.T) 
 
 	path := writeFiber(t, host, "daily-report", `---
 name: Daily report
-status: active
+status: closed
+closed-at: 2026-05-08T07:30:00Z
 outcome: digest
 shuttle:
-  enabled: true
   kind: standing
   schedule:
     expr: "0 9 * * 1-5"
     tz: Europe/Paris
-  review:
-    state: awaiting
-    run_id: "20260508T070000+0000"
-  next_due_at: null
 ---
 
 Body.
@@ -1444,29 +1292,21 @@ func enableDaemonLifecycle(t *testing.T, url string) {
 	})
 }
 
-func TestCloseCmd_ResetsStandingReviewToScheduled(t *testing.T) {
+func TestCloseCmd_StandingWritesNoReviewBlock(t *testing.T) {
 	host, cleanup := withTempHost(t)
 	defer cleanup()
 
-	// A standing role finishing a run carries review.state=awaiting. Closing it
-	// (composting) must reset review to scheduled in frontmatter — otherwise the
-	// poll overlay's put_if_missing keeps a stale awaiting and the un-temper
-	// drag re-composts the card. The runtime-store half is exercised by the
-	// daemon-path test below; SHUTTLE_LIFECYCLE_OFFLINE (set by withTempHost)
-	// makes this case isolate the frontmatter reset.
+	// Close composts a standing role: status:closed + tempered:false. There is
+	// no review axis (slice 5) — close writes status + tempered + closed-at and
+	// never invents a review block.
 	path := writeFiber(t, host, "newsletter", `---
 name: Newsletter
 status: active
 shuttle:
-  enabled: true
   kind: standing
   schedule:
     expr: "0 9 * * 1-5"
     tz: UTC
-  review:
-    state: awaiting
-    run_id: "run-1"
-    completed_at: 2026-06-01T09:12:00Z
 ---
 
 Body.
@@ -1482,40 +1322,31 @@ Body.
 	if !strings.Contains(text, "status: closed") {
 		t.Fatalf("expected status: closed:\n%s", text)
 	}
-	if !strings.Contains(text, "state: scheduled") {
-		t.Fatalf("review.state should reset to scheduled:\n%s", text)
+	if !strings.Contains(text, "tempered: false") {
+		t.Fatalf("expected tempered: false (composted):\n%s", text)
 	}
-	if strings.Contains(text, "state: awaiting") {
-		t.Fatalf("stale awaiting review must be gone:\n%s", text)
-	}
-	// The finished run's cycle fields are cleared with the reset.
-	if strings.Contains(text, "run_id: run-1") || strings.Contains(text, "completed_at:") {
-		t.Fatalf("run-cycle review fields should be cleared on reset:\n%s", text)
+	if strings.Contains(text, "review") {
+		t.Fatalf("close must not write a review block (slice 5):\n%s", text)
 	}
 }
 
-func TestReopenCmd_ResetsStandingReviewToScheduled(t *testing.T) {
+func TestReopenCmd_StandingClearsVerdictNoReviewBlock(t *testing.T) {
 	host, cleanup := withTempHost(t)
 	defer cleanup()
 
-	// Reopen is the un-temper path's first step. A composted standing role can
-	// still carry review.state=awaiting in frontmatter; reopen must reset it so
-	// the reopened (active) role resolves awaitingReview → close-awaiting-review
-	// instead of close-composted.
+	// Reopen is the un-temper path's first step: a composted standing role
+	// (status:closed + tempered:false) re-enters active work with the verdict
+	// cleared. No review axis to reset (slice 5).
 	path := writeFiber(t, host, "cc-bills", `---
 name: CC bills
 status: closed
 tempered: false
 closed-at: 2026-06-01T09:30:00Z
 shuttle:
-  enabled: false
   kind: standing
   schedule:
     expr: "0 9 1 * *"
     tz: UTC
-  review:
-    state: awaiting
-    run_id: "run-7"
 ---
 
 Body.
@@ -1529,25 +1360,24 @@ Body.
 	if !strings.Contains(text, "status: active") {
 		t.Fatalf("expected status: active after reopen:\n%s", text)
 	}
-	if !strings.Contains(text, "state: scheduled") {
-		t.Fatalf("review.state should reset to scheduled:\n%s", text)
+	if strings.Contains(text, "tempered") {
+		t.Fatalf("reopen should clear the verdict:\n%s", text)
 	}
-	if strings.Contains(text, "state: awaiting") {
-		t.Fatalf("stale awaiting review must be gone after reopen:\n%s", text)
+	if strings.Contains(text, "review") {
+		t.Fatalf("reopen must not write a review block (slice 5):\n%s", text)
 	}
 }
 
-func TestCloseCmd_LeavesOneshotReviewUntouched(t *testing.T) {
+func TestCloseCmd_OneshotWritesNoReviewBlock(t *testing.T) {
 	host, cleanup := withTempHost(t)
 	defer cleanup()
 
-	// reset_review is standing-role-only. A oneshot has no recurring review
-	// cycle, so close must not invent or mutate a review block.
+	// A oneshot close (accept terminus): status:closed + tempered:true, no
+	// review block invented.
 	path := writeFiber(t, host, "oneoff", `---
 name: One off
 status: active
 shuttle:
-  enabled: true
   kind: oneshot
 ---
 
@@ -1564,65 +1394,11 @@ Body.
 	if !strings.Contains(text, "status: closed") {
 		t.Fatalf("expected status: closed:\n%s", text)
 	}
-	if strings.Contains(text, "review:") || strings.Contains(text, "state: scheduled") {
+	if !strings.Contains(text, "tempered: true") {
+		t.Fatalf("expected tempered: true:\n%s", text)
+	}
+	if strings.Contains(text, "review") {
 		t.Fatalf("oneshot close should not write a review block:\n%s", text)
-	}
-}
-
-func TestCloseCmd_ClearsRuntimeReviewThroughDaemon(t *testing.T) {
-	host, cleanup := withTempHost(t)
-	defer cleanup()
-
-	// The runtime-store half: with a reachable daemon, close drives a
-	// reset-review POST so the daemon clears the role's runtime lifecycle row
-	// (reviving RuntimeStore.delete_lifecycle). The frontmatter reset still
-	// happens locally; the daemon call clears the OTHER store.
-	path := writeFiber(t, host, "weekly", `---
-name: Weekly
-status: active
-shuttle:
-  enabled: true
-  kind: standing
-  schedule:
-    expr: "0 9 * * 1"
-    tz: UTC
-  review:
-    state: awaiting
-    run_id: "run-9"
----
-
-Body.
-`)
-
-	var requestPath string
-	var payload map[string]any
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestPath = r.URL.Path
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			t.Fatalf("decode payload: %v", err)
-		}
-		_, _ = w.Write([]byte("reset review lifecycle for weekly (was awaiting)\n"))
-	}))
-	defer srv.Close()
-	enableDaemonLifecycle(t, srv.URL)
-
-	closeTempered = "false"
-	defer func() { closeTempered = "" }()
-	if err := closeCmd.RunE(closeCmd, []string{"weekly"}); err != nil {
-		t.Fatalf("RunE: %v", err)
-	}
-
-	if requestPath != "/api/v1/lifecycle" {
-		t.Fatalf("expected reset-review to POST /api/v1/lifecycle, got %q", requestPath)
-	}
-	if payload["action"] != "reset-review" || payload["fiber"] != "weekly" {
-		t.Fatalf("unexpected reset-review payload: %#v", payload)
-	}
-
-	// Frontmatter reset still applied locally alongside the daemon call.
-	text := readFiberText(t, path)
-	if !strings.Contains(text, "status: closed") || !strings.Contains(text, "state: scheduled") {
-		t.Fatalf("close should still reset frontmatter when daemon is reachable:\n%s", text)
 	}
 }
 

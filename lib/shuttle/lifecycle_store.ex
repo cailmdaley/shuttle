@@ -13,7 +13,11 @@ defmodule Shuttle.LifecycleStore do
 
   alias Shuttle.{Cron, FeltStores, RuntimeStore}
 
-  @runtime_keys ~w(review next_due_at last_run_at session)
+  # Legacy + daemon-owned shuttle keys wiped from the block on every accept /
+  # resume / mark-awaiting rewrite (clean cutover, slice 5: `enabled` and
+  # `review` are gone; `next_due_at` / `last_run_at` / `session` are
+  # daemon-owned and don't live in the synced document).
+  @runtime_keys ~w(enabled review next_due_at last_run_at session)
 
   @spec accept(String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
   def accept(fiber_id, opts \\ []) when is_binary(fiber_id) do
@@ -220,30 +224,22 @@ defmodule Shuttle.LifecycleStore do
   defp require_schedule(%{"schedule" => schedule}) when is_map(schedule), do: {:ok, schedule}
   defp require_schedule(_), do: {:error, "fiber has no schedule"}
 
+  # accept/resume both re-arm an awaiting role by writing `status: active` back
+  # to the document — the sole dispatch gate (slice 5: no enabled flag, no
+  # review block). tempered and closed-at are cleared so the card leaves the
+  # Awaiting/Tempered/Composted columns.
   defp update_document(frontmatter, keep_outcome?) do
     frontmatter =
       frontmatter
       |> Map.put("status", "active")
       |> Map.delete("tempered")
       |> Map.delete("closed-at")
-      |> enable_shuttle()
 
     frontmatter =
       if keep_outcome?, do: frontmatter, else: Map.put(frontmatter, "outcome", "")
 
     {:ok, frontmatter}
   end
-
-  # accept/resume both re-arm the role. A paused standing role (`enabled:
-  # false`) sits in Drafts with its last run's `review` preserved; accepting
-  # (the human "temper") or resuming it reschedules the next run AND flips
-  # `enabled` back on, so it re-enters the queue. Already-enabled roles are
-  # unaffected (no-op).
-  defp enable_shuttle(%{"shuttle" => shuttle} = frontmatter) when is_map(shuttle) do
-    %{frontmatter | "shuttle" => Map.put(shuttle, "enabled", true)}
-  end
-
-  defp enable_shuttle(frontmatter), do: frontmatter
 
   defp evict_runtime_keys(%{"shuttle" => shuttle} = frontmatter) do
     %{frontmatter | "shuttle" => Map.drop(shuttle, @runtime_keys)}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/cailmdaley/shuttle/pkg/schema"
@@ -46,7 +47,6 @@ The running daemon picks it up on its next poll.`,
 		}
 
 		block := &schema.Block{
-			Enabled:     true,
 			Kind:        "standing",
 			Interactive: true,
 			ProjectDir:  projectDir,
@@ -63,6 +63,13 @@ The running daemon picks it up on its next poll.`,
 			block.Agent = f.Block.Agent
 		}
 
+		// A standing role is born armed (status:active), so it must declare its
+		// owning daemon — the dispatch predicate is strict block.host ==
+		// own_host_id with no wildcard. resolveOwnHost stamps it by default.
+		if strings.TrimSpace(block.Host) == "" {
+			return fmt.Errorf("repeat requires a host (the owning daemon's host id; pass --host or run on the owning machine)")
+		}
+
 		// Validate (catches bad cron, bad tz, unknown agent) before touching the file.
 		if errs := schema.Validate(block, agents); len(errs) > 0 {
 			fmt.Fprintln(cmd.ErrOrStderr(), "shuttle: validation failed:")
@@ -76,18 +83,16 @@ The running daemon picks it up on its next poll.`,
 		if err != nil {
 			return fmt.Errorf("computing next occurrence: %w", err)
 		}
-		block.NextDueAt = &next
-		block.Review = &schema.Review{State: "scheduled"}
 
-		// Ensure felt status is dispatchable. The poller filters on
-		// status in [active, open]; a missing field is treated as
-		// ineligible. See lib/shuttle/poller.ex `eligible?/2`.
+		// Arm the role: status:active is the sole dispatch gate (slice 5 — no
+		// enabled flag, no review block). Due-ness is computed cron.next(now)
+		// by the daemon; next_due is shown here for the operator only.
 		statusBefore := f.Status()
 		statusChanged := false
 		if statusBefore == "closed" {
 			return fmt.Errorf("fiber %s has status: closed; use 'shuttle reopen %s' to clear verdict fields and requeue it before installing", args[0], args[0])
 		}
-		if statusBefore != "active" && statusBefore != "open" {
+		if statusBefore != "active" {
 			f.SetStatus("active")
 			statusChanged = true
 		}

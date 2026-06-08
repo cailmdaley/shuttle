@@ -15,23 +15,21 @@ import (
 // ---- Types -----------------------------------------------------------------
 
 // Block is the in-memory representation of the shuttle: YAML block.
-// Fields mirror the JSON schema at share/schema.json.
+// Fields mirror the JSON schema at share/schema.json. There is no enabled flag
+// and no review axis: a fiber is shuttle-managed iff it carries this block, and
+// it dispatches iff the felt-native status is "active". Lifecycle is status +
+// tempered, uniform across kinds (slice 5: enabled/review dropped).
 type Block struct {
-	Enabled     bool      `json:"enabled" yaml:"enabled"`
 	Kind        string    `json:"kind" yaml:"kind"`
 	Interactive bool      `json:"interactive,omitempty" yaml:"interactive,omitempty"`
 	Host        string    `json:"host,omitempty" yaml:"host,omitempty"`
 	ProjectDir  string    `json:"project_dir,omitempty" yaml:"project_dir,omitempty"`
 	Agent       string    `json:"agent,omitempty" yaml:"agent,omitempty"`
 	Schedule    *Schedule `json:"schedule,omitempty" yaml:"schedule,omitempty"`
-	Review      *Review   `json:"review,omitempty" yaml:"review,omitempty"`
 	// Session is daemon-owned: written at dispatch time, read at resume time.
 	// The CLI preserves it through lifecycle operations (pause/resume/set-model).
-	// Set via 'shuttle session-set'; cleared via 'shuttle session-clear'.
+	// Removed at slice 6 (resume reads felt history instead).
 	Session *Session `json:"session,omitempty" yaml:"session,omitempty"`
-	// Daemon-owned: the CLI reads these but only writes them in specific verbs.
-	NextDueAt *time.Time `json:"next_due_at,omitempty" yaml:"next_due_at,omitempty"`
-	LastRunAt *time.Time `json:"last_run_at,omitempty" yaml:"last_run_at,omitempty"`
 }
 
 // Session holds the most recent dispatch session for resume purposes.
@@ -98,36 +96,26 @@ func (s *Schedule) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// Review holds the current review state for a standing role.
-type Review struct {
-	State         string  `json:"state,omitempty" yaml:"state,omitempty"`
-	RunID         *string `json:"run_id,omitempty" yaml:"run_id,omitempty"`
-	CompletedAt   string  `json:"completed_at,omitempty" yaml:"completed_at,omitempty"`
-	AcceptedRunID *string `json:"accepted_run_id,omitempty" yaml:"accepted_run_id,omitempty"`
-}
-
 // UnmarshalJSON accepts the canonical `kind` field as well as the legacy
 // `mode` alias used by pre-CLI shuttle blocks serialized through felt's JSON
-// view. Output always normalizes to `Kind`.
+// view. Output always normalizes to `Kind`. Legacy daemon-owned fields
+// (enabled, review, next_due_at, last_run_at) are NOT decoded — slice 5 dropped
+// them outright (clean cutover, no read-tolerance): a felt JSON view that still
+// carries them simply ignores them, and the next Go rewrite wipes them.
 func (b *Block) UnmarshalJSON(data []byte) error {
 	var aux struct {
-		Enabled     bool       `json:"enabled"`
-		Kind        string     `json:"kind"`
-		Mode        string     `json:"mode"`
-		Interactive bool       `json:"interactive"`
-		Host        string     `json:"host"`
-		ProjectDir  string     `json:"project_dir"`
-		Agent       string     `json:"agent"`
-		Schedule    *Schedule  `json:"schedule"`
-		Review      *Review    `json:"review"`
-		Session     *Session   `json:"session"`
-		NextDueAt   *time.Time `json:"next_due_at"`
-		LastRunAt   *time.Time `json:"last_run_at"`
+		Kind        string    `json:"kind"`
+		Mode        string    `json:"mode"`
+		Interactive bool      `json:"interactive"`
+		Host        string    `json:"host"`
+		ProjectDir  string    `json:"project_dir"`
+		Agent       string    `json:"agent"`
+		Schedule    *Schedule `json:"schedule"`
+		Session     *Session  `json:"session"`
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
 	}
-	b.Enabled = aux.Enabled
 	b.Kind = aux.Kind
 	if b.Kind == "" {
 		b.Kind = aux.Mode
@@ -137,20 +125,12 @@ func (b *Block) UnmarshalJSON(data []byte) error {
 	b.ProjectDir = aux.ProjectDir
 	b.Agent = aux.Agent
 	b.Schedule = aux.Schedule
-	b.Review = aux.Review
 	b.Session = aux.Session
-	b.NextDueAt = aux.NextDueAt
-	b.LastRunAt = aux.LastRunAt
 	return nil
 }
 
 // ValidKinds enumerates the allowed kind values.
 var ValidKinds = []string{"oneshot", "standing"}
-
-// ValidReviewStates enumerates canonical persisted review.state values.
-// Runtime states such as "due" and "running" are derived by the daemon
-// snapshot and must not be written to frontmatter.
-var ValidReviewStates = []string{"scheduled", "awaiting", "accepted"}
 
 // ---- Validation ------------------------------------------------------------
 
@@ -187,18 +167,6 @@ func Validate(b *Block, agents *AgentRegistry) ValidationErrors {
 		add("kind", fmt.Sprintf("must be one of %v, got %q", ValidKinds, b.Kind))
 	}
 
-	if b.Enabled && strings.TrimSpace(b.ProjectDir) == "" {
-		add("project_dir", "required when enabled=true")
-	}
-
-	// An enabled block must declare which daemon owns it. The dispatch
-	// predicate is strict block.host == own_host_id with no wildcard, so a
-	// host-less enabled block would silently never dispatch. install/repeat
-	// stamp host by default; this guards the invariant at the write boundary.
-	if b.Enabled && strings.TrimSpace(b.Host) == "" {
-		add("host", "required when enabled=true (the owning daemon's host id; install/repeat stamp it by default)")
-	}
-
 	if b.Agent != "" && agents != nil {
 		if _, ok := agents.Find(b.Agent); !ok {
 			ids := agents.IDs()
@@ -218,12 +186,6 @@ func Validate(b *Block, agents *AgentRegistry) ValidationErrors {
 			} else if _, err := time.LoadLocation(b.Schedule.TZ); err != nil {
 				add("schedule.tz", fmt.Sprintf("unknown timezone %q: %v", b.Schedule.TZ, err))
 			}
-		}
-	}
-
-	if b.Review != nil && b.Review.State != "" {
-		if !contains(ValidReviewStates, b.Review.State) {
-			add("review.state", fmt.Sprintf("must be one of %v, got %q", ValidReviewStates, b.Review.State))
 		}
 	}
 

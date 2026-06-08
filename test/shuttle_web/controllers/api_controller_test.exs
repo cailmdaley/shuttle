@@ -409,25 +409,28 @@ defmodule ShuttleWeb.APIControllerTest do
   end
 
   test "ad-hoc dispatch returns 422 for a standing role awaiting review" do
+    # Awaiting is felt-native (slice 5): status:closed + untempered.
     fiber_id = "tests/api-awaiting-refuses-adhoc"
-    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
+
+    fiber =
+      make_fiber(fiber_id, %{
+        "status" => "closed",
+        "closed-at" => "2026-05-24T10:00:00Z",
+        "tags" => ["constitution", "standing"]
+      })
+
     MockRunner.set_fiber(fiber_id, fiber)
 
     MockRunner.set_shuttle(
       fiber_id,
       """
-      enabled: true
       kind: standing
       agent: claude-sonnet
       schedule:
         expr: "0 9 * * 1-5"
         tz: Europe/Paris
-      review:
-        state: awaiting
-        run_id: "adhoc-1778282769604"
-        completed_at: "2026-05-24T10:00:00Z"
-      next_due_at: "2999-01-01T09:00:00+01:00"
-      """
+      """,
+      "closed"
     )
 
     conn =
@@ -444,7 +447,6 @@ defmodule ShuttleWeb.APIControllerTest do
     body = Jason.decode!(conn.resp_body)
     assert body["dispatched"] == false
     assert body["reason"] == "awaiting_review"
-    assert body["run_id"] == "adhoc-1778282769604"
     assert body["message"] =~ "shuttle-ctl accept #{fiber_id}"
     assert body["message"] =~ "shuttle-ctl resume #{fiber_id}"
   end
@@ -455,10 +457,11 @@ defmodule ShuttleWeb.APIControllerTest do
   test "actions resolve returns the canonical lifecycle action via the Poller" do
     with_actions_host()
 
+    # Awaiting is felt-native (slice 5): status:closed + untempered standing.
     MockRunner.set_shuttle(
       "tests/action-awaiting",
-      "enabled: true\nkind: standing\nreview:\n  state: awaiting\n",
-      "active"
+      "kind: standing\n",
+      "closed"
     )
 
     conn =
@@ -474,9 +477,8 @@ defmodule ShuttleWeb.APIControllerTest do
     assert body["target"] == "tempered"
     assert body["action"]["id"] == "accept-run"
 
-    # Resolution now runs through the Poller, which fetches the fiber (and
-    # overlays the daemon-owned runtime lifecycle) rather than parsing the
-    # frontmatter inline in the controller.
+    # Resolution runs through the Poller, which fetches the fiber rather than
+    # parsing the frontmatter inline in the controller.
     assert Enum.any?(MockRunner.commands(), fn {command, args} ->
              command == "felt" and "show" in args
            end)
@@ -488,14 +490,11 @@ defmodule ShuttleWeb.APIControllerTest do
   # purely from the supplied map.
   @tag :capture_log
   test "actions resolve accepts an inline fiber map and skips disk lookup" do
+    # Awaiting is felt-native (slice 5): status:closed + untempered standing.
     inline_fiber = %{
       "id" => "remote/host/standing-awaiting",
-      "status" => "active",
-      "shuttle" => %{
-        "enabled" => true,
-        "kind" => "standing",
-        "review" => %{"state" => "awaiting"}
-      }
+      "status" => "closed",
+      "shuttle" => %{"kind" => "standing"}
     }
 
     conn =
@@ -564,8 +563,8 @@ defmodule ShuttleWeb.APIControllerTest do
   # Controls: well-formed shapes still resolve correctly after the hardening.
   @tag :capture_log
   test "actions resolve controls: well-formed shapes still resolve correctly" do
-    # A non-standing fiber's review key is irrelevant — even a string review
-    # must not change the resolution (it degrades to the default path).
+    # An armed oneshot (status: active) dragged to inFlight launches it
+    # (dispatch-ad-hoc). A stray review key in the block is irrelevant (slice 5).
     nonstanding =
       post(
         api_conn(),
@@ -573,8 +572,8 @@ defmodule ShuttleWeb.APIControllerTest do
         Jason.encode!(%{
           fiber: %{
             "id" => "x",
-            "status" => "open",
-            "shuttle" => %{"enabled" => true, "kind" => "oneshot", "review" => "awaiting"}
+            "status" => "active",
+            "shuttle" => %{"kind" => "oneshot", "review" => "awaiting"}
           },
           target: "inFlight"
         })
@@ -583,7 +582,8 @@ defmodule ShuttleWeb.APIControllerTest do
     assert nonstanding.status == 200
     assert Jason.decode!(nonstanding.resp_body)["action"]["id"] == "dispatch-ad-hoc"
 
-    # A well-formed awaiting standing role still resolves accept-run.
+    # A well-formed awaiting standing role (status:closed + untempered) still
+    # resolves accept-run.
     standing =
       post(
         api_conn(),
@@ -591,12 +591,8 @@ defmodule ShuttleWeb.APIControllerTest do
         Jason.encode!(%{
           fiber: %{
             "id" => "x",
-            "status" => "active",
-            "shuttle" => %{
-              "enabled" => true,
-              "kind" => "standing",
-              "review" => %{"state" => "awaiting"}
-            }
+            "status" => "closed",
+            "shuttle" => %{"kind" => "standing"}
           },
           target: "tempered"
         })

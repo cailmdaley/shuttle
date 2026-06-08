@@ -102,7 +102,7 @@ defmodule ShuttleWeb.DispatchController do
   end
 
   defp ineligible_detail(:disabled),
-    do: %{detail: "disabled", message: "Disabled — set shuttle.enabled: true to allow dispatch."}
+    do: %{detail: "disabled", message: "Draft — set status: active to allow dispatch."}
 
   defp ineligible_detail(:closed),
     do: %{detail: "closed", message: "Fiber is closed — reopen it before dispatching."}

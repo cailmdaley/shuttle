@@ -132,56 +132,22 @@ defmodule Shuttle.Actions do
       status == "closed" and target == "composted" ->
         :close_composted
 
-      # An awaiting standing role's pending run gets a human verdict: accept-run
-      # keeps it (advance the schedule), close-composted drops it. inFlight ("run
-      # it again now") is the same "keep it" gesture as tempered.
-      standing?(shuttle) and review_state(shuttle) == "awaiting" and
-          target in ["inFlight", "tempered"] ->
-        :accept_run
-
-      # `awaitingReview` is the awaiting role's HOME column — a drop there is a
-      # same-column no-op (Portolan's drop handler already short-circuits
-      # `fromColumn == target`, so this is only reached by a non-shipping caller
-      # or a stale multi-step sequence). Resolve it to close-awaiting-review —
-      # the non-verdict "this stays in review" verb — NOT close-composted, which
-      # would silently destroy the pending run on what the user meant as a no-op.
-      # close-awaiting-review joins `action_ids` by construction (it's the
-      # resolution of a kanban target), so resolve ⊆ availability still holds.
-      standing?(shuttle) and review_state(shuttle) == "awaiting" and
-          target == "awaitingReview" ->
-        :close_awaiting_review
-
-      # drafts ("park it") on an awaiting role has no non-destructive verb in the
-      # review vocabulary (pause isn't a review verb and would 409); compost the
-      # pending run so the column stays available.
-      standing?(shuttle) and review_state(shuttle) == "awaiting" and
-          target in ["drafts", "composted"] ->
-        :close_composted
-
-      # A disabled fiber (paused draft) dragged out of drafts re-enables via
-      # reopen; staying in drafts is a no-op pause. The close columns close it.
-      not enabled?(shuttle) and target in ["drafts", "inFlight"] ->
+      # A draft (`status: open`) is paused/not-yet-armed (slice 5: status is the
+      # sole gate, no enabled flag). Dragging it out of drafts arms it via
+      # reopen (→ status:active); a drop back in drafts is a no-op pause. The
+      # close columns close it with the chosen verdict.
+      status == "open" and target in ["drafts", "inFlight"] ->
         :reopen
 
+      # An armed fiber (`status: active`). drafts parks it (pause → status:open).
+      # inFlight ("launch it now") force-dispatches, which surfaces the real
+      # dispatch outcome (spawned, or a concrete error). This holds for both an
+      # armed standing role (ad-hoc tick) and an armed oneshot (launch).
       target == "drafts" ->
         :pause
 
-      standing?(shuttle) and enabled?(shuttle) and target == "inFlight" and
-          review_state(shuttle) in ["scheduled", "accepted"] ->
-        :dispatch_ad_hoc
-
-      # An enabled (non-standing) oneshot is already in the dispatch contract;
-      # `inFlight` means "launch it now", not `reopen` (reopen only applies to a
-      # closed or disabled fiber and is NOT in actions_for for an enabled one —
-      # resolving to it here is what produced the 409 `action_not_available`
-      # when a stranded-but-enabled oneshot was dragged from drafts to inFlight).
-      # Force-dispatch instead, which surfaces the real dispatch outcome
-      # (spawned, or a concrete error like missing host / project_dir).
-      enabled?(shuttle) and not standing?(shuttle) and target == "inFlight" ->
-        :dispatch_ad_hoc
-
       target == "inFlight" ->
-        :reopen
+        :dispatch_ad_hoc
 
       target == "awaitingReview" ->
         :close_awaiting_review
@@ -222,18 +188,10 @@ defmodule Shuttle.Actions do
     end
   end
 
-  defp enabled?(shuttle), do: Map.get(shuttle, "enabled") == true
   defp standing?(shuttle), do: Map.get(shuttle, "kind", Map.get(shuttle, "mode")) == "standing"
 
   # `tempered` absent (nil) is the no-verdict state — the awaiting signal for a
   # closed fiber. `tempered: true` (accepted oneshot terminus) and
   # `tempered: false` (composted) both have a verdict and are NOT awaiting.
   defp untempered?(fiber), do: is_nil(Map.get(fiber, "tempered"))
-
-  defp review_state(shuttle) do
-    case Map.get(shuttle, "review") do
-      review when is_map(review) -> Map.get(review, "state") || "scheduled"
-      _ -> "scheduled"
-    end
-  end
 end

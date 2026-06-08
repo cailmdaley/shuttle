@@ -30,7 +30,7 @@ defmodule ShuttleWeb.FiberController do
          {:ok, body} <- optional_string(params, "body", ""),
          {:ok, frontmatter} <- normalize_frontmatter(params, name),
          {:ok, frontmatter} <- normalize_shuttle_host(frontmatter),
-         :ok <- validate_shuttle(frontmatter["shuttle"]),
+         :ok <- validate_shuttle(frontmatter["shuttle"], frontmatter["status"]),
          :ok <- validate_fiber_id(fiber_id),
          {:ok, path} <- felt_add(fiber_id, name, body, frontmatter),
          :ok <- inject_non_native_frontmatter(path, frontmatter) do
@@ -84,15 +84,19 @@ defmodule ShuttleWeb.FiberController do
 
   defp normalize_shuttle_host(frontmatter), do: {:ok, frontmatter}
 
-  defp validate_shuttle(nil), do: :ok
+  defp validate_shuttle(nil, _status), do: :ok
 
-  defp validate_shuttle(shuttle) when is_map(shuttle) do
+  # An armed shuttle fiber (status: active — the sole dispatch gate, slice 5)
+  # must declare a project_dir that exists on this host; the worker starts there
+  # rather than falling back to the felt store. A draft (status: open) carries
+  # no such requirement.
+  defp validate_shuttle(shuttle, status) when is_map(shuttle) do
     cond do
-      Map.get(shuttle, "enabled") != true ->
+      status != "active" ->
         :ok
 
       not is_binary(Map.get(shuttle, "project_dir")) or Map.get(shuttle, "project_dir") == "" ->
-        {:error, "shuttle.project_dir is required when enabled=true"}
+        {:error, "shuttle.project_dir is required when status: active"}
 
       not File.dir?(Path.expand(Map.fetch!(shuttle, "project_dir"))) ->
         {:error, "shuttle.project_dir does not exist on this host"}
@@ -102,7 +106,7 @@ defmodule ShuttleWeb.FiberController do
     end
   end
 
-  defp validate_shuttle(_), do: {:error, "shuttle must be an object"}
+  defp validate_shuttle(_, _), do: {:error, "shuttle must be an object"}
 
   # Let felt own placement, identity, and duplicate-rejection. `--top-level`
   # disables felt's leading-segment slug resolution so the fiber lands at the

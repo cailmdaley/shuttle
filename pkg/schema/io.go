@@ -366,8 +366,15 @@ func removeMappingKey(mapping *yaml.Node, key string) {
 	}
 }
 
+// knownShuttleKeys are the keys mergeUnknownShuttleFields recognizes. Keys
+// present here are NOT carried forward as "unknown" fields when a Go rewrite
+// re-encodes the block; only keys ABSENT here are preserved. Live struct fields
+// (kind, interactive, host, project_dir, agent, schedule, session) plus the
+// legacy fields slice 5 dropped (enabled, review) plus daemon-owned timestamps
+// (next_due_at, last_run_at) are all listed, so a Go rewrite WIPES the dropped
+// fields cleanly rather than resurrecting them as unknowns (clean cutover, no
+// read-tolerant preservation).
 var knownShuttleKeys = map[string]bool{
-	"enabled":     true,
 	"kind":        true,
 	"mode":        true, // legacy alias; rewritten to kind on the next save
 	"interactive": true,
@@ -375,10 +382,11 @@ var knownShuttleKeys = map[string]bool{
 	"project_dir": true,
 	"agent":       true,
 	"schedule":    true,
-	"review":      true,
 	"session":     true,
-	"next_due_at": true,
-	"last_run_at": true,
+	"enabled":     true, // legacy (slice 5): recognized so it's wiped, not preserved
+	"review":      true, // legacy (slice 5): recognized so it's wiped, not preserved
+	"next_due_at": true, // daemon-owned timestamp: not a struct field; wiped on Go rewrite
+	"last_run_at": true, // daemon-owned timestamp: not a struct field; wiped on Go rewrite
 }
 
 // mergeUnknownShuttleFields preserves forward-compatible shuttle: keys when a

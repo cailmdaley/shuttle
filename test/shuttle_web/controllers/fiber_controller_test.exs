@@ -117,7 +117,9 @@ defmodule ShuttleWeb.FiberControllerTest do
     refute File.exists?(Path.join([daemon_root, ".felt", "tests", "project-local", "project-local.md"]))
   end
 
-  test "POST /api/v1/fiber/create rejects enabled fibers without project_dir" do
+  test "POST /api/v1/fiber/create rejects armed fibers without project_dir" do
+    # The controller defaults status to active (armed); an armed shuttle block
+    # (slice 5: status is the gate, no enabled flag) requires a project_dir.
     conn =
       api_conn()
       |> post(
@@ -125,13 +127,13 @@ defmodule ShuttleWeb.FiberControllerTest do
         Jason.encode!(%{
           id: "tests/missing-project",
           name: "Missing project",
-          frontmatter: %{shuttle: %{enabled: true, kind: "oneshot"}}
+          frontmatter: %{shuttle: %{kind: "oneshot"}}
         })
       )
 
     assert conn.status == 400
 
-    assert %{"error" => "shuttle.project_dir is required when enabled=true"} =
+    assert %{"error" => "shuttle.project_dir is required when status: active"} =
              Jason.decode!(conn.resp_body)
   end
 

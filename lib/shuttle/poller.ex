@@ -781,17 +781,14 @@ defmodule Shuttle.Poller do
   end
 
   defp lifecycle_runtime(fiber_id, metadata, state) do
-    review = stringify_keys(Map.get(metadata, :review, %{}))
-
     %{
       fiber_id: fiber_id,
       uid: uid_for_fiber(state, fiber_id, metadata),
       kind: Map.get(metadata, :kind, "oneshot"),
-      phase: Map.get(metadata, :phase) || Map.get(review, "state") || "scheduled",
+      phase: Map.get(metadata, :phase) || "scheduled",
       run_id: Map.get(metadata, :run_id),
       run_kind: Map.get(metadata, :run_kind),
       session: stringify_keys(Map.get(metadata, :session, %{})),
-      review: review,
       next_due_at: unix_ms(Map.get(metadata, :next_due_at)),
       last_run_at: unix_ms(Map.get(metadata, :last_run_at))
     }
@@ -877,7 +874,6 @@ defmodule Shuttle.Poller do
       run_id: role.run_id,
       next_due_at: role.next_due_at,
       last_run_at: role.last_run_at,
-      review: role.review,
       schedule: role.schedule,
       validation_errors: role.validation_errors,
       due_in_ms: due_in_ms(role.next_due_at, now)
@@ -885,11 +881,11 @@ defmodule Shuttle.Poller do
     |> compact_runtime()
   end
 
-  # The runtime phase is the schedule-derived display state (slice 4: no review
-  # axis). `state/3` yields running/dormant/due/scheduled; awaiting/accepted are
-  # document facts the kanban classifier reads from status/tempered, not a phase.
+  # The runtime phase is the schedule-derived display state (slice 4/5: no review
+  # axis, no enabled flag). `state/3` yields running/due/scheduled; awaiting,
+  # accepted, and paused/draft are document facts the kanban classifier reads
+  # from status/tempered, not a phase.
   defp standing_phase(%{state: "running"}), do: "running"
-  defp standing_phase(%{state: "dormant"}), do: "dormant"
   defp standing_phase(%{state: "due"}), do: "due"
   defp standing_phase(_), do: "scheduled"
 
@@ -1598,13 +1594,10 @@ defmodule Shuttle.Poller do
       cond do
         # Human-worker fibers opt out of auto-dispatch entirely. The user
         # is doing the work themselves; the kanban shows the card in
-        # inFlight via status:active + enabled:true, but Shuttle never
-        # tries to spawn anything.
+        # inFlight via status:active, but Shuttle never tries to spawn
+        # anything. This is the sole gate that keeps human-worker fibers out
+        # of dispatch (slice 5: no enabled flag).
         human_worker?(fiber) ->
-          false
-
-        # Must have shuttle.enabled: true
-        Map.get(shuttle, "enabled", false) != true ->
           false
 
         # Must target this daemon. Exactly `block.host == own_host_id`; an
@@ -1618,19 +1611,16 @@ defmodule Shuttle.Poller do
         not project_dir_available?(shuttle) ->
           false
 
-        # Closed is the awaiting-review / anti-oscillation gate. A closed fiber
-        # is never dispatch-eligible — a oneshot terminus, or (new model) a
-        # standing role that ran this cycle and is `status: closed` + untempered
-        # pending a human verdict. Re-arming is an explicit accept that writes
-        # `status: active`; until then closed stays dormant. Made explicit (not
-        # only implied by `status in [open, active]` below) so a tempered fiber
-        # can never oscillate back to dispatching on a later poll — the
-        # citation-audit-skill tempered-never-reverts invariant.
-        status == "closed" ->
-          false
-
-        # Must be committed to active work
-        status not in ["open", "active"] ->
+        # `status: active` is the SOLE dispatch gate (slice 5: enabled/review
+        # dropped). A fiber is shuttle-managed iff it carries a shuttle: block;
+        # it dispatches iff status is active. `open` is a draft/paused (not
+        # dispatched); `closed` is the awaiting-review / anti-oscillation gate —
+        # a oneshot terminus, or a standing role that ran this cycle and is
+        # `status: closed` + untempered pending a human verdict. Re-arming is an
+        # explicit accept that writes `status: active`. This keeps tempered
+        # fibers from ever oscillating back to dispatching on a later poll (the
+        # citation-audit-skill tempered-never-reverts invariant).
+        status != "active" ->
           false
 
         # Must not already be running
@@ -1734,47 +1724,56 @@ defmodule Shuttle.Poller do
         {:not_eligible, {:project_dir_missing, Map.get(shuttle, "project_dir")}}
 
       # The remaining cases only gate a NON-forced dispatch (force overrides
-      # status/enabled). Report them so a plain dispatch failure is legible.
-      not forced? and Map.get(shuttle, "enabled", false) != true ->
-        {:not_eligible, :disabled}
-
+      # status). status is the sole gate (slice 5: no enabled flag): a draft
+      # (status: open) or a closed/awaiting fiber is reported so a plain
+      # dispatch failure is legible.
       not forced? and status == "closed" ->
         {:not_eligible, :closed}
+
+      not forced? and status != "active" ->
+        {:not_eligible, :disabled}
 
       true ->
         {:not_eligible, :not_due_or_blocked}
     end
   end
 
+  # Ad-hoc dispatch (`ad_hoc: true`, no `force`) bypasses the cron schedule but
+  # still requires the role to be otherwise dispatchable. The gate is the felt
+  # document (slice 5: no review.state): an armed standing role is `status:
+  # active` (a closed/awaiting role is NOT ad-hoc dispatchable — its run is
+  # pending a verdict).
   defp force_dispatchable_standing_role?(fiber, state) do
     status = Map.get(fiber, "status", "")
     fiber_id = Map.get(fiber, "id", "")
     shuttle = Map.get(fiber, "shuttle")
 
     with true <- is_map(shuttle),
-         true <- Map.get(shuttle, "enabled", false) == true,
          true <- host_owned?(shuttle, state.own_host_id),
-         true <- status in ["open", "active"],
+         true <- status == "active",
          {:ok, role} <- fetch_standing_role(fiber_id, state),
          true <- StandingRole.standing?(role),
          true <- StandingRole.valid?(role) do
-      review_state = role.review["state"] || "scheduled"
-      review_state in ["scheduled", "accepted", "due"]
+      true
     else
       _ -> false
     end
   end
 
+  # Awaiting review is felt-native (slice 5): `status: closed` + untempered. An
+  # ad-hoc dispatch against a standing role in that state is refused with the
+  # awaiting marker so the caller surfaces "pending a verdict" rather than a
+  # flat not-eligible.
   defp awaiting_ad_hoc_dispatch_error(fiber, state, opts) do
     if Keyword.get(opts, :ad_hoc, false) do
       fiber_id = Map.get(fiber, "id", "")
+      status = Map.get(fiber, "status", "")
+      tempered = Map.get(fiber, "tempered")
 
-      with {:ok, role} <- fetch_standing_role(fiber_id, state),
-           true <- StandingRole.standing?(role),
-           review_state when review_state in ["awaiting", "review", "in_review"] <-
-             role.review["state"] || "scheduled" do
-        {:error,
-         {:awaiting_review, Map.get(role.review, "run_id"), Map.get(role.review, "completed_at")}}
+      with true <- status == "closed" and is_nil(tempered),
+           {:ok, role} <- fetch_standing_role(fiber_id, state),
+           true <- StandingRole.standing?(role) do
+        {:error, {:awaiting_review, role.run_id, Map.get(fiber, "closed-at")}}
       else
         _ -> false
       end

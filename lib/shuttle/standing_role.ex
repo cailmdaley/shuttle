@@ -14,11 +14,9 @@ defmodule Shuttle.StandingRole do
     :fiber_id,
     :mode,
     :schedule,
-    :review,
     :next_due_at,
     :last_run_at,
     :run_id,
-    enabled: true,
     validation_errors: []
   ]
 
@@ -26,11 +24,9 @@ defmodule Shuttle.StandingRole do
           fiber_id: String.t(),
           mode: String.t() | nil,
           schedule: map(),
-          review: map(),
           next_due_at: DateTime.t() | nil,
           last_run_at: DateTime.t() | nil,
           run_id: String.t() | nil,
-          enabled: boolean(),
           validation_errors: [String.t()]
         }
 
@@ -40,13 +36,9 @@ defmodule Shuttle.StandingRole do
       fiber_id: fiber_id,
       mode: string(data["kind"] || data["mode"]),
       schedule: map(data["schedule"]),
-      review: map(data["review"]),
       next_due_at: parse_datetime(data["next_due_at"]),
       last_run_at: parse_datetime(data["last_run_at"]),
-      run_id: string(get_in(data, ["review", "run_id"])),
-      # `enabled` gates the schedule-derived phases. Absent or true ⇒ armed;
-      # only an explicit `false` (a pause) makes the role dormant. See state/3.
-      enabled: Map.get(data, "enabled") != false
+      run_id: nil
     }
 
     {:ok, %{role | validation_errors: validation_errors(role)}}
@@ -57,12 +49,13 @@ defmodule Shuttle.StandingRole do
   def standing?(_), do: false
 
   @doc """
-  The schedule-derived display phase, computed from cron + liveness + enabled —
-  NOT from `review.state` (slice 4: the review axis is gone). "Awaiting review"
-  and "accepted" are document facts (`status:closed` + untempered / `tempered`),
-  surfaced by the kanban classifier from the document, not derived here. This
-  function only answers the schedule question for an armed role: is a worker
-  live, is the role paused, is its next tick due, or is it sleeping.
+  The schedule-derived display phase for an armed role, computed from cron +
+  liveness — NOT from `review.state` or `enabled` (slice 4/5: both axes gone).
+  "Awaiting review", "accepted", and "paused/draft" are document facts
+  (`status:closed` + untempered / `tempered`, and `status:open`), surfaced by the
+  kanban classifier from the document, not derived here. This function only
+  answers the schedule question for an armed role (`status: active`): is a worker
+  live, is its next tick due, or is it sleeping.
   """
   @spec state(t(), DateTime.t(), boolean()) :: String.t()
   def state(%__MODULE__{} = role, now, running?) do
@@ -70,10 +63,6 @@ defmodule Shuttle.StandingRole do
       # A live worker is a fact, not a schedule conclusion — it wins even for a
       # role paused with `--no-kill`, so the card reads true until the run ends.
       running? -> "running"
-      # Paused (`enabled: false`) collapses every schedule-derived phase to
-      # dormant → the kanban reads Drafts. The dispatch gate (poller `eligible?`)
-      # already honored `enabled`; this aligns the *display* with it.
-      not role.enabled -> "dormant"
       due_by_schedule?(role, now) -> "due"
       true -> "scheduled"
     end
@@ -214,7 +203,6 @@ defmodule Shuttle.StandingRole do
       next_due_at: unix_ms(role.next_due_at),
       last_run_at: unix_ms(role.last_run_at),
       schedule: role.schedule,
-      review: role.review,
       validation_errors: role.validation_errors
     }
   end

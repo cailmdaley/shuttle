@@ -2,18 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/cailmdaley/shuttle/shuttle-block",
   "title": "Shuttle fiber frontmatter block",
-  "description": "The shuttle: YAML block written and validated by the shuttle CLI. Daemon-owned fields are documented but not written by the CLI.",
+  "description": "The shuttle: YAML block written and validated by the shuttle CLI. A fiber is shuttle-managed iff it carries this block; it dispatches iff the felt-native status is 'active'. There is no enabled flag and no review axis — lifecycle is status + tempered, uniform across kinds.",
   "type": "object",
-  "required": ["enabled", "kind"],
+  "required": ["kind"],
   "properties": {
-    "enabled": {
-      "type": "boolean",
-      "description": "The dispatch signal. CLI sets true on install, false on uninstall. Daemon flips to false after successful oneshot run."
-    },
     "kind": {
       "type": "string",
       "enum": ["oneshot", "standing"],
-      "description": "Dispatch mode. oneshot: dispatched once (daemon clears enabled after run). standing: recurring per schedule."
+      "description": "Dispatch mode. oneshot: dispatched once, then status:closed at exit (terminus on accept). standing: recurring per schedule; accept re-arms it. kind exists only to make accept kind-aware."
     },
     "interactive": {
       "type": "boolean",
@@ -22,11 +18,11 @@
     "host": {
       "type": "string",
       "minLength": 1,
-      "description": "Machine id (own_host_id) of the daemon that owns dispatch for this fiber. The dispatch predicate is strict: a daemon dispatches a block iff block.host == its own_host_id. There is no nil-wildcard and no 'local' default — an absent/empty host is unowned and ineligible on every daemon. install/repeat stamp this by default; required when enabled=true."
+      "description": "Machine id (own_host_id) of the daemon that owns dispatch for this fiber. The dispatch predicate is strict: a daemon dispatches a block iff block.host == its own_host_id. There is no nil-wildcard and no 'local' default — an absent/empty host is unowned and ineligible on every daemon. install/repeat stamp this by default; required for an armed install."
     },
     "project_dir": {
       "type": "string",
-      "description": "Absolute or tilde-prefixed working directory on the target host where the worker tmux session should start."
+      "description": "Absolute or tilde-prefixed working directory on the target host where the worker tmux session should start. Required for an armed install (status:active)."
     },
     "agent": {
       "type": "string",
@@ -48,39 +44,14 @@
       },
       "additionalProperties": false
     },
-    "review": {
+    "session": {
       "type": "object",
-      "description": "Legacy per-run review state for standing roles. The authoritative home is now the per-host daemon runtime store (~/.shuttle/runtime.db); this frontmatter block is read-only compatibility for fibers dispatched before the eviction and is no longer written by the CLI or daemon. Runtime-only states such as due/running are runtime-store phases, never frontmatter.",
+      "description": "Daemon-owned resume handle, written at dispatch and read at the next resume. Removed at slice 6 (resume reads felt history instead). Documented here only so legacy fibers still validate during the cutover.",
       "properties": {
-        "state": {
-          "type": "string",
-          "enum": ["scheduled", "awaiting", "accepted"],
-          "description": "Canonical persisted review state. scheduled means dispatchable when next_due_at is due; awaiting means a completed run needs human review; accepted records the most recently accepted run before the role returns to scheduled."
-        },
-        "run_id": {
-          "type": ["string", "null"],
-          "description": "Current run identifier. Set by daemon when dispatching; ad-hoc standing runs use an adhoc- prefix."
-        },
-        "completed_at": {
-          "type": ["string", "null"],
-          "format": "date-time",
-          "description": "Completion timestamp for the run awaiting review. Set by daemon or worker handoff when review.state becomes awaiting."
-        },
-        "accepted_run_id": {
-          "type": ["string", "null"],
-          "description": "Run id of the last accepted run. Set by CLI accept."
-        }
+        "id": { "type": "string" },
+        "agent": { "type": "string" },
+        "dispatched_at": { "type": "string", "format": "date-time" }
       }
-    },
-    "next_due_at": {
-      "type": ["string", "null"],
-      "format": "date-time",
-      "description": "ISO 8601 datetime. Daemon-owned for standing roles after the first install; CLI sets initial value on repeat and advances on scheduled-run accept. Ad-hoc run accept preserves it."
-    },
-    "last_run_at": {
-      "type": ["string", "null"],
-      "format": "date-time",
-      "description": "Daemon-owned. Set when a run completes."
     }
   },
   "additionalProperties": false,
@@ -92,20 +63,11 @@
       "then": {
         "required": ["schedule"]
       }
-    },
-    {
-      "if": {
-        "properties": { "enabled": { "const": true } }
-      },
-      "then": {
-        "required": ["project_dir", "host"]
-      }
     }
   ],
   "notes": {
-    "writer_ownership": "Document fields the CLI writes to synced frontmatter: enabled, kind, interactive, agent, schedule, host, project_dir. Runtime fields (review.state/run_id/completed_at/accepted_run_id, session, next_due_at, last_run_at) are NOT written to frontmatter anymore — they live in the per-host daemon runtime store (~/.shuttle/runtime.db), which is authoritative. CLI lifecycle verbs (accept/resume/pause/session-set) mutate that store via the daemon HTTP routes and fail closed when the daemon is unreachable rather than rewriting the synced fiber. The review/next_due_at/last_run_at blocks here remain only to validate and read legacy fibers. Constitution: shuttle-durable-runtime-store.",
-    "derived_states": "due and running are runtime-store phases derived from next_due_at and live worker state. They are not persisted review.state values.",
-    "legacy_review_aliases": "Older fibers may carry review.state=review or in_review for awaiting. Readers should normalize them when possible; new writers must use awaiting.",
+    "lifecycle": "Lifecycle is status + tempered, uniform across kinds. status:open = draft/paused (not dispatched). status:active + no tempered = armed (oneshot dispatches when deps met; standing when cron.next(now) is due). A live tmux session = running (read from tmux, never stored). Worker exit = status:closed + no tempered = awaiting review (this closed state is the don't-re-fire / anti-oscillation gate). accept: oneshot -> tempered:true (terminus); standing -> status:active + closed-at cleared (re-armed). reject -> tempered:false = composted (terminus, both kinds). The sole dispatch gate is status:active.",
+    "writer_ownership": "Document fields the CLI writes to synced frontmatter: kind, interactive, agent, schedule, host, project_dir. The felt-native status field drives dispatch — the CLI mutates it (open=draft, active=armed, closed=terminus/awaiting) through the lifecycle verbs.",
     "schema_tz_migration": "Pre-CLI standing roles used schedule.timezone. Migration renames to schedule.tz. The Elixir daemon reads tz after migration.",
     "kind_migration": "Pre-CLI standing roles used shuttle.mode instead of shuttle.kind. Migration renames to kind."
   }

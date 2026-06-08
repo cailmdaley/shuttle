@@ -111,7 +111,6 @@ func snapshotToRows(origin string, snap *Snapshot, stale bool) []FiberStatus {
 			FiberID: e.FiberID,
 			Origin:  origin,
 			Agent:   e.Agent,
-			Enabled: true,
 			State:   state,
 			Running: true,
 			Session: e.TmuxSession,
@@ -123,7 +122,6 @@ func snapshotToRows(origin string, snap *Snapshot, stale bool) []FiberStatus {
 		rows = append(rows, FiberStatus{
 			FiberID: r.FiberID,
 			Origin:  origin,
-			Enabled: true,
 			State:   "retrying",
 			Stale:   stale,
 		})
@@ -141,7 +139,6 @@ func snapshotToRows(origin string, snap *Snapshot, stale bool) []FiberStatus {
 		row := FiberStatus{
 			FiberID: sr.FiberID,
 			Origin:  origin,
-			Enabled: true,
 			Kind:    "standing",
 			State:   state,
 			Stale:   stale,
@@ -151,9 +148,6 @@ func snapshotToRows(origin string, snap *Snapshot, stale bool) []FiberStatus {
 		}
 		if sr.LastRunAt != nil {
 			row.LastRunAt = formatUnixMS(*sr.LastRunAt)
-		}
-		if rev, ok := sr.Review["state"].(string); ok {
-			row.ReviewState = rev
 		}
 		rows = append(rows, row)
 	}

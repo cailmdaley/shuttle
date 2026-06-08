@@ -14,7 +14,7 @@ import (
 // ---- Validation tests -------------------------------------------------------
 
 func TestValidate_ValidOneshot(t *testing.T) {
-	b := &Block{Enabled: true, Kind: "oneshot", ProjectDir: "/tmp/project", Host: "test-host"}
+	b := &Block{Kind: "oneshot", ProjectDir: "/tmp/project", Host: "test-host"}
 	if errs := Validate(b, nil); len(errs) != 0 {
 		t.Fatalf("expected no errors, got: %v", errs)
 	}
@@ -22,60 +22,29 @@ func TestValidate_ValidOneshot(t *testing.T) {
 
 func TestValidate_ValidStanding(t *testing.T) {
 	b := &Block{
-		Enabled:    true,
 		Kind:       "standing",
 		ProjectDir: "/tmp/project",
 		Host:       "test-host",
 		Schedule:   &Schedule{Expr: "0 9 * * 1-5", TZ: "Europe/Paris"},
-		Review:     &Review{State: "scheduled"},
 	}
 	if errs := Validate(b, nil); len(errs) != 0 {
 		t.Fatalf("expected no errors, got: %v", errs)
 	}
 }
 
-func TestValidate_EnabledRequiresProjectDir(t *testing.T) {
-	b := &Block{Enabled: true, Kind: "oneshot"}
-	errs := Validate(b, nil)
-	if len(errs) == 0 {
-		t.Fatal("expected project_dir validation error")
-	}
-	if errs[0].Field != "project_dir" {
-		t.Fatalf("expected field=project_dir, got %q", errs[0].Field)
-	}
-}
-
-func TestValidate_EnabledRequiresHost(t *testing.T) {
-	// An enabled block must carry a host: the strict dispatch predicate has no
-	// wildcard, so a host-less enabled block would silently never dispatch.
-	b := &Block{Enabled: true, Kind: "oneshot", ProjectDir: "/tmp/project"}
-	errs := Validate(b, nil)
-	if len(errs) == 0 {
-		t.Fatal("expected host validation error for enabled host-less block")
-	}
-	found := false
-	for _, e := range errs {
-		if e.Field == "host" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected a host error, got: %v", errs)
-	}
-}
-
-func TestValidate_DisabledAllowsMissingHost(t *testing.T) {
-	// A disabled draft need not be owned yet — resume/install stamps host
-	// when it goes live.
-	b := &Block{Enabled: false, Kind: "oneshot"}
+func TestValidate_MinimalBlockValidates(t *testing.T) {
+	// Slice 5: Validate keys only on kind (+ schedule for standing, + agent
+	// registry). project_dir/host requirements for an armed install moved to
+	// install.go/repeat.go, which know the status. A host-less, project_dir-less
+	// oneshot block is structurally valid.
+	b := &Block{Kind: "oneshot"}
 	if errs := Validate(b, nil); len(errs) != 0 {
-		t.Fatalf("expected no errors for disabled host-less block, got: %v", errs)
+		t.Fatalf("expected no errors for minimal oneshot block, got: %v", errs)
 	}
 }
 
 func TestValidate_BadCron(t *testing.T) {
 	b := &Block{
-		Enabled:    true,
 		Kind:       "standing",
 		ProjectDir: "/tmp/project",
 		Host:       "test-host",
@@ -92,7 +61,6 @@ func TestValidate_BadCron(t *testing.T) {
 
 func TestValidate_BadTimezone(t *testing.T) {
 	b := &Block{
-		Enabled:    true,
 		Kind:       "standing",
 		ProjectDir: "/tmp/project",
 		Host:       "test-host",
@@ -108,7 +76,7 @@ func TestValidate_BadTimezone(t *testing.T) {
 }
 
 func TestValidate_MissingScheduleForStanding(t *testing.T) {
-	b := &Block{Enabled: true, Kind: "standing", ProjectDir: "/tmp/project"}
+	b := &Block{Kind: "standing", ProjectDir: "/tmp/project"}
 	errs := Validate(b, nil)
 	if len(errs) == 0 {
 		t.Fatal("expected error: schedule required for standing")
@@ -116,7 +84,7 @@ func TestValidate_MissingScheduleForStanding(t *testing.T) {
 }
 
 func TestValidate_BadKind(t *testing.T) {
-	b := &Block{Enabled: true, Kind: "weekly"}
+	b := &Block{Kind: "weekly"}
 	errs := Validate(b, nil)
 	if len(errs) == 0 {
 		t.Fatal("expected validation error for unknown kind")
@@ -283,8 +251,8 @@ func TestWriteBlock_PreservesNonShuttleFrontmatter(t *testing.T) {
 	}
 
 	block := &Block{
-		Enabled: true,
-		Kind:    "oneshot",
+		Kind:       "oneshot",
+		ProjectDir: "/tmp/project",
 	}
 	if err := f.WriteBlock(block); err != nil {
 		t.Fatalf("WriteBlock: %v", err)
@@ -297,9 +265,6 @@ func TestWriteBlock_PreservesNonShuttleFrontmatter(t *testing.T) {
 	}
 	if f2.Block == nil {
 		t.Fatal("expected shuttle block after write")
-	}
-	if !f2.Block.Enabled {
-		t.Fatal("expected enabled=true")
 	}
 	if f2.Block.Kind != "oneshot" {
 		t.Fatalf("expected kind=oneshot, got %q", f2.Block.Kind)
@@ -319,7 +284,7 @@ func TestWriteBlock_PreservesNonShuttleFrontmatter(t *testing.T) {
 func TestWriteBlock_Uninstall(t *testing.T) {
 	path := writeTmpFiber(t, sampleFiber)
 	f, _ := ReadFiber(path)
-	block := &Block{Enabled: true, Kind: "oneshot"}
+	block := &Block{Kind: "oneshot"}
 	_ = f.WriteBlock(block)
 
 	// Now uninstall (nil block).
@@ -344,15 +309,14 @@ func TestWriteBlock_PreservesProjectDirAndUnknownShuttleFields(t *testing.T) {
 		t.Fatal("expected shuttle block")
 	}
 
-	f.Block.Enabled = true
 	if err := f.WriteBlock(f.Block); err != nil {
 		t.Fatalf("WriteBlock: %v", err)
 	}
 
 	raw, _ := os.ReadFile(path)
 	content := string(raw)
+	// Live struct fields and forward-compatible unknown keys survive a rewrite.
 	for _, want := range []string{
-		"enabled: true",
 		"project_dir: /tmp/shuttle-project",
 		"elixir_only:",
 		"nested: value",
@@ -360,6 +324,11 @@ func TestWriteBlock_PreservesProjectDirAndUnknownShuttleFields(t *testing.T) {
 		if !strings.Contains(content, want) {
 			t.Fatalf("expected rewritten fiber to contain %q; got:\n%s", want, content)
 		}
+	}
+	// Clean cutover (slice 5): the legacy `enabled` key is wiped on rewrite, not
+	// resurrected as an unknown field.
+	if strings.Contains(content, "enabled") {
+		t.Fatalf("legacy enabled key survived rewrite; got:\n%s", content)
 	}
 }
 
@@ -371,7 +340,6 @@ func TestWriteBlock_RoundTripsInteractive(t *testing.T) {
 	}
 
 	if err := f.WriteBlock(&Block{
-		Enabled:     true,
 		Kind:        "oneshot",
 		Interactive: true,
 		ProjectDir:  "/tmp/project",
@@ -394,6 +362,10 @@ func TestWriteBlock_RoundTripsInteractive(t *testing.T) {
 }
 
 func TestWriteBlock_RemovesKnownFieldsWhenCleared(t *testing.T) {
+	// A legacy block carrying enabled + review (slice 5 dropped both) plus a
+	// cleared session and interactive. A Go rewrite wipes every recognized key
+	// not present in the encoded block (clean cutover) while preserving an
+	// unknown forward-compatible key.
 	content := `---
 name: Session Test
 status: active
@@ -436,8 +408,13 @@ Body.
 	if strings.Contains(rewritten, "interactive:") {
 		t.Fatalf("known cleared interactive field was preserved; got:\n%s", rewritten)
 	}
-	if !strings.Contains(rewritten, "completed_at:") || !strings.Contains(rewritten, "2026-05-08T12:00:00Z") {
-		t.Fatalf("completed_at was not preserved; got:\n%s", rewritten)
+	// Clean cutover (slice 5): the legacy enabled + review keys are wiped, not
+	// resurrected as unknown fields.
+	if strings.Contains(rewritten, "enabled") {
+		t.Fatalf("legacy enabled key survived rewrite; got:\n%s", rewritten)
+	}
+	if strings.Contains(rewritten, "review:") || strings.Contains(rewritten, "completed_at:") {
+		t.Fatalf("legacy review block survived rewrite; got:\n%s", rewritten)
 	}
 	if !strings.Contains(rewritten, "elixir_only: preserved") {
 		t.Fatalf("unknown field was not preserved; got:\n%s", rewritten)
@@ -452,7 +429,7 @@ func TestWriteBlock_AtomicOnBadWrite(t *testing.T) {
 	// Corrupt the block to force an error during encoding... actually,
 	// we can't easily simulate a mid-write crash here. Instead, verify
 	// that after a successful write the file is complete (not truncated).
-	block := &Block{Enabled: true, Kind: "standing", Schedule: &Schedule{Expr: "0 9 * * 1-5", TZ: "UTC"}}
+	block := &Block{Kind: "standing", Schedule: &Schedule{Expr: "0 9 * * 1-5", TZ: "UTC"}}
 	if err := f.WriteBlock(block); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -509,7 +486,7 @@ func TestValidate_UnknownAgent(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(dir, "agents.json"), []byte(agentJSON), 0644)
 	agents, _ := LoadAgentRegistryFromFile(filepath.Join(dir, "agents.json"))
 
-	b := &Block{Enabled: true, Kind: "oneshot", ProjectDir: "/tmp/project", Host: "test-host", Agent: "unknown-agent"}
+	b := &Block{Kind: "oneshot", ProjectDir: "/tmp/project", Host: "test-host", Agent: "unknown-agent"}
 	errs := Validate(b, agents)
 	if len(errs) == 0 {
 		t.Fatal("expected validation error for unknown agent")
@@ -523,6 +500,9 @@ func TestValidate_UnknownAgent(t *testing.T) {
 
 func TestBlockUnmarshalJSON_NewFormat(t *testing.T) {
 	var block Block
+	// A felt JSON view may still carry legacy enabled/review keys; slice 5
+	// drops them silently (no read-tolerance, no struct field) — they must not
+	// error, and the live fields decode normally.
 	data := []byte(`{
 	  "enabled": true,
 	  "kind": "standing",
@@ -534,7 +514,7 @@ func TestBlockUnmarshalJSON_NewFormat(t *testing.T) {
 	if err := json.Unmarshal(data, &block); err != nil {
 		t.Fatalf("json.Unmarshal: %v", err)
 	}
-	if !block.Enabled || block.Kind != "standing" || block.Agent != "claude-sonnet" {
+	if block.Kind != "standing" || block.Agent != "claude-sonnet" {
 		t.Fatalf("unexpected block: %+v", block)
 	}
 	if !block.Interactive {
@@ -548,7 +528,6 @@ func TestBlockUnmarshalJSON_NewFormat(t *testing.T) {
 func TestBlockUnmarshalJSON_LegacyAliases(t *testing.T) {
 	var block Block
 	data := []byte(`{
-	  "enabled": true,
 	  "mode": "standing",
 	  "schedule": {"expr": "0 9 * * 1-5", "timezone": "UTC"}
 	}`)
@@ -670,7 +649,7 @@ Body.
 		t.Fatalf("ReadFiber: %v", err)
 	}
 	f.SetStatus("active")
-	block := &Block{Enabled: true, Kind: "oneshot"}
+	block := &Block{Kind: "oneshot"}
 	if err := f.WriteBlock(block); err != nil {
 		t.Fatalf("WriteBlock: %v", err)
 	}
@@ -682,8 +661,8 @@ Body.
 	if got := f2.Status(); got != "active" {
 		t.Fatalf("expected status=active, got %q", got)
 	}
-	if f2.Block == nil || !f2.Block.Enabled || f2.Block.Kind != "oneshot" {
-		t.Fatalf("expected shuttle block enabled+oneshot, got %+v", f2.Block)
+	if f2.Block == nil || f2.Block.Kind != "oneshot" {
+		t.Fatalf("expected oneshot shuttle block, got %+v", f2.Block)
 	}
 }
 

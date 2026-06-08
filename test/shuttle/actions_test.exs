@@ -3,8 +3,11 @@ defmodule Shuttle.ActionsTest do
 
   alias Shuttle.Actions
 
+  # Lifecycle is status + tempered, uniform across kinds (slice 5: no enabled
+  # flag, no review axis). Awaiting review is `status: closed` + untempered.
+
   test "awaiting standing-role transitions resolve to accept-run" do
-    fiber = standing("awaiting")
+    fiber = awaiting_standing()
 
     assert {:ok, %{id: "accept-run", invocation: %{verb: "accept"}}} =
              Actions.resolve_transition(fiber, "tempered")
@@ -13,8 +16,8 @@ defmodule Shuttle.ActionsTest do
              Actions.resolve_transition(fiber, "inFlight")
   end
 
-  test "dormant standing-role in-flight transition resolves to ad-hoc dispatch" do
-    fiber = standing("scheduled")
+  test "armed standing-role in-flight transition resolves to ad-hoc dispatch" do
+    fiber = armed_standing()
 
     assert {:ok, %{id: "dispatch-ad-hoc", invocation: %{verb: "dispatch", ad_hoc: true}}} =
              Actions.resolve_transition(fiber, "inFlight")
@@ -24,7 +27,7 @@ defmodule Shuttle.ActionsTest do
     # New-model awaiting: `status: closed` + no `tempered` on a standing role.
     # The verdict gestures re-arm (accept-run) or reject (close-composted); this
     # closed role does NOT collapse to reopen the way a oneshot does.
-    fiber = %{standing("scheduled") | "status" => "closed"}
+    fiber = awaiting_standing()
 
     assert {:ok, %{id: "accept-run", invocation: %{verb: "accept"}}} =
              Actions.resolve_transition(fiber, "inFlight")
@@ -50,7 +53,7 @@ defmodule Shuttle.ActionsTest do
     # A rejected standing role carries a verdict (`tempered: false`), so it is
     # NOT awaiting — it falls through to the generic closed clauses: reopen to
     # revive, close columns re-close with a verdict.
-    fiber = Map.merge(standing("scheduled"), %{"status" => "closed", "tempered" => false})
+    fiber = Map.merge(armed_standing(), %{"status" => "closed", "tempered" => false})
 
     assert {:ok, %{id: "reopen", invocation: %{verb: "reopen"}}} =
              Actions.resolve_transition(fiber, "inFlight")
@@ -63,7 +66,7 @@ defmodule Shuttle.ActionsTest do
     fiber = %{
       "id" => "work/thing",
       "status" => "closed",
-      "shuttle" => %{"enabled" => true, "kind" => "oneshot"}
+      "shuttle" => %{"kind" => "oneshot"}
     }
 
     assert {:ok, %{id: "close-tempered", invocation: %{verb: "close", tempered: true}}} =
@@ -74,7 +77,7 @@ defmodule Shuttle.ActionsTest do
     fiber = %{
       "id" => "work/draft",
       "status" => "open",
-      "shuttle" => %{"enabled" => false, "kind" => "oneshot"}
+      "shuttle" => %{"kind" => "oneshot"}
     }
 
     actions = Actions.actions_for(fiber)
@@ -91,7 +94,7 @@ defmodule Shuttle.ActionsTest do
     fiber = %{
       "id" => "work/running",
       "status" => "active",
-      "shuttle" => %{"enabled" => true, "kind" => "oneshot"}
+      "shuttle" => %{"kind" => "oneshot"}
     }
 
     actions = Actions.actions_for(fiber, true)
@@ -102,19 +105,15 @@ defmodule Shuttle.ActionsTest do
     refute Enum.any?(actions, &(&1.id == "reopen"))
   end
 
-  test "enabled idle oneshot dragged to inFlight force-dispatches (not reopen)" do
-    # Regression for the 409 `action_not_available` bug: an enabled oneshot
-    # with no live worker classifies into the drafts fallback, so dragging it
-    # to inFlight resolved to `reopen` — which is NOT in actions_for for an
-    # enabled fiber, so the invoke step (validate_available) rejected it. The
-    # resolve and availability cond-chains disagreed. The fix: inFlight on an
-    # enabled oneshot means "launch it now" → dispatch-ad-hoc, which IS made
-    # available below. This test pins the invariant: every resolved action
-    # must be present in actions_for.
+  test "armed idle oneshot dragged to inFlight force-dispatches (not reopen)" do
+    # Regression for the 409 `action_not_available` bug: an armed oneshot with
+    # no live worker, dragged to inFlight, means "launch it now" → dispatch-ad-hoc
+    # (NOT reopen, which only applies to a closed or draft fiber). This test pins
+    # the invariant: every resolved action must be present in actions_for.
     fiber = %{
-      "id" => "work/idle-enabled",
+      "id" => "work/idle-armed",
       "status" => "active",
-      "shuttle" => %{"enabled" => true, "kind" => "oneshot"}
+      "shuttle" => %{"kind" => "oneshot"}
     }
 
     actions = Actions.actions_for(fiber)
@@ -128,13 +127,13 @@ defmodule Shuttle.ActionsTest do
     assert Enum.any?(actions, &(&1.id == resolved))
   end
 
-  test "disabled oneshot draft dragged to inFlight still reopens (enables it)" do
-    # The disabled path is unchanged: reopen is the verb that flips a paused
-    # draft back to enabled, and it remains in actions_for for disabled fibers.
+  test "draft oneshot (status: open) dragged to inFlight reopens (arms it)" do
+    # A draft (`status: open`) dragged out of drafts arms it via reopen
+    # (→ status:active). reopen remains in actions_for for a draft.
     fiber = %{
       "id" => "work/paused-draft",
       "status" => "open",
-      "shuttle" => %{"enabled" => false, "kind" => "oneshot"}
+      "shuttle" => %{"kind" => "oneshot"}
     }
 
     actions = Actions.actions_for(fiber)
@@ -146,7 +145,7 @@ defmodule Shuttle.ActionsTest do
   end
 
   test "awaiting standing-role offers accept or compost, not a continue verb" do
-    fiber = standing("awaiting")
+    fiber = awaiting_standing()
     actions = Actions.actions_for(fiber)
 
     assert Enum.any?(actions, &(&1.id == "accept-run"))
@@ -160,43 +159,35 @@ defmodule Shuttle.ActionsTest do
     # the action `resolve_transition` picks for a drag MUST be present in the
     # `actions_for` availability set. When it isn't, the daemon's
     # `validate_available` rejects the invoke with 409 `action_not_available`.
-    #
-    # Before the by-construction fix (action_ids derived from action_for_target),
-    # the two cond-chains were hand-maintained independently and disagreed for
-    # 110 of these 270 combinations. This test sweeps the full matrix so any
-    # future edit that reintroduces a disagreement fails here, loudly, with the
-    # exact offending combination — not silently in a live drag.
+    # action_ids is derived from action_for_target, so the two can never disagree
+    # by construction; this test sweeps the full matrix to keep it that way.
     @kanban_targets ~w(drafts inFlight awaitingReview tempered composted)
     @statuses ~w(open active closed)
     @kinds ~w(oneshot standing)
-    @review_states ~w(scheduled awaiting accepted)
+    @tempereds [nil, true, false]
 
     test "every resolved drag target is an available action across the full matrix" do
       combos =
         for status <- @statuses,
-            enabled <- [true, false],
             kind <- @kinds,
-            review <- @review_states,
+            tempered <- @tempereds,
             running? <- [false, true],
             target <- @kanban_targets do
-          fiber = %{
+          base = %{
             "id" => "work/matrix",
             "status" => status,
-            "shuttle" => %{
-              "enabled" => enabled,
-              "kind" => kind,
-              "review" => %{"state" => review}
-            }
+            "shuttle" => %{"kind" => kind}
           }
+
+          fiber = if is_nil(tempered), do: base, else: Map.put(base, "tempered", tempered)
 
           available = Actions.actions_for(fiber, running?) |> Enum.map(& &1.id)
           {:ok, %{id: resolved}} = Actions.resolve_transition(fiber, target, running?)
 
           {%{
              status: status,
-             enabled: enabled,
              kind: kind,
-             review: review,
+             tempered: tempered,
              running: running?,
              target: target,
              resolved: resolved,
@@ -212,8 +203,8 @@ defmodule Shuttle.ActionsTest do
       assert violations == [],
              "resolve/availability disagreement for #{length(violations)} combos:\n" <>
                Enum.map_join(violations, "\n", fn v ->
-                 "  status=#{v.status} enabled=#{v.enabled} kind=#{v.kind} " <>
-                   "review=#{v.review} running=#{v.running} target=#{v.target} " <>
+                 "  status=#{v.status} kind=#{v.kind} tempered=#{inspect(v.tempered)} " <>
+                   "running=#{v.running} target=#{v.target} " <>
                    "→ resolved=#{v.resolved} NOT IN #{inspect(v.available)}"
                end)
     end
@@ -222,17 +213,14 @@ defmodule Shuttle.ActionsTest do
       # The verdict-protection invariant in new-model terms. Awaiting is now
       # `status: closed` + tempered UNSET; the moment a verdict lands (`tempered`
       # present, true or false) the role is a terminus, not awaiting, so the
-      # awaiting re-arm clauses must NOT fire. This pins the entanglement guard:
-      # accept-run is reserved for genuinely-awaiting (untempered) closed roles;
-      # a role the user already ruled on falls through to the generic closed
-      # clauses (reopen to revive, close columns re-close with a verdict). A
-      # stale `review.state: awaiting` in frontmatter must not override the
-      # verdict — `tempered` presence wins.
+      # awaiting re-arm clauses must NOT fire. accept-run is reserved for
+      # genuinely-awaiting (untempered) closed roles; a role the user already
+      # ruled on falls through to the generic closed clauses.
       fiber = %{
         "id" => "work/closed-verdict",
         "status" => "closed",
         "tempered" => false,
-        "shuttle" => %{"enabled" => true, "kind" => "standing", "review" => %{"state" => "awaiting"}}
+        "shuttle" => %{"kind" => "standing"}
       }
 
       assert {:ok, %{id: "close-tempered", invocation: %{verb: "close", tempered: true}}} =
@@ -251,13 +239,13 @@ defmodule Shuttle.ActionsTest do
       refute "accept-run" in available
     end
 
-    test "same-column awaitingReview drop on a live awaiting standing role is non-destructive" do
+    test "same-column awaitingReview drop on an awaiting standing role is non-destructive" do
       # The awaiting role's HOME column is awaitingReview. A drop there is a
       # same-column no-op; it must not silently compost the pending run. Resolves
       # to close-awaiting-review (the non-verdict "stays in review" verb), never
       # close-composted. Pins the legit verdict columns at the same time:
       # tempered/inFlight = accept (keep the run), composted = compost (drop it).
-      fiber = standing("awaiting")
+      fiber = awaiting_standing()
 
       assert {:ok, %{id: "close-awaiting-review", invocation: %{verb: "close"}}} =
                Actions.resolve_transition(fiber, "awaitingReview")
@@ -267,14 +255,14 @@ defmodule Shuttle.ActionsTest do
       assert {:ok, %{id: "close-composted"}} = Actions.resolve_transition(fiber, "composted")
     end
 
-    test "a disabled standing role can still be composted (the canary repro)" do
-      # ai-futures/shuttle/misc/standing-roles/canary-local-snapshot: a disabled
-      # standing role used to expose `[:reopen]` only, so dragging it to any
-      # close column 409'd. It must now offer the full close vocabulary.
+    test "a draft standing role can still be composted (the canary repro)" do
+      # canary-local-snapshot: a draft standing role (status: open) used to expose
+      # `[:reopen]` only, so dragging it to any close column 409'd. It must offer
+      # the full close vocabulary.
       fiber = %{
-        "id" => "work/disabled-standing",
-        "status" => "active",
-        "shuttle" => %{"enabled" => false, "kind" => "standing", "review" => %{"state" => "scheduled"}}
+        "id" => "work/draft-standing",
+        "status" => "open",
+        "shuttle" => %{"kind" => "standing"}
       }
 
       actions = Actions.actions_for(fiber) |> Enum.map(& &1.id)
@@ -287,15 +275,22 @@ defmodule Shuttle.ActionsTest do
     end
   end
 
-  defp standing(review_state) do
+  # An armed standing role: status:active, no verdict.
+  defp armed_standing do
     %{
       "id" => "work/standing",
       "status" => "active",
-      "shuttle" => %{
-        "enabled" => true,
-        "kind" => "standing",
-        "review" => %{"state" => review_state}
-      }
+      "shuttle" => %{"kind" => "standing"}
+    }
+  end
+
+  # An awaiting standing role: status:closed + untempered (slice 5: the
+  # felt-native awaiting signal, no review.state axis).
+  defp awaiting_standing do
+    %{
+      "id" => "work/standing",
+      "status" => "closed",
+      "shuttle" => %{"kind" => "standing"}
     }
   end
 end

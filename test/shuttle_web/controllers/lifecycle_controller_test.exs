@@ -254,7 +254,7 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     File.rm_rf(root)
   end
 
-  test "accept re-enables a paused standing role (temper resumes it)" do
+  test "accept re-arms a standing role awaiting review (temper resumes it)" do
     root =
       System.tmp_dir!()
       |> Path.join("shuttle-lifecycle-accept-reenable-#{System.unique_integer([:positive])}")
@@ -265,9 +265,10 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     File.mkdir_p!(fiber_dir)
     path = Path.join(fiber_dir, "standing-accept-reenable.md")
 
-    # A paused role (enabled: false → Drafts) whose last run is awaiting
-    # (status: closed + untempered). Accepting it ("temper") re-arms from the doc
-    # schedule AND flips enabled back on so it re-enters the queue.
+    # A standing role whose last run is awaiting (status: closed + untempered).
+    # Accepting it ("temper") re-arms from the doc schedule — status: active is
+    # the sole dispatch gate (slice 5: no enabled flag), and any stale enabled
+    # key is wiped on the rewrite.
     File.write!(path, """
     ---
     name: Standing accept reenable
@@ -300,8 +301,9 @@ defmodule ShuttleWeb.LifecycleControllerTest do
       assert conn.status == 200
 
       frontmatter = frontmatter(File.read!(path))
-      assert frontmatter =~ "enabled: true"
       assert frontmatter =~ "status: active"
+      # Clean cutover: no enabled flag survives the re-arm rewrite.
+      refute frontmatter =~ "enabled"
     end)
 
     File.rm_rf(root)

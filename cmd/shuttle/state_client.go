@@ -65,7 +65,6 @@ type StandingRoleEntry struct {
 	NextDueAt  *int64         `json:"next_due_at,omitempty"`
 	LastRunAt  *int64         `json:"last_run_at,omitempty"`
 	Schedule   map[string]any `json:"schedule,omitempty"`
-	Review     map[string]any `json:"review,omitempty"`
 	Validation []any          `json:"validation_errors,omitempty"`
 	Extra      map[string]any `json:"-"`
 }

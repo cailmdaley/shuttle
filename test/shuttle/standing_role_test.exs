@@ -19,13 +19,12 @@ defmodule Shuttle.StandingRoleTest do
     role
   end
 
-  describe "enabled gates the schedule-derived phases" do
+  # The schedule-derived display phase is now cron + liveness only (slice 5: no
+  # enabled axis). Paused/draft is a document fact (`status: open`) surfaced by
+  # the kanban classifier, not a StandingRole phase — `state/3` answers only the
+  # schedule question for an armed role.
+  describe "schedule-derived phase (cron + liveness)" do
     test "an armed role whose tick has arrived is due" do
-      assert StandingRole.state(role(%{}), @now, false) == "due"
-    end
-
-    test "absent enabled defaults to armed" do
-      assert role(%{}).enabled == true
       assert StandingRole.state(role(%{}), @now, false) == "due"
     end
 
@@ -34,13 +33,8 @@ defmodule Shuttle.StandingRoleTest do
       assert StandingRole.state(sleeping, @now, false) == "scheduled"
     end
 
-    test "a paused role is dormant regardless of its schedule" do
-      assert role(%{"enabled" => false}).enabled == false
-      assert StandingRole.state(role(%{"enabled" => false}), @now, false) == "dormant"
-    end
-
-    test "a live worker overrides dormant (a paused-with --no-kill role reads running until it ends)" do
-      assert StandingRole.state(role(%{"enabled" => false}), @now, true) == "running"
+    test "a live worker reads running regardless of schedule" do
+      assert StandingRole.state(role(%{}), @now, true) == "running"
     end
   end
 

@@ -819,11 +819,11 @@ defmodule Shuttle.Dispatcher do
   # `status: closed`, `tempered`, and `closed_at` stay on disk — Portolan's
   # `classifyFiber` keeps the card in `awaitingReview` / `tempered` /
   # `composted` forever, even though a worker is now running. Reopen
-  # (status=active, tempered cleared, closed_at cleared, enabled=true) lets
-  # the runningWorker check classify the card as `inFlight` on the next poll.
+  # (status=active, tempered cleared, closed_at cleared) lets the runningWorker
+  # check classify the card as `inFlight` on the next poll.
   #
-  # Skips the shell-out when the fiber is already in a clean active+enabled
-  # state — re-dispatching a healthy in-flight oneshot shouldn't rewrite
+  # Skips the shell-out when the fiber is already in a clean active state —
+  # re-dispatching a healthy in-flight oneshot shouldn't rewrite
   # frontmatter on every click. Failures are non-fatal: the worker can still
   # spawn; we just log the sticky-column risk loudly so it doesn't go silent
   # the way the prior "frontend orchestrates transition" path did.
@@ -857,11 +857,10 @@ defmodule Shuttle.Dispatcher do
 
   defp already_clean?(fiber) do
     status = Map.get(fiber, "status", "")
-    enabled = get_in(fiber, ["shuttle", "enabled"]) == true
     tempered = Map.get(fiber, "tempered")
     closed_at = Map.get(fiber, "closed-at") || Map.get(fiber, "closed_at")
 
-    status == "active" and enabled and is_nil(tempered) and is_nil(closed_at)
+    status == "active" and is_nil(tempered) and is_nil(closed_at)
   end
 
   # Dual-recognition: a live worker under either the uid-keyed name or the

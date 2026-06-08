@@ -78,7 +78,7 @@ func TestCompositeRows_All(t *testing.T) {
 		Local: &Snapshot{
 			Eligible: []SnapshotEntry{{FiberID: "local/a", Agent: "claude-opus", State: "running", TmuxSession: "a-shuttle"}},
 			StandingRoles: []StandingRoleEntry{
-				{FiberID: "local/standing", State: "scheduled", Review: map[string]any{"state": "scheduled"}},
+				{FiberID: "local/standing", State: "scheduled"},
 			},
 		},
 		Remotes: map[string]*RemoteSnapshot{
@@ -249,7 +249,6 @@ func TestCompositeRows_StandingRoleNextDueRendered(t *testing.T) {
 				FiberID:   "ai-futures/shuttle/standing-roles/canary",
 				State:     "scheduled",
 				NextDueAt: &due,
-				Review:    map[string]any{"state": "scheduled"},
 			}},
 		},
 	}
@@ -262,9 +261,6 @@ func TestCompositeRows_StandingRoleNextDueRendered(t *testing.T) {
 	}
 	if rows[0].Kind != "standing" {
 		t.Errorf("expected Kind=standing, got %q", rows[0].Kind)
-	}
-	if rows[0].ReviewState != "scheduled" {
-		t.Errorf("expected ReviewState=scheduled, got %q", rows[0].ReviewState)
 	}
 }
 
