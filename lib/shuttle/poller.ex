@@ -476,6 +476,7 @@ defmodule Shuttle.Poller do
         |> Enum.map(& &1.entry)
         |> Enum.filter(&owned_feed_entry?(&1, state.own_host_id))
         |> Enum.sort_by(&get_in(&1, [:fiber, "id"]))
+        |> stamp_runtime(state.running)
 
       stores = Keyword.get(opts, :felt_stores, state.felt_stores)
       {:reply, {:ok, Shuttle.FiberDocuments.envelope(stores, entries)}, state}
@@ -1145,6 +1146,58 @@ defmodule Shuttle.Poller do
     do: host_owned?(shuttle, own_host_id)
 
   defp owned_feed_entry?(_, _), do: false
+
+  # Stamp serve-time tmux liveness onto each owned feed row. The owner is the
+  # only daemon that knows its own running workers (`state.running`), so it
+  # carries that truth on the same `/api/v1/fibers` rows a viewer already reads
+  # — closing the cross-host read plane: a remote viewer renders `▸ aloft` for
+  # this fiber exactly when we run a live worker for it.
+  #
+  # This is COMPUTED at serve time from the in-memory watcher registry, never
+  # persisted to the document (the no-daemon-state-on-the-fiber invariant holds:
+  # `:runtime` is a wire field on the served envelope row, not frontmatter). The
+  # join keys by `uid` (rename-safe) — `state.running` is keyed by the fiber's
+  # runtime_key (uid when present), and we also index by the meta's address so a
+  # uid-less fiber still matches. A row with no live worker carries no `:runtime`.
+  defp stamp_runtime(entries, running) when map_size(running) == 0, do: entries
+
+  defp stamp_runtime(entries, running) do
+    index = runtime_index(running)
+    Enum.map(entries, &put_runtime(&1, index))
+  end
+
+  defp runtime_index(running) do
+    Enum.reduce(running, %{}, fn {runtime_key, meta}, acc ->
+      payload = runtime_payload(meta)
+
+      [runtime_key, metadata_uid(meta), fiber_address(meta)]
+      |> Enum.filter(&(is_binary(&1) and &1 != ""))
+      |> Enum.reduce(acc, fn key, a -> Map.put_new(a, key, payload) end)
+    end)
+  end
+
+  defp put_runtime(%{fiber: fiber} = entry, index) do
+    [Map.get(fiber, "uid"), Map.get(fiber, "slug"), Map.get(fiber, "id")]
+    |> Enum.find_value(fn k -> is_binary(k) and k != "" and Map.get(index, k) end)
+    |> case do
+      nil -> entry
+      payload -> Map.put(entry, :runtime, payload)
+    end
+  end
+
+  # The eligible-row subset of a worker's meta, as a wire payload. Mirrors the
+  # `eligible` snapshot row so the feed's `runtime` and the snapshot agree on
+  # shape; the viewer reads `tmux_session` for liveness and may surface the rest.
+  defp runtime_payload(meta) do
+    %{
+      tmux_session: meta.session,
+      agent: Map.get(meta, :agent_id),
+      state: Map.get(meta, :state, "running"),
+      run_id: Map.get(meta, :run_id),
+      started_at: DateTime.to_unix(meta.started_at, :millisecond),
+      last_activity_at: DateTime.to_unix(meta.last_activity_at, :millisecond)
+    }
+  end
 
   defp refresh_document_cache(%State{} = state, candidates, host_map) do
     previous = state.document_cache

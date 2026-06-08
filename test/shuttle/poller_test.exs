@@ -585,6 +585,80 @@ defmodule Shuttle.PollerTest do
     assert [%{fiber: %{"id" => ^uid, "name" => "changed document"}}] = body.fibers
   end
 
+  test "owner feed stamps serve-time runtime onto an owned fiber with a live worker" do
+    uid = "01JZ00000000000000000000RT"
+
+    fiber =
+      make_fiber("tests/aloft", %{
+        "uid" => uid,
+        "modified_at" => "2026-06-08T01:00:00Z"
+      })
+
+    MockRunner.set_fiber("tests/aloft", fiber)
+    MockRunner.set_shuttle("tests/aloft", "enabled: true\nkind: oneshot\nhost: candide\n")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_runtime_stamp,
+        runner: MockRunner,
+        own_host_id: "candide",
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    send(poller, :run_poll_cycle)
+
+    # The fiber dispatches (lands in state.running) AND its document caches.
+    assert wait_until(fn ->
+             snap = Poller.snapshot(poller)
+             length(snap.eligible) == 1 and
+               get_in(snap, [:document_cache, "entries"]) >= 1
+           end)
+
+    assert {:ok, body} = Poller.cached_fiber_documents(poller)
+    assert [%{runtime: runtime} = entry] = body.fibers
+    # Liveness joins by uid (rename-safe): the served row's fiber uid matches
+    # the runtime_key under which state.running tracks the live worker.
+    assert get_in(entry, [:fiber, "uid"]) == uid
+    assert %{tmux_session: session, state: _state, started_at: started} = runtime
+    assert is_binary(session)
+    assert is_integer(started)
+  end
+
+  test "owner feed omits runtime for an owned fiber with no live worker" do
+    uid = "01JZ00000000000000000000RX"
+
+    fiber =
+      make_fiber("tests/idle", %{
+        "uid" => uid,
+        "modified_at" => "2026-06-08T01:00:00Z"
+      })
+
+    MockRunner.set_fiber("tests/idle", fiber)
+    MockRunner.set_shuttle("tests/idle", "enabled: true\nkind: oneshot\nhost: candide\n")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_runtime_idle,
+        runner: MockRunner,
+        own_host_id: "candide",
+        # No worker slots: the document caches but nothing runs, so no runtime.
+        max_concurrent_workers: 0,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             get_in(Poller.snapshot(poller), [:document_cache, "entries"]) >= 1
+           end)
+
+    assert {:ok, body} = Poller.cached_fiber_documents(poller)
+    assert [entry] = body.fibers
+    refute Map.has_key?(entry, :runtime)
+  end
+
   test "snapshot remains responsive while poll cycle is reading felt" do
     fiber = make_fiber("tests/slow-felt-read")
     MockRunner.set_fiber("tests/slow-felt-read", fiber)
