@@ -219,11 +219,10 @@ defmodule Shuttle.Poller do
   @doc """
   Run a standing-role lifecycle transition (`:accept` / `:resume`) through the
   Poller so the in-memory lifecycle cache is refreshed from the runtime store
-  immediately after the write. Without this, `LifecycleStore.accept` writes the
-  runtime DB but the next poll re-derives `state.lifecycle` from the stale
-  in-memory copy and clobbers the write straight back to `awaiting` (see
-  `merge_lifecycle_overlay` in the poll path). Running the transition inside the
-  GenServer makes the DB write + cache refresh atomic against poll cycles.
+  immediately after the write. accept/resume write the felt document (the
+  lifecycle truth) plus the host-local runtime row; running the transition
+  inside the GenServer makes that write + the in-memory cache refresh atomic
+  against poll cycles, so a concurrent poll can't re-derive a stale row.
   """
   @spec lifecycle_transition(:accept | :resume | :reset_review, String.t(), keyword()) ::
           {:ok, String.t()} | {:error, term()}
@@ -560,7 +559,6 @@ defmodule Shuttle.Poller do
 
     case fetch_fiber_full(fiber_id, state) do
       {:ok, fiber} ->
-        fiber = overlay_runtime_lifecycle(fiber, fiber_id, state)
         running? = Keyword.get(opts, :running, live_running?(state, fiber_id))
         {:reply, {:ok, Actions.actions_for(fiber, running?)}, state}
 
@@ -574,7 +572,6 @@ defmodule Shuttle.Poller do
 
     case fetch_fiber_full(fiber_id, state) do
       {:ok, fiber} ->
-        fiber = overlay_runtime_lifecycle(fiber, fiber_id, state)
         running? = Keyword.get(opts, :running, live_running?(state, fiber_id))
         {:reply, Actions.resolve_transition(fiber, target, running?), state}
 
@@ -888,10 +885,12 @@ defmodule Shuttle.Poller do
     |> compact_runtime()
   end
 
+  # The runtime phase is the schedule-derived display state (slice 4: no review
+  # axis). `state/3` yields running/dormant/due/scheduled; awaiting/accepted are
+  # document facts the kanban classifier reads from status/tempered, not a phase.
   defp standing_phase(%{state: "running"}), do: "running"
   defp standing_phase(%{state: "dormant"}), do: "dormant"
   defp standing_phase(%{state: "due"}), do: "due"
-  defp standing_phase(%{review: %{"state" => state}}) when is_binary(state), do: state
   defp standing_phase(_), do: "scheduled"
 
   defp preserve_active_phase(%{phase: phase} = runtime) when phase in ["running", "retrying"] do
@@ -1902,28 +1901,19 @@ defmodule Shuttle.Poller do
     |> then(fn {roles, lifecycle} -> {Enum.reverse(roles), lifecycle} end)
   end
 
-  defp standing_role_from_fiber(fiber, state) do
+  # Standing roles are parsed straight from the felt document's `shuttle:` block
+  # (slice 4: no runtime lifecycle overlay). The document is the truth — status,
+  # tempered, and the cron schedule — and the StandingRole reads exactly that.
+  defp standing_role_from_fiber(fiber, _state) do
     fiber_id = Map.get(fiber, "id", "")
 
     case Map.get(fiber, "shuttle") do
       shuttle when is_map(shuttle) ->
-        shuttle
-        |> merge_lifecycle_overlay(lifecycle_record(state, fiber_id))
-        |> then(&StandingRole.from_map(fiber_id, &1))
+        StandingRole.from_map(fiber_id, shuttle)
 
       _ ->
         {:error, :no_shuttle_block}
     end
-  end
-
-  defp merge_lifecycle_overlay(shuttle, nil), do: shuttle
-
-  defp merge_lifecycle_overlay(shuttle, lifecycle) when is_map(shuttle) and is_map(lifecycle) do
-    shuttle
-    |> put_if_missing("review", stringify_keys(Map.get(lifecycle, :review, %{})))
-    |> put_if_missing("next_due_at", Map.get(lifecycle, :next_due_at))
-    |> put_if_missing("last_run_at", Map.get(lifecycle, :last_run_at))
-    |> put_if_missing("session", stringify_keys(Map.get(lifecycle, :session, %{})))
   end
 
   # Resolves which configured felt store owns `fiber_id` — the store root used
@@ -2416,33 +2406,10 @@ defmodule Shuttle.Poller do
       %{}
   end
 
-  # Overlay daemon-owned runtime lifecycle (review state, next_due_at, …) onto a
-  # fiber's `shuttle:` block before action classification. Standing-role review
-  # state lives in the runtime store, not the frontmatter (LifecycleStore evicts
-  # it), so `fetch_fiber_full` — which reads only `felt show --json` — returns a
-  # fiber whose `review.state` always looks like the default `scheduled`. Action
-  # availability would then disagree with `/state` (which is runtime-derived),
-  # rejecting valid transitions like accept-run with `action_not_available`.
-  # Reads the runtime store DB-first so resolution is correct even if the
-  # in-memory cache lags a just-landed transition.
-  defp overlay_runtime_lifecycle(fiber, fiber_id, %State{} = state) do
-    case Map.get(fiber, "shuttle") do
-      shuttle when is_map(shuttle) ->
-        Map.put(
-          fiber,
-          "shuttle",
-          merge_lifecycle_overlay(shuttle, runtime_lifecycle(state, fiber_id))
-        )
-
-      _ ->
-        fiber
-    end
-  end
-
   # Refresh a single fiber's in-memory lifecycle entry from the runtime store
   # after an external transition wrote it. Keeps `state.lifecycle` in lock-step
-  # with the DB so the next poll's `merge_lifecycle_overlay` reads the new state
-  # instead of clobbering it back.
+  # with the DB so the runtime row's session id / phase stay current for the
+  # callers that still read it (orphan resurrection, retry rehydration).
   defp refresh_lifecycle_entry(%State{} = state, fiber_id) do
     case RuntimeStore.fetch_lifecycle(state.runtime_store_path, fiber_id) do
       metadata when is_map(metadata) ->
@@ -3196,17 +3163,14 @@ defmodule Shuttle.Poller do
     end
   end
 
-  # Standing dispatch is gated by the FELT DOCUMENT, not the runtime review
-  # overlay (the slice-1 cutover) and not a stored `next_due_at` (the slice-2
-  # cutover). A role dispatches iff its document says `status: active` with no
-  # verdict (`tempered` unset) AND the cron schedule fired a tick inside the
-  # poll window ending at now. `status: closed` (untempered) is the
-  # awaiting-review / don't-re-fire signal — eligible?'s `status == "closed"`
-  # clause already excludes it before this is reached, and the
-  # `active → closed → active` document transition is the per-cycle "already ran
-  # this cycle" gate (replacing the old `completed_standing_runs` MapSet). The
-  # runtime review overlay still drives the kanban *display* (StandingRole.state)
-  # until it is removed in slice 4; it no longer drives dispatch.
+  # Standing dispatch is gated entirely by the FELT DOCUMENT — not a runtime
+  # review overlay (deleted in slice 4) and not a stored `next_due_at` (slice 2).
+  # A role dispatches iff its document says `status: active` with no verdict
+  # (`tempered` unset) AND the cron schedule fired a tick inside the poll window
+  # ending at now. `status: closed` (untempered) is the awaiting-review /
+  # don't-re-fire signal — eligible?'s `status == "closed"` clause already
+  # excludes it before this is reached, and the `active → closed → active`
+  # document transition is the per-cycle "already ran this cycle" gate.
   defp standing_role_due?(fiber, state) do
     fiber_id = Map.get(fiber, "id", "")
 
@@ -3265,41 +3229,28 @@ defmodule Shuttle.Poller do
   defp fetch_standing_role(fiber_id, state) do
     case fetch_shuttle_block(fiber_id, state) do
       {:ok, shuttle} ->
-        shuttle
-        |> merge_lifecycle_overlay(lifecycle_record(state, fiber_id))
-        |> then(&StandingRole.from_map(fiber_id, &1))
+        StandingRole.from_map(fiber_id, shuttle)
 
       {:error, _} ->
         {:error, :no_shuttle_block}
     end
   end
 
+  # The runtime lifecycle row no longer carries review (slice 4). Phase is the
+  # schedule-derived label; awaiting/accepted are document facts, not stored.
   defp lifecycle_metadata_from_role(%StandingRole{} = role) do
     %{
       fiber_id: role.fiber_id,
       kind: role.mode || "standing",
-      phase: role.review["state"] || "scheduled",
+      phase: "scheduled",
       run_id: role.run_id,
       next_due_at: role.next_due_at,
-      last_run_at: role.last_run_at,
-      review: role.review
+      last_run_at: role.last_run_at
     }
   end
 
   defp persist_lifecycle(%State{} = state, fiber_id, metadata) do
     RuntimeStore.upsert_lifecycle(state.runtime_store_path, fiber_id, metadata)
-  end
-
-  defp put_if_missing(map, _key, nil), do: map
-  defp put_if_missing(map, _key, value) when value == %{}, do: map
-
-  defp put_if_missing(map, key, value) do
-    case Map.get(map, key) do
-      nil -> Map.put(map, key, value)
-      "" -> Map.put(map, key, value)
-      %{} = nested when map_size(nested) == 0 -> Map.put(map, key, value)
-      _ -> map
-    end
   end
 
   defp stringify_keys(value) when is_map(value) do

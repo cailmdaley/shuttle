@@ -16,20 +16,19 @@ defmodule Shuttle.LifecycleStoreTest do
       with_runtime_store(fn path ->
         RuntimeStore.upsert_lifecycle(path, "tests/standing", %{
           kind: "standing",
-          phase: "awaiting",
-          run_id: "run-1",
-          review: %{"state" => "awaiting", "run_id" => "run-1"}
+          phase: "scheduled",
+          run_id: "run-1"
         })
 
         assert RuntimeStore.fetch_lifecycle(path, "tests/standing") != nil
 
         assert {:ok, message} = LifecycleStore.reset_review("tests/standing")
         assert message =~ "reset review lifecycle for tests/standing"
-        assert message =~ "was awaiting"
+        assert message =~ "cleared runtime row"
 
-        # Row gone → the overlay has nothing to merge → a subsequent poll cannot
-        # re-inject awaiting. This is the "survives a poll" guarantee: the stale
-        # state cannot reappear because its only source has been removed.
+        # Row gone → nothing for any reader to revive. This is the "survives a
+        # poll" guarantee: the stale row cannot reappear because its only source
+        # has been removed.
         assert RuntimeStore.fetch_lifecycle(path, "tests/standing") == nil
         assert RuntimeStore.list_lifecycle(path) == []
       end)
@@ -39,7 +38,7 @@ defmodule Shuttle.LifecycleStoreTest do
       with_runtime_store(fn path ->
         assert {:ok, message} = LifecycleStore.reset_review("tests/clean")
         assert message =~ "reset review lifecycle for tests/clean"
-        refute message =~ "was "
+        refute message =~ "cleared runtime row"
         assert RuntimeStore.fetch_lifecycle(path, "tests/clean") == nil
       end)
     end

@@ -653,12 +653,15 @@ defmodule Shuttle.DispatchIntegrationTest do
   end
 
   # Scheduled standing-run dispatches scope the review-comment lookup to the
-  # current run window — events older than the run window's start time are
-  # ignored. Without this, a stale `resume_mode: "previous"` from days ago
-  # blocks every subsequent scheduled run with :missing_session_id.
-  # (Real-world example: loom/email/morning-post stuck 2026-05-09 → 2026-05-14
-  # with no surfaced signal; the warning log fired every 30s for 5 days.)
-  test "scheduled standing-run ignores review-comment older than the run window", %{host: host} do
+  # current run window — the window opens at the LAST worker-exit event in felt
+  # history (slice 4: not parsed from the prompt's run_id). A resume directive
+  # filed BEFORE that exit is from a prior run cycle and is ignored. Without
+  # this, a stale `resume_mode: "previous"` from days ago blocks every
+  # subsequent scheduled run with :missing_session_id. (Real-world example:
+  # loom/email/morning-post stuck 2026-05-09 → 2026-05-14 with no surfaced
+  # signal; the warning log fired every 30s for 5 days.)
+  test "scheduled standing-run ignores a resume directive older than the last worker exit",
+       %{host: host} do
     write_fiber(host, "tests/standing-stale-resume", """
     ---
     name: Standing stale resume
@@ -672,30 +675,30 @@ defmodule Shuttle.DispatchIntegrationTest do
       schedule:
         expr: 0 9 * * 1-5
         tz: Europe/Paris
-      review:
-        state: scheduled
-      next_due_at: 2026-05-14T09:00:00+02:00
     ---
     Standing role with a stale resume directive.
     """)
 
-    # Review-comment filed *now* (in the test's wall clock); resume_mode says
-    # previous but there's no session id. Without scoping this would block.
+    # A resume directive from a PRIOR run cycle (resume_mode: previous, no
+    # session id) ...
     append_review_comment(host, "tests/standing-stale-resume",
       summary: "Resume previous",
       resume_mode: "previous"
     )
 
-    # Pretend the current run window starts well in the future — the just-
-    # appended review-comment is "older" than the window, so it shouldn't
-    # apply. Dispatcher should take :fresh.
-    future_run_id = "29990101T090000+0000"
+    # ... followed by a later worker-exit, which opens the current run window
+    # AFTER the directive. The directive is therefore outside the window and is
+    # ignored → :fresh.
+    append_worker_exit(host, "tests/standing-stale-resume",
+      agent: "claude-sonnet",
+      session: "11111111-2222-3333-4444-555555555555"
+    )
 
     assert {:ok, _} =
              Dispatcher.dispatch("tests/standing-stale-resume",
                runner: IntegrationRunner,
                felt_store: host,
-               prompt_context: {:standing_run, future_run_id}
+               prompt_context: {:standing_run, "29990101T090000+0000"}
              )
 
     script = read_run_script()
@@ -704,9 +707,11 @@ defmodule Shuttle.DispatchIntegrationTest do
     refute script =~ "send-keys"
   end
 
-  # Inverse of the above: when the review-comment falls *within* the current
-  # run window, the existing fail-loud-on-missing-session contract still holds.
-  test "scheduled standing-run honors review-comment inside the run window", %{host: host} do
+  # Inverse of the above: when the review-comment is filed AFTER the last
+  # worker-exit, it falls inside the current run window and the existing
+  # fail-loud-on-missing-session contract still holds.
+  test "scheduled standing-run honors a resume directive filed after the last worker exit",
+       %{host: host} do
     write_fiber(host, "tests/standing-fresh-resume", """
     ---
     name: Standing fresh resume
@@ -720,27 +725,28 @@ defmodule Shuttle.DispatchIntegrationTest do
       schedule:
         expr: 0 9 * * 1-5
         tz: Europe/Paris
-      review:
-        state: scheduled
-      next_due_at: 2020-01-01T09:00:00+00:00
     ---
     Standing role with an in-window resume directive but no session id.
     """)
 
+    # The window opens at this worker-exit ...
+    append_worker_exit(host, "tests/standing-fresh-resume",
+      agent: "claude-sonnet",
+      session: "<unknown>"
+    )
+
+    # ... and the resume directive is filed after it, so it applies. No usable
+    # session id → fail loud per the existing contract.
     append_review_comment(host, "tests/standing-fresh-resume",
       summary: "Resume previous",
       resume_mode: "previous"
     )
 
-    # Past run_id: review-comment occurred after the window opened, so the
-    # directive applies. No session id → fail loud per the existing contract.
-    past_run_id = "20200101T090000+0000"
-
     assert {:error, :missing_session_id} =
              Dispatcher.dispatch("tests/standing-fresh-resume",
                runner: IntegrationRunner,
                felt_store: host,
-               prompt_context: {:standing_run, past_run_id}
+               prompt_context: {:standing_run, "20200101T090000+0000"}
              )
   end
 

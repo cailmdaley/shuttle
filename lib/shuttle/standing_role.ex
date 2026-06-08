@@ -1,10 +1,13 @@
 defmodule Shuttle.StandingRole do
   @moduledoc """
-  Parses and classifies `shuttle.mode: standing` fiber declarations.
+  Parses and classifies `shuttle.kind: standing` fiber declarations.
 
-  Standing roles are still felt fibers. Shuttle only interprets the `shuttle:`
-  frontmatter block to decide whether a role is sleeping, due, running, or in
-  review.
+  Standing roles are still felt fibers. Shuttle interprets the `shuttle:` block
+  plus the document's `status`/`tempered` to decide whether a role is sleeping,
+  due, or running. "Awaiting review" and "accepted/composted" are document facts
+  (`status:closed` + untempered / `tempered`), not a `review.state` axis (slice
+  4 removed that); the schedule-derived phase here only answers
+  sleeping/due/running for an armed role.
   """
 
   defstruct [
@@ -18,11 +21,6 @@ defmodule Shuttle.StandingRole do
     enabled: true,
     validation_errors: []
   ]
-
-  @canonical_review_states ~w(scheduled awaiting accepted)
-  @awaiting_review_states ~w(awaiting review in_review)
-  @scheduleable_review_states ~w(scheduled accepted)
-  @legacy_review_states ~w(review in_review)
 
   @type t :: %__MODULE__{
           fiber_id: String.t(),
@@ -58,37 +56,55 @@ defmodule Shuttle.StandingRole do
   def standing?(%__MODULE__{mode: "standing"}), do: true
   def standing?(_), do: false
 
+  @doc """
+  The schedule-derived display phase, computed from cron + liveness + enabled —
+  NOT from `review.state` (slice 4: the review axis is gone). "Awaiting review"
+  and "accepted" are document facts (`status:closed` + untempered / `tempered`),
+  surfaced by the kanban classifier from the document, not derived here. This
+  function only answers the schedule question for an armed role: is a worker
+  live, is the role paused, is its next tick due, or is it sleeping.
+  """
   @spec state(t(), DateTime.t(), boolean()) :: String.t()
   def state(%__MODULE__{} = role, now, running?) do
-    review_state = role.review["state"] || "scheduled"
-
     cond do
       # A live worker is a fact, not a schedule conclusion — it wins even for a
       # role paused with `--no-kill`, so the card reads true until the run ends.
       running? -> "running"
       # Paused (`enabled: false`) collapses every schedule-derived phase to
-      # dormant → the kanban reads Drafts. A preserved `review` survives in the
-      # facts (accept/temper re-enables and reschedules); it just doesn't keep
-      # the card out of Drafts. The dispatch gate (poller `eligible?`) already
-      # honored `enabled`; this aligns the *display* with it.
+      # dormant → the kanban reads Drafts. The dispatch gate (poller `eligible?`)
+      # already honored `enabled`; this aligns the *display* with it.
       not role.enabled -> "dormant"
-      review_state in @awaiting_review_states -> "review"
-      review_state == "accepted" -> "accepted"
-      due?(role, now) -> "due"
+      due_by_schedule?(role, now) -> "due"
       true -> "scheduled"
     end
   end
 
-  @spec due?(t(), DateTime.t()) :: boolean()
-  def due?(
-        %__MODULE__{next_due_at: %DateTime{} = next_due_at, review: review} = role,
-        %DateTime{} = now
-      ) do
-    valid?(role) and (review["state"] || "scheduled") in @scheduleable_review_states and
-      DateTime.compare(next_due_at, now) != :gt
+  # Display window for the `state/3` "due" phase — the recent past in which a
+  # fired tick still reads as "due" before the poll dispatches it and the
+  # document flips to closed. Cron occurrences are strictly-after, so a fixed
+  # lookback window is how a just-fired tick is recognized (mirrors the dispatch
+  # path's `due_by_cron?` window, sized for display rather than the poll cadence).
+  @display_due_window_ms 90_000
+
+  # Display due-ness for `state/3`: a valid role whose cron schedule fired a tick
+  # inside `(now - window, now]`. Pure cron — no stored next_due_at, no review
+  # gate (slice 4).
+  defp due_by_schedule?(%__MODULE__{schedule: schedule} = role, %DateTime{} = now) do
+    window_start = DateTime.add(now, -@display_due_window_ms, :millisecond)
+
+    valid?(role) and
+      match?(
+        {:ok, %DateTime{}},
+        with {:ok, tick} <- Shuttle.Cron.next_occurrence(schedule, window_start),
+             true <- DateTime.compare(tick, now) != :gt do
+          {:ok, tick}
+        else
+          _ -> :no_tick
+        end
+      )
   end
 
-  def due?(_, _), do: false
+  defp due_by_schedule?(_, _), do: false
 
   @doc """
   Cron-derived due check for the **dispatch** path: a valid role whose schedule
@@ -106,9 +122,7 @@ defmodule Shuttle.StandingRole do
   not a stored timestamp.
 
   It does NOT consult `review.state` — the dispatch gate is the felt document's
-  `status`/`tempered` (the poller checks those before calling this). `due?/2`
-  keeps the review gate for the kanban **display** path (`state/3`) until the
-  overlay is deleted in slice 4.
+  `status`/`tempered` (the poller checks those before calling this).
   """
   @spec due_by_cron?(t(), DateTime.t(), pos_integer()) :: boolean()
   def due_by_cron?(%__MODULE__{schedule: schedule} = role, %DateTime{} = now, window_ms)
@@ -129,12 +143,10 @@ defmodule Shuttle.StandingRole do
 
   def due_by_cron?(_, _, _), do: false
 
-  # Dispatch-path validity: a standing role with a parseable schedule. Slice 2
-  # deliberately does NOT gate dispatch on `valid?/1`, which still carries the
-  # legacy "scheduleable review state requires next_due_at" coupling — the live
-  # daily-practice role has no stored next_due_at and no review block, yet must
-  # dispatch off its cron. Those review/next_due validations only constrain the
-  # display path until the overlay is deleted in slice 4.
+  # Dispatch-path validity: a standing role with a parseable schedule. Both the
+  # dispatch and display paths now gate on schedule alone — the review/next_due
+  # validations are gone (slice 4: the document, not a review overlay, is the
+  # truth, and doc-sourced roles carry no stored next_due_at or review block).
   defp dispatchable?(%__MODULE__{mode: "standing", schedule: schedule}) do
     match?({:ok, %DateTime{}}, Shuttle.Cron.next_occurrence(schedule, DateTime.utc_now()))
   end
@@ -169,32 +181,19 @@ defmodule Shuttle.StandingRole do
   end
 
   @doc """
-  Run id for a *scheduled* (non-ad-hoc) standing dispatch.
+  Run id for a *scheduled* (non-ad-hoc) standing dispatch — a display label for
+  the prompt's `Run:` line, minted from `now`.
 
-  A **resumed** run continues the awaiting run, so it must keep that run's id;
-  a fresh scheduled run mints a new one from `next_due_at`. The distinction is
-  written by the lifecycle verbs: `LifecycleStore.resume` preserves
-  `review.run_id` and leaves `accepted_run_id` nil (the run continues), whereas
-  `accept` sets `accepted_run_id == run_id` (the run is done — the next dispatch
-  is a genuinely new run).
-
-  Keeping the id on resume is load-bearing: the run id drives the review-comment
-  window (`Dispatcher.run_window_start`/`parse_run_id`). `resume` sets
-  `next_due_at = now`, so minting the id from `next_due_at` would put the window
-  start *after* the `resume_mode: previous` directive that the same gesture filed
-  a beat earlier — it falls outside its own run window and `check_resume_intent`
-  silently falls back to `:fresh`. (That made the kanban Resume button behave
-  exactly like New session — see gotcha-standing-role-resume-button-grayed.)
+  It is no longer load-bearing for resume continuity. The resume window-start
+  used to be parsed from this id, so a resumed run had to keep the awaiting
+  run's id (via `review.run_id`); slice 4 deleted `review`, and
+  `Dispatcher.run_window_start` now derives the window from felt history (the
+  last worker-exit event's timestamp). The id is therefore free to be a fresh
+  timestamp every dispatch.
   """
   @spec dispatch_run_id(t(), DateTime.t()) :: String.t()
-  def dispatch_run_id(%__MODULE__{run_id: run_id, review: review} = role, now) do
-    accepted = review && review["accepted_run_id"]
-
-    if is_binary(run_id) and run_id != "" and (is_nil(accepted) or accepted == "") do
-      run_id
-    else
-      next_run_id(role, now)
-    end
+  def dispatch_run_id(%__MODULE__{} = role, now) do
+    next_run_id(role, now)
   end
 
   @spec ad_hoc_run_id(DateTime.t()) :: String.t()
@@ -220,12 +219,14 @@ defmodule Shuttle.StandingRole do
     }
   end
 
+  # Validity is the document's intrinsic shape: a standing role with a parseable
+  # cron schedule. Slice 4 deleted the review/next_due validations — the document
+  # (status + tempered) is the truth, and doc-sourced roles carry no review block
+  # or stored next_due_at to validate against.
   defp validation_errors(%__MODULE__{} = role) do
     [
       validate_mode(role),
-      validate_review_state(role),
-      validate_next_due(role),
-      validate_acceptance_ids(role)
+      validate_schedule(role)
     ]
     |> Enum.reject(&is_nil/1)
   end
@@ -233,49 +234,10 @@ defmodule Shuttle.StandingRole do
   defp validate_mode(%__MODULE__{mode: "standing"}), do: nil
   defp validate_mode(%__MODULE__{mode: mode}), do: "kind must be standing, got #{inspect(mode)}"
 
-  defp validate_review_state(%__MODULE__{review: review}) do
-    state = review["state"] || "scheduled"
-
-    if state in @canonical_review_states or state in @legacy_review_states do
-      nil
-    else
-      "unsupported review state #{inspect(state)}"
-    end
-  end
-
-  defp validate_next_due(%__MODULE__{review: review, next_due_at: next_due_at}) do
-    state = review["state"] || "scheduled"
-
-    cond do
-      state in @scheduleable_review_states and is_nil(next_due_at) ->
-        "scheduleable state #{state} requires next_due_at"
-
-      state in @awaiting_review_states and not is_nil(next_due_at) and
-          not ad_hoc_run_id?(string(review["run_id"])) ->
-        "review state #{state} must clear next_due_at"
-
-      true ->
-        nil
-    end
-  end
-
-  defp validate_acceptance_ids(%__MODULE__{review: review}) do
-    state = review["state"] || "scheduled"
-    run_id = string(review["run_id"])
-    accepted_run_id = string(review["accepted_run_id"])
-
-    cond do
-      state == "accepted" and (is_nil(run_id) or run_id == "") ->
-        "accepted review state requires run_id"
-
-      state == "accepted" and accepted_run_id != run_id ->
-        "accepted_run_id must match run_id in accepted review state"
-
-      state in @awaiting_review_states and (is_nil(run_id) or run_id == "") ->
-        "review state requires run_id"
-
-      true ->
-        nil
+  defp validate_schedule(%__MODULE__{schedule: schedule}) do
+    case Shuttle.Cron.next_occurrence(schedule, DateTime.utc_now()) do
+      {:ok, %DateTime{}} -> nil
+      _ -> "schedule must be a parseable cron expression"
     end
   end
 

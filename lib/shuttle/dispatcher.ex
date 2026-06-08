@@ -115,10 +115,14 @@ defmodule Shuttle.Dispatcher do
     passing `force: true`, which routes back through `check_resume_intent`
     so the freshly-filed review-comment's `resume_mode` is honored.
   - Scheduled standing-role dispatches scope the review-comment lookup to the
-    current run window (events at or after the run_id timestamp). A stale
-    `resume_mode: "previous"` from a prior run would otherwise gate every
-    future scheduled dispatch with `:missing_session_id` (see
-    `loom/email/morning-post` blocked for 5 days, 2026-05-09 → 2026-05-14).
+    current run window — events at or after the **last worker-exit event in
+    felt history** (`run_window_start/3`). A stale `resume_mode: "previous"`
+    from a prior run would otherwise gate every future scheduled dispatch with
+    `:missing_session_id` (see `loom/email/morning-post` blocked for 5 days,
+    2026-05-09 → 2026-05-14). The window start lives in felt history — the
+    chronological substrate — not in a `review.run_id` the document no longer
+    carries: a resume directive filed after the awaiting run exited
+    necessarily post-dates that exit, so it falls inside the window.
   - All other contexts defer to `check_resume_intent/3`, which reads the
     most recent review-comment from felt history and honors its `resume_mode`.
 
@@ -136,8 +140,11 @@ defmodule Shuttle.Dispatcher do
         :fresh
 
       _ ->
+        since =
+          if force?, do: nil, else: run_window_start(prompt_context, fiber_id, felt_store)
+
         check_opts =
-          [since: if(force?, do: nil, else: run_window_start(prompt_context))]
+          [since: since]
           |> then(fn o -> if is_nil(felt_store), do: o, else: [{:felt_store, felt_store} | o] end)
           |> then(fn o ->
             case Keyword.get(opts, :session_id) do
@@ -153,35 +160,48 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
-  # Standing-run prompt contexts carry the run_id (a YYYYMMDDTHHMMSS+ZZZZ
-  # timestamp string). Parse it back into a DateTime — used to scope the
-  # review-comment lookup to events from the current run window so stale
-  # directives from older runs can't silently gate the dispatcher.
-  defp run_window_start({:standing_run, run_id}) when is_binary(run_id),
-    do: parse_run_id(run_id)
+  # The lower bound for the review-comment lookup on a standing run: the
+  # timestamp of the most recent worker-exit event in felt history. felt history
+  # is the chronological substrate (slice 4 — the document no longer carries a
+  # `review.run_id`), so the run window starts where the awaiting run ended. A
+  # resume directive is filed AFTER the run exits, so it lands at or after this
+  # bound and `check_resume_intent --since` finds it; a stale directive from an
+  # older run (before the last exit) falls outside and can't silently gate the
+  # dispatcher. Non-standing contexts (oneshots, ad-hoc) impose no window.
+  defp run_window_start({:standing_run, _run_id}, fiber_id, felt_store),
+    do: last_worker_exit_at(fiber_id, felt_store: felt_store)
 
-  defp run_window_start({:standing_run, run_id, _}) when is_binary(run_id),
-    do: parse_run_id(run_id)
+  defp run_window_start({:standing_run, _run_id, _}, fiber_id, felt_store),
+    do: last_worker_exit_at(fiber_id, felt_store: felt_store)
 
-  defp run_window_start(_), do: nil
+  defp run_window_start(_, _fiber_id, _felt_store), do: nil
 
-  defp parse_run_id(run_id) when is_binary(run_id) do
-    case Regex.run(
-           ~r/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})([+-])(\d{2})(\d{2})$/,
-           run_id
-         ) do
-      [_, y, mo, d, h, mi, s, sign, tzh, tzm] ->
-        case DateTime.from_iso8601("#{y}-#{mo}-#{d}T#{h}:#{mi}:#{s}#{sign}#{tzh}:#{tzm}") do
-          {:ok, dt, _offset} -> dt
-          _ -> nil
-        end
+  # The `occurred_at` of the latest worker-exit event in felt history, parsed to
+  # a DateTime. Mirrors `latest_history_session_id` (same event, parsed for its
+  # timestamp instead of its session id). nil when no exit event is recorded
+  # (a never-run role) — then the lookup spans all of history.
+  defp last_worker_exit_at(fiber_id, opts) do
+    felt_store = Keyword.get(opts, :felt_store) || default_felt_store()
 
-      _ ->
-        nil
+    fiber_id
+    |> query_history(["--last", "20", "--json"], felt_store: felt_store)
+    |> Enum.find_value(fn event ->
+      text = get_in(event, ["payload", "text"])
+
+      if is_binary(text) and String.contains?(text, "worker exited") do
+        parse_occurred_at(Map.get(event, "occurred_at"))
+      end
+    end)
+  end
+
+  defp parse_occurred_at(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, dt, _offset} -> dt
+      _ -> nil
     end
   end
 
-  defp parse_run_id(_), do: nil
+  defp parse_occurred_at(_), do: nil
 
   @doc """
   Checks whether the most recent review-comment requests resume of the previous

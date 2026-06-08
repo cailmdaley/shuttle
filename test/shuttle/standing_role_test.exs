@@ -5,13 +5,14 @@ defmodule Shuttle.StandingRoleTest do
 
   @now ~U[2026-06-02 10:00:00Z]
 
-  # A schedule-due standing role (next_due_at in the past, scheduled review).
+  # A standing role. Due-ness is computed from the cron schedule + now (slice 4:
+  # no stored next_due_at, no review block). `* * * * *` fires every minute, so a
+  # tick is always at/before now → the deterministic "due" role; the daily
+  # weekday 09:00 schedule's next tick at 10:00 Tue is tomorrow → "scheduled".
   defp role(overrides) do
     base = %{
       "kind" => "standing",
-      "schedule" => %{"expr" => "0 9 * * 1-5", "tz" => "Europe/Paris"},
-      "review" => %{"state" => "scheduled"},
-      "next_due_at" => "2020-01-01T00:00:00Z"
+      "schedule" => %{"expr" => "* * * * *", "tz" => "Europe/Paris"}
     }
 
     {:ok, role} = StandingRole.from_map("f", Map.merge(base, overrides))
@@ -19,7 +20,7 @@ defmodule Shuttle.StandingRoleTest do
   end
 
   describe "enabled gates the schedule-derived phases" do
-    test "an armed, past-due role is due" do
+    test "an armed role whose tick has arrived is due" do
       assert StandingRole.state(role(%{}), @now, false) == "due"
     end
 
@@ -28,16 +29,14 @@ defmodule Shuttle.StandingRoleTest do
       assert StandingRole.state(role(%{}), @now, false) == "due"
     end
 
+    test "an armed role whose next tick is in the future is scheduled, not due" do
+      sleeping = role(%{"schedule" => %{"expr" => "0 9 * * 1-5", "tz" => "UTC"}})
+      assert StandingRole.state(sleeping, @now, false) == "scheduled"
+    end
+
     test "a paused role is dormant regardless of its schedule" do
       assert role(%{"enabled" => false}).enabled == false
       assert StandingRole.state(role(%{"enabled" => false}), @now, false) == "dormant"
-    end
-
-    test "a paused role with a preserved awaiting review is still dormant (pause is absolute → Drafts)" do
-      paused_with_review =
-        role(%{"enabled" => false, "review" => %{"state" => "awaiting"}, "next_due_at" => nil})
-
-      assert StandingRole.state(paused_with_review, @now, false) == "dormant"
     end
 
     test "a live worker overrides dormant (a paused-with --no-kill role reads running until it ends)" do
@@ -53,8 +52,7 @@ defmodule Shuttle.StandingRoleTest do
     defp cron_role(expr, overrides \\ %{}) do
       base = %{
         "kind" => "standing",
-        "schedule" => %{"expr" => expr, "tz" => "UTC"},
-        "review" => %{"state" => "scheduled"}
+        "schedule" => %{"expr" => expr, "tz" => "UTC"}
       }
 
       {:ok, role} = StandingRole.from_map("f", Map.merge(base, overrides))
@@ -75,17 +73,16 @@ defmodule Shuttle.StandingRoleTest do
       refute StandingRole.due_by_cron?(cron_role("0 9 * * *"), now, @window_ms)
     end
 
-    test "ignores review.state — the gate is cron + the doc, not review" do
-      # A stale awaiting overlay does not change due-ness: the poller checks the
-      # document's status/tempered, and this checks the cron window. `due?/2`
-      # (the display path) still consults review.state and so differs here.
+    test "due-ness is cron + the doc, never a review axis" do
+      # The dispatch gate is purely the cron window (and the poller's document
+      # status/tempered check before it). There is no review.state to consult —
+      # a leftover review key in the block has no effect on due-ness (slice 4).
       now = ~U[2026-06-02 10:00:30Z]
 
-      awaiting =
+      with_stray_review =
         cron_role("* * * * *", %{"review" => %{"state" => "awaiting", "run_id" => "adhoc-1"}})
 
-      assert StandingRole.due_by_cron?(awaiting, now, @window_ms)
-      refute StandingRole.due?(awaiting, now)
+      assert StandingRole.due_by_cron?(with_stray_review, now, @window_ms)
     end
 
     test "a missed tick (daemon down across it) is not replayed" do
@@ -123,47 +120,27 @@ defmodule Shuttle.StandingRoleTest do
     end
   end
 
-  describe "dispatch_run_id — resume keeps the run id, fresh/accepted mints a new one" do
+  describe "dispatch_run_id — a fresh display label every dispatch (slice 4)" do
     @resume_now ~U[2026-06-05 16:04:19Z]
 
-    test "a resumed run (preserved run_id, no accepted_run_id) keeps the awaiting run's id" do
-      # LifecycleStore.resume leaves review = {state: scheduled, run_id: <preserved>}
-      # and sets next_due_at = now. dispatch_run_id must return the preserved id,
-      # NOT strftime(next_due_at) — otherwise the run window excludes the resume
-      # directive and the dispatcher silently falls back to :fresh.
-      resumed =
-        role(%{
-          "review" => %{"state" => "scheduled", "run_id" => "20260605T070000+0000"},
-          "next_due_at" => "2026-06-05T16:04:19Z"
-        })
+    test "mints from now — the id is no longer load-bearing for resume continuity" do
+      # The resume window-start is now derived from felt history (the last
+      # worker-exit event), not parsed from this id. The id is therefore a fresh
+      # timestamp label every dispatch, regardless of any leftover review block.
+      role = role(%{})
 
-      assert StandingRole.dispatch_run_id(resumed, @resume_now) == "20260605T070000+0000"
+      assert StandingRole.dispatch_run_id(role, @resume_now) ==
+               StandingRole.next_run_id(role, @resume_now)
     end
 
-    test "an accepted run (accepted_run_id == run_id) mints a fresh id from next_due_at" do
-      # accept advances the recurrence; the next run is genuinely new, so the id
-      # comes from next_due_at (the next cron occurrence), not the accepted run.
-      accepted =
-        role(%{
-          "review" => %{
-            "state" => "scheduled",
-            "run_id" => "20260605T070000+0000",
-            "accepted_run_id" => "20260605T070000+0000"
-          },
-          "next_due_at" => "2026-06-08T09:00:00+02:00"
-        })
+    test "a stray review.run_id in the block does not pin the id" do
+      with_stray_review =
+        role(%{"review" => %{"state" => "scheduled", "run_id" => "20260605T070000+0000"}})
 
-      assert StandingRole.dispatch_run_id(accepted, @resume_now) ==
-               StandingRole.next_run_id(accepted, @resume_now)
+      refute StandingRole.dispatch_run_id(with_stray_review, @resume_now) == "20260605T070000+0000"
 
-      refute StandingRole.dispatch_run_id(accepted, @resume_now) == "20260605T070000+0000"
-    end
-
-    test "a fresh scheduled role (no run_id) mints from next_due_at" do
-      fresh = role(%{"review" => %{"state" => "scheduled"}, "next_due_at" => "2026-06-08T09:00:00+02:00"})
-
-      assert StandingRole.dispatch_run_id(fresh, @resume_now) ==
-               StandingRole.next_run_id(fresh, @resume_now)
+      assert StandingRole.dispatch_run_id(with_stray_review, @resume_now) ==
+               StandingRole.next_run_id(with_stray_review, @resume_now)
     end
   end
 end

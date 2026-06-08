@@ -105,7 +105,7 @@ defmodule ShuttleWeb.LifecycleControllerTest do
              "--felt-store\n#{store}\nset-interactive\ntests/interactive-uid\nfalse\n"
   end
 
-  test "accept for standing roles writes lifecycle store and evicts runtime frontmatter" do
+  test "accept for standing roles re-arms from the doc and evicts runtime frontmatter" do
     root =
       System.tmp_dir!()
       |> Path.join("shuttle-lifecycle-accept-#{System.unique_integer([:positive])}")
@@ -116,12 +116,13 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     File.mkdir_p!(fiber_dir)
     path = Path.join(fiber_dir, "standing-accept.md")
 
+    # Slice 4: awaiting is the document itself — `status: closed` + untempered.
+    # accept re-arms straight from the doc schedule; there is no `review` axis.
     File.write!(path, """
     ---
     name: Standing accept
     status: closed
     outcome: digest
-    tempered: false
     closed-at: 2026-06-01T09:30:00Z
     shuttle:
       enabled: true
@@ -131,16 +132,6 @@ defmodule ShuttleWeb.LifecycleControllerTest do
       schedule:
         expr: 0 9 * * 1-5
         tz: UTC
-      review:
-        state: awaiting
-        run_id: run-1
-        completed_at: 2026-06-01T09:12:00Z
-        accepted_run_id: null
-      next_due_at: 2026-06-01T09:00:00Z
-      last_run_at: 2026-06-01T09:12:00Z
-      session:
-        id: stale-session
-        dispatched_at: 2026-06-01T09:00:00Z
     ---
 
     Body.
@@ -158,14 +149,12 @@ defmodule ShuttleWeb.LifecycleControllerTest do
         )
 
       assert conn.status == 200
-      assert conn.resp_body =~ "accepted run run-1"
+      assert conn.resp_body =~ "accepted run for tests/standing-accept"
 
       text = File.read!(path)
       frontmatter = frontmatter(text)
       refute frontmatter =~ "review:"
-      refute frontmatter =~ "next_due_at:"
-      refute frontmatter =~ "last_run_at:"
-      refute frontmatter =~ "session:"
+      refute frontmatter =~ "closed-at:"
       assert frontmatter =~ "status: active"
       assert frontmatter =~ ~s(outcome: "")
       assert frontmatter =~ "schedule:"
@@ -173,25 +162,16 @@ defmodule ShuttleWeb.LifecycleControllerTest do
       assert [
                %{
                  fiber_id: "tests/standing-accept",
-                 metadata: %{
-                   phase: "scheduled",
-                   run_id: "run-1",
-                   next_due_at: next_due_at,
-                   review: %{
-                     "state" => "scheduled",
-                     "run_id" => "run-1",
-                     "accepted_run_id" => "run-1"
-                   }
-                 }
+                 metadata: metadata
                }
              ] = RuntimeStore.list_lifecycle(runtime_store)
 
-      # Regression for the next_due_at drift bug: accept must land on the next
-      # occurrence AFTER now, not one cron tick from the STALE stored value. The
-      # fixture's stored next_due_at (2026-06-01) is in the past; the old code
-      # advanced it to 2026-06-02 — also in the past — so `due?` stayed true and
-      # the role re-fired immediately (the morning-post drift). The fix anchors
-      # on max(now, stored), so the result is a real future 09:00 tick.
+      assert metadata.phase == "scheduled"
+      refute Map.has_key?(metadata, :review)
+
+      # accept re-arms to the next occurrence AFTER now (cron.next(now)), a real
+      # future 09:00 weekday tick — never a stale past value (morning-post drift).
+      next_due_at = metadata.next_due_at
       now = DateTime.utc_now()
       assert DateTime.compare(next_due_at, now) == :gt
       assert next_due_at.hour == 9 and next_due_at.minute == 0
@@ -263,12 +243,10 @@ defmodule ShuttleWeb.LifecycleControllerTest do
 
       assert conn.status == 200
       assert conn.resp_body =~ "reset review lifecycle for tests/standing-reset"
-      assert conn.resp_body =~ "was awaiting"
+      assert conn.resp_body =~ "cleared runtime row"
 
-      # The runtime row is gone, so the poll overlay's put_if_missing has nothing
-      # to inject — combined with the frontmatter review.state: scheduled, a
-      # subsequent resolve of awaitingReview returns close-awaiting-review, not
-      # close-composted.
+      # The runtime row is gone, so nothing lingers for a reader to revive. The
+      # document (status + tempered) is the lifecycle truth.
       assert RuntimeStore.fetch_lifecycle(runtime_store, "tests/standing-reset") == nil
       assert RuntimeStore.list_lifecycle(runtime_store) == []
     end)
@@ -287,13 +265,14 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     File.mkdir_p!(fiber_dir)
     path = Path.join(fiber_dir, "standing-accept-reenable.md")
 
-    # A role that was paused (enabled: false → Drafts) but whose last run's
-    # awaiting review was preserved. Accepting it ("temper") should reschedule
-    # AND flip enabled back on so it re-enters the queue.
+    # A paused role (enabled: false → Drafts) whose last run is awaiting
+    # (status: closed + untempered). Accepting it ("temper") re-arms from the doc
+    # schedule AND flips enabled back on so it re-enters the queue.
     File.write!(path, """
     ---
     name: Standing accept reenable
-    status: active
+    status: closed
+    closed-at: 2026-06-01T09:30:00Z
     shuttle:
       enabled: false
       kind: standing
@@ -302,13 +281,6 @@ defmodule ShuttleWeb.LifecycleControllerTest do
       schedule:
         expr: 0 9 * * 1-5
         tz: UTC
-      review:
-        state: awaiting
-        run_id: run-1
-        completed_at: 2026-06-01T09:12:00Z
-        accepted_run_id: null
-      next_due_at: 2026-06-01T09:00:00Z
-      last_run_at: 2026-06-01T09:12:00Z
     ---
 
     Body.
@@ -346,11 +318,14 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     File.mkdir_p!(fiber_dir)
     path = Path.join(fiber_dir, "standing-resume.md")
 
+    # Slice 4: awaiting is `status: closed` + untempered. resume re-arms from the
+    # doc for immediate dispatch — no review axis, no preserved run_id.
     File.write!(path, """
     ---
     name: Standing resume
-    status: active
+    status: closed
     outcome: digest
+    closed-at: 2026-06-01T09:12:00Z
     shuttle:
       enabled: true
       kind: standing
@@ -359,11 +334,6 @@ defmodule ShuttleWeb.LifecycleControllerTest do
       schedule:
         expr: 0 9 * * 1-5
         tz: UTC
-      review:
-        state: awaiting
-        run_id: run-2
-      next_due_at: null
-      last_run_at: 2026-06-01T09:12:00Z
     ---
 
     Body.
@@ -385,27 +355,30 @@ defmodule ShuttleWeb.LifecycleControllerTest do
 
       frontmatter = path |> File.read!() |> frontmatter()
       refute frontmatter =~ "review:"
-      refute frontmatter =~ "next_due_at:"
-      refute frontmatter =~ "last_run_at:"
+      refute frontmatter =~ "closed-at:"
+      assert frontmatter =~ "status: active"
       assert frontmatter =~ "outcome: digest"
 
       assert [
                %{
                  fiber_id: "tests/standing-resume",
-                 metadata: %{
-                   phase: "scheduled",
-                   run_id: "run-2",
-                   next_due_at: %DateTime{},
-                   review: %{"state" => "scheduled", "run_id" => "run-2"}
-                 }
+                 metadata: metadata
                }
              ] = RuntimeStore.list_lifecycle(runtime_store)
+
+      assert metadata.phase == "scheduled"
+      assert %DateTime{} = metadata.next_due_at
+      refute Map.has_key?(metadata, :review)
     end)
 
     File.rm_rf(root)
   end
 
-  test "accept reads review and timing from lifecycle store after frontmatter eviction" do
+  test "accept refuses a status:active role even with a stale awaiting runtime overlay (overlay is dead)" do
+    # Slice 4 deleted the runtime review overlay. Accept reads ONLY the document:
+    # an armed (`status: active`) role is not awaiting, so accept refuses — even
+    # if a stale runtime row still carries `review.state: awaiting`. This pins
+    # that no path revives the overlay to drive a transition.
     root =
       System.tmp_dir!()
       |> Path.join("shuttle-lifecycle-accept-overlay-#{System.unique_integer([:positive])}")
@@ -416,11 +389,6 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     File.mkdir_p!(fiber_dir)
     path = Path.join(fiber_dir, "standing-accept-overlay.md")
 
-    # The realistic legacy awaiting shape: `status: active` with the review
-    # evicted from frontmatter and living in the runtime overlay (this is
-    # daily-practice's live shape). accept reads review/timing back from the
-    # overlay. (New-model awaiting — `status: closed` + untempered — re-arms
-    # straight from the doc instead; covered in lifecycle_store_test.)
     File.write!(path, """
     ---
     name: Standing accept overlay
@@ -463,39 +431,11 @@ defmodule ShuttleWeb.LifecycleControllerTest do
           })
         )
 
-      assert conn.status == 200
-      assert conn.resp_body =~ "accepted run run-overlay"
+      assert conn.status == 400
+      assert conn.resp_body =~ "not awaiting review"
 
-      frontmatter = path |> File.read!() |> frontmatter()
-      refute frontmatter =~ "review:"
-      refute frontmatter =~ "next_due_at:"
-      refute frontmatter =~ "last_run_at:"
-
-      assert [
-               %{
-                 metadata: %{
-                   phase: "scheduled",
-                   run_id: "run-overlay",
-                   next_due_at: next_due_at,
-                   last_run_at: ~U[2026-06-01 09:12:00Z],
-                   review: %{
-                     "state" => "scheduled",
-                     "run_id" => "run-overlay",
-                     "accepted_run_id" => "run-overlay"
-                   }
-                 }
-               }
-             ] = RuntimeStore.list_lifecycle(runtime_store)
-
-      # Regression for the next_due_at drift bug: accept must land on the next
-      # occurrence AFTER now, not one cron tick from the STALE stored value. The
-      # fixture's stored next_due_at (2026-06-01) is in the past; the old code
-      # advanced it to 2026-06-02 — also in the past — so `due?` stayed true and
-      # the role re-fired immediately (the morning-post drift). The fix anchors
-      # on max(now, stored), so the result is a real future 09:00 tick.
-      now = DateTime.utc_now()
-      assert DateTime.compare(next_due_at, now) == :gt
-      assert next_due_at.hour == 9 and next_due_at.minute == 0
+      # The document is untouched — still armed.
+      assert frontmatter(File.read!(path)) =~ "status: active"
     end)
 
     File.rm_rf(root)
@@ -539,7 +479,7 @@ defmodule ShuttleWeb.LifecycleControllerTest do
         )
 
       assert conn.status == 400
-      assert conn.resp_body =~ "fiber has no review state"
+      assert conn.resp_body =~ "not awaiting review"
       refute File.exists?(args_file)
     end)
 

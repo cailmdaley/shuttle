@@ -250,7 +250,11 @@ defmodule Shuttle.RuntimeStore do
     run_kind = Map.get(metadata, :run_kind)
     next_due_at = metadata |> Map.get(:next_due_at) |> encode_optional_datetime()
     last_run_at = metadata |> Map.get(:last_run_at) |> encode_optional_datetime()
-    review_json = Jason.encode!(Map.get(metadata, :review, %{}))
+    # The review axis is gone (slice 4): awaiting/accepted/composted are document
+    # facts (status + tempered), not a runtime review.state. The column stays for
+    # one release (dropped with the store in slice 6) but is always written empty
+    # so nothing downstream can revive a review overlay from it.
+    review_json = "{}"
     updated_at = DateTime.utc_now() |> DateTime.to_iso8601()
 
     runtime_key = runtime_key(fiber_id, metadata)

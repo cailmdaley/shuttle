@@ -1,14 +1,17 @@
 defmodule Shuttle.LifecycleStore do
   @moduledoc """
-  Daemon-owned standing-role lifecycle transitions backed by RuntimeStore.
+  Standing-role lifecycle transitions (accept / resume / mark-awaiting), written
+  straight to the felt document.
 
-  The synced fiber remains the document: status, outcome, address, and schedule
-  stay there. Runtime lifecycle keys are written to the host-local runtime
-  store and removed from the `shuttle:` frontmatter so Poller can rehydrate them
-  through its lifecycle overlay.
+  The document is the single source of truth: `status`, `tempered`, `outcome`,
+  the cron `schedule`, `agent`, `host`. Accept and resume re-arm an awaiting
+  role (`status: closed` + untempered) by writing `status: active` back to the
+  document; `mark_awaiting` is the worker-exit writer that flips it closed. The
+  runtime store is written for the still-living session/next_due index (gone in
+  slice 6), but no review axis lives anywhere (slice 4 removed it).
   """
 
-  alias Shuttle.{Cron, FeltStores, RuntimeStore, StandingRole}
+  alias Shuttle.{Cron, FeltStores, RuntimeStore}
 
   @runtime_keys ~w(review next_due_at last_run_at session)
 
@@ -18,16 +21,12 @@ defmodule Shuttle.LifecycleStore do
 
     with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
-         :ok <- require_standing(shuttle) do
-      # New-model awaiting is `status: closed` + untempered in the document
-      # itself — no `review.state`. Recognize it directly from the doc and
-      # re-arm from the doc schedule. The legacy review-overlay path stays for
-      # roles still carrying a runtime `review.state` (pre-cutover).
-      if doc_awaiting?(frontmatter) do
-        accept_from_doc(fiber_id, path, frontmatter, body, shuttle, keep_outcome?)
-      else
-        accept_from_review(fiber_id, path, frontmatter, body, shuttle, keep_outcome?)
-      end
+         :ok <- require_standing(shuttle),
+         :ok <- require_doc_awaiting(frontmatter) do
+      # Awaiting is `status: closed` + untempered in the document itself — there
+      # is no `review.state` (slice 4 removed the review axis). Recognize it
+      # straight from the doc and re-arm from the doc schedule.
+      accept_from_doc(fiber_id, path, frontmatter, body, shuttle, keep_outcome?)
     end
   end
 
@@ -41,8 +40,7 @@ defmodule Shuttle.LifecycleStore do
           phase: "scheduled",
           run_id: "",
           next_due_at: next_due_at,
-          last_run_at: nil,
-          review: %{"state" => "scheduled"}
+          last_run_at: nil
         }
         |> stamp_uid(fiber_id)
 
@@ -53,55 +51,13 @@ defmodule Shuttle.LifecycleStore do
     end
   end
 
-  defp accept_from_review(fiber_id, path, frontmatter, body, shuttle, keep_outcome?) do
-    shuttle = merge_lifecycle_overlay(fiber_id, shuttle)
-
-    with {:ok, review} <- require_review_state(shuttle, "awaiting"),
-         {:ok, schedule} <- require_schedule(shuttle),
-         {:ok, next_due_at} <- accepted_next_due_at(schedule, shuttle, review),
-         {:ok, frontmatter} <- update_document(frontmatter, keep_outcome?) do
-      run_id = Map.get(review, "run_id") || ""
-      ad_hoc? = StandingRole.ad_hoc_run_id?(run_id)
-
-      lifecycle =
-        %{
-          kind: "standing",
-          phase: "scheduled",
-          run_id: run_id,
-          next_due_at: next_due_at,
-          last_run_at: parse_datetime(Map.get(shuttle, "last_run_at")),
-          review: %{
-            "state" => "scheduled",
-            "run_id" => run_id,
-            "accepted_run_id" => run_id
-          }
-        }
-        |> stamp_uid(fiber_id)
-
-      RuntimeStore.upsert_lifecycle(runtime_store_path(), fiber_id, lifecycle)
-      write_fiber!(path, evict_runtime_keys(frontmatter), body)
-
-      next_text = if next_due_at, do: DateTime.to_iso8601(next_due_at), else: "unchanged"
-
-      if ad_hoc? do
-        {:ok,
-         "accepted ad-hoc run #{run_id} for #{fiber_id}\n  next due: #{next_text} (unchanged)\n"}
-      else
-        {:ok, "accepted run #{run_id} for #{fiber_id}\n  next due: #{next_text}\n"}
-      end
-    end
-  end
-
   @spec resume(String.t()) :: {:ok, String.t()} | {:error, String.t()}
   def resume(fiber_id) when is_binary(fiber_id) do
     with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
-         :ok <- require_standing(shuttle) do
-      if doc_awaiting?(frontmatter) do
-        resume_from_doc(fiber_id, path, frontmatter, body)
-      else
-        resume_from_review(fiber_id, path, frontmatter, body, shuttle)
-      end
+         :ok <- require_standing(shuttle),
+         :ok <- require_doc_awaiting(frontmatter) do
+      resume_from_doc(fiber_id, path, frontmatter, body)
     end
   end
 
@@ -115,8 +71,7 @@ defmodule Shuttle.LifecycleStore do
         phase: "scheduled",
         run_id: nil,
         next_due_at: now,
-        last_run_at: nil,
-        review: %{"state" => "scheduled"}
+        last_run_at: nil
       }
       |> stamp_uid(fiber_id)
 
@@ -127,40 +82,6 @@ defmodule Shuttle.LifecycleStore do
      "resumed #{fiber_id} (standing role; re-queued for immediate dispatch)\n" <>
        "  next_due_at:  #{DateTime.to_iso8601(now)} (immediate)\n" <>
        "  note: use 'accept' to advance the recurrence instead\n"}
-  end
-
-  defp resume_from_review(fiber_id, path, frontmatter, body, shuttle) do
-    shuttle = merge_lifecycle_overlay(fiber_id, shuttle)
-
-    with {:ok, review} <- require_any_review_state(shuttle, ["awaiting", "review", "in_review"]),
-         {:ok, frontmatter} <- update_document(frontmatter, true) do
-      prior_state = Map.get(review, "state")
-      run_id = Map.get(review, "run_id") || ""
-      now = DateTime.utc_now()
-
-      lifecycle =
-        %{
-          kind: "standing",
-          phase: "scheduled",
-          run_id: empty_to_nil(run_id),
-          next_due_at: now,
-          last_run_at: parse_datetime(Map.get(shuttle, "last_run_at")),
-          review: %{"state" => "scheduled"} |> put_if_present("run_id", run_id)
-        }
-        |> stamp_uid(fiber_id)
-
-      RuntimeStore.upsert_lifecycle(runtime_store_path(), fiber_id, lifecycle)
-      write_fiber!(path, evict_runtime_keys(frontmatter), body)
-
-      run_line = if run_id == "", do: "", else: "  prior run_id: #{run_id}\n"
-
-      {:ok,
-       "resumed #{fiber_id} (standing role; re-queued for immediate dispatch)\n" <>
-         "  review.state: #{prior_state} -> scheduled\n" <>
-         "  next_due_at:  #{DateTime.to_iso8601(now)} (immediate)\n" <>
-         run_line <>
-         "  note: use 'accept' to advance the recurrence instead\n"}
-    end
   end
 
   @doc """
@@ -197,49 +118,22 @@ defmodule Shuttle.LifecycleStore do
   end
 
   @doc """
-  Clear a standing role's runtime lifecycle state on close/reopen.
+  Clear a standing role's runtime lifecycle row on close/reopen.
 
-  Close and reopen are lifecycle transitions just like accept/resume — they
-  end (or restart) a role's review cycle — so they must reset `review.state`,
-  the mirror of what accept does when it advances the cycle. Before this, no
-  verb reset review on close/reopen: a composted standing role kept
-  `review.state: awaiting`, and the un-temper sequence (reopen → re-resolve)
-  re-resolved `awaitingReview` to close-composted, silently re-composting the
-  card the user dragged toward Awaiting Review.
-
-  Two stores hold review state and BOTH must be cleared (neither alone closes
-  the loop):
-
-    - The **runtime store** lifecycle row. `RuntimeStore.delete_lifecycle`
-      existed but had no production caller — close/reopen wrote only
-      frontmatter, so a stale `awaiting` row survived indefinitely and the
-      poll-path `merge_lifecycle_overlay` (frontmatter-precedence
-      `put_if_missing`) re-injected it on the next poll for any role whose
-      frontmatter lacked a review key. This is the revival.
-    - The **frontmatter** `review.state`. Reset to `scheduled` so a role that
-      DOES carry review in frontmatter (real standing roles do) reads
-      `scheduled` directly, and `put_if_missing` then has nothing to fix.
-
-  The frontmatter reset is performed by the Go `shuttle-ctl close`/`reopen`
-  writer (which already owns the status/tempered/closed-at write); this verb
-  owns the runtime-store half and exists so the kanban invoke path and the
-  remote daemon can clear the runtime row in-process (atomic against poll
-  cycles via `Poller.refresh_lifecycle_entry`). A no-op when the fiber has no
-  runtime row (oneshots, already-clean roles).
+  Close and reopen end (or restart) a role's cycle; this drops the host-local
+  runtime row so no stale next_due/session lingers for the kanban invoke path or
+  a remote daemon (atomic against poll cycles via
+  `Poller.refresh_lifecycle_entry`). The document carries the lifecycle truth
+  (status + tempered) — there is no review axis to reset (slice 4). A no-op when
+  the fiber has no runtime row (oneshots, already-clean roles). Named
+  `reset_review` for the invoke verb that calls it; the work is a row delete.
   """
   @spec reset_review(String.t()) :: {:ok, String.t()} | {:error, String.t()}
   def reset_review(fiber_id) when is_binary(fiber_id) do
     existing = RuntimeStore.fetch_lifecycle(runtime_store_path(), fiber_id)
     RuntimeStore.delete_lifecycle(runtime_store_path(), fiber_id)
 
-    note =
-      case existing do
-        %{review: %{"state" => state}} when is_binary(state) and state != "scheduled" ->
-          " (was #{state})"
-
-        _ ->
-          ""
-      end
+    note = if is_nil(existing), do: "", else: " (cleared runtime row)"
 
     {:ok, "reset review lifecycle for #{fiber_id}#{note}\n"}
   end
@@ -277,11 +171,23 @@ defmodule Shuttle.LifecycleStore do
   defp shuttle_block(%{"shuttle" => shuttle}) when is_map(shuttle), do: {:ok, shuttle}
   defp shuttle_block(_), do: {:error, "fiber has no shuttle: block"}
 
-  # New-model awaiting, read straight from the document: `status: closed` with
-  # no verdict (`tempered` unset). `tempered: false` (composted) and
-  # `tempered: true` are termini, not awaiting.
+  # Awaiting, read straight from the document: `status: closed` with no verdict
+  # (`tempered` unset). `tempered: false` (composted) and `tempered: true` are
+  # termini, not awaiting. This is the sole accept/resume precondition (slice 4:
+  # no `review.state` to consult).
   defp doc_awaiting?(frontmatter) do
     Map.get(frontmatter, "status") == "closed" and is_nil(Map.get(frontmatter, "tempered"))
+  end
+
+  defp require_doc_awaiting(frontmatter) do
+    if doc_awaiting?(frontmatter) do
+      :ok
+    else
+      {:error,
+       "fiber is not awaiting review (accept/resume require status:closed + untempered; " <>
+         "status=#{inspect(Map.get(frontmatter, "status"))}, " <>
+         "tempered=#{inspect(Map.get(frontmatter, "tempered"))})"}
+    end
   end
 
   # Key the runtime row by the fiber's intrinsic uid, like the poller does, so
@@ -303,20 +209,6 @@ defmodule Shuttle.LifecycleStore do
     end
   end
 
-  defp merge_lifecycle_overlay(fiber_id, shuttle) do
-    case RuntimeStore.fetch_lifecycle(runtime_store_path(), fiber_id) do
-      lifecycle when is_map(lifecycle) ->
-        shuttle
-        |> put_if_missing("review", stringify_keys(Map.get(lifecycle, :review, %{})))
-        |> put_if_missing("next_due_at", Map.get(lifecycle, :next_due_at))
-        |> put_if_missing("last_run_at", Map.get(lifecycle, :last_run_at))
-        |> put_if_missing("session", stringify_keys(Map.get(lifecycle, :session, %{})))
-
-      _ ->
-        shuttle
-    end
-  end
-
   defp require_standing(%{"kind" => "standing"}), do: :ok
   defp require_standing(%{"mode" => "standing"}), do: :ok
 
@@ -325,51 +217,8 @@ defmodule Shuttle.LifecycleStore do
       {:error,
        "accept/resume store path only applies to standing roles (kind=#{inspect(Map.get(shuttle, "kind"))})"}
 
-  defp require_review_state(shuttle, expected) do
-    with {:ok, review} <- review_map(shuttle),
-         ^expected <- Map.get(review, "state") do
-      {:ok, review}
-    else
-      {:error, reason} -> {:error, reason}
-      actual -> {:error, "fiber is not #{expected} review state (state=#{inspect(actual)})"}
-    end
-  end
-
-  defp require_any_review_state(shuttle, expected) do
-    with {:ok, review} <- review_map(shuttle),
-         true <- Map.get(review, "state") in expected do
-      {:ok, review}
-    else
-      {:error, reason} -> {:error, reason}
-      _ -> {:error, "fiber is not in a resumable review state"}
-    end
-  end
-
-  defp review_map(%{"review" => review}) when is_map(review), do: {:ok, review}
-  defp review_map(_), do: {:error, "fiber has no review state"}
-
   defp require_schedule(%{"schedule" => schedule}) when is_map(schedule), do: {:ok, schedule}
   defp require_schedule(_), do: {:error, "fiber has no schedule"}
-
-  defp accepted_next_due_at(_schedule, shuttle, %{"run_id" => "adhoc-" <> _}) do
-    {:ok, parse_datetime(Map.get(shuttle, "next_due_at"))}
-  end
-
-  defp accepted_next_due_at(schedule, shuttle, _review) do
-    now = DateTime.utc_now()
-    stored = parse_datetime(Map.get(shuttle, "next_due_at"))
-
-    # Anchor on the present. Advancing from a STALE stored next_due_at (manual
-    # dispatch, late accept, daemon downtime) only moves one cron tick and can
-    # stay in the past — then `due?` stays true and the role re-fires immediately
-    # instead of waiting for the next real occurrence (the morning-post drift
-    # bug). Use the later of stored/now so we always land on the next occurrence
-    # AFTER now; missed ticks are skipped, not replayed (correct for a recurring
-    # role — you want the next morning post, not a backlog of them).
-    from = if stored && DateTime.compare(stored, now) == :gt, do: stored, else: now
-
-    Cron.next_occurrence(schedule, from)
-  end
 
   defp update_document(frontmatter, keep_outcome?) do
     frontmatter =
@@ -410,37 +259,6 @@ defmodule Shuttle.LifecycleStore do
   defp runtime_store_path do
     System.get_env("SHUTTLE_RUNTIME_STORE") || RuntimeStore.default_path()
   end
-
-  defp parse_datetime(nil), do: nil
-  defp parse_datetime(""), do: nil
-  defp parse_datetime(%DateTime{} = value), do: value
-
-  defp parse_datetime(value) when is_binary(value) do
-    case DateTime.from_iso8601(value) do
-      {:ok, datetime, _} -> datetime
-      {:error, _} -> nil
-    end
-  end
-
-  defp parse_datetime(_), do: nil
-
-  defp put_if_present(map, _key, ""), do: map
-  defp put_if_present(map, _key, nil), do: map
-  defp put_if_present(map, key, value), do: Map.put(map, key, value)
-  defp put_if_missing(map, _key, nil), do: map
-  defp put_if_missing(map, _key, value) when value == %{}, do: map
-
-  defp put_if_missing(map, key, value) do
-    case Map.get(map, key) do
-      nil -> Map.put(map, key, value)
-      "" -> Map.put(map, key, value)
-      %{} = nested when map_size(nested) == 0 -> Map.put(map, key, value)
-      _ -> map
-    end
-  end
-
-  defp empty_to_nil(""), do: nil
-  defp empty_to_nil(value), do: value
 
   defp stringify_keys(map),
     do: Map.new(map, fn {key, value} -> {to_string(key), stringify_value(value)} end)

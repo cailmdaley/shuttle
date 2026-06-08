@@ -770,6 +770,10 @@ defmodule Shuttle.PollerTest do
     fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
     MockRunner.set_fiber(fiber_id, fiber)
 
+    # Slice 4: the runtime row carries no review axis. Phase is the
+    # schedule-derived label "scheduled"; awaiting/accepted are document facts
+    # (status:closed/tempered), not stored. A leftover review block in the
+    # frontmatter is ignored — it never shapes the persisted row.
     MockRunner.set_shuttle(
       fiber_id,
       """
@@ -778,12 +782,6 @@ defmodule Shuttle.PollerTest do
       schedule:
         expr: "0 9 * * 1-5"
         tz: Europe/Paris
-      review:
-        state: awaiting
-        run_id: run-1
-        accepted_run_id: null
-      next_due_at: null
-      last_run_at: "2026-06-02T09:13:00+02:00"
       """
     )
 
@@ -806,17 +804,18 @@ defmodule Shuttle.PollerTest do
     assert [
              %{
                fiber_id: ^fiber_id,
-               metadata: %{
-                 kind: "standing",
-                 phase: "awaiting",
-                 run_id: "run-1",
-                 review: %{"state" => "awaiting"}
-               }
+               metadata: metadata
              }
            ] = Shuttle.RuntimeStore.list_lifecycle(runtime_store_path)
 
-    assert [%{fiber_id: ^fiber_id, state: "review", run_id: "run-1"}] =
-             Poller.snapshot(poller).standing_roles
+    assert metadata.kind == "standing"
+    assert metadata.phase == "scheduled"
+    refute Map.has_key?(metadata, :review)
+
+    # The schedule-derived snapshot state is scheduled or due (cron + now), never
+    # a review-derived "review"/"accepted".
+    assert [%{fiber_id: ^fiber_id, state: state}] = Poller.snapshot(poller).standing_roles
+    assert state in ["scheduled", "due"]
   after
     cleanup_runtime_store_paths()
   end
@@ -929,17 +928,18 @@ defmodule Shuttle.PollerTest do
     cleanup_runtime_store_paths()
   end
 
-  # Regression: standing-role review state lives in the runtime store, not the
-  # frontmatter (LifecycleStore evicts it). Action resolution must overlay it,
-  # or `accept-run` on an awaiting role is wrongly rejected as
-  # `action_not_available` (the kanban "can't temper the weekly arXiv role" bug).
-  test "actions reflect runtime-store review state even when the frontmatter omits it" do
+  # Slice 4: awaiting is a DOCUMENT fact (status:closed + untempered), not a
+  # runtime-store review row. Action resolution reads the document straight — no
+  # overlay — so `accept-run` is available on a closed+untempered standing role
+  # (the kanban "temper the weekly arXiv role" gesture re-arms it).
+  test "actions reflect doc awaiting (status:closed + untempered) for a standing role" do
     fiber_id = "tests/standing-actions-overlay"
     runtime_store_path = runtime_store_path()
-    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
+    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"], "status" => "closed"})
     MockRunner.set_fiber(fiber_id, fiber)
 
-    # No review: block in the frontmatter — the daemon owns review state.
+    # The document is the authority: status:closed with no `tempered` is the
+    # awaiting signal. No review block anywhere.
     MockRunner.set_shuttle(
       fiber_id,
       """
@@ -948,17 +948,9 @@ defmodule Shuttle.PollerTest do
       schedule:
         expr: "0 9 * * 1"
         tz: Europe/Paris
-      """
+      """,
+      "closed"
     )
-
-    Shuttle.RuntimeStore.upsert_lifecycle(runtime_store_path, fiber_id, %{
-      kind: "standing",
-      phase: "awaiting",
-      run_id: "run-1",
-      next_due_at: nil,
-      last_run_at: nil,
-      review: %{"state" => "awaiting", "run_id" => "run-1"}
-    })
 
     {:ok, poller} =
       Poller.start_link(
@@ -970,10 +962,7 @@ defmodule Shuttle.PollerTest do
       )
 
     send(poller, :run_poll_cycle)
-
-    assert wait_until(fn ->
-             match?([%{fiber_id: ^fiber_id}], Poller.snapshot(poller).standing_roles)
-           end)
+    Process.sleep(100)
 
     {:ok, actions} = Poller.actions_for(poller, fiber_id, [])
     ids = Enum.map(actions, &(Map.get(&1, :id) || Map.get(&1, "id")))
@@ -1008,7 +997,9 @@ defmodule Shuttle.PollerTest do
       restore_env("LOOM_HOMES", previous_loom_homes)
     end)
 
-    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
+    # Slice 4: awaiting is a document fact (status:closed + untempered). accept
+    # re-arms it from the doc schedule and writes a `scheduled` runtime row.
+    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"], "status" => "closed"})
     MockRunner.set_fiber(fiber_id, fiber)
 
     MockRunner.set_shuttle(
@@ -1019,17 +1010,9 @@ defmodule Shuttle.PollerTest do
       schedule:
         expr: "0 9 * * 1"
         tz: Europe/Paris
-      """
+      """,
+      "closed"
     )
-
-    Shuttle.RuntimeStore.upsert_lifecycle(runtime_store_path, fiber_id, %{
-      kind: "standing",
-      phase: "awaiting",
-      run_id: "20260601T070000+0000",
-      next_due_at: nil,
-      last_run_at: nil,
-      review: %{"state" => "awaiting", "run_id" => "20260601T070000+0000"}
-    })
 
     {:ok, poller} =
       Poller.start_link(
@@ -1041,7 +1024,7 @@ defmodule Shuttle.PollerTest do
 
     assert {:ok, _output} = Poller.lifecycle_transition(poller, :accept, fiber_id, [])
 
-    assert %{phase: "scheduled", review: %{"state" => "scheduled"}} =
+    assert %{phase: "scheduled"} =
              Shuttle.RuntimeStore.fetch_lifecycle(runtime_store_path, fiber_id)
 
     send(poller, :run_poll_cycle)
@@ -1078,7 +1061,8 @@ defmodule Shuttle.PollerTest do
       restore_env("LOOM_HOMES", previous_loom_homes)
     end)
 
-    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
+    # Slice 4: awaiting is a document fact (status:closed + untempered).
+    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"], "status" => "closed"})
     MockRunner.set_fiber(fiber_id, fiber)
 
     MockRunner.set_shuttle(
@@ -1089,17 +1073,9 @@ defmodule Shuttle.PollerTest do
       schedule:
         expr: "0 9 * * 1"
         tz: Europe/Paris
-      """
+      """,
+      "closed"
     )
-
-    Shuttle.RuntimeStore.upsert_lifecycle(runtime_store_path, fiber_id, %{
-      kind: "standing",
-      phase: "awaiting",
-      run_id: "20260601T070000+0000",
-      next_due_at: nil,
-      last_run_at: nil,
-      review: %{"state" => "awaiting", "run_id" => "20260601T070000+0000"}
-    })
 
     {:ok, poller} =
       Poller.start_link(
@@ -1110,7 +1086,7 @@ defmodule Shuttle.PollerTest do
       )
 
     # Hold the next poll inside its read-only felt walk; its snapshot still sees
-    # the role as `awaiting`.
+    # the role as the closed (awaiting) document.
     MockRunner.set_felt_ls_delay(400)
     send(poller, :run_poll_cycle)
 
@@ -1542,7 +1518,11 @@ defmodule Shuttle.PollerTest do
            end)
   end
 
-  test "poller rejects stale accepted standing metadata" do
+  # Slice 4: a stale stored next_due_at no longer fires the role — due-ness is
+  # cron-computed against the poll window (the morning-post-drift rule). A role
+  # whose only past tick fell outside the window is not dispatched, and its
+  # snapshot is a valid schedule-derived state (no review/accepted validation).
+  test "poller does not dispatch a standing role whose stored next_due is stale" do
     fiber = make_fiber("tests/standing-stale", %{"tags" => ["constitution", "standing"]})
     MockRunner.set_fiber("tests/standing-stale", fiber)
 
@@ -1555,10 +1535,6 @@ defmodule Shuttle.PollerTest do
         kind: cron
         expr: "0 9 * * 1-5"
         timezone: Europe/Paris
-      review:
-        state: accepted
-        run_id: run-2
-        accepted_run_id: run-1
       next_due_at: "2000-01-03T09:00:00+01:00"
       """
     )
@@ -1578,18 +1554,23 @@ defmodule Shuttle.PollerTest do
              cmd == "tmux" and hd(args) == "new-session"
            end)
 
-    assert [%{fiber_id: "tests/standing-stale", validation_errors: errors}] =
+    assert [%{fiber_id: "tests/standing-stale", state: state, validation_errors: []}] =
              Poller.snapshot(poller).standing_roles
 
-    assert Enum.any?(errors, &String.contains?(&1, "accepted_run_id"))
+    assert state in ["scheduled", "due"]
   end
 
-  test "snapshot exposes review and accepted standing states" do
-    review = make_fiber("tests/standing-review", %{"tags" => ["constitution", "standing"]})
-    accepted = make_fiber("tests/standing-accepted", %{"tags" => ["constitution", "standing"]})
-    MockRunner.set_fiber("tests/standing-review", review)
-    MockRunner.set_fiber("tests/standing-accepted", accepted)
+  # Slice 4: the snapshot state is schedule-derived (scheduled/due/dormant/
+  # running), never a review-derived "review"/"accepted". Awaiting/accepted are
+  # document facts the kanban classifier reads from status/tempered.
+  test "snapshot standing state is schedule-derived, not review-derived" do
+    sleeping = make_fiber("tests/standing-review", %{"tags" => ["constitution", "standing"]})
+    paused = make_fiber("tests/standing-accepted", %{"tags" => ["constitution", "standing"]})
+    MockRunner.set_fiber("tests/standing-review", sleeping)
+    MockRunner.set_fiber("tests/standing-accepted", paused)
 
+    # A leftover review block is ignored; the role reads scheduled (its next
+    # weekday-09:00 tick is in the future).
     MockRunner.set_shuttle(
       "tests/standing-review",
       """
@@ -1601,17 +1582,14 @@ defmodule Shuttle.PollerTest do
         timezone: Europe/Paris
       review:
         state: awaiting
-        run_id: run-1
-        accepted_run_id: null
-      next_due_at: null
-      last_run_at: "2026-05-02T09:12:00+02:00"
       """
     )
 
+    # A paused role reads dormant regardless of any review block.
     MockRunner.set_shuttle(
       "tests/standing-accepted",
       """
-      enabled: true
+      enabled: false
       mode: standing
       schedule:
         kind: cron
@@ -1619,10 +1597,6 @@ defmodule Shuttle.PollerTest do
         timezone: Europe/Paris
       review:
         state: accepted
-        run_id: run-2
-        accepted_run_id: run-2
-      next_due_at: "2999-01-01T09:00:00+01:00"
-      last_run_at: "2026-05-02T09:12:00+02:00"
       """
     )
 
@@ -1641,8 +1615,8 @@ defmodule Shuttle.PollerTest do
            end)
 
     roles = Poller.snapshot(poller).standing_roles
-    assert Enum.find(roles, &(&1.fiber_id == "tests/standing-review")).state == "review"
-    assert Enum.find(roles, &(&1.fiber_id == "tests/standing-accepted")).state == "accepted"
+    assert Enum.find(roles, &(&1.fiber_id == "tests/standing-review")).state == "scheduled"
+    assert Enum.find(roles, &(&1.fiber_id == "tests/standing-accepted")).state == "dormant"
   end
 
   test "poller respects dependency satisfaction" do
