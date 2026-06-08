@@ -103,6 +103,44 @@ defmodule ShuttleWeb.LifecycleControllerTest do
              "--felt-store\n#{store}\nset-interactive\ntests/interactive-uid\nfalse\n"
   end
 
+  test "set-outcome delegates to shuttle-ctl, preserving a multi-line value as one arg" do
+    root =
+      System.tmp_dir!()
+      |> Path.join("shuttle-lifecycle-outcome-#{System.unique_integer([:positive])}")
+
+    store = Path.join(root, "loom")
+    fiber_dir = Path.join([store, ".felt", "tests", "outcome-edit"])
+    File.mkdir_p!(fiber_dir)
+    File.write!(Path.join(fiber_dir, "outcome-edit.md"), "---\nname: Outcome edit\n---\n\n")
+
+    args_file = install_fake_shuttle_ctl!()
+    old_loom_homes = System.get_env("LOOM_HOMES")
+    System.put_env("LOOM_HOMES", store)
+
+    on_exit(fn ->
+      restore_env("LOOM_HOMES", old_loom_homes)
+      File.rm_rf(root)
+    end)
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/lifecycle",
+        Jason.encode!(%{
+          "action" => "set-outcome",
+          "fiber" => "tests/outcome-edit",
+          "outcome" => "Blocked: waiting on ADS token\nsecond line"
+        })
+      )
+
+    assert conn.status == 200
+
+    # The multi-line outcome rides as a single argv element (one `--outcome`
+    # value), so the block scalar survives without stdin piping.
+    assert File.read!(args_file) ==
+             "set-outcome\ntests/outcome-edit\n--outcome\nBlocked: waiting on ADS token\nsecond line\n"
+  end
+
   test "accept for standing roles re-arms from the doc and evicts runtime frontmatter" do
     root =
       System.tmp_dir!()

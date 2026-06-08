@@ -5,14 +5,14 @@ defmodule ShuttleWeb.LifecycleController do
   Cross-host lifecycle requests from Portolan land here on the selected
   daemon. The endpoint delegates to the existing shuttle-ctl Go CLI, so the
   validated offline frontmatter writer remains the single implementation of
-  install/pause/resume/repeat/accept/set-model/set-interactive/uninstall.
+  install/pause/resume/repeat/accept/set-model/set-interactive/set-outcome/uninstall.
   """
 
   use Phoenix.Controller, formats: [:json]
 
   alias Shuttle.{FeltStores, LifecycleService}
 
-  @allowed ~w(install pause resume repeat accept set-model set-interactive uninstall)
+  @allowed ~w(install pause resume repeat accept set-model set-interactive set-outcome uninstall)
 
   def create(conn, params) do
     with {:ok, action} <- action(params),
@@ -53,7 +53,7 @@ defmodule ShuttleWeb.LifecycleController do
   end
 
   defp execute(action, %{"fiber" => fiber} = params)
-       when action in ~w(pause set-model set-interactive uninstall) do
+       when action in ~w(pause set-model set-interactive set-outcome uninstall) do
     with {:ok, fiber_id} <- fiber_address(fiber) do
       action
       |> args_for(%{params | "fiber" => fiber_id})
@@ -105,6 +105,14 @@ defmodule ShuttleWeb.LifecycleController do
 
   defp args_for("set-model", %{"fiber" => fiber, "agent" => agent}),
     do: {:ok, ["set-model", fiber, agent]}
+
+  # The outcome string round-trips as a single argv element, so multi-line
+  # values (block scalars) survive without stdin piping. set-outcome refuses a
+  # block-less fiber and runs `ensure_owned_here`, so a misrouted edit surfaces
+  # a loud owner-mismatch rather than writing the wrong host's document.
+  defp args_for("set-outcome", %{"fiber" => fiber, "outcome" => outcome})
+       when is_binary(outcome),
+       do: {:ok, ["set-outcome", fiber, "--outcome", outcome]}
 
   defp args_for("set-interactive", %{"fiber" => fiber, "interactive" => interactive})
        when is_boolean(interactive) do
