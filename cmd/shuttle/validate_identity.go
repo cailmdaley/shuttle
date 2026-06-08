@@ -30,7 +30,6 @@ type identitySummary struct {
 	MissingUIDCount   int `json:"missing_uid_count"`
 	DocumentSkewCount int `json:"document_skew_count"`
 	DuplicateUIDCount int `json:"duplicate_uid_count"`
-	RuntimeSkewCount  int `json:"runtime_skew_count"`
 	HostlessOpenCount int `json:"hostless_open_count"`
 }
 
@@ -38,12 +37,11 @@ type identityDaemonReport struct {
 	URL           string                   `json:"url"`
 	Host          string                   `json:"host,omitempty"`
 	FiberCount    int                      `json:"fiber_count"`
-	MissingUID    []identityFiberFinding   `json:"missing_uid,omitempty"`
-	DocumentSkew  []identityFiberFinding   `json:"document_skew,omitempty"`
-	DuplicateUIDs []identityDuplicateUID   `json:"duplicate_uids,omitempty"`
-	RuntimeSkew   []identityRuntimeFinding `json:"runtime_skew,omitempty"`
-	HostlessOpen  []identityFiberFinding   `json:"hostless_open,omitempty"`
-	Error         string                   `json:"error,omitempty"`
+	MissingUID    []identityFiberFinding `json:"missing_uid,omitempty"`
+	DocumentSkew  []identityFiberFinding `json:"document_skew,omitempty"`
+	DuplicateUIDs []identityDuplicateUID `json:"duplicate_uids,omitempty"`
+	HostlessOpen  []identityFiberFinding `json:"hostless_open,omitempty"`
+	Error         string                 `json:"error,omitempty"`
 }
 
 type identityFiberFinding struct {
@@ -62,13 +60,6 @@ type identityDuplicateUID struct {
 	Count int                    `json:"count"`
 }
 
-type identityRuntimeFinding struct {
-	Key     string `json:"key"`
-	UID     string `json:"uid,omitempty"`
-	FiberID string `json:"fiber_id,omitempty"`
-	Reason  string `json:"reason"`
-}
-
 type daemonFibersResponse struct {
 	Host   string           `json:"host"`
 	Fibers []daemonFiberRow `json:"fibers"`
@@ -80,20 +71,15 @@ type daemonFiberRow struct {
 	Fiber     map[string]any `json:"fiber"`
 }
 
-type daemonStateResponse struct {
-	Runtime map[string]map[string]any `json:"runtime"`
-}
-
 var validateIdentityCmd = &cobra.Command{
 	Use:   "validate-identity",
 	Short: "Validate federated fiber UID readiness across daemon feeds",
-	Long: `Queries Shuttle daemon document and runtime surfaces and checks the
+	Long: `Queries the Shuttle daemon document surface and checks the
 intrinsic-identity migration invariants:
 
   - /api/v1/fibers rows carry ULID uid values
   - document id equals uid when uid is present
   - uid values do not describe multiple slug addresses in one daemon feed
-  - /api/v1/state.runtime rows are keyed by uid when a uid is present
   - open/active shuttle fibers have shuttle.host ownership
 
 By default it checks the usual local tunnel ports (:4000, :4001, :4002).
@@ -113,7 +99,6 @@ Pass --daemon-url repeatedly to validate another set of daemon base URLs.`,
 		hasGaps := report.Summary.MissingUIDCount > 0 ||
 			report.Summary.DocumentSkewCount > 0 ||
 			report.Summary.DuplicateUIDCount > 0 ||
-			report.Summary.RuntimeSkewCount > 0 ||
 			report.Summary.HostlessOpenCount > 0
 
 		if jsonOutput {
@@ -146,7 +131,6 @@ func validateIdentity(urls []string) identityReport {
 		report.Summary.MissingUIDCount += len(daemon.MissingUID)
 		report.Summary.DocumentSkewCount += len(daemon.DocumentSkew)
 		report.Summary.DuplicateUIDCount += len(daemon.DuplicateUIDs)
-		report.Summary.RuntimeSkewCount += len(daemon.RuntimeSkew)
 		report.Summary.HostlessOpenCount += len(daemon.HostlessOpen)
 	}
 	return report
@@ -189,36 +173,6 @@ func validateIdentityDaemon(baseURL string) identityDaemonReport {
 		}
 	}
 	sortIdentityDaemonReport(&report)
-
-	var state daemonStateResponse
-	if err := fetchJSON(baseURL+"/api/v1/state", &state); err != nil {
-		report.RuntimeSkew = append(report.RuntimeSkew, identityRuntimeFinding{
-			Reason: "state fetch failed: " + err.Error(),
-		})
-		return report
-	}
-	for key, row := range state.Runtime {
-		uid := stringField(row, "uid")
-		if uid == "" {
-			report.RuntimeSkew = append(report.RuntimeSkew, identityRuntimeFinding{
-				Key:     key,
-				FiberID: stringField(row, "fiber_id"),
-				Reason:  "runtime row missing uid",
-			})
-			continue
-		}
-		if key != uid {
-			report.RuntimeSkew = append(report.RuntimeSkew, identityRuntimeFinding{
-				Key:     key,
-				UID:     uid,
-				FiberID: stringField(row, "fiber_id"),
-				Reason:  "runtime key differs from uid",
-			})
-		}
-	}
-	sort.Slice(report.RuntimeSkew, func(i, j int) bool {
-		return report.RuntimeSkew[i].Key < report.RuntimeSkew[j].Key
-	})
 
 	return report
 }
@@ -302,13 +256,12 @@ func isOpenStatus(status string) bool {
 
 func printIdentityReport(report identityReport) {
 	fmt.Printf("Federated identity validation (%s)\n", report.GeneratedAt.Format(time.RFC3339))
-	fmt.Printf("Daemons: %d  Fibers: %d  Missing UID: %d  Document skew: %d  Duplicate UID: %d  Runtime skew: %d  Hostless open: %d\n\n",
+	fmt.Printf("Daemons: %d  Fibers: %d  Missing UID: %d  Document skew: %d  Duplicate UID: %d  Hostless open: %d\n\n",
 		report.Summary.DaemonCount,
 		report.Summary.FiberCount,
 		report.Summary.MissingUIDCount,
 		report.Summary.DocumentSkewCount,
 		report.Summary.DuplicateUIDCount,
-		report.Summary.RuntimeSkewCount,
 		report.Summary.HostlessOpenCount,
 	)
 
@@ -326,7 +279,6 @@ func printIdentityReport(report identityReport) {
 		printFindingGroup("document id != uid", daemon.DocumentSkew)
 		printFindingGroup("hostless open/active", daemon.HostlessOpen)
 		printDuplicateGroup(daemon.DuplicateUIDs)
-		printRuntimeGroup(daemon.RuntimeSkew)
 		fmt.Println()
 	}
 }
@@ -349,16 +301,6 @@ func printDuplicateGroup(rows []identityDuplicateUID) {
 	fmt.Printf("  duplicate uid (%d):\n", len(rows))
 	for _, row := range rows {
 		fmt.Printf("    - %s (%d rows)\n", row.UID, row.Count)
-	}
-}
-
-func printRuntimeGroup(rows []identityRuntimeFinding) {
-	if len(rows) == 0 {
-		return
-	}
-	fmt.Printf("  runtime skew (%d):\n", len(rows))
-	for _, row := range rows {
-		fmt.Printf("    - key=%s uid=%s fiber_id=%s: %s\n", row.Key, row.UID, row.FiberID, row.Reason)
 	}
 }
 
