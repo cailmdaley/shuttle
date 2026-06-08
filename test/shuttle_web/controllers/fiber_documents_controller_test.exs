@@ -92,14 +92,45 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
     assert [%{"fiber" => %{"body" => "Body text."}}] = Jason.decode!(conn.resp_body)["fibers"]
   end
 
-  test "GET /api/v1/fibers?shuttle=true returns only fibers with a shuttle block", %{store: store} do
+  test "GET /api/v1/fibers?shuttle=true serves only this daemon's owned shuttle rows",
+       %{store: store} do
+    # Owned: shuttle block pinned to this daemon's host.
     write_fiber!(store, "tests/managed", """
     ---
     name: Managed
     status: active
     shuttle:
-      enabled: true
+      kind: oneshot
       host: test-host
+    ---
+
+    Body.
+    """)
+
+    # Owned by ANOTHER host: physically rooted here (so it lands in the local
+    # walk / document cache) but pinned to a peer. Slice 7: the owner-only feed
+    # never serves a peer's fiber — it belongs to that host's feed, and a viewer
+    # concatenates owners' answers rather than merging a mirror copy.
+    write_fiber!(store, "tests/elsewhere", """
+    ---
+    name: Owned elsewhere
+    status: active
+    shuttle:
+      kind: oneshot
+      host: other-host
+    ---
+
+    Body.
+    """)
+
+    # Unowned: a shuttle block with no host:. Detected (it has a block) but not
+    # considered — it names no daemon, so no daemon's feed claims it.
+    write_fiber!(store, "tests/unowned", """
+    ---
+    name: Unowned draft
+    status: open
+    shuttle:
+      kind: oneshot
     ---
 
     Body.
@@ -115,7 +146,7 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
     Body.
     """)
 
-    # Unfiltered: both fibers come back (back-compatible default).
+    # Unfiltered: every fiber comes back (the content/search reader path).
     all = get(api_conn(), "/api/v1/fibers")
     assert all.status == 200
 
@@ -124,9 +155,9 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
       |> Enum.map(& &1["fiber"]["name"])
       |> Enum.sort()
 
-    assert all_names == ["Managed", "Plain todo"]
+    assert all_names == ["Managed", "Owned elsewhere", "Plain todo", "Unowned draft"]
 
-    # shuttle=true: only the fiber carrying a non-empty `shuttle:` block.
+    # shuttle=true: ONLY the row this daemon owns (shuttle block + host == own).
     only = get(api_conn(), "/api/v1/fibers?shuttle=true")
     assert only.status == 200
     assert [%{"fiber" => %{"name" => "Managed"}}] = Jason.decode!(only.resp_body)["fibers"]

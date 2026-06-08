@@ -464,10 +464,17 @@ defmodule Shuttle.Poller do
 
   def handle_call({:cached_fiber_documents, opts}, _from, state) do
     if state.document_cache_ready do
+      # Owner-only kanban feed: the document cache holds every shuttle fiber
+      # PHYSICALLY ROOTED in a configured store, which includes fibers pinned to
+      # another host's `shuttle.host:`. The feed serves strictly this daemon's
+      # owned rows (the same predicate the direct FiberDocuments path applies),
+      # so a viewer reading us as a remote origin gets only what we own — no
+      # peer-mirror rows to merge or elect.
       entries =
         state.document_cache
         |> Map.values()
         |> Enum.map(& &1.entry)
+        |> Enum.filter(&owned_feed_entry?(&1, state.own_host_id))
         |> Enum.sort_by(&get_in(&1, [:fiber, "id"]))
 
       stores = Keyword.get(opts, :felt_stores, state.felt_stores)
@@ -715,119 +722,20 @@ defmodule Shuttle.Poller do
       document_cache: stringify_keys(state.document_cache_stats)
     }
 
-    Map.put(snap, :runtime, runtime_by_fiber(state, snap, now))
+    # No separate per-fiber runtime index (slice 7). The runtime store and the
+    # review overlay it fed are gone; liveness rides the `eligible`/`running`
+    # rows (each carries uid, tmux_session, state), standing-role due-ness rides
+    # `standing_roles`, and a viewer computes next_due from the document
+    # `schedule` it already reads off the owner-only feed. There is nothing left
+    # for a `:runtime` overlay to add.
+    snap
   end
-
-  # The per-fiber runtime index is derived from the live `running` map (tmux
-  # liveness) and the standing-role snapshots (cron-computed due-ness). There is
-  # no persisted lifecycle base (slice 6: runtime store gone): a oneshot's phase
-  # is "running" iff its watcher is live, and a standing role's phase comes from
-  # status/tempered/cron/liveness.
-  defp runtime_by_fiber(%State{} = state, snap, now) do
-    %{}
-    |> merge_running_runtime(snap.eligible, state)
-    |> merge_standing_runtime(snap.standing_roles, now, state)
-  end
-
-  defp merge_running_runtime(runtime, running, state) do
-    Enum.reduce(running, runtime, fn worker, acc ->
-      fiber_id = worker.fiber_id
-      runtime_key = runtime_entry_key(state, fiber_id, worker)
-
-      Map.update(acc, runtime_key, running_runtime(worker, state), fn existing ->
-        existing
-        |> Map.merge(running_runtime(worker, state))
-        |> Map.put(:phase, "running")
-      end)
-    end)
-  end
-
-  defp running_runtime(worker, state) do
-    %{
-      fiber_id: worker.fiber_id,
-      uid: uid_for_fiber(state, worker.fiber_id, worker),
-      phase: "running",
-      running: true,
-      tmux_session: worker.tmux_session,
-      agent: worker.agent,
-      run_id: worker.run_id,
-      started_at: worker.started_at,
-      last_activity_at: worker.last_activity_at,
-      runtime_seconds: worker.runtime_seconds
-    }
-    |> compact_runtime()
-  end
-
-  defp merge_standing_runtime(runtime, standing_roles, now, state) do
-    Enum.reduce(standing_roles, runtime, fn role, acc ->
-      fiber_id = role.fiber_id
-      runtime_key = runtime_entry_key(state, fiber_id)
-
-      Map.update(acc, runtime_key, standing_runtime(role, now, state), fn existing ->
-        existing
-        |> Map.merge(standing_runtime(role, now, state))
-        |> preserve_active_phase()
-      end)
-    end)
-  end
-
-  defp standing_runtime(role, now, state) do
-    %{
-      fiber_id: role.fiber_id,
-      uid: uid_for_fiber(state, role.fiber_id),
-      kind: "standing",
-      phase: standing_phase(role),
-      state: role.state,
-      run_id: role.run_id,
-      next_due_at: role.next_due_at,
-      last_run_at: role.last_run_at,
-      schedule: role.schedule,
-      validation_errors: role.validation_errors,
-      due_in_ms: due_in_ms(role.next_due_at, now)
-    }
-    |> compact_runtime()
-  end
-
-  # The runtime phase is the schedule-derived display state (slice 4/5: no review
-  # axis, no enabled flag). `state/3` yields running/due/scheduled; awaiting,
-  # accepted, and paused/draft are document facts the kanban classifier reads
-  # from status/tempered, not a phase.
-  defp standing_phase(%{state: "running"}), do: "running"
-  defp standing_phase(%{state: "due"}), do: "due"
-  defp standing_phase(_), do: "scheduled"
-
-  defp preserve_active_phase(%{phase: phase} = runtime) when phase in ["running", "retrying"] do
-    runtime
-  end
-
-  defp preserve_active_phase(runtime), do: runtime
-
-  defp compact_runtime(map) do
-    Map.reject(map, fn
-      {_key, nil} -> true
-      {_key, %{}} -> true
-      {_key, []} -> true
-      _ -> false
-    end)
-  end
-
-  defp due_in_ms(nil, _now), do: nil
-
-  defp due_in_ms(next_due_at, now) when is_integer(next_due_at) do
-    max(0, next_due_at - DateTime.to_unix(now, :millisecond))
-  end
-
-  defp due_in_ms(_, _now), do: nil
 
   defp uid_for_fiber(%State{} = state, fiber_id, metadata \\ %{}) do
     case metadata_uid(metadata) || Map.get(state.fiber_uid_cache, fiber_id) do
       uid when is_binary(uid) and uid != "" -> uid
       _ -> nil
     end
-  end
-
-  defp runtime_entry_key(%State{} = state, fiber_id, metadata \\ %{}) do
-    uid_for_fiber(state, fiber_id, metadata) || fiber_id
   end
 
   defp runtime_key_for_fiber(fiber) when is_map(fiber) do
@@ -1228,6 +1136,15 @@ defmodule Shuttle.Poller do
 
     {:ok, all_fibers, host_map, uid_map}
   end
+
+  # Owner-only feed gate for a cached document entry: keep it iff its
+  # `shuttle.host` equals this daemon's `own_host_id`. The same `host_owned?`
+  # predicate the dispatch plane uses, so the feed and dispatch agree on the
+  # single owner of each fiber.
+  defp owned_feed_entry?(%{fiber: %{"shuttle" => shuttle}}, own_host_id),
+    do: host_owned?(shuttle, own_host_id)
+
+  defp owned_feed_entry?(_, _), do: false
 
   defp refresh_document_cache(%State{} = state, candidates, host_map) do
     previous = state.document_cache

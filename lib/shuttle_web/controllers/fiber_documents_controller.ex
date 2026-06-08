@@ -12,10 +12,15 @@ defmodule ShuttleWeb.FiberDocumentsController do
     * `body=true`    — include each fiber's markdown body.
 
   `GET /api/v1/fibers` only:
-    * `shuttle=true` — return ONLY fibers carrying a `shuttle:` block (the
-      subset Portolan's kanban needs). Lets the daemon serve the few hundred
-      shuttle fibers instead of the several thousand it holds, collapsing the
-      cross-tunnel transfer. Omitted/unknown => unfiltered (back-compatible).
+    * `shuttle=true` — the owner-only kanban feed: return ONLY the fibers THIS
+      daemon owns — a `shuttle:` block AND `shuttle.host == own_host_id`. A
+      viewer reads this endpoint as a REMOTE origin and concatenates each
+      owner's answer (never merges, because no fiber is authoritatively present
+      on two hosts); a fiber pinned to another host belongs to that host's feed,
+      never this one's git mirror. Also narrows the cross-tunnel transfer to the
+      few hundred owned shuttle fibers. Omitted/unknown => unfiltered (every
+      fiber, unowned included) — the content/search/graph readers, not the
+      kanban feed.
   """
 
   use Phoenix.Controller, formats: [:json]

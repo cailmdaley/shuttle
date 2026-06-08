@@ -927,12 +927,24 @@ defmodule ShuttleWeb.APIControllerTest do
     assert body["host"] != nil
     assert is_list(body["eligible"])
     assert is_list(body["running_detail"])
-    assert body["runtime"][uid]["fiber_id"] == "tests/state"
-    assert body["runtime"][uid]["phase"] == "running"
-    assert body["runtime"][uid]["uid"] == uid
-    refute Map.has_key?(body["runtime"], "tests/state")
-    assert [%{"fiber_id" => "tests/state", "uid" => ^uid}] = body["eligible"]
-    assert body["runtime"][uid]["tmux_session"] == "state-#{uid}-shuttle"
+
+    # Slice 7: no separate `:runtime` index. Liveness rides the `eligible` rows
+    # — each carries the intrinsic uid, the live tmux session, and run state, so
+    # a consumer reads running-ness off the row instead of joining against a
+    # parallel runtime overlay (which the cutover deleted with the store).
+    refute Map.has_key?(body, "runtime")
+
+    expected_session = "state-#{uid}-shuttle"
+
+    assert [
+             %{
+               "fiber_id" => "tests/state",
+               "uid" => ^uid,
+               "state" => "running",
+               "tmux_session" => ^expected_session
+             }
+           ] = body["eligible"]
+
     assert is_list(body["reservations"])
     assert is_list(body["waiters"])
   end

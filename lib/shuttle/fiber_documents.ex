@@ -210,7 +210,7 @@ defmodule Shuttle.FiberDocuments do
 
   defp decode_store(store, output, shuttle_only?) do
     with {:ok, decoded} when is_list(decoded) <- Jason.decode(output) do
-      rows = if shuttle_only?, do: Enum.filter(decoded, &shuttle_fiber?/1), else: decoded
+      rows = if shuttle_only?, do: Enum.filter(decoded, &owned_kanban_fiber?/1), else: decoded
       {:ok, rows |> Enum.flat_map(&entry_for(store, &1))}
     else
       {:ok, _} -> {:error, %{felt_store: store, error: "felt ls returned non-list JSON"}}
@@ -218,19 +218,37 @@ defmodule Shuttle.FiberDocuments do
     end
   end
 
+  # The kanban (`?shuttle=true`) feed serves only the rows THIS daemon owns:
+  # a non-empty `shuttle:` block AND `shuttle.host == own_host_id`. The feed is
+  # consumed cross-tunnel as a REMOTE origin, and the owner-only contract is that
+  # each daemon answers strictly for its host-owned fibers — a viewer concatenates
+  # owners' answers and never merges, because no fiber is authoritatively present
+  # on two hosts. A fiber physically rooted here but pinned to another host's
+  # `shuttle.host:` belongs to that host's feed, never this one's mirror. (A
+  # viewer's LOCAL origin additionally surfaces unowned-but-local drafts by
+  # walking felt directly; that is a Portolan-side concern, not this endpoint.)
+  defp owned_kanban_fiber?(fiber) do
+    shuttle_fiber?(fiber) and host_owned?(fiber)
+  end
+
   # A fiber is kanban-relevant to Portolan iff it carries a non-empty `shuttle:`
-  # block. Filtering here — before entry_for's realpath + report.html stat — lets
-  # a remote daemon serve the few hundred shuttle fibers Portolan's kanban needs
-  # instead of the several thousand it holds, collapsing the cross-tunnel transfer
-  # that dominated kanban cold-load. An un-upgraded daemon simply ignores the
-  # `?shuttle=` query param and returns everything, so the Portolan side degrades
-  # gracefully (no speedup, no breakage). Non-shuttle due-dated todos are a
-  # Portolan-local concern and never live on a remote, so this drops nothing the
-  # kanban shows.
+  # block. Non-shuttle due-dated todos are a Portolan-local concern and never
+  # live on a remote, so this drops nothing the kanban shows.
   defp shuttle_fiber?(%{"shuttle" => shuttle}) when is_map(shuttle) and map_size(shuttle) > 0,
     do: true
 
   defp shuttle_fiber?(_), do: false
+
+  # Host-ownership: a fiber is owned by this daemon iff its `shuttle.host`
+  # equals `own_host_id`. Strict equality — an absent or empty `host:` is
+  # unowned everywhere (no wildcard), so it never appears in any daemon's feed.
+  # Mirrors `Shuttle.Poller`'s dispatch-side predicate; the feed and the
+  # dispatch plane agree on exactly one owner per fiber.
+  defp host_owned?(%{"shuttle" => %{"host" => host}}) when is_binary(host) and host != "" do
+    host == own_host_id()
+  end
+
+  defp host_owned?(_), do: false
 
   defp entry_for(store, %{"id" => id} = fiber) when is_binary(id) and id != "" do
     # Three values, all read from felt, none reverse-derived or guessed by Shuttle:

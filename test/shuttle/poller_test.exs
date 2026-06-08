@@ -1589,7 +1589,7 @@ defmodule Shuttle.PollerTest do
            )
   end
 
-  test "running snapshot runtime entries are keyed by intrinsic uid when present" do
+  test "running snapshot keys the in-memory registry and rows by intrinsic uid" do
     fiber_id = "tests/running-uid-keyed"
     uid = "01KTCA2CWXBSNHETE66MXKPVE7"
 
@@ -1607,21 +1607,18 @@ defmodule Shuttle.PollerTest do
 
     assert {:ok, _session} = Poller.dispatch_fiber(poller, fiber_id, [])
 
-    # The in-memory running registry is keyed by uid (slice 3/6), and the
-    # snapshot's per-fiber runtime index keys the running entry by uid too.
+    # The in-memory running registry is keyed by uid (slice 3/6).
     state = :sys.get_state(poller)
     assert Map.has_key?(state.running, uid)
     refute Map.has_key?(state.running, fiber_id)
 
+    # Slice 7: no separate `:runtime` index. The live worker rides the
+    # `eligible` row, which carries both the intrinsic uid (the join key) and the
+    # felt address (the display/CLI handle).
     snap = Poller.snapshot(poller)
+    refute Map.has_key?(snap, :runtime)
 
-    assert %{
-             fiber_id: ^fiber_id,
-             uid: ^uid,
-             phase: "running"
-           } = Map.fetch!(snap.runtime, uid)
-
-    refute Map.has_key?(snap.runtime, fiber_id)
+    assert [%{fiber_id: ^fiber_id, uid: ^uid, state: "running"}] = snap.eligible
   end
 
   test "force-dispatch honors resume_mode: previous review-comment (unified resume path)" do
