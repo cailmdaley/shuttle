@@ -6,11 +6,25 @@ defmodule ShuttleWeb.FeltEditController do
   resolves to this daemon, so a viewer's tag edit on a remote-owned card routes
   here over the SSH tunnel instead of editing the viewer's own loom mirror.
   Single-writer at the document holds: the owner daemon is the lone writer of a
-  fiber it owns, and `felt edit` is the single felt-native tag writer (the same
-  CLI Portolan shells for local cards).
+  fiber it owns, and `felt edit` is the single felt-native writer (the same CLI
+  Portolan shells for local cards) for tags, opaque scalar frontmatter, and the
+  native `due:` date.
 
   `POST /api/v1/felt-edit` body: `{ "fiber_id": "...", "add": [...],
-  "remove": [...] }`. An empty diff is a 200 no-op.
+  "remove": [...], "set": {"key": scalar, ...}, "unset": [...], "due": "..." }`.
+
+    * `add` / `remove` — tag diff (`felt edit --tag/--untag`).
+    * `set` — opaque top-level scalar frontmatter (`felt edit --set key=value`);
+      the felt CLI reads each value as a YAML scalar so booleans/numbers keep
+      their type. Used by the cross-host kanban horizon edit (`horizon`/`cold`).
+    * `unset` — remove opaque top-level keys (`felt edit --unset key`).
+    * `due` — the native date. Absent leaves it; `null` clears it
+      (`--due ""`); a string sets it (`--due <value>`).
+
+  felt itself owns the validation (native-key guard, scalar-only, structured
+  clobber refusal) and surfaces a loud non-zero exit, so the daemon does not
+  re-implement those rails. An empty diff (no tags, no set/unset, no `due` key)
+  is a 200 no-op.
   """
 
   use Phoenix.Controller, formats: [:json]
@@ -20,9 +34,12 @@ defmodule ShuttleWeb.FeltEditController do
   def create(conn, %{"fiber_id" => fiber_id} = params) when is_binary(fiber_id) do
     add = string_list(params["add"])
     remove = string_list(params["remove"])
+    unset = string_list(params["unset"])
 
-    with {:ok, host, address} <- host_for_fiber(fiber_id),
-         {:ok, output} <- run(host, address, add, remove) do
+    with {:ok, set_pairs} <- set_pairs(params["set"]),
+         {:ok, due_args} <- due_args(params),
+         {:ok, host, address} <- host_for_fiber(fiber_id),
+         {:ok, output} <- run(host, address, add, remove, unset, set_pairs, due_args) do
       conn
       |> put_resp_content_type("text/plain")
       |> send_resp(200, output)
@@ -52,13 +69,16 @@ defmodule ShuttleWeb.FeltEditController do
     end
   end
 
-  # An empty diff is a no-op, mirroring Portolan's local `runFeltTagEdit`.
-  defp run(_host, _fiber_id, [], []), do: {:ok, ""}
+  # An empty diff is a no-op, mirroring Portolan's local felt-edit path.
+  defp run(_host, _fiber_id, [], [], [], [], []), do: {:ok, ""}
 
-  defp run(host, fiber_id, add, remove) do
+  defp run(host, fiber_id, add, remove, unset, set_pairs, due_args) do
     args = ["-C", host, "edit", fiber_id]
     args = Enum.reduce(remove, args, fn tag, acc -> acc ++ ["--untag", tag] end)
     args = Enum.reduce(add, args, fn tag, acc -> acc ++ ["--tag", tag] end)
+    args = Enum.reduce(unset, args, fn key, acc -> acc ++ ["--unset", key] end)
+    args = Enum.reduce(set_pairs, args, fn pair, acc -> acc ++ ["--set", pair] end)
+    args = args ++ due_args
 
     case System.cmd("felt", args, stderr_to_stdout: true) do
       {output, 0} -> {:ok, output}
@@ -66,6 +86,39 @@ defmodule ShuttleWeb.FeltEditController do
     end
   rescue
     e in ErlangError -> {:error, Exception.message(e)}
+  end
+
+  # `set` is a map of opaque scalar frontmatter. Render each entry as the
+  # `key=value` argument `felt edit --set` expects; felt re-parses the value as
+  # a YAML scalar (so a JSON boolean `true` lands as the YAML boolean `true`).
+  # Non-scalar values are refused here with a 400 rather than handed to felt.
+  defp set_pairs(nil), do: {:ok, []}
+
+  defp set_pairs(map) when is_map(map) do
+    Enum.reduce_while(map, {:ok, []}, fn {key, value}, {:ok, acc} ->
+      case scalar_string(value) do
+        {:ok, encoded} -> {:cont, {:ok, acc ++ ["#{key}=#{encoded}"]}}
+        :error -> {:halt, {:error, "set value for #{key} must be a scalar"}}
+      end
+    end)
+  end
+
+  defp set_pairs(_), do: {:error, "set must be an object of key/value pairs"}
+
+  defp scalar_string(value) when is_binary(value), do: {:ok, value}
+  defp scalar_string(value) when is_boolean(value), do: {:ok, to_string(value)}
+  defp scalar_string(value) when is_number(value), do: {:ok, to_string(value)}
+  defp scalar_string(_), do: :error
+
+  # `due`: absent leaves the date untouched, `null` clears it (`--due ""`), a
+  # string sets it. felt validates the date format and rejects loudly.
+  defp due_args(params) do
+    case Map.fetch(params, "due") do
+      :error -> {:ok, []}
+      {:ok, nil} -> {:ok, ["--due", ""]}
+      {:ok, value} when is_binary(value) -> {:ok, ["--due", value]}
+      {:ok, _} -> {:error, "due must be a string or null"}
+    end
   end
 
   defp string_list(values) when is_list(values) do

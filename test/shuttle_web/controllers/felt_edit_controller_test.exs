@@ -47,6 +47,52 @@ defmodule ShuttleWeb.FeltEditControllerTest do
              "-C\n#{store}\nedit\ntests/remote-tags\n--untag\nold\n--tag\nconstitution\n--tag\nnew\n"
   end
 
+  test "routes a horizon edit through felt edit --unset/--set/--due" do
+    root =
+      System.tmp_dir!()
+      |> Path.join("shuttle-felt-edit-horizon-#{System.unique_integer([:positive])}")
+
+    store = Path.join(root, "loom")
+    fiber_dir = Path.join([store, ".felt", "tests", "remote-tags"])
+    File.mkdir_p!(fiber_dir)
+
+    File.write!(
+      Path.join(fiber_dir, "remote-tags.md"),
+      "---\nname: Remote tags\nstatus: active\n---\n\nbody\n"
+    )
+
+    args_file = install_fake_felt!(root)
+    old_loom_homes = System.get_env("LOOM_HOMES")
+    System.put_env("LOOM_HOMES", store)
+
+    on_exit(fn ->
+      restore_env("LOOM_HOMES", old_loom_homes)
+      File.rm_rf(root)
+    end)
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/felt-edit",
+        Jason.encode!(%{
+          "fiber_id" => "tests/remote-tags",
+          "set" => %{"horizon" => "stashed", "cold" => true},
+          "unset" => [],
+          "due" => nil
+        })
+      )
+
+    assert conn.status == 200
+
+    # Boolean preserved as a YAML-typed scalar argument; `due: null` clears via
+    # an empty --due. Set args appear in map order; cold/horizon both present.
+    args = File.read!(args_file)
+    assert args =~ "--set\nhorizon=stashed\n"
+    assert args =~ "--set\ncold=true\n"
+    assert args =~ "--due\n\n"
+    assert String.starts_with?(args, "-C\n#{store}\nedit\ntests/remote-tags\n")
+  end
+
   test "an empty diff is a 200 no-op that never shells felt edit" do
     root =
       System.tmp_dir!()
