@@ -12,7 +12,7 @@ defmodule ShuttleWeb.LifecycleController do
 
   alias Shuttle.{FeltStores, LifecycleService}
 
-  @allowed ~w(install pause resume repeat accept reset-review set-model set-interactive uninstall)
+  @allowed ~w(install pause resume repeat accept set-model set-interactive uninstall)
 
   def create(conn, params) do
     with {:ok, action} <- action(params),
@@ -48,15 +48,6 @@ defmodule ShuttleWeb.LifecycleController do
       case LifecycleService.resume(fiber_id) do
         {:ok, output} -> {:ok, output}
         {:error, _reason} -> args_for("resume", %{"fiber" => fiber_id}) |> then(&run_elem/1)
-      end
-    end
-  end
-
-  defp execute("reset-review", %{"fiber" => fiber}) do
-    with {:ok, fiber_id} <- fiber_address(fiber) do
-      case LifecycleService.reset_review(fiber_id) do
-        {:ok, output} -> {:ok, output}
-        {:error, reason} -> {:error, reason}
       end
     end
   end

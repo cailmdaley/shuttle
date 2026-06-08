@@ -43,15 +43,6 @@
         }
       },
       "additionalProperties": false
-    },
-    "session": {
-      "type": "object",
-      "description": "Daemon-owned resume handle, written at dispatch and read at the next resume. Removed at slice 6 (resume reads felt history instead). Documented here only so legacy fibers still validate during the cutover.",
-      "properties": {
-        "id": { "type": "string" },
-        "agent": { "type": "string" },
-        "dispatched_at": { "type": "string", "format": "date-time" }
-      }
     }
   },
   "additionalProperties": false,

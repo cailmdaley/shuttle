@@ -1,22 +1,19 @@
 defmodule Shuttle.LifecycleService do
   @moduledoc """
-  Daemon-side orchestration for the standing-role lifecycle verbs that mutate
-  the runtime store (`accept` / `resume`).
+  Daemon-side orchestration for the standing-role lifecycle verbs that re-arm an
+  awaiting role by writing the felt document (`accept` / `resume`).
 
   Both the `/api/v1/lifecycle` endpoint (operator / shuttle-ctl) and the
   `/api/v1/actions/invoke` kanban path go through here, so an accept behaves
   identically regardless of which gesture triggered it. The work is:
 
     1. Run the transition *through the Poller* (`Poller.lifecycle_transition/3`)
-       so its in-memory lifecycle cache is refreshed from the runtime store and
-       the next poll won't clobber the write back to `awaiting`.
+       so the felt-document write is atomic against poll cycles.
     2. Append a felt-history event recording the transition.
 
-  Previously the kanban path shelled out to the Go `shuttle-ctl accept`, which
-  re-reads `shuttle.review.state` from the *frontmatter* — where standing-role
-  review state no longer lives — and refused with "not awaiting review". Keeping
-  the runtime-store-aware implementation in one in-process place avoids that
-  whole class of frontmatter/runtime divergence.
+  Awaiting is `status: closed` + untempered in the document itself (slice 4: no
+  review axis); re-arm writes `status: active` and `next_due` is recomputed from
+  the cron schedule on the next poll (slice 6: no runtime store).
   """
 
   alias Shuttle.{FeltStores, LifecycleStore, Poller}
@@ -49,27 +46,10 @@ defmodule Shuttle.LifecycleService do
     end
   end
 
-  # Clear a standing role's runtime review state on close/reopen. Unlike
-  # accept/resume this writes no felt-history event — close/reopen already log
-  # their own status transition, and the runtime-store clear is bookkeeping, not
-  # a reviewable verdict. Routed through the Poller (when live) so the runtime
-  # delete and the in-memory lifecycle-cache eviction are atomic against poll
-  # cycles, mirroring accept/resume.
-  @spec reset_review(String.t()) :: {:ok, String.t()} | {:error, String.t()}
-  def reset_review(fiber_id) when is_binary(fiber_id) do
-    with {:ok, address} <- fiber_address(fiber_id) do
-      case transition(:reset_review, address, []) do
-        {:ok, output} -> {:ok, output}
-        {:error, reason} -> {:error, to_message(reason)}
-      end
-    end
-  end
-
-  # When the Poller is running (the live daemon) route through it so the runtime
-  # DB write and the in-memory lifecycle-cache refresh happen atomically against
-  # poll cycles — otherwise the next poll re-derives the role from the stale
-  # cache and clobbers the write. When it isn't (offline lifecycle ops, unit
-  # tests) write the runtime store directly; there's no cache to keep in sync.
+  # When the Poller is running (the live daemon) route through it so the felt
+  # document write happens atomically against poll cycles — otherwise a
+  # concurrent poll could read a half-written document. When it isn't (offline
+  # lifecycle ops, unit tests) write the document directly.
   defp transition(verb, fiber_id, opts) do
     if is_pid(Process.whereis(Poller)) do
       Poller.lifecycle_transition(verb, fiber_id, opts)
@@ -80,7 +60,6 @@ defmodule Shuttle.LifecycleService do
 
   defp lifecycle_store_args(:accept, fiber_id, opts), do: [fiber_id, opts]
   defp lifecycle_store_args(:resume, fiber_id, _opts), do: [fiber_id]
-  defp lifecycle_store_args(:reset_review, fiber_id, _opts), do: [fiber_id]
 
   defp fiber_address(identifier) do
     case FeltStores.resolve_fiber(identifier) do

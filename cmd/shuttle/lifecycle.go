@@ -204,12 +204,12 @@ tempered/composted close — use 'shuttle reopen' to requeue a finished fiber.`,
 			// render_user_message_block/2 in the dispatcher suppresses the
 			// "From User" prompt block when the latest review-comment has
 			// empty text, so we keep `resume_mode: previous` in the payload
-			// without surfacing meaningless machinery as a directive.
-			if f.Block.Session != nil && f.Block.Session.ID != "" {
-				sessionID := f.Block.Session.ID
-				_ = appendFeltHistoryReviewComment(host, fiberID, "", "previous")
-				fmt.Printf("  resume_mode: previous (session %s)\n", sessionID)
-			}
+			// without surfacing meaningless machinery as a directive. The prior
+			// session id lives in felt history (the worker-exit event), not a
+			// doc-resident block (slice 6); the dispatcher parses it back via
+			// extract_session_id, so resume intent is filed unconditionally.
+			_ = appendFeltHistoryReviewComment(host, fiberID, "", "previous")
+			fmt.Println("  resume_mode: previous (session read from felt history)")
 			return nil
 		},
 	}
@@ -456,10 +456,9 @@ history event recording the acceptance.`,
 			f.SetStatus("active")
 			f.SetTempered(nil)
 			f.ClearClosedAt()
-			// Clear the session block: the accepted run is finalized, and the
-			// next dispatch is a NEW run that should start fresh (resume reads
-			// felt history, not this block, post-slice-6).
-			f.Block.Session = nil
+			// No session block to clear: resume reads felt history, not a
+			// doc-resident block (slice 6). A WriteBlock still wipes any legacy
+			// `session:` key via knownShuttleKeys (clean cutover).
 			if !keepOutcome {
 				f.SetOutcome("")
 			}

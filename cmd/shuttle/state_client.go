@@ -195,35 +195,6 @@ func (e lifecycleStatusError) Error() string {
 	return fmt.Sprintf("daemon returned %d: %s", e.status, e.body)
 }
 
-func postSession(action string, payload map[string]any) (string, error) {
-	if os.Getenv("SHUTTLE_SESSION_OFFLINE") != "" {
-		return "", fmt.Errorf("daemon session bridge disabled by SHUTTLE_SESSION_OFFLINE")
-	}
-
-	payload["action"] = action
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return "", fmt.Errorf("encoding session request: %w", err)
-	}
-
-	url := daemonURL() + "/api/v1/session"
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("reaching daemon at %s: %w", daemonURL(), err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("reading daemon response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("daemon returned %d: %s", resp.StatusCode, string(respBody))
-	}
-	return string(respBody), nil
-}
-
 func fetchCompositeFrom(url string) (*CompositeState, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Get(url)

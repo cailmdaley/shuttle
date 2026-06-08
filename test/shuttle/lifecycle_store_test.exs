@@ -1,80 +1,7 @@
 defmodule Shuttle.LifecycleStoreTest do
   use ExUnit.Case
 
-  alias Shuttle.{Actions, LifecycleStore, RuntimeStore}
-
-  describe "reset_review/1" do
-    test "deletes the runtime lifecycle row so the poll overlay can't re-inject stale awaiting" do
-      # The durable root of the un-temper re-compost bug: close/reopen wrote only
-      # frontmatter and never touched the runtime store, so a standing role's
-      # `review.state: awaiting` survived in the runtime DB indefinitely. The
-      # poll-path merge_lifecycle_overlay (frontmatter-precedence put_if_missing)
-      # then re-injected it on reopen for any role lacking a frontmatter review
-      # key — re-opening the verdict-drop window. reset_review revives
-      # RuntimeStore.delete_lifecycle (previously zero production callers) to
-      # clear that row.
-      with_runtime_store(fn path ->
-        RuntimeStore.upsert_lifecycle(path, "tests/standing", %{
-          kind: "standing",
-          phase: "scheduled",
-          run_id: "run-1"
-        })
-
-        assert RuntimeStore.fetch_lifecycle(path, "tests/standing") != nil
-
-        assert {:ok, message} = LifecycleStore.reset_review("tests/standing")
-        assert message =~ "reset review lifecycle for tests/standing"
-        assert message =~ "cleared runtime row"
-
-        # Row gone → nothing for any reader to revive. This is the "survives a
-        # poll" guarantee: the stale row cannot reappear because its only source
-        # has been removed.
-        assert RuntimeStore.fetch_lifecycle(path, "tests/standing") == nil
-        assert RuntimeStore.list_lifecycle(path) == []
-      end)
-    end
-
-    test "is a no-op for a fiber with no runtime row (oneshots, already-clean roles)" do
-      with_runtime_store(fn path ->
-        assert {:ok, message} = LifecycleStore.reset_review("tests/clean")
-        assert message =~ "reset review lifecycle for tests/clean"
-        refute message =~ "cleared runtime row"
-        assert RuntimeStore.fetch_lifecycle(path, "tests/clean") == nil
-      end)
-    end
-  end
-
-  describe "the closed/reopen review reset closes the un-temper re-compost loop" do
-    test "after reset, an awaiting-review drag on the reopened role resolves to close-awaiting-review" do
-      # End-to-end semantic pin tying the two halves together. After close/reopen
-      # reset review to scheduled (frontmatter) and cleared the runtime row, the
-      # reopened standing role is active + scheduled (NOT awaiting). Resolving the
-      # awaitingReview drag on THAT state returns close-awaiting-review — the card
-      # lands back in the review pile — instead of close-composted, the silent
-      # re-compost. Without the reset, the role would still read awaiting and
-      # re-compost (the bug). This is the contract the reset exists to protect.
-      reopened_after_reset = %{
-        "id" => "tests/standing",
-        "status" => "active",
-        "shuttle" => %{
-          "enabled" => true,
-          "kind" => "standing",
-          "review" => %{"state" => "scheduled"}
-        }
-      }
-
-      assert {:ok, %{id: "close-awaiting-review"}} =
-               Actions.resolve_transition(reopened_after_reset, "awaitingReview")
-
-      # And the pre-reset state it replaces would have re-composted — the exact
-      # regression. (Documents the delta the reset removes.)
-      stale_awaiting = put_in(reopened_after_reset, ["shuttle", "review", "state"], "awaiting")
-
-      assert {:ok, %{id: "close-awaiting-review"}} =
-               Actions.resolve_transition(stale_awaiting, "awaitingReview"),
-             "post-C4-fix, even a stale awaiting role no longer re-composts on the home column"
-    end
-  end
+  alias Shuttle.LifecycleStore
 
   describe "accept/resume recognize new-model awaiting (status:closed + untempered)" do
     test "accept re-arms a closed+untempered standing role from the doc schedule" do
@@ -84,16 +11,12 @@ defmodule Shuttle.LifecycleStoreTest do
         assert message =~ "next due:"
 
         # Document re-armed straight from the doc: status:active, verdict cleared.
+        # next_due is recomputed from the cron schedule on the next poll — there
+        # is no runtime row to assert (slice 6: runtime store gone).
         fm = read_frontmatter(path)
         assert fm["status"] == "active"
         refute Map.has_key?(fm, "tempered")
-
-        # A scheduled runtime row exists with a FUTURE next_due (cron.next(now)),
-        # not the past — the morning-post-drift anchor-on-now rule.
-        row = RuntimeStore.fetch_lifecycle(runtime_store_path(), fiber_id)
-        assert row.phase == "scheduled"
-        assert %DateTime{} = row.next_due_at
-        assert DateTime.compare(row.next_due_at, DateTime.utc_now()) == :gt
+        refute Map.has_key?(fm, "closed-at")
       end)
     end
 
@@ -105,22 +28,16 @@ defmodule Shuttle.LifecycleStoreTest do
         fm = read_frontmatter(path)
         assert fm["status"] == "active"
         refute Map.has_key?(fm, "tempered")
-
-        row = RuntimeStore.fetch_lifecycle(runtime_store_path(), fiber_id)
-        assert row.phase == "scheduled"
-        # Immediate: next_due is ~now (resume re-queues right away).
-        assert %DateTime{} = row.next_due_at
-        assert DateTime.diff(DateTime.utc_now(), row.next_due_at) |> abs() < 5
       end)
     end
 
     test "a tempered:false (composted) standing role is NOT awaiting — accept refuses" do
       with_doc_awaiting_role(
         fn fiber_id, _path ->
-          # Composted is a verdict, not awaiting: it has no runtime review row,
-          # so the legacy review path is consulted and rejects.
+          # Composted is a verdict, not awaiting (status:closed + tempered:false):
+          # the doc-awaiting precondition rejects.
           assert {:error, reason} = LifecycleStore.accept(fiber_id)
-          assert reason =~ "review"
+          assert reason =~ "awaiting review"
         end,
         status: "closed",
         tempered: false
@@ -165,8 +82,9 @@ defmodule Shuttle.LifecycleStoreTest do
   end
 
   # Builds a real on-disk felt fiber (resolvable by the felt CLI) in the
-  # new-model awaiting shape, points LOOM_HOMES + SHUTTLE_RUNTIME_STORE at the
-  # fixtures, and runs `fun.(fiber_id, path)`.
+  # new-model awaiting shape, points LOOM_HOMES at the fixture, and runs
+  # `fun.(fiber_id, path)`. There is no runtime store anymore (slice 6): the
+  # felt document carries the entire lifecycle.
   defp with_doc_awaiting_role(fun, opts \\ []) do
     status = Keyword.get(opts, :status, "closed")
     tempered = Keyword.get(opts, :tempered, nil)
@@ -183,7 +101,6 @@ defmodule Shuttle.LifecycleStoreTest do
     name: Daily French practice
     status: #{status}
     #{tempered_line}shuttle:
-      enabled: true
       kind: standing
       host: testhost
       agent: claude-sonnet
@@ -195,19 +112,13 @@ defmodule Shuttle.LifecycleStoreTest do
     Body.
     """)
 
-    runtime = Path.join(loom, "runtime.db")
-
     prev_loom = System.get_env("LOOM_HOMES")
-    prev_runtime = System.get_env("SHUTTLE_RUNTIME_STORE")
     System.put_env("LOOM_HOMES", loom)
-    System.put_env("SHUTTLE_RUNTIME_STORE", runtime)
-    RuntimeStore.init(runtime)
 
     try do
       fun.("life/french/practice", path)
     after
       restore_env("LOOM_HOMES", prev_loom)
-      restore_env("SHUTTLE_RUNTIME_STORE", prev_runtime)
       File.rm_rf(loom)
     end
   end
@@ -217,27 +128,6 @@ defmodule Shuttle.LifecycleStoreTest do
     YamlElixir.read_from_string!(fm)
   end
 
-  defp runtime_store_path, do: System.get_env("SHUTTLE_RUNTIME_STORE")
-
   defp restore_env(key, nil), do: System.delete_env(key)
   defp restore_env(key, value), do: System.put_env(key, value)
-
-  defp with_runtime_store(fun) do
-    path =
-      Path.join(
-        System.tmp_dir!(),
-        "shuttle-lifecycle-store-test-#{System.unique_integer([:positive])}/runtime.db"
-      )
-
-    old = System.get_env("SHUTTLE_RUNTIME_STORE")
-    System.put_env("SHUTTLE_RUNTIME_STORE", path)
-    RuntimeStore.init(path)
-
-    try do
-      fun.(path)
-    after
-      if old, do: System.put_env("SHUTTLE_RUNTIME_STORE", old), else: System.delete_env("SHUTTLE_RUNTIME_STORE")
-      File.rm_rf(Path.dirname(path))
-    end
-  end
 end

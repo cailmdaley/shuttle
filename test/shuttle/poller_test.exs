@@ -1,7 +1,7 @@
 defmodule Shuttle.PollerTest do
   use ExUnit.Case
 
-  alias Shuttle.{Poller, RuntimeStore}
+  alias Shuttle.Poller
   alias Shuttle.Dispatcher
 
   # ── Mock Runner ──
@@ -294,19 +294,6 @@ defmodule Shuttle.PollerTest do
     end)
   end
 
-  defp runtime_store_path do
-    Path.join(
-      System.tmp_dir!(),
-      "shuttle-poller-runtime-test-#{System.unique_integer([:positive])}/runtime.db"
-    )
-  end
-
-  defp cleanup_runtime_store_paths do
-    System.tmp_dir!()
-    |> Path.join("shuttle-poller-runtime-test-*")
-    |> Path.wildcard()
-    |> Enum.each(&File.rm_rf/1)
-  end
 
   defp restore_env(key, nil), do: System.delete_env(key)
   defp restore_env(key, value), do: System.put_env(key, value)
@@ -335,6 +322,28 @@ defmodule Shuttle.PollerTest do
           "",
           "--field",
           "resume_mode=#{resume_mode}"
+        ],
+        stderr_to_stdout: true
+      )
+
+    if code != 0, do: raise("felt history append failed (#{code}): #{out}")
+  end
+
+  # Mirror the dispatcher's at-spawn session record: a felt-history event whose
+  # summary carries `session=<uuid>` (slice 6: felt history is the durable
+  # session-id home, parsed back by extract_session_id at resume).
+  defp append_dispatch_session(id, session_id) do
+    {out, code} =
+      System.cmd(
+        "felt",
+        [
+          "-C",
+          "/tmp",
+          "history",
+          "append",
+          id,
+          "--summary",
+          "worker dispatched (agent=claude-sonnet) session=#{session_id}"
         ],
         stderr_to_stdout: true
       )
@@ -430,74 +439,6 @@ defmodule Shuttle.PollerTest do
              snap = Poller.snapshot(poller)
              length(snap.eligible) == 1 and hd(snap.eligible).fiber_id == "tests/host-match"
            end)
-  end
-
-  test "poller migrates stale address-keyed lifecycle rows after discovery" do
-    runtime_store_path = runtime_store_path()
-    uid = "01KTCA2CWXBSNHETE66MXKPVE7"
-    backfill_uid = "01KTCA2D66ESFB8CBRPETGQQBK"
-
-    RuntimeStore.upsert_lifecycle(runtime_store_path, "tests/lifecycle-migrates", %{
-      kind: "standing",
-      phase: "scheduled"
-    })
-
-    RuntimeStore.upsert_lifecycle(runtime_store_path, "tests/lifecycle-backfills", %{
-      uid: backfill_uid,
-      kind: "standing",
-      phase: "scheduled"
-    })
-
-    MockRunner.set_fiber(
-      "tests/lifecycle-migrates",
-      make_fiber("tests/lifecycle-migrates", %{"uid" => uid})
-    )
-
-    MockRunner.set_fiber(
-      "tests/lifecycle-backfills",
-      make_fiber("tests/lifecycle-backfills", %{"uid" => backfill_uid})
-    )
-
-    MockRunner.set_shuttle("tests/lifecycle-migrates", "enabled: false\nkind: standing\n")
-    MockRunner.set_shuttle("tests/lifecycle-backfills", "enabled: false\nkind: standing\n")
-
-    {:ok, poller} =
-      Poller.start_link(
-        name: :test_poller_lifecycle_store_reconcile,
-        runner: MockRunner,
-        poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
-      )
-
-    send(poller, :run_poll_cycle)
-
-    assert wait_until(fn ->
-             RuntimeStore.list_lifecycle(runtime_store_path)
-             |> Enum.map(& &1.runtime_key)
-             |> Enum.sort() ==
-               ["01KTCA2CWXBSNHETE66MXKPVE7", "01KTCA2D66ESFB8CBRPETGQQBK"]
-           end)
-
-    assert [
-             %{
-               runtime_key: "01KTCA2CWXBSNHETE66MXKPVE7",
-               fiber_id: "tests/lifecycle-migrates",
-               uid: ^uid,
-               metadata: %{fiber_id: "tests/lifecycle-migrates", uid: ^uid}
-             },
-             %{
-               runtime_key: "01KTCA2D66ESFB8CBRPETGQQBK",
-               fiber_id: "tests/lifecycle-backfills",
-               uid: ^backfill_uid,
-               metadata: %{
-                 fiber_id: "tests/lifecycle-backfills",
-                 uid: ^backfill_uid
-               }
-             }
-           ] = RuntimeStore.list_lifecycle(runtime_store_path)
-
-    cleanup_runtime_store_paths()
   end
 
   # The Poller defaults `own_host_id` from a two-step precedence chain:
@@ -764,20 +705,17 @@ defmodule Shuttle.PollerTest do
              Poller.snapshot(poller).standing_roles
   end
 
-  test "poller persists standing-role lifecycle state to the runtime store" do
+  test "poller surfaces a standing-role snapshot from the document (no runtime store)" do
     fiber_id = "tests/standing-lifecycle-persist"
-    runtime_store_path = runtime_store_path()
     fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
     MockRunner.set_fiber(fiber_id, fiber)
 
-    # Slice 4: the runtime row carries no review axis. Phase is the
-    # schedule-derived label "scheduled"; awaiting/accepted are document facts
-    # (status:closed/tempered), not stored. A leftover review block in the
-    # frontmatter is ignored — it never shapes the persisted row.
+    # The standing role is read straight from the document (slice 6: no runtime
+    # store). Phase is the schedule-derived label; awaiting/accepted are document
+    # facts (status:closed/tempered), not stored.
     MockRunner.set_shuttle(
       fiber_id,
       """
-      enabled: true
       kind: standing
       schedule:
         expr: "0 9 * * 1-5"
@@ -790,105 +728,32 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_standing_lifecycle_persist,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
-
-    assert wait_until(fn ->
-             Shuttle.RuntimeStore.list_lifecycle(runtime_store_path)
-             |> Enum.any?(&(&1.fiber_id == fiber_id))
-           end)
-
-    assert [
-             %{
-               fiber_id: ^fiber_id,
-               metadata: metadata
-             }
-           ] = Shuttle.RuntimeStore.list_lifecycle(runtime_store_path)
-
-    assert metadata.kind == "standing"
-    assert metadata.phase == "scheduled"
-    refute Map.has_key?(metadata, :review)
 
     # The schedule-derived snapshot state is scheduled or due (cron + now), never
     # a review-derived "review"/"accepted".
-    assert [%{fiber_id: ^fiber_id, state: state}] = Poller.snapshot(poller).standing_roles
-    assert state in ["scheduled", "due"]
-  after
-    cleanup_runtime_store_paths()
-  end
-
-  test "poller overlays persisted lifecycle when rebuilding standing-role snapshots" do
-    fiber_id = "tests/standing-lifecycle-overlay"
-    runtime_store_path = runtime_store_path()
-    fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
-    MockRunner.set_fiber(fiber_id, fiber)
-
-    MockRunner.set_shuttle(
-      fiber_id,
-      """
-      enabled: true
-      kind: standing
-      schedule:
-        expr: "0 9 * * 1-5"
-        tz: Europe/Paris
-      review:
-        state: scheduled
-      next_due_at: null
-      """
-    )
-
-    Shuttle.RuntimeStore.upsert_lifecycle(runtime_store_path, fiber_id, %{
-      kind: "standing",
-      phase: "scheduled",
-      run_id: nil,
-      next_due_at: ~U[2999-01-01 08:00:00Z],
-      last_run_at: nil,
-      review: %{"state" => "scheduled"}
-    })
-
-    {:ok, poller} =
-      Poller.start_link(
-        name: :test_poller_standing_lifecycle_overlay,
-        runner: MockRunner,
-        poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
-      )
-
-    send(poller, :run_poll_cycle)
-
     assert wait_until(fn ->
              match?([%{fiber_id: ^fiber_id}], Poller.snapshot(poller).standing_roles)
            end)
 
-    assert [%{fiber_id: ^fiber_id, state: "scheduled", validation_errors: []}] =
-             Poller.snapshot(poller).standing_roles
-  after
-    cleanup_runtime_store_paths()
+    assert [%{fiber_id: ^fiber_id, state: state}] = Poller.snapshot(poller).standing_roles
+    assert state in ["scheduled", "due"]
   end
 
-  # Slice-1 wedge clear: dispatch is gated by the felt DOCUMENT (status:active +
-  # schedule), not by the runtime review overlay. A role whose document is armed
-  # but whose stale runtime row still says `awaiting` (the live daily-practice
-  # shape — accept landed on another key, this row never advanced) must dispatch
-  # when past due. Before the cutover, review.state=awaiting made `due?` false and
-  # the role was wedged: armed by the human, refused by the daemon.
-  test "a status:active standing role with a stale awaiting overlay still dispatches (wedge clear)" do
+  # A status:active standing role dispatches off the cron schedule, read straight
+  # from the document (slice 6: no runtime overlay can wedge it). An every-minute
+  # schedule is reliably due now regardless of wall-clock.
+  test "a status:active standing role dispatches off the cron schedule" do
     fiber_id = "tests/standing-wedge"
-    runtime_store_path = runtime_store_path()
     fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"]})
     MockRunner.set_fiber(fiber_id, fiber)
 
-    # Frontmatter carries NO review block: the document is the authority and it
-    # says status:active (armed). Slice 2: due-ness is cron-computed, so an
-    # every-minute schedule is reliably due now regardless of wall-clock.
     MockRunner.set_shuttle(
       fiber_id,
       """
-      enabled: true
       kind: standing
       agent: claude-sonnet
       schedule:
@@ -897,44 +762,26 @@ defmodule Shuttle.PollerTest do
       """
     )
 
-    # The stale runtime row says awaiting. An ad-hoc run_id keeps an
-    # awaiting+next_due row valid (the daily-practice case), so the wedge is
-    # exercised rather than masked by a validation error. The stored next_due_at
-    # is deliberately stale-and-past: slice 2 no longer reads it for the gate, so
-    # the role still dispatches off the cron schedule.
-    Shuttle.RuntimeStore.upsert_lifecycle(runtime_store_path, fiber_id, %{
-      kind: "standing",
-      phase: "awaiting",
-      run_id: "adhoc-1",
-      next_due_at: ~U[2000-01-03 08:00:00Z],
-      last_run_at: nil,
-      review: %{"state" => "awaiting", "run_id" => "adhoc-1"}
-    })
-
     {:ok, poller} =
       Poller.start_link(
         name: :test_poller_standing_wedge,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
     Process.sleep(100)
 
     assert [%{fiber_id: ^fiber_id, state: "running"}] = Poller.snapshot(poller).eligible
-  after
-    cleanup_runtime_store_paths()
   end
 
-  # Slice 4: awaiting is a DOCUMENT fact (status:closed + untempered), not a
-  # runtime-store review row. Action resolution reads the document straight — no
-  # overlay — so `accept-run` is available on a closed+untempered standing role
-  # (the kanban "temper the weekly arXiv role" gesture re-arms it).
+  # Awaiting is a DOCUMENT fact (status:closed + untempered), not a runtime-store
+  # review row (slices 4/6). Action resolution reads the document straight — so
+  # `accept-run` is available on a closed+untempered standing role (the kanban
+  # "temper the weekly arXiv role" gesture re-arms it).
   test "actions reflect doc awaiting (status:closed + untempered) for a standing role" do
     fiber_id = "tests/standing-actions-overlay"
-    runtime_store_path = runtime_store_path()
     fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"], "status" => "closed"})
     MockRunner.set_fiber(fiber_id, fiber)
 
@@ -943,7 +790,6 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(
       fiber_id,
       """
-      enabled: true
       kind: standing
       schedule:
         expr: "0 9 * * 1"
@@ -957,8 +803,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_actions_overlay,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
+        felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
@@ -970,42 +815,29 @@ defmodule Shuttle.PollerTest do
 
     assert {:ok, %{id: "accept-run"}} =
              Poller.resolve_action(poller, fiber_id, "tempered", [])
-  after
-    cleanup_runtime_store_paths()
   end
 
-  # Regression: accepting a standing run through the Poller must advance the
-  # runtime store AND refresh the in-memory lifecycle cache, or the very next
-  # poll re-derives the role from the stale cache and clobbers the acceptance
-  # straight back to `awaiting` (why an accepted weekly-arXiv run kept
-  # reappearing in Awaiting review).
-  test "accept through the Poller advances the runtime store and survives the next poll" do
+  # Accepting a standing run through the Poller re-arms the felt document
+  # (status:active, verdict cleared) and that re-arm survives the next poll —
+  # there is no runtime cache to clobber it (slice 6). The document IS the truth.
+  test "accept through the Poller re-arms the document and survives the next poll" do
     fiber_id = "tests/standing-accept-sticks"
-    runtime_store_path = runtime_store_path()
-    File.mkdir_p!(Path.dirname(runtime_store_path))
 
-    previous_runtime_store = System.get_env("SHUTTLE_RUNTIME_STORE")
     previous_loom_homes = System.get_env("LOOM_HOMES")
-    # LifecycleStore reads SHUTTLE_RUNTIME_STORE; share it with the Poller so
-    # both sides of the transition touch the same DB (mirrors production, where
-    # both fall back to the same default path).
-    System.put_env("SHUTTLE_RUNTIME_STORE", runtime_store_path)
     System.put_env("LOOM_HOMES", "/tmp")
 
     on_exit(fn ->
-      restore_env("SHUTTLE_RUNTIME_STORE", previous_runtime_store)
       restore_env("LOOM_HOMES", previous_loom_homes)
     end)
 
-    # Slice 4: awaiting is a document fact (status:closed + untempered). accept
-    # re-arms it from the doc schedule and writes a `scheduled` runtime row.
+    # Awaiting is a document fact (status:closed + untempered). accept re-arms it
+    # from the doc schedule (status:active).
     fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"], "status" => "closed"})
     MockRunner.set_fiber(fiber_id, fiber)
 
     MockRunner.set_shuttle(
       fiber_id,
       """
-      enabled: true
       kind: standing
       schedule:
         expr: "0 9 * * 1"
@@ -1024,51 +856,39 @@ defmodule Shuttle.PollerTest do
 
     assert {:ok, _output} = Poller.lifecycle_transition(poller, :accept, fiber_id, [])
 
-    assert %{phase: "scheduled"} =
-             Shuttle.RuntimeStore.fetch_lifecycle(runtime_store_path, fiber_id)
+    # The document is re-armed to status:active.
+    armed = File.read!("/tmp/.felt/#{fiber_id}/standing-accept-sticks.md")
+    assert armed =~ "status: active"
 
     send(poller, :run_poll_cycle)
     Process.sleep(75)
 
-    assert %{phase: "scheduled"} =
-             Shuttle.RuntimeStore.fetch_lifecycle(runtime_store_path, fiber_id),
-           "the next poll clobbered the acceptance back to awaiting"
-  after
-    cleanup_runtime_store_paths()
+    # Still active after the poll — nothing clobbers the document back to awaiting.
+    assert File.read!("/tmp/.felt/#{fiber_id}/standing-accept-sticks.md") =~ "status: active"
   end
 
   test "an accept that lands during a poll read is not clobbered when the poll completes" do
-    # Regression for Symptom B of the poll-merge wedge (sibling of the retry
-    # case): a standing-role `accept` writes `scheduled` to the runtime store,
-    # but pre-refactor a poll Task already in flight — snapshotted while the role
-    # was still `awaiting` — recomputed lifecycle from that stale snapshot,
-    # re-persisted `awaiting`, and `merge_poll_cycle_state` set
-    # `lifecycle: poll_state.lifecycle`, reverting the acceptance. Post-refactor
-    # the Task only reads; lifecycle is recomputed and persisted in
-    # `apply_poll_cycle/2` from current state, so the accept stands. The sibling
-    # test above does NOT catch this — it accepts before the poll even starts.
+    # Regression for Symptom B of the poll-merge wedge: a standing-role `accept`
+    # re-arms the felt document (status:active), but a poll Task already in flight
+    # — snapshotted while the role was still the closed (awaiting) document —
+    # must not revert the acceptance when it completes. The poll Task only reads;
+    # the document is the single source of truth (slice 6), so the accept stands.
     fiber_id = "tests/standing-accept-during-poll"
-    runtime_store_path = runtime_store_path()
-    File.mkdir_p!(Path.dirname(runtime_store_path))
 
-    previous_runtime_store = System.get_env("SHUTTLE_RUNTIME_STORE")
     previous_loom_homes = System.get_env("LOOM_HOMES")
-    System.put_env("SHUTTLE_RUNTIME_STORE", runtime_store_path)
     System.put_env("LOOM_HOMES", "/tmp")
 
     on_exit(fn ->
-      restore_env("SHUTTLE_RUNTIME_STORE", previous_runtime_store)
       restore_env("LOOM_HOMES", previous_loom_homes)
     end)
 
-    # Slice 4: awaiting is a document fact (status:closed + untempered).
+    # Awaiting is a document fact (status:closed + untempered).
     fiber = make_fiber(fiber_id, %{"tags" => ["constitution", "standing"], "status" => "closed"})
     MockRunner.set_fiber(fiber_id, fiber)
 
     MockRunner.set_shuttle(
       fiber_id,
       """
-      enabled: true
       kind: standing
       schedule:
         expr: "0 9 * * 1"
@@ -1085,6 +905,8 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
+    doc_path = "/tmp/.felt/#{fiber_id}/standing-accept-during-poll.md"
+
     # Hold the next poll inside its read-only felt walk; its snapshot still sees
     # the role as the closed (awaiting) document.
     MockRunner.set_felt_ls_delay(400)
@@ -1098,18 +920,13 @@ defmodule Shuttle.PollerTest do
 
     # Accept while the poll is still reading (the GenServer stays responsive).
     assert {:ok, _output} = Poller.lifecycle_transition(poller, :accept, fiber_id, [])
-
-    assert %{phase: "scheduled"} =
-             Shuttle.RuntimeStore.fetch_lifecycle(runtime_store_path, fiber_id)
+    assert File.read!(doc_path) =~ "status: active"
 
     # Let the held poll complete and apply against current state.
     Process.sleep(500)
 
-    assert %{phase: "scheduled"} =
-             Shuttle.RuntimeStore.fetch_lifecycle(runtime_store_path, fiber_id),
+    assert File.read!(doc_path) =~ "status: active",
            "a poll completing after the accept reverted the acceptance to awaiting"
-  after
-    cleanup_runtime_store_paths()
   end
 
   test "direct ad-hoc dispatch creates an ad-hoc standing run before the schedule is due" do
@@ -1303,19 +1120,11 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(
       fiber_id,
       """
-      enabled: true
       kind: standing
       agent: claude-sonnet
       schedule:
         expr: "0 9 * * 1-5"
         tz: Europe/Paris
-      review:
-        state: awaiting
-        run_id: "adhoc-1779793385922"
-        completed_at: "2026-05-26T12:40:00Z"
-      session:
-        id: stored-standing-session-id
-      next_due_at: "2999-01-01T09:00:00+01:00"
       """
     )
 
@@ -1327,6 +1136,9 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
+    # The prior run's session id lives in felt history (slice 6); a forced resume
+    # parses it back via extract_session_id. The resume directive post-dates it.
+    append_dispatch_session(fiber_id, "stored-standing-session-id")
     append_review_comment(fiber_id, resume_mode: "previous")
 
     assert {:ok, _session} = Poller.dispatch_fiber(poller, fiber_id, force: true)
@@ -1730,10 +1542,11 @@ defmodule Shuttle.PollerTest do
     assert new_session_count == 0
   end
 
-  test "poller schedules retry when worker exits and fiber still active" do
-    # Uses "tests/haiku-retry" to avoid session collisions — this test leaves two
-    # WorkerWatcher processes alive (initial + retry) that would interfere with
-    # subsequent tests using the same session name "haiku-shuttle".
+  test "poller re-dispatches a still-active oneshot after its worker exits (retry collapsed into poll loop)" do
+    # Retries collapsed into the poll loop (slice 6): when a multi-session
+    # oneshot worker exits but its document is still status:active, the claim is
+    # released and the next poll re-picks it (status:active + no live session →
+    # eligible) and starts a fresh session.
     fiber = make_fiber("tests/haiku-retry")
     MockRunner.set_fiber("tests/haiku-retry", fiber)
     MockRunner.set_shuttle("tests/haiku-retry", @oneshot_shuttle)
@@ -1753,135 +1566,19 @@ defmodule Shuttle.PollerTest do
     snap1 = Poller.snapshot(poller)
     assert length(snap1.eligible) == 1
 
-    # Simulate worker exit (tmux session dies)
+    # Simulate worker exit (tmux session dies). The claim is released; the fiber
+    # is no longer running and no longer retrying (the retry queue is gone).
     MockRunner.remove_tmux_session(Dispatcher.session_name("tests/haiku-retry"))
     send(poller, {:worker_exited, "tests/haiku-retry", :normal_exit, false})
     Process.sleep(50)
 
     snap2 = Poller.snapshot(poller)
     assert length(snap2.eligible) == 0
-    assert length(snap2.retrying) == 1
-    assert hd(snap2.retrying).fiber_id == "tests/haiku-retry"
+    assert snap2.retrying == []
 
-    assert wait_until(
-             fn ->
-               MockRunner.commands()
-               |> Enum.count(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
-               |> Kernel.==(2)
-             end,
-             80
-           )
-  end
-
-  test "a continuation retry scheduled during a poll read survives the cycle with a live timer" do
-    # Regression for the wedge that motivated making the poll Task a pure read.
-    # Pre-refactor, the Task computed a rival %State{} from a pre-exit snapshot
-    # and `merge_poll_cycle_state` reassembled `running`/`retry_queue` from two
-    # lineages — so a worker-exit retry scheduled *while a poll was in flight*
-    # could be dropped (fiber resurrected into `running`) or have its timer
-    # orphaned (entry survives, timer already fired), wedging the fiber until a
-    # daemon restart. Post-refactor the Task only reads; the retry is born and
-    # lives in the GenServer's current state, which the completing poll never
-    # overwrites. This test holds a poll mid-read, schedules the retry, lets the
-    # poll complete, and asserts the retry is intact with a LIVE timer.
-    fiber_id = "tests/retry-survives-poll"
-    fiber = make_fiber(fiber_id)
-    MockRunner.set_fiber(fiber_id, fiber)
-    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
-
-    {:ok, poller} =
-      Poller.start_link(
-        name: :test_poller_retry_survives_poll,
-        runner: MockRunner,
-        poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"]
-      )
-
-    assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, [])
-
-    # Hold the next poll cycle inside its read-only felt walk, then confirm the
-    # Task is actually mid-read (its snapshot has the fiber running).
-    MockRunner.set_felt_ls_delay(400)
+    # The next poll re-dispatches it: a second new-session call.
     send(poller, :run_poll_cycle)
 
-    assert wait_until(fn ->
-             Enum.any?(MockRunner.commands(), fn {cmd, args} ->
-               cmd == "felt" and Enum.take(args, 2) == ["ls", "--json"]
-             end)
-           end)
-
-    # Worker exits while the poll is still reading. handle_worker_exit schedules
-    # a continuation retry on the GenServer's CURRENT state.
-    MockRunner.remove_tmux_session(session)
-    send(poller, {:worker_exited, fiber_id, :normal_exit, false})
-
-    assert wait_until(fn ->
-             snap = Poller.snapshot(poller)
-             Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id))
-           end)
-
-    # Let the held poll complete (~400ms) and apply against current state.
-    Process.sleep(500)
-
-    state = :sys.get_state(poller)
-    retry = Map.get(state.retry_queue, fiber_id)
-
-    assert retry, "continuation retry was dropped by the completing poll cycle"
-    assert is_reference(retry.timer_ref)
-
-    assert Process.read_timer(retry.timer_ref),
-           "retry timer was orphaned (already fired/cancelled) — the fiber would wedge"
-
-    assert MapSet.member?(state.claimed, fiber_id)
-
-    refute Map.has_key?(state.running, fiber_id),
-           "the exited fiber must not be resurrected into running by the completing poll"
-  end
-
-  test "poller rehydrates pending retries from runtime store on restart" do
-    fiber_id = "tests/retry-rehydrate"
-    runtime_store_path = runtime_store_path()
-
-    fiber = make_fiber(fiber_id)
-    MockRunner.set_fiber(fiber_id, fiber)
-    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
-
-    {:ok, poller} =
-      Poller.start_link(
-        name: :test_poller_retry_rehydrate_1,
-        runner: MockRunner,
-        poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
-      )
-
-    assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, [])
-    MockRunner.remove_tmux_session(session)
-    send(poller, {:worker_exited, fiber_id, :normal_exit, false})
-
-    assert wait_until(fn ->
-             Poller.snapshot(poller).retrying
-             |> Enum.any?(&(&1.fiber_id == fiber_id))
-           end)
-
-    assert [
-             %{
-               fiber_id: ^fiber_id,
-               metadata: %{attempt: 1, delay_type: :continuation}
-             }
-           ] = Shuttle.RuntimeStore.list_retries(runtime_store_path)
-
-    GenServer.stop(poller)
-
-    {:ok, restarted} =
-      Poller.start_link(
-        name: :test_poller_retry_rehydrate_2,
-        runner: MockRunner,
-        poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
-      )
-
     assert wait_until(
              fn ->
                MockRunner.commands()
@@ -1890,17 +1587,11 @@ defmodule Shuttle.PollerTest do
              end,
              80
            )
-
-    refute Enum.any?(Poller.snapshot(restarted).retrying, &(&1.fiber_id == fiber_id))
-    assert [] = Shuttle.RuntimeStore.list_retries(runtime_store_path)
-  after
-    cleanup_runtime_store_paths()
   end
 
-  test "poller keeps retry queue under intrinsic uid when present" do
-    fiber_id = "tests/retry-uid-keyed"
+  test "running snapshot runtime entries are keyed by intrinsic uid when present" do
+    fiber_id = "tests/running-uid-keyed"
     uid = "01KTCA2CWXBSNHETE66MXKPVE7"
-    runtime_store_path = runtime_store_path()
 
     fiber = make_fiber(fiber_id, %{"uid" => uid})
     MockRunner.set_fiber(fiber_id, fiber)
@@ -1908,111 +1599,29 @@ defmodule Shuttle.PollerTest do
 
     {:ok, poller} =
       Poller.start_link(
-        name: :test_poller_retry_uid_keyed,
+        name: :test_poller_running_uid_keyed,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
+        felt_stores: ["/tmp"]
       )
 
-    assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, [])
+    assert {:ok, _session} = Poller.dispatch_fiber(poller, fiber_id, [])
 
-    MockRunner.remove_tmux_session(session)
-    send(poller, {:worker_exited, fiber_id, :normal_exit, false})
-
-    assert wait_until(fn ->
-             Poller.snapshot(poller).retrying
-             |> Enum.any?(&(&1.fiber_id == fiber_id and &1.uid == uid))
-           end)
-
+    # The in-memory running registry is keyed by uid (slice 3/6), and the
+    # snapshot's per-fiber runtime index keys the running entry by uid too.
     state = :sys.get_state(poller)
-    assert Map.has_key?(state.retry_queue, uid)
-    refute Map.has_key?(state.retry_queue, fiber_id)
-    assert MapSet.member?(state.claimed, fiber_id)
-
-    assert [
-             %{
-               fiber_id: ^fiber_id,
-               runtime_key: ^uid,
-               uid: ^uid,
-               metadata: %{fiber_id: ^fiber_id, uid: ^uid, delay_type: :continuation}
-             }
-           ] = Shuttle.RuntimeStore.list_retries(runtime_store_path)
+    assert Map.has_key?(state.running, uid)
+    refute Map.has_key?(state.running, fiber_id)
 
     snap = Poller.snapshot(poller)
 
     assert %{
              fiber_id: ^fiber_id,
              uid: ^uid,
-             phase: "retrying"
+             phase: "running"
            } = Map.fetch!(snap.runtime, uid)
 
     refute Map.has_key?(snap.runtime, fiber_id)
-  after
-    cleanup_runtime_store_paths()
-  end
-
-  test "poller keeps standing lifecycle cache under intrinsic uid when present" do
-    fiber_id = "tests/standing-lifecycle-uid-keyed"
-    uid = "01KTCA2CWXBSNHETE66MXKPVE7"
-    runtime_store_path = runtime_store_path()
-
-    fiber = make_fiber(fiber_id, %{"uid" => uid, "tags" => ["constitution", "standing"]})
-    MockRunner.set_fiber(fiber_id, fiber)
-
-    MockRunner.set_shuttle(
-      fiber_id,
-      """
-      enabled: true
-      kind: standing
-      schedule:
-        expr: "0 9 * * 1"
-        tz: Europe/Paris
-      review:
-        state: scheduled
-      """
-    )
-
-    {:ok, poller} =
-      Poller.start_link(
-        name: :test_poller_lifecycle_uid_keyed,
-        runner: MockRunner,
-        poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
-      )
-
-    send(poller, :run_poll_cycle)
-
-    assert wait_until(fn ->
-             Poller.snapshot(poller).standing_roles
-             |> Enum.any?(&(&1.fiber_id == fiber_id and &1.uid == uid))
-           end)
-
-    state = :sys.get_state(poller)
-    assert Map.has_key?(state.lifecycle, uid)
-    refute Map.has_key?(state.lifecycle, fiber_id)
-
-    assert [
-             %{
-               fiber_id: ^fiber_id,
-               runtime_key: ^uid,
-               uid: ^uid,
-               metadata: %{fiber_id: ^fiber_id, uid: ^uid, kind: "standing"}
-             }
-           ] = Shuttle.RuntimeStore.list_lifecycle(runtime_store_path)
-
-    snap = Poller.snapshot(poller)
-
-    assert %{
-             fiber_id: ^fiber_id,
-             uid: ^uid,
-             kind: "standing"
-           } = Map.fetch!(snap.runtime, uid)
-
-    refute Map.has_key?(snap.runtime, fiber_id)
-  after
-    cleanup_runtime_store_paths()
   end
 
   test "force-dispatch honors resume_mode: previous review-comment (unified resume path)" do
@@ -2030,13 +1639,17 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(
       fiber_id,
       """
-      enabled: true
       kind: oneshot
       agent: claude-sonnet
-      session:
-        id: stored-session-id
       """
     )
+
+    # Record the prior session id in felt history (the dispatcher writes a
+    # "worker dispatched ... session=<uuid>" event at spawn; slice 6: felt
+    # history is the only durable session-id home), and file the resume directive
+    # BEFORE the poller starts so its first poll dispatches the resume.
+    append_dispatch_session(fiber_id, "stored-session-id")
+    append_review_comment(fiber_id, resume_mode: "previous")
 
     {:ok, poller} =
       Poller.start_link(
@@ -2046,24 +1659,25 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
-    # File the review-comment first (mirrors the kanban modal's order:
-    # file directive → dispatch).
-    append_review_comment(fiber_id, resume_mode: "previous")
+    # Whether the resume comes from the auto-poll or the explicit force-dispatch,
+    # the dispatch produces a --resume invocation against the history session id,
+    # not a fresh new-session.
+    _ = Poller.dispatch_fiber(poller, fiber_id, force: true)
 
-    assert {:ok, _session} = Poller.dispatch_fiber(poller, fiber_id, force: true)
+    assert wait_until(fn -> new_session_scripts() != [] end)
 
-    # The dispatch produced a --resume invocation against the stored
-    # session id, not a fresh new-session.
-    script_path = new_session_scripts() |> List.last()
-    assert script_path, "expected at least one new-session script"
-    script = File.read!(script_path)
+    script = new_session_scripts() |> List.last() |> File.read!()
 
     assert script =~ "--resume"
     assert script =~ "stored-session-id"
   end
 
-  test "poller continuation retries start fresh even after resume-previous review comment" do
-    fiber_id = "tests/continuation-fresh-despite-review-comment"
+  test "poller continuation re-dispatches fresh when no resume directive is on file" do
+    # Retries collapsed into the poll loop (slice 6). A multi-session oneshot's
+    # autonomous continuation re-dispatches through the normal poll path; with no
+    # `resume_mode: previous` review-comment on file, the dispatch is fresh — it
+    # does not resume a prior session UUID.
+    fiber_id = "tests/continuation-fresh"
 
     fiber = make_fiber(fiber_id)
     MockRunner.set_fiber(fiber_id, fiber)
@@ -2071,49 +1685,34 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(
       fiber_id,
       """
-      enabled: true
       kind: oneshot
       agent: claude-sonnet
-      session:
-        id: old-session-id
       """
     )
 
+    # A prior session id exists in felt history, but no resume directive — so the
+    # autonomous re-dispatch must NOT resume it.
+    append_dispatch_session(fiber_id, "old-session-id")
+
     {:ok, poller} =
       Poller.start_link(
-        name: :test_poller_continuation_forces_fresh,
+        name: :test_poller_continuation_fresh,
         runner: MockRunner,
         poll_interval_ms: 60_000,
         felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
-
-    # `session.id: old-session-id` in the fiber file makes this an "orphaned
-    # dispatch" on first poll — the daemon sees a session was once dispatched
-    # but no tmux session is alive for it. Goes through continuation retry
-    # (with force_fresh: true) rather than direct dispatch, so the first new
-    # session shows up after the @continuation_retry_delay_ms gate (~1s).
-    # 80 attempts × 25ms = 2s, comfortably covers the gate.
     assert wait_until(fn -> length(new_session_scripts()) == 1 end, 80)
-
-    append_review_comment(fiber_id, resume_mode: "previous")
 
     MockRunner.remove_tmux_session(Dispatcher.session_name(fiber_id))
     send(poller, {:worker_exited, fiber_id, :normal_exit, false})
 
+    # Next poll re-dispatches the still-active oneshot.
+    send(poller, :run_poll_cycle)
     assert wait_until(fn -> length(new_session_scripts()) == 2 end, 80)
 
-    [first_script | rest] = new_session_scripts()
-    second_script = rest |> List.last() |> File.read!()
-
-    # Both the orphan-resurrection retry and the post-worker-exit continuation
-    # retry must dispatch fresh — no --resume of the stale UUID baked in.
-    first_script_body = first_script |> File.read!()
-    assert first_script_body =~ "Fiber: #{fiber_id}"
-    refute first_script_body =~ "--resume"
-    refute first_script_body =~ "old-session-id"
-
+    second_script = new_session_scripts() |> List.last() |> File.read!()
     assert second_script =~ "Fiber: #{fiber_id}"
     refute second_script =~ "--resume"
     refute second_script =~ "old-session-id"
@@ -2215,25 +1814,21 @@ defmodule Shuttle.PollerTest do
     assert Enum.any?(snap.eligible, &(&1.fiber_id == fiber_id and &1.state == "running"))
   end
 
-  test "poller resurrects orphaned oneshot when shuttle.session.id is set but tmux session is dead" do
-    # Simulates: oneshot was dispatched (so shuttle.session.id is in the fiber
-    # file), the worker exited while the daemon was down (so no worker_exited
-    # ever fired and no continuation retry was scheduled), and on next poll
-    # cycle the daemon must notice and schedule a continuation retry itself.
-    # Without this, the fiber sits "in-flight but dead" forever — the upstream
-    # cause of the kanban gotcha-classifier-orphaned-oneshot.
+  # Retries collapsed into the poll loop (slice 6): a status:active oneshot whose
+  # worker died while the daemon was down has no live tmux session, so it is
+  # simply eligible again — the next poll re-dispatches it. There is no separate
+  # "resurrection" path or retry row to assert; the contract is that a fresh
+  # session is spawned.
+  test "poller re-dispatches a status:active oneshot whose worker died while the daemon was down" do
     fiber_id = "tests/orphan-dispatched-dead"
 
-    dispatched_shuttle = """
-    enabled: true
+    MockRunner.set_shuttle(fiber_id, """
     kind: oneshot
-    session:
-      id: 577af64b-644a-4733-9e6a-f60d86b6941f
-      dispatched_at: 2026-05-24T10:36:35.176394Z
-    """
+    agent: claude-sonnet
+    """)
 
-    MockRunner.set_shuttle(fiber_id, dispatched_shuttle)
-    # No add_tmux_session — the dispatched session has died.
+    # A prior dispatch is recorded in felt history but no tmux session is alive.
+    append_dispatch_session(fiber_id, "577af64b-644a-4733-9e6a-f60d86b6941f")
 
     {:ok, poller} =
       Poller.start_link(
@@ -2244,150 +1839,30 @@ defmodule Shuttle.PollerTest do
       )
 
     assert wait_until(fn ->
-             snap = Poller.snapshot(poller)
-             Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id))
+             Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+               cmd == "tmux" and hd(args) == "new-session"
+             end)
            end)
 
-    snap = Poller.snapshot(poller)
-    retry = Enum.find(snap.retrying, &(&1.fiber_id == fiber_id))
-    assert retry, "expected a retry entry for the orphaned fiber"
-    # Continuation retries use a short fixed delay (@continuation_retry_delay_ms,
-    # typically ~1s) rather than the exponential failure backoff. The retry
-    # being scheduled at all is the contract — exact delay belongs to retry_delay/3.
-    assert retry.attempt == 1
-  end
-
-  test "poller resurrects orphaned oneshot from runtime session when frontmatter is document-only" do
-    fiber_id = "tests/orphan-runtime-session"
-    runtime_store_path = runtime_store_path()
-
-    MockRunner.set_shuttle(fiber_id, """
-    enabled: true
-    kind: oneshot
-    """)
-
-    Shuttle.RuntimeStore.upsert_lifecycle(runtime_store_path, fiber_id, %{
-      kind: "oneshot",
-      phase: "dispatched",
-      session: %{
-        "id" => "runtime-session-577af64b",
-        "agent" => "codex",
-        "dispatched_at" => "2026-05-24T10:36:35.176394Z"
-      }
-    })
-
-    {:ok, poller} =
-      Poller.start_link(
-        name: :test_poller_resurrect_runtime_session,
-        runner: MockRunner,
-        poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
-      )
-
-    assert wait_until(fn ->
-             snap = Poller.snapshot(poller)
-             Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id))
-           end)
-
-    snap = Poller.snapshot(poller)
-    assert %{attempt: 1} = Enum.find(snap.retrying, &(&1.fiber_id == fiber_id))
-  after
-    cleanup_runtime_store_paths()
-  end
-
-  test "poller resurrects orphaned oneshot from dispatched lifecycle without captured session" do
-    fiber_id = "tests/orphan-runtime-dispatched-no-session"
-    runtime_store_path = runtime_store_path()
-
-    MockRunner.set_shuttle(fiber_id, """
-    enabled: true
-    kind: oneshot
-    """)
-
-    Shuttle.RuntimeStore.upsert_lifecycle(runtime_store_path, fiber_id, %{
-      kind: "oneshot",
-      phase: "dispatched"
-    })
-
-    {:ok, poller} =
-      Poller.start_link(
-        name: :test_poller_resurrect_runtime_dispatched_no_session,
-        runner: MockRunner,
-        poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
-      )
-
-    assert wait_until(fn ->
-             snap = Poller.snapshot(poller)
-             Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id))
-           end)
-
-    snap = Poller.snapshot(poller)
-    assert %{attempt: 1} = Enum.find(snap.retrying, &(&1.fiber_id == fiber_id))
-  after
-    cleanup_runtime_store_paths()
-  end
-
-  test "orphan continuation clears stale dispatched lifecycle when fiber is no longer eligible" do
-    fiber_id = "tests/orphan-runtime-dispatched-disabled"
-    runtime_store_path = runtime_store_path()
-
-    # A draft (status: open) is no longer eligible (slice 5: status is the gate),
-    # so the stale dispatched runtime row must be cleared rather than retried.
-    MockRunner.set_shuttle(
-      fiber_id,
-      """
-      kind: oneshot
-      """,
-      "open"
-    )
-
-    Shuttle.RuntimeStore.upsert_lifecycle(runtime_store_path, fiber_id, %{
-      kind: "oneshot",
-      phase: "dispatched"
-    })
-
-    {:ok, poller} =
-      Poller.start_link(
-        name: :test_poller_clears_ineligible_orphan_lifecycle,
-        runner: MockRunner,
-        poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
-      )
-
-    Process.sleep(1_200)
-
-    assert wait_until(fn ->
-             Shuttle.RuntimeStore.fetch_lifecycle(runtime_store_path, fiber_id) == nil
-           end)
-
-    refute Enum.any?(Poller.snapshot(poller).retrying, &(&1.fiber_id == fiber_id))
-  after
-    cleanup_runtime_store_paths()
+    assert Enum.any?(Poller.snapshot(poller).eligible, &(&1.fiber_id == fiber_id))
   end
 
   # Regression for the 2026-05-30 incident: a cineca/candide restart resurrected
-  # Mac-owned Portolan constitutions locally because the orphan-resurrection
-  # path never read `host`. The cutover routes resurrection through the same
-  # strict predicate as the poll path — a fiber owned by another host is not
-  # this daemon's orphan to resurrect.
-  test "poller does not resurrect a foreign-host orphaned oneshot" do
+  # Mac-owned Portolan constitutions locally because the orphan path never read
+  # `host`. The poll path uses the strict ownership predicate — a fiber owned by
+  # another host is never dispatched here.
+  test "poller does not dispatch a foreign-host oneshot whose worker is dead" do
     fiber_id = "tests/orphan-foreign-host"
 
     MockRunner.set_shuttle(fiber_id, """
-    enabled: true
     kind: oneshot
     host: some-other-machine
-    session:
-      id: 577af64b-644a-4733-9e6a-f60d86b6941f
-      dispatched_at: 2026-05-24T10:36:35.176394Z
     """)
 
-    # No add_tmux_session — the dispatched session has died. own_host_id is the
-    # default "test-host", which does not equal "some-other-machine".
+    append_dispatch_session(fiber_id, "577af64b-644a-4733-9e6a-f60d86b6941f")
+
+    # own_host_id is the default "test-host", which does not equal
+    # "some-other-machine".
     {:ok, poller} =
       Poller.start_link(
         name: :test_poller_resurrect_foreign_host,
@@ -2396,14 +1871,10 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
-    # Give the reconcile pass time to (not) act.
+    send(poller, :run_poll_cycle)
     Process.sleep(150)
 
     snap = Poller.snapshot(poller)
-
-    refute Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id)),
-           "a foreign-host orphan must never be resurrected on this daemon"
-
     assert snap.claimed_count == 0
 
     refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
@@ -2411,19 +1882,15 @@ defmodule Shuttle.PollerTest do
            end)
   end
 
-  # The project_dir disqualifier applies to resurrection too: a checkout that
-  # does not exist on this host means the worker can't run here, owned or not.
-  test "poller does not resurrect an orphan whose declared project_dir is missing" do
+  # The project_dir disqualifier applies to the poll path: a checkout that does
+  # not exist on this host means the worker can't run here, owned or not.
+  test "poller does not dispatch an active oneshot whose declared project_dir is missing" do
     fiber_id = "tests/orphan-missing-project-dir"
 
     MockRunner.set_shuttle(fiber_id, """
-    enabled: true
     kind: oneshot
     host: test-host
     project_dir: /nonexistent/path/shuttle-orphan-missing
-    session:
-      id: 577af64b-644a-4733-9e6a-f60d86b6941f
-      dispatched_at: 2026-05-24T10:36:35.176394Z
     """)
 
     {:ok, poller} =
@@ -2434,14 +1901,16 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
+    send(poller, :run_poll_cycle)
     Process.sleep(150)
 
     snap = Poller.snapshot(poller)
-
-    refute Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id)),
-           "an orphan with a missing project_dir must not be resurrected here"
-
+    assert snap.eligible == []
     assert snap.claimed_count == 0
+
+    refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
   end
 
   # The poll path: an absent host: is unowned everywhere (no nil-wildcard).
@@ -2503,51 +1972,61 @@ defmodule Shuttle.PollerTest do
     File.rm_rf!(Path.join(["/tmp/.felt", "tests/host-absent.md"]))
   end
 
-  test "poller does not resurrect a standing role even when its session.id is stale" do
-    # Standing roles use review.state for lifecycle, not session.id presence;
-    # an old session.id is the historical marker for the most recent run, not
-    # a "should be running now" signal. Resurrecting them would cause them to
-    # bypass their schedule.
-    fiber_id = "tests/standing-stale-session"
+  test "poller marks an armed standing role awaiting when its worker died while the daemon was down" do
+    # Slice 6 dead-orphan handling on the tmux-scan substrate: a standing role
+    # whose document is armed (status:active, no verdict) but whose tmux session
+    # is gone never fired handle_worker_exit (daemon was down across the exit), so
+    # the poll-scan marks it awaiting (status:closed) — never re-dispatched, never
+    # re-fired off the schedule mid-cycle.
+    fiber_id = "tests/standing-dead-orphan"
 
-    standing_shuttle = """
-    enabled: true
+    previous_loom_homes = System.get_env("LOOM_HOMES")
+    System.put_env("LOOM_HOMES", "/tmp")
+    on_exit(fn -> restore_env("LOOM_HOMES", previous_loom_homes) end)
+
+    # A far-future schedule so the role is NOT cron-due — the only thing that
+    # could touch it is the dead-orphan marker, not a scheduled dispatch.
+    MockRunner.set_shuttle(fiber_id, """
     kind: standing
-    schedule: "0 9 * * *"
-    session:
-      id: standing-past-run-uuid
-    review:
-      state: scheduled
-    """
+    agent: claude-sonnet
+    schedule:
+      expr: "0 9 1 1 *"
+      tz: Europe/Paris
+    """)
 
-    MockRunner.set_shuttle(fiber_id, standing_shuttle)
+    # The felt-history discriminator: a trailing "worker dispatched" event with no
+    # "worker exited" after it marks this as a daemon-down-across-exit dead orphan.
+    append_dispatch_session(fiber_id, "dead-session-uuid")
+
+    doc_path = "/tmp/.felt/#{fiber_id}/standing-dead-orphan.md"
 
     {:ok, poller} =
       Poller.start_link(
-        name: :test_poller_standing_not_resurrected,
+        name: :test_poller_standing_dead_orphan,
         runner: MockRunner,
         poll_interval_ms: 60_000,
         felt_stores: ["/tmp"]
       )
 
-    Process.sleep(150)
-    snap = Poller.snapshot(poller)
+    send(poller, :run_poll_cycle)
 
-    refute Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id)),
-           "standing roles must not be resurrected by the orphan reconcile pass"
+    assert wait_until(fn -> File.read!(doc_path) =~ "status: closed" end, 80)
+
+    # No worker was spawned — the role was marked awaiting, not dispatched.
+    refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
   end
 
-  test "poller does not resurrect a closed oneshot even with session.id set" do
+  test "poller does not re-dispatch a closed oneshot whose worker is dead" do
     fiber_id = "tests/closed-with-session"
 
-    dispatched_shuttle = """
-    enabled: true
+    MockRunner.set_shuttle(fiber_id, """
     kind: oneshot
-    session:
-      id: closed-uuid
-    """
+    agent: claude-sonnet
+    """, "closed")
 
-    MockRunner.set_shuttle(fiber_id, dispatched_shuttle, "closed")
+    append_dispatch_session(fiber_id, "closed-uuid")
 
     {:ok, poller} =
       Poller.start_link(
@@ -2557,9 +2036,13 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
+    send(poller, :run_poll_cycle)
     Process.sleep(150)
-    snap = Poller.snapshot(poller)
-    refute Enum.any?(snap.retrying, &(&1.fiber_id == fiber_id))
+
+    # Closed is the don't-re-fire gate: no new session is spawned.
+    refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
   end
 
   test "poller clears stale running state when the tmux session disappears" do
@@ -2615,9 +2098,11 @@ defmodule Shuttle.PollerTest do
            ] = snap.orphans
   end
 
-  test "poller rehydrates live running workers from the runtime store on restart" do
+  test "poller re-adopts a live tmux worker on restart (running is tmux-derived)" do
+    # Daemon state is derived and disposable (slice 6: no runtime store). After a
+    # restart the live tmux session is re-adopted by adopt_orphans, so the worker
+    # is tracked again — running work survives because tmux owns the process.
     fiber_id = "tests/runtime-rehydrate-live"
-    runtime_store_path = runtime_store_path()
 
     fiber = make_fiber(fiber_id)
     MockRunner.set_fiber(fiber_id, fiber)
@@ -2628,8 +2113,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_runtime_rehydrate_live_1,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
+        felt_stores: ["/tmp"]
       )
 
     assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, [])
@@ -2637,176 +2121,27 @@ defmodule Shuttle.PollerTest do
 
     GenServer.stop(poller)
 
+    # The tmux session is still alive (the MockRunner tracks it across the
+    # GenServer restart) — the restarted poller re-adopts it from the tmux scan.
     {:ok, restarted} =
       Poller.start_link(
         name: :test_poller_runtime_rehydrate_live_2,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
+        felt_stores: ["/tmp"]
       )
 
     assert wait_until(fn ->
              Poller.snapshot(restarted).eligible
              |> Enum.any?(&(&1.fiber_id == fiber_id and &1.tmux_session == session))
            end)
-  after
-    cleanup_runtime_store_paths()
   end
 
-  test "poller persists running workers under intrinsic uid when present" do
-    fiber_id = "tests/runtime-uid-keyed"
-    uid = "01KTCA2CWXBSNHETE66MXKPVE7"
-    runtime_store_path = runtime_store_path()
-
-    fiber = make_fiber(fiber_id, %{"uid" => uid})
-    MockRunner.set_fiber(fiber_id, fiber)
-    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
-
-    {:ok, poller} =
-      Poller.start_link(
-        name: :test_poller_runtime_uid_keyed,
-        runner: MockRunner,
-        poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
-      )
-
-    assert {:ok, _session} = Poller.dispatch_fiber(poller, fiber_id, [])
-
-    assert [
-             %{
-               fiber_id: ^fiber_id,
-               runtime_key: ^uid,
-               uid: ^uid,
-               metadata: %{fiber_id: ^fiber_id, uid: ^uid}
-             }
-           ] = Shuttle.RuntimeStore.list_running(runtime_store_path)
-
-    state = :sys.get_state(poller)
-    assert Map.has_key?(state.running, uid)
-    refute Map.has_key?(state.running, fiber_id)
-
-    snap = Poller.snapshot(poller)
-
-    assert %{
-             fiber_id: ^fiber_id,
-             uid: ^uid,
-             phase: "running",
-             running: true
-           } = Map.fetch!(snap.runtime, uid)
-
-    refute Map.has_key?(snap.runtime, fiber_id)
-  after
-    cleanup_runtime_store_paths()
-  end
-
-  test "poller prefers uid running row when legacy row rehydrates first" do
-    fiber_id = "tests/runtime-prefers-uid"
-    uid = "01KTCA2CWXBSNHETE66MXKPVE7"
-    session = Dispatcher.session_name(fiber_id)
-    runtime_store_path = runtime_store_path()
-    earlier = ~U[2026-06-05 17:00:00Z]
-    later = ~U[2026-06-05 17:01:00Z]
-
-    fiber = make_fiber(fiber_id, %{"uid" => uid})
-    MockRunner.set_fiber(fiber_id, fiber)
-    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
-    MockRunner.add_tmux_session(session)
-
-    RuntimeStore.upsert_running(runtime_store_path, fiber_id, %{
-      session: session,
-      agent_id: "codex",
-      state: "running",
-      started_at: earlier,
-      last_activity_at: earlier
-    })
-
-    RuntimeStore.upsert_running(runtime_store_path, fiber_id, %{
-      uid: uid,
-      session: session,
-      agent_id: "codex",
-      state: "running",
-      started_at: later,
-      last_activity_at: later
-    })
-
-    {:ok, poller} =
-      Poller.start_link(
-        name: :test_poller_runtime_rehydrate_prefers_uid,
-        runner: MockRunner,
-        poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
-      )
-
-    assert wait_until(fn ->
-             state = :sys.get_state(poller)
-             Map.has_key?(state.running, uid) and not Map.has_key?(state.running, fiber_id)
-           end)
-
-    assert [
-             %{
-               runtime_key: ^uid,
-               fiber_id: ^fiber_id,
-               uid: ^uid
-             }
-           ] = RuntimeStore.list_running(runtime_store_path)
-  after
-    cleanup_runtime_store_paths()
-  end
-
-  test "poller migrates address-keyed running rows after discovery" do
-    fiber_id = "tests/runtime-migrates-after-discovery"
-    uid = "01KTCA2F0QRRH749B6MB4G6G20"
-    session = Dispatcher.session_name(fiber_id)
-    runtime_store_path = runtime_store_path()
-    now = ~U[2026-06-05 17:00:00Z]
-
-    fiber = make_fiber(fiber_id, %{"uid" => uid})
-    MockRunner.set_fiber(fiber_id, fiber)
-    MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
-    MockRunner.add_tmux_session(session)
-
-    RuntimeStore.upsert_running(runtime_store_path, fiber_id, %{
-      session: session,
-      agent_id: "codex",
-      state: "running",
-      started_at: now,
-      last_activity_at: now
-    })
-
-    {:ok, poller} =
-      Poller.start_link(
-        name: :test_poller_runtime_reconcile_running,
-        runner: MockRunner,
-        poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
-      )
-
-    send(poller, :run_poll_cycle)
-
-    assert wait_until(fn ->
-             state = :sys.get_state(poller)
-             Map.has_key?(state.running, uid) and not Map.has_key?(state.running, fiber_id)
-           end)
-
-    assert [
-             %{
-               runtime_key: ^uid,
-               fiber_id: ^fiber_id,
-               uid: ^uid,
-               metadata: %{fiber_id: ^fiber_id, uid: ^uid}
-             }
-           ] = RuntimeStore.list_running(runtime_store_path)
-  after
-    cleanup_runtime_store_paths()
-  end
-
-  test "poller drops runtime store records whose tmux session disappeared while daemon was down" do
+  test "poller does not track a worker whose tmux session disappeared while daemon was down" do
+    # No runtime store to rehydrate from (slice 6): a restart re-scans tmux, and
+    # a dead session is simply absent — nothing is tracked as running, and the
+    # still-active fiber is re-dispatched fresh on the next poll.
     fiber_id = "tests/runtime-rehydrate-missing"
-    runtime_store_path = runtime_store_path()
 
     fiber = make_fiber(fiber_id)
     MockRunner.set_fiber(fiber_id, fiber)
@@ -2817,8 +2152,7 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_runtime_rehydrate_missing_1,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
+        felt_stores: ["/tmp"]
       )
 
     assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, [])
@@ -2831,24 +2165,14 @@ defmodule Shuttle.PollerTest do
         name: :test_poller_runtime_rehydrate_missing_2,
         runner: MockRunner,
         poll_interval_ms: 60_000,
-        felt_stores: ["/tmp"],
-        runtime_store_path: runtime_store_path
+        felt_stores: ["/tmp"]
       )
 
-    snap = Poller.snapshot(restarted)
-
-    assert [
-             %{
-               fiber_id: ^fiber_id,
-               tmux_session: ^session,
-               reason: "missing_tmux_session"
-             }
-             | _
-           ] = snap.orphans
-
-    assert [] = Shuttle.RuntimeStore.list_running(runtime_store_path)
-  after
-    cleanup_runtime_store_paths()
+    # The dead session is not adopted: the restarted poller has no running entry
+    # for this fiber.
+    state = :sys.get_state(restarted)
+    refute Map.has_key?(state.running, fiber_id)
+    refute Enum.any?(state.running, fn {_k, m} -> Map.get(m, :fiber_id) == fiber_id end)
   end
 
   test "poller clears stale parent running state when only a child session exists" do

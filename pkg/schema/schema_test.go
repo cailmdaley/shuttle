@@ -363,9 +363,10 @@ func TestWriteBlock_RoundTripsInteractive(t *testing.T) {
 
 func TestWriteBlock_RemovesKnownFieldsWhenCleared(t *testing.T) {
 	// A legacy block carrying enabled + review (slice 5 dropped both) plus a
-	// cleared session and interactive. A Go rewrite wipes every recognized key
-	// not present in the encoded block (clean cutover) while preserving an
-	// unknown forward-compatible key.
+	// legacy session block (slice 6 dropped it — resume reads felt history) and
+	// interactive. A Go rewrite wipes every recognized key not present in the
+	// encoded block (clean cutover) while preserving an unknown forward-
+	// compatible key.
 	content := `---
 name: Session Test
 status: active
@@ -390,12 +391,11 @@ Body.
 	if err != nil {
 		t.Fatalf("ReadFiber: %v", err)
 	}
-	if f.Block == nil || f.Block.Session == nil {
-		t.Fatalf("expected session block, got %+v", f.Block)
+	if f.Block == nil {
+		t.Fatalf("expected shuttle block, got %+v", f.Block)
 	}
 
 	f.Block.Interactive = false
-	f.Block.Session = nil
 	if err := f.WriteBlock(f.Block); err != nil {
 		t.Fatalf("WriteBlock: %v", err)
 	}

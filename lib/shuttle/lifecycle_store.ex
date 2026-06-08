@@ -6,12 +6,13 @@ defmodule Shuttle.LifecycleStore do
   The document is the single source of truth: `status`, `tempered`, `outcome`,
   the cron `schedule`, `agent`, `host`. Accept and resume re-arm an awaiting
   role (`status: closed` + untempered) by writing `status: active` back to the
-  document; `mark_awaiting` is the worker-exit writer that flips it closed. The
-  runtime store is written for the still-living session/next_due index (gone in
-  slice 6), but no review axis lives anywhere (slice 4 removed it).
+  document; `mark_awaiting` is the worker-exit writer that flips it closed. There
+  is no runtime store (slice 6 deleted it) and no review axis (slice 4 removed
+  it): the document carries the entire lifecycle, and `next_due` is recomputed
+  from the cron schedule on the next poll.
   """
 
-  alias Shuttle.{Cron, FeltStores, RuntimeStore}
+  alias Shuttle.{Cron, FeltStores}
 
   # Legacy + daemon-owned shuttle keys wiped from the block on every accept /
   # resume / mark-awaiting rewrite (clean cutover, slice 5: `enabled` and
@@ -38,17 +39,9 @@ defmodule Shuttle.LifecycleStore do
     with {:ok, schedule} <- require_schedule(shuttle),
          {:ok, next_due_at} <- Cron.next_occurrence(schedule, DateTime.utc_now()),
          {:ok, frontmatter} <- update_document(frontmatter, keep_outcome?) do
-      lifecycle =
-        %{
-          kind: "standing",
-          phase: "scheduled",
-          run_id: "",
-          next_due_at: next_due_at,
-          last_run_at: nil
-        }
-        |> stamp_uid(fiber_id)
-
-      RuntimeStore.upsert_lifecycle(runtime_store_path(), fiber_id, lifecycle)
+      # The document carries the entire lifecycle: writing `status: active` re-arms
+      # the role, and `next_due` is recomputed from the cron schedule on the next
+      # poll. There is no runtime row to upsert (slice 6).
       write_fiber!(path, evict_runtime_keys(frontmatter), body)
 
       {:ok, "accepted run for #{fiber_id}\n  next due: #{DateTime.to_iso8601(next_due_at)}\n"}
@@ -69,17 +62,9 @@ defmodule Shuttle.LifecycleStore do
     now = DateTime.utc_now()
     {:ok, frontmatter} = update_document(frontmatter, true)
 
-    lifecycle =
-      %{
-        kind: "standing",
-        phase: "scheduled",
-        run_id: nil,
-        next_due_at: now,
-        last_run_at: nil
-      }
-      |> stamp_uid(fiber_id)
-
-    RuntimeStore.upsert_lifecycle(runtime_store_path(), fiber_id, lifecycle)
+    # Re-arm by writing `status: active`; the next poll's cron window picks the
+    # role up immediately (the active document IS the re-queue). No runtime row
+    # (slice 6).
     write_fiber!(path, evict_runtime_keys(frontmatter), body)
 
     {:ok,
@@ -96,13 +81,12 @@ defmodule Shuttle.LifecycleStore do
   don't-re-fire gate: a closed role is never dispatch-eligible, so the
   `active → closed → active` cycle encodes "already ran this occurrence."
 
-  Deliberately does NOT touch `review` or the runtime row: awaiting is fully
-  doc-representable, and routing through `shuttle-ctl close` would run
-  `resetStandingReview`/`clearRuntimeReviewLifecycle` and erase the marker. This
-  is the mirror of `update_document` (the accept re-arm) — it sets
-  `status: closed` where accept sets `status: active`. Atomic via `write_fiber!`
-  (tmp + rename). A no-op-shaped error (not standing / unreadable) returns
-  `{:error, _}` so the caller can log without crashing the exit path.
+  Awaiting is fully doc-representable: there is no review axis (slice 4) and no
+  runtime row (slice 6), so this is a single felt write. It is the mirror of
+  `update_document` (the accept re-arm) — it sets `status: closed` where accept
+  sets `status: active`. Atomic via `write_fiber!` (tmp + rename). A no-op-shaped
+  error (not standing / unreadable) returns `{:error, _}` so the caller can log
+  without crashing the exit path.
   """
   @spec mark_awaiting(String.t()) :: {:ok, String.t()} | {:error, String.t()}
   def mark_awaiting(fiber_id) when is_binary(fiber_id) do
@@ -119,27 +103,6 @@ defmodule Shuttle.LifecycleStore do
 
       {:ok, "marked #{fiber_id} awaiting review (status: closed, untempered)\n"}
     end
-  end
-
-  @doc """
-  Clear a standing role's runtime lifecycle row on close/reopen.
-
-  Close and reopen end (or restart) a role's cycle; this drops the host-local
-  runtime row so no stale next_due/session lingers for the kanban invoke path or
-  a remote daemon (atomic against poll cycles via
-  `Poller.refresh_lifecycle_entry`). The document carries the lifecycle truth
-  (status + tempered) — there is no review axis to reset (slice 4). A no-op when
-  the fiber has no runtime row (oneshots, already-clean roles). Named
-  `reset_review` for the invoke verb that calls it; the work is a row delete.
-  """
-  @spec reset_review(String.t()) :: {:ok, String.t()} | {:error, String.t()}
-  def reset_review(fiber_id) when is_binary(fiber_id) do
-    existing = RuntimeStore.fetch_lifecycle(runtime_store_path(), fiber_id)
-    RuntimeStore.delete_lifecycle(runtime_store_path(), fiber_id)
-
-    note = if is_nil(existing), do: "", else: " (cleared runtime row)"
-
-    {:ok, "reset review lifecycle for #{fiber_id}#{note}\n"}
   end
 
   defp read_fiber(fiber_id) do
@@ -194,25 +157,6 @@ defmodule Shuttle.LifecycleStore do
     end
   end
 
-  # Key the runtime row by the fiber's intrinsic uid, like the poller does, so
-  # accept/resume never births a second address-keyed row for a fiber the poller
-  # already tracks under its uid. This dual-writer-two-keys split is the exact
-  # root of the daily-practice wedge (finding-live-wedge-anatomy). Falls back to
-  # address-keying when felt can't resolve a uid (legacy/test fibers).
-  defp stamp_uid(lifecycle, fiber_id) do
-    case resolve_uid(fiber_id) do
-      uid when is_binary(uid) and uid != "" -> Map.put(lifecycle, :uid, uid)
-      _ -> lifecycle
-    end
-  end
-
-  defp resolve_uid(fiber_id) do
-    case FeltStores.resolve_fiber(fiber_id) do
-      {:ok, %{uid: uid}} -> uid
-      _ -> nil
-    end
-  end
-
   defp require_standing(%{"kind" => "standing"}), do: :ok
   defp require_standing(%{"mode" => "standing"}), do: :ok
 
@@ -250,10 +194,6 @@ defmodule Shuttle.LifecycleStore do
     File.write!(tmp, ["---\n", yaml(frontmatter), "---\n", body, ensure_trailing_newline(body)])
     File.rename!(tmp, path)
     :ok
-  end
-
-  defp runtime_store_path do
-    System.get_env("SHUTTLE_RUNTIME_STORE") || RuntimeStore.default_path()
   end
 
   defp stringify_keys(map),

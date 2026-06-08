@@ -174,8 +174,9 @@ defmodule Shuttle.Agents do
 
     * `:session_id` — for Claude agents only: pre-specifies the session UUID via
       `--session-id <uuid>`. Ignored for other harnesses. Allows the Shuttle
-      daemon to know the session UUID before the worker runs, making it storable
-      in `shuttle.session.id` before dispatch rather than via post-hoc capture.
+      daemon to know the session UUID before the worker runs, so it can record it
+      in felt history at dispatch (the durable resume handle; slice 6 dropped the
+      doc-resident `shuttle.session` block) rather than via post-hoc capture.
   """
   @spec build_command(agent_record(), String.t(), keyword()) :: String.t()
   def build_command(agent, prompt, opts \\ []) do

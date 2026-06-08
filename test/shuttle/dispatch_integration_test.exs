@@ -1,7 +1,7 @@
 defmodule Shuttle.DispatchIntegrationTest do
   use ExUnit.Case, async: false
 
-  alias Shuttle.{Dispatcher, Poller, RuntimeStore}
+  alias Shuttle.{Dispatcher, Poller}
 
   # ── Integration Runner ─────────────────────────────────────────────────────
   # Passes `felt` commands to the real felt CLI (with -C felt_store).
@@ -252,16 +252,18 @@ defmodule Shuttle.DispatchIntegrationTest do
     tags:
       - constitution
     shuttle:
-      enabled: true
       kind: oneshot
       agent: claude-sonnet
-      session:
-        agent: claude-sonnet
-        dispatched_at: "2026-05-01T09:00:00Z"
-        id: cli-resume-session-uuid
     ---
     A fiber where shuttle-ctl resume has filed the review-comment.
     """)
+
+    # The prior session id lives in felt history (slice 6: no doc-resident
+    # session block); the dispatcher parses it back via extract_session_id.
+    append_worker_exit(host, "tests/cli-resume-fixed",
+      agent: "claude-sonnet",
+      session: "cli-resume-session-uuid"
+    )
 
     # Simulate what shuttle-ctl resume does after the fix: file a review-comment
     # with resume_mode=previous so the dispatcher knows to invoke --resume.
@@ -293,16 +295,17 @@ defmodule Shuttle.DispatchIntegrationTest do
     tags:
       - constitution
     shuttle:
-      enabled: true
       kind: oneshot
       agent: claude-sonnet
-      session:
-        agent: claude-sonnet
-        dispatched_at: "2026-05-01T09:00:00Z"
-        id: kanban-session-uuid-5678
     ---
     A fiber that the kanban resumes.
     """)
+
+    # The prior session id lives in felt history (slice 6).
+    append_worker_exit(host, "tests/kanban-resume",
+      agent: "claude-sonnet",
+      session: "kanban-session-uuid-5678"
+    )
 
     # Kanban writes a review-comment on "Resume previous" click.
     append_review_comment(host, "tests/kanban-resume",
@@ -365,56 +368,46 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert script =~ "Shuttle resumed your previous session"
   end
 
-  test "poller resume uses runtime-store session when frontmatter session was cleared", %{
+  test "poller resume recovers the session id from felt history", %{
     host: host
   } do
-    runtime_store_path =
-      Path.join(host, "runtime.db")
-
-    write_fiber(host, "tests/poller-runtime-resume", """
+    write_fiber(host, "tests/poller-history-resume", """
     ---
-    name: Poller runtime resume fiber
+    name: Poller history resume fiber
     status: active
     tags:
       - constitution
     shuttle:
-      enabled: true
       kind: oneshot
       agent: claude-sonnet
       host: test-host
     ---
-    A fiber whose resume handle lives only in the daemon runtime store.
+    A fiber whose resume handle lives only in felt history (slice 6).
     """)
 
-    RuntimeStore.upsert_lifecycle(runtime_store_path, "tests/poller-runtime-resume", %{
-      kind: "oneshot",
-      phase: "dispatched",
-      session: %{
-        "id" => "runtime-resume-session-uuid",
-        "agent" => "claude-sonnet",
-        "dispatched_at" => "2026-05-01T09:00:00Z"
-      }
-    })
+    append_worker_exit(host, "tests/poller-history-resume",
+      agent: "claude-sonnet",
+      session: "history-resume-session-uuid"
+    )
 
-    append_review_comment(host, "tests/poller-runtime-resume",
-      summary: "Continue from the runtime handle",
+    append_review_comment(host, "tests/poller-history-resume",
+      summary: "Continue from the history handle",
       resume_mode: "previous"
     )
 
     {:ok, poller} =
       Poller.start_link(
-        name: :test_poller_runtime_resume,
+        name: :test_poller_history_resume,
         runner: IntegrationRunner,
         poll_interval_ms: 600_000,
-        felt_stores: [host],
-        runtime_store_path: runtime_store_path
+        felt_stores: [host]
       )
 
     assert {:ok, _} =
-             Poller.dispatch_fiber(poller, "tests/poller-runtime-resume", [])
+             Poller.dispatch_fiber(poller, "tests/poller-history-resume", [])
 
     script = read_run_script()
-    assert script =~ "--resume 'runtime-resume-session-uuid'"
+    assert script =~ "--resume 'history-resume-session-uuid'"
     assert script =~ "Shuttle resumed your previous session"
   end
 
@@ -435,7 +428,7 @@ defmodule Shuttle.DispatchIntegrationTest do
 
       write_resume_fiber(host, id,
         agent: agent,
-        frontmatter_session: session_id
+        history_session: session_id
       )
 
       append_review_comment(host, id,
@@ -488,25 +481,16 @@ defmodule Shuttle.DispatchIntegrationTest do
 
   test "codex session capture ignores newer non-worker session in same cwd", %{host: host} do
     session_dir = Path.join(host, "codex-sessions")
-    runtime_store = Path.join(host, "runtime.db")
     File.mkdir_p!(session_dir)
 
     previous_dir = System.get_env("SHUTTLE_CODEX_SESSIONS_DIR")
-    previous_runtime_store = System.get_env("SHUTTLE_RUNTIME_STORE")
     System.put_env("SHUTTLE_CODEX_SESSIONS_DIR", session_dir)
-    System.put_env("SHUTTLE_RUNTIME_STORE", runtime_store)
 
     on_exit(fn ->
       if previous_dir do
         System.put_env("SHUTTLE_CODEX_SESSIONS_DIR", previous_dir)
       else
         System.delete_env("SHUTTLE_CODEX_SESSIONS_DIR")
-      end
-
-      if previous_runtime_store do
-        System.put_env("SHUTTLE_RUNTIME_STORE", previous_runtime_store)
-      else
-        System.delete_env("SHUTTLE_RUNTIME_STORE")
       end
     end)
 
@@ -538,7 +522,6 @@ defmodule Shuttle.DispatchIntegrationTest do
     tags:
       - constitution
     shuttle:
-      enabled: true
       kind: oneshot
       agent: codex
     ---
@@ -552,24 +535,11 @@ defmodule Shuttle.DispatchIntegrationTest do
                work_dir: work_dir
              )
 
-    assert eventually(fn ->
-             Enum.any?(RuntimeStore.list_lifecycle(runtime_store), fn
-               %{
-                 fiber_id: "tests/codex-capture",
-                 metadata: %{session: %{"id" => "right-worker-session", "agent" => "codex"}}
-               } ->
-                 true
-
-               _ ->
-                 false
-             end)
-           end)
-
-    refute Enum.any?(IntegrationRunner.commands(), fn
-             {"shuttle-ctl", ["session-set" | _]} -> true
-             {"shuttle-ctl", args} -> "wrong-human-session" in args
-             _ -> false
-           end)
+    # The captured worker session id is recorded in felt history (slice 6:
+    # the only durable session-id home), carrying the `session=<uuid>` token the
+    # dispatcher parses back at resume. The wrong (human) session is ignored.
+    assert eventually(fn -> history_text(host, "tests/codex-capture") =~ "session=right-worker-session" end)
+    refute history_text(host, "tests/codex-capture") =~ "wrong-human-session"
   end
 
   test "interactive prelude names the active-fiber handoff exception", %{host: host} do
@@ -850,21 +820,19 @@ defmodule Shuttle.DispatchIntegrationTest do
            "expected blocked entry to evict after fiber closed"
   end
 
-  # Slice-1 standing dead-orphan reconciler. A standing worker that exits while
-  # the daemon is DOWN never fires handle_worker_exit, so the armed document
-  # would re-fire on the next poll. On restart, the daemon rehydrates the dead
-  # running entry (its tmux session is gone), and the reconciler writes
-  # `status: closed` (untempered) to the document — the new-model awaiting
-  # marker — so the active→closed→active cycle still encodes "already ran this
-  # occurrence." Keyed on the running-worker entry: a role with NO running
-  # entry (the live daily-practice wedge) is left armed, proven by the sibling
-  # fiber below.
-  test "a dead standing running entry on an armed doc is marked awaiting; one without is left armed",
+  # Slice-6 standing dead-orphan reconciler on the tmux-scan substrate. A standing
+  # worker that exits while the daemon is DOWN never fires handle_worker_exit, so
+  # the armed document would re-fire. On poll, the daemon scans tmux: an armed
+  # standing role with no live session whose felt history shows a trailing "worker
+  # dispatched" with no "worker exited" after it (the daemon-down-across-exit
+  # case) is marked awaiting (status:closed). The felt-history discriminator
+  # replaces slice 1's runtime-store session.id check (slice 6: no runtime store).
+  # A role whose last run already exited (the daily-practice "armed, not-yet-due,
+  # never-dispatched-this-cycle" shape) is left armed, proven by the sibling.
+  test "a standing role with an un-exited dispatch is marked awaiting; one whose run exited is left armed",
        %{host: host} do
-    runtime_store_path = Path.join(host, "runtime.db")
-
-    # The dead worker's role — armed, with a stale running entry whose session
-    # is gone.
+    # The dead worker's role — armed, no live session, with a trailing un-exited
+    # "worker dispatched" event in history (the daemon-down case).
     write_fiber(host, "tests/standing-dead", """
     ---
     name: Standing dead-orphan
@@ -873,7 +841,6 @@ defmodule Shuttle.DispatchIntegrationTest do
       - constitution
       - standing
     shuttle:
-      enabled: true
       kind: standing
       agent: claude-sonnet
       host: test-host
@@ -884,17 +851,22 @@ defmodule Shuttle.DispatchIntegrationTest do
     A standing role whose worker died while the daemon was down.
     """)
 
-    # The control — armed, NO running entry (the daily-practice shape). Must be
-    # left untouched: nothing dispatched it, so there is no dead worker.
+    append_dispatch_event(host, "tests/standing-dead",
+      agent: "claude-sonnet",
+      session: "dead-session-uuid"
+    )
+
+    # The control — armed, whose last run already exited (its dispatch is
+    # followed by an exit). Must be left untouched: the run completed, this is the
+    # next cycle's armed-and-waiting shape.
     write_fiber(host, "tests/standing-armed", """
     ---
-    name: Standing armed (no running entry)
+    name: Standing armed (last run exited)
     status: active
     tags:
       - constitution
       - standing
     shuttle:
-      enabled: true
       kind: standing
       agent: claude-sonnet
       host: test-host
@@ -902,19 +874,18 @@ defmodule Shuttle.DispatchIntegrationTest do
         expr: "0 8 * * *"
         tz: Europe/Paris
     ---
-    A standing role that has not been dispatched this cycle.
+    A standing role whose previous run completed; armed for the next tick.
     """)
 
-    dead_session = Dispatcher.session_name("tests/standing-dead")
+    append_dispatch_event(host, "tests/standing-armed",
+      agent: "claude-sonnet",
+      session: "completed-session-uuid"
+    )
 
-    RuntimeStore.upsert_running(runtime_store_path, "tests/standing-dead", %{
-      fiber_id: "tests/standing-dead",
-      session: dead_session,
-      agent_id: "claude-sonnet",
-      run_id: "adhoc-1",
-      started_at: ~U[2026-05-01 08:00:00Z],
-      last_activity_at: ~U[2026-05-01 08:00:00Z]
-    })
+    append_worker_exit(host, "tests/standing-armed",
+      agent: "claude-sonnet",
+      session: "completed-session-uuid"
+    )
 
     # mark_awaiting resolves the fiber through FeltStores (LOOM_HOMES), not the
     # injected runner — point it at the temp store for the duration.
@@ -927,8 +898,7 @@ defmodule Shuttle.DispatchIntegrationTest do
           name: :test_poller_standing_dead_orphan,
           runner: IntegrationRunner,
           poll_interval_ms: 600_000,
-          felt_stores: [host],
-          runtime_store_path: runtime_store_path
+          felt_stores: [host]
         )
 
       # The dead role flips to awaiting (status:closed, untempered, closed-at).
@@ -942,8 +912,8 @@ defmodule Shuttle.DispatchIntegrationTest do
       refute Map.has_key?(dead_fm, "tempered")
       assert is_binary(dead_fm["closed-at"])
 
-      # The control role, with no running entry, stays armed — the reconciler
-      # cannot regress a role it never saw dispatched.
+      # The control role, whose last run exited, stays armed — the reconciler does
+      # not regress a role whose run already completed.
       assert read_frontmatter(host, "tests/standing-armed")["status"] == "active"
     after
       if prev_loom, do: System.put_env("LOOM_HOMES", prev_loom), else: System.delete_env("LOOM_HOMES")
@@ -1208,19 +1178,7 @@ defmodule Shuttle.DispatchIntegrationTest do
 
   defp write_resume_fiber(host, id, opts) do
     agent = Keyword.fetch!(opts, :agent)
-    frontmatter_session = Keyword.get(opts, :frontmatter_session)
-
-    session_block =
-      if frontmatter_session do
-        """
-          session:
-            agent: #{agent}
-            dispatched_at: "2026-05-01T09:00:00Z"
-            id: #{frontmatter_session}
-        """
-      else
-        ""
-      end
+    history_session = Keyword.get(opts, :history_session)
 
     write_fiber(host, id, """
     ---
@@ -1229,13 +1187,16 @@ defmodule Shuttle.DispatchIntegrationTest do
     tags:
       - constitution
     shuttle:
-      enabled: true
       kind: oneshot
       agent: #{agent}
-    #{session_block}
     ---
     A fiber used by the resume matrix.
     """)
+
+    # The session id lives in felt history (slice 6: no doc-resident session).
+    if history_session do
+      append_worker_exit(host, id, agent: agent, session: history_session)
+    end
   end
 
   # Appends a review-comment event to the fiber's felt history so that
@@ -1263,10 +1224,35 @@ defmodule Shuttle.DispatchIntegrationTest do
   defp maybe_field(fields, _key, nil), do: fields
   defp maybe_field(fields, key, value), do: fields ++ ["--field", "#{key}=#{value}"]
 
+  # Raw felt-history text for a fiber, used to assert the dispatcher recorded the
+  # session id (`session=<uuid>`) in history (slice 6: the durable session home).
+  defp history_text(host, id) do
+    case System.cmd("felt", ["-C", host, "history", id, "--last", "20"], stderr_to_stdout: true) do
+      {out, 0} -> out
+      _ -> ""
+    end
+  end
+
   defp append_worker_exit(host, id, opts) do
     agent = Keyword.fetch!(opts, :agent)
     session = Keyword.fetch!(opts, :session)
     summary = "worker exited (:normal_exit); agent=#{agent} session=#{session}"
+
+    {out, code} =
+      System.cmd("felt", ["-C", host, "history", "append", id, "-m", summary],
+        stderr_to_stdout: true
+      )
+
+    if code != 0, do: raise("felt history append failed (#{code}): #{out}")
+  end
+
+  # Mirror the dispatcher's at-spawn session record (slice 6): a "worker
+  # dispatched ... session=<uuid>" felt-history event, the durable session-id
+  # home and the dead-orphan discriminator's "dispatched" marker.
+  defp append_dispatch_event(host, id, opts) do
+    agent = Keyword.fetch!(opts, :agent)
+    session = Keyword.fetch!(opts, :session)
+    summary = "worker dispatched (agent=#{agent}) session=#{session}"
 
     {out, code} =
       System.cmd("felt", ["-C", host, "history", "append", id, "-m", summary],

@@ -26,24 +26,6 @@ type Block struct {
 	ProjectDir  string    `json:"project_dir,omitempty" yaml:"project_dir,omitempty"`
 	Agent       string    `json:"agent,omitempty" yaml:"agent,omitempty"`
 	Schedule    *Schedule `json:"schedule,omitempty" yaml:"schedule,omitempty"`
-	// Session is daemon-owned: written at dispatch time, read at resume time.
-	// The CLI preserves it through lifecycle operations (pause/resume/set-model).
-	// Removed at slice 6 (resume reads felt history instead).
-	Session *Session `json:"session,omitempty" yaml:"session,omitempty"`
-}
-
-// Session holds the most recent dispatch session for resume purposes.
-// Written by the Elixir daemon after a successful worker spawn; read at
-// the next dispatch to support resume-previous mode.
-type Session struct {
-	// ID is the harness-native session UUID.
-	// - Claude: the UUID passed via --session-id (pre-specified).
-	// - Codex/Pi: captured from the session JSONL after dispatch.
-	ID string `json:"id" yaml:"id"`
-	// Agent is the agent ID used for this session (e.g. "claude-sonnet").
-	Agent string `json:"agent,omitempty" yaml:"agent,omitempty"`
-	// DispatchedAt is when the session was spawned.
-	DispatchedAt time.Time `json:"dispatched_at" yaml:"dispatched_at"`
 }
 
 // Schedule holds the recurrence definition for a standing role.
@@ -99,9 +81,10 @@ func (s *Schedule) UnmarshalJSON(data []byte) error {
 // UnmarshalJSON accepts the canonical `kind` field as well as the legacy
 // `mode` alias used by pre-CLI shuttle blocks serialized through felt's JSON
 // view. Output always normalizes to `Kind`. Legacy daemon-owned fields
-// (enabled, review, next_due_at, last_run_at) are NOT decoded — slice 5 dropped
-// them outright (clean cutover, no read-tolerance): a felt JSON view that still
-// carries them simply ignores them, and the next Go rewrite wipes them.
+// (enabled, review, next_due_at, last_run_at, session) are NOT decoded — slices
+// 5/6 dropped them outright (clean cutover, no read-tolerance): a felt JSON view
+// that still carries them simply ignores them, and the next Go rewrite wipes
+// them. Resume reads the session id from felt history, not a doc-resident block.
 func (b *Block) UnmarshalJSON(data []byte) error {
 	var aux struct {
 		Kind        string    `json:"kind"`
@@ -111,7 +94,6 @@ func (b *Block) UnmarshalJSON(data []byte) error {
 		ProjectDir  string    `json:"project_dir"`
 		Agent       string    `json:"agent"`
 		Schedule    *Schedule `json:"schedule"`
-		Session     *Session  `json:"session"`
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
@@ -125,7 +107,6 @@ func (b *Block) UnmarshalJSON(data []byte) error {
 	b.ProjectDir = aux.ProjectDir
 	b.Agent = aux.Agent
 	b.Schedule = aux.Schedule
-	b.Session = aux.Session
 	return nil
 }
 

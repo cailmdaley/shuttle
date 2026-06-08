@@ -50,9 +50,10 @@ defmodule Shuttle.Dispatcher do
       under force) and `resolve_resume_intent` ignores the ad-hoc
       short-circuit so the most recent review-comment's `resume_mode` is
       honored regardless of dispatch context.
-    * `:runtime_session_id` — daemon-owned prior session UUID supplied by the
-      Poller from RuntimeStore. Falls back to legacy frontmatter/history when
-      absent so standalone dispatch remains compatible.
+    * `:runtime_session_id` — prior session UUID the caller already resolved (a
+      live in-memory watcher record within the daemon's lifetime). Falls back to
+      felt history (`latest_history_session_id`) when absent, which is the
+      durable home post-slice-6 (no runtime store, no doc-resident session).
   """
   @spec dispatch(String.t(), keyword()) :: dispatch_result()
   def dispatch(fiber_id, opts \\ []) do
@@ -230,7 +231,7 @@ defmodule Shuttle.Dispatcher do
   """
   @spec check_resume_intent(String.t(), map(), keyword()) ::
           :fresh | {:previous, String.t()} | {:error, :missing_session_id}
-  def check_resume_intent(fiber_id, fiber, opts \\ []) do
+  def check_resume_intent(fiber_id, _fiber, opts \\ []) do
     felt_store = Keyword.get(opts, :felt_store, default_felt_store())
 
     since_args =
@@ -249,7 +250,6 @@ defmodule Shuttle.Dispatcher do
 
         session_id =
           Keyword.get(opts, :session_id) ||
-            get_in(fiber, ["shuttle", "session", "id"]) ||
             latest_history_session_id(fiber_id, felt_store: felt_store)
 
         case {resume_mode, session_id} do
@@ -1019,23 +1019,20 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
-  # Store the session UUID after a successful fresh dispatch.
-  # - Claude: UUID was pre-specified; write synchronously.
+  # Record the session UUID in felt history after a successful fresh dispatch, so
+  # "Resume previous" can recover it across a daemon restart. felt history is the
+  # chronological substrate and the only durable session-id home post-slice-6 (no
+  # runtime store, no doc-resident `shuttle.session` block); `latest_history_
+  # session_id` parses the `session=<uuid>` token back out at the next dispatch,
+  # and the worker-exit event reads it the same way.
+  # - Claude: UUID was pre-specified; write synchronously (fire-and-forget Task).
   # - Codex/Pi: capture UUID from session file asynchronously with backoff.
   # - None: agent doesn't support session IDs; skip.
   defp store_session_id(fiber_id, agent_id, {:claude, uuid}, _runner, felt_store) do
-    # Fire-and-forget: storing the UUID is best-effort; blocking dispatch on a
-    # shuttle-ctl call would delay WorkerWatcher startup and cause flaky tests
-    # (the watcher init checks the session, but the session can be removed by
-    # other actors while we wait for shuttle-ctl to finish).
+    # Fire-and-forget: recording the UUID is best-effort; blocking dispatch on a
+    # felt write would delay WorkerWatcher startup and cause flaky tests.
     Task.start(fn ->
-      case Shuttle.SessionStore.set(fiber_id, uuid, agent_id, felt_store: felt_store) do
-        {:ok, _} ->
-          Logger.info("Stored session UUID #{uuid} for #{fiber_id}")
-
-        {:error, reason} ->
-          Logger.warning("Could not store session UUID for #{fiber_id}: #{reason}")
-      end
+      record_dispatch_session(fiber_id, agent_id, uuid, felt_store)
     end)
   end
 
@@ -1053,16 +1050,7 @@ defmodule Shuttle.Dispatcher do
     Task.start(fn ->
       case capture_session_uuid(cli, work_dir, capture_fiber_id, dispatched_after, 100) do
         {:ok, uuid} ->
-          case Shuttle.SessionStore.set(fiber_id, uuid, agent_id, felt_store: felt_store) do
-            {:ok, _} ->
-              Logger.info("Captured and stored session UUID #{uuid} for #{fiber_id}")
-
-            {:error, reason} ->
-              Logger.warning(
-                "Captured UUID #{uuid} but could not store for #{fiber_id}: " <>
-                  reason
-              )
-          end
+          record_dispatch_session(fiber_id, agent_id, uuid, felt_store)
 
         {:error, reason} ->
           Logger.warning(
@@ -1074,6 +1062,28 @@ defmodule Shuttle.Dispatcher do
   end
 
   defp store_session_id(_fiber_id, _agent_id, :none, _runner, _felt_store), do: :ok
+
+  # Append a felt-history event carrying the dispatch session UUID. The summary
+  # uses the same `session=<uuid>` token the worker-exit event uses, so
+  # `latest_history_session_id`/`extract_session_id` recover it uniformly.
+  defp record_dispatch_session(fiber_id, agent_id, uuid, felt_store) do
+    store = felt_store || default_felt_store()
+    summary = "worker dispatched (agent=#{agent_id}) session=#{uuid}"
+
+    case System.cmd("felt", ["-C", store, "history", "append", fiber_id, "--summary", summary],
+           stderr_to_stdout: true
+         ) do
+      {_, 0} ->
+        Logger.info("Recorded session UUID #{uuid} for #{fiber_id} in felt history")
+
+      {output, code} ->
+        Logger.warning(
+          "Could not record session UUID for #{fiber_id} (felt exit #{code}): #{String.trim(output)}"
+        )
+    end
+  rescue
+    e -> Logger.warning("Could not record session UUID for #{fiber_id}: #{inspect(e)}")
+  end
 
   # Poll for the session UUID written by codex/pi to their respective session
   # JSONL files. Tries `attempts` times with 50 ms between each.

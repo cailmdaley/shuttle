@@ -33,13 +33,11 @@ defmodule Shuttle.Poller do
 
   use GenServer
   require Logger
-  import Bitwise, only: [<<<: 2]
 
   alias Shuttle.{
     Actions,
     Dispatcher,
     LifecycleStore,
-    RuntimeStore,
     StandingRole,
     WorkerWatcher
   }
@@ -56,9 +54,6 @@ defmodule Shuttle.Poller do
   @default_stall_timeout_ms 300_000
   @dispatch_call_timeout_ms 30_000
   @orchestrator_state_call_timeout_ms 30_000
-  @continuation_retry_delay_ms 1_000
-  @failure_retry_base_ms 10_000
-  @default_max_retry_backoff_ms 300_000
 
   defmodule State do
     @moduledoc false
@@ -76,7 +71,6 @@ defmodule Shuttle.Poller do
       :max_concurrent_workers,
       :heartbeat_interval_ms,
       :stall_timeout_ms,
-      :max_retry_backoff_ms,
       :next_poll_due_at_ms,
       :tick_timer_ref,
       :tick_token,
@@ -84,8 +78,6 @@ defmodule Shuttle.Poller do
       :felt_stores,
       # Machine identity used by shuttle.host dispatch affinity.
       :own_host_id,
-      # Host-local SQLite file where daemon runtime state is persisted.
-      :runtime_store_path,
       # When true, felt_stores is re-read from env + persisted registration on
       # each poll cycle. Set true when :felt_stores opt isn't passed to
       # start_link; false when the caller passed an explicit list (tests,
@@ -93,16 +85,17 @@ defmodule Shuttle.Poller do
       :auto_discover_felt_stores,
       :runner,
       poll_check_in_progress: false,
-      # Runtime/process registry. Keyed by intrinsic UID when known; metadata
-      # carries :fiber_id as the felt address used for CLI shell-outs and
-      # public API payloads.
+      # In-memory watcher registry, keyed by intrinsic UID when known; metadata
+      # carries :fiber_id as the felt address used for CLI shell-outs and public
+      # API payloads. NOT persisted (slice 6: no runtime store) — tmux is the
+      # source of truth for liveness, so a restart re-derives `running` by
+      # adopting live shuttle sessions (`adopt_orphans`) and every poll
+      # reconciles entries whose tmux session has died.
       running: %{},
       claimed: MapSet.new(),
-      retry_queue: %{},
       waiters: %{},
       reservations: %{},
       standing_roles: [],
-      lifecycle: %{},
       orphans: [],
       # %{fiber_id => felt_store} — populated by discover_candidates/1 on each
       # poll cycle and by host_for_fiber/2 on demand. Entries are never evicted
@@ -218,20 +211,19 @@ defmodule Shuttle.Poller do
 
   @doc """
   Run a standing-role lifecycle transition (`:accept` / `:resume`) through the
-  Poller so the in-memory lifecycle cache is refreshed from the runtime store
-  immediately after the write. accept/resume write the felt document (the
-  lifecycle truth) plus the host-local runtime row; running the transition
-  inside the GenServer makes that write + the in-memory cache refresh atomic
-  against poll cycles, so a concurrent poll can't re-derive a stale row.
+  Poller so the felt-document write is atomic against poll cycles. accept/resume
+  re-arm an awaiting role by writing `status: active` to the document (slice 6:
+  no runtime row); running the transition inside the GenServer keeps a concurrent
+  poll from reading a half-written document.
   """
-  @spec lifecycle_transition(:accept | :resume | :reset_review, String.t(), keyword()) ::
+  @spec lifecycle_transition(:accept | :resume, String.t(), keyword()) ::
           {:ok, String.t()} | {:error, term()}
   def lifecycle_transition(verb, fiber_id, opts \\ []),
     do: lifecycle_transition(__MODULE__, verb, fiber_id, opts)
 
   @spec lifecycle_transition(
           GenServer.server(),
-          :accept | :resume | :reset_review,
+          :accept | :resume,
           String.t(),
           keyword()
         ) :: {:ok, String.t()} | {:error, term()}
@@ -338,11 +330,6 @@ defmodule Shuttle.Poller do
         _ -> self()
       end
 
-    runtime_store_path =
-      Keyword.get_lazy(opts, :runtime_store_path, &default_runtime_store_path/0)
-
-    :ok = RuntimeStore.init(runtime_store_path)
-
     state = %State{
       self_ref: self_ref,
       poll_interval_ms: Keyword.get(opts, :poll_interval_ms, @default_poll_interval_ms),
@@ -351,28 +338,22 @@ defmodule Shuttle.Poller do
       heartbeat_interval_ms:
         Keyword.get(opts, :heartbeat_interval_ms, @default_heartbeat_interval_ms),
       stall_timeout_ms: Keyword.get(opts, :stall_timeout_ms, @default_stall_timeout_ms),
-      max_retry_backoff_ms:
-        Keyword.get(opts, :max_retry_backoff_ms, @default_max_retry_backoff_ms),
       next_poll_due_at_ms: now_ms,
       tick_timer_ref: nil,
       tick_token: nil,
       felt_stores: felt_stores,
       own_host_id: to_string(own_host_id),
-      runtime_store_path: runtime_store_path,
       auto_discover_felt_stores: auto_discover,
       runner: runner
     }
 
     Logger.info("configured felt stores: #{inspect(felt_stores)}")
 
-    # Rehydrate the daemon-owned runtime store first, then adopt any live tmux
-    # sessions that predate the store or were created while the daemon was down.
-    state =
-      state
-      |> rehydrate_lifecycle_store()
-      |> rehydrate_runtime_store()
-      |> adopt_orphans()
-      |> rehydrate_retry_queue()
+    # Daemon state is derived and disposable (slice 6: no runtime store). Rebuild
+    # `running` from tmux by adopting any live shuttle sessions — a restart
+    # re-scans tmux and is immediately correct, and running work survives because
+    # tmux owns the worker process.
+    state = adopt_orphans(state)
 
     # Schedule first tick immediately
     state = schedule_tick(state, 0)
@@ -447,18 +428,6 @@ defmodule Shuttle.Poller do
     broadcast_snapshot(state)
     {:noreply, state}
   end
-
-  def handle_info({:retry, fiber_id, retry_token}, state) do
-    result =
-      case pop_retry(state, fiber_id, retry_token) do
-        {:ok, retry, state} -> handle_retry(state, fiber_id, retry)
-        :missing -> {:noreply, state}
-      end
-
-    result
-  end
-
-  def handle_info({:retry, _}, state), do: {:noreply, state}
 
   def handle_info({:wait_timeout, fiber_id, waiter_id}, state) do
     waiters = Map.get(state.waiters, fiber_id, [])
@@ -587,17 +556,10 @@ defmodule Shuttle.Poller do
       case verb do
         :accept -> LifecycleStore.accept(fiber_id, opts)
         :resume -> LifecycleStore.resume(fiber_id)
-        :reset_review -> LifecycleStore.reset_review(fiber_id)
         other -> {:error, "unknown lifecycle transition #{inspect(other)}"}
       end
 
-    case result do
-      {:ok, output} ->
-        {:reply, {:ok, output}, refresh_lifecycle_entry(state, fiber_id)}
-
-      {:error, _} = error ->
-        {:reply, error, state}
-    end
+    {:reply, result, state}
   end
 
   def handle_call({:wait, fiber_id, timeout_ms, opts}, _from, state) do
@@ -721,19 +683,6 @@ defmodule Shuttle.Poller do
         }
       end)
 
-    retrying =
-      Enum.map(state.retry_queue, fn {_runtime_key, retry} ->
-        fiber_id = fiber_address(retry)
-
-        %{
-          fiber_id: fiber_id,
-          uid: uid_for_fiber(state, fiber_id, retry),
-          attempt: retry.attempt,
-          due_in_ms: max(0, retry.due_at_ms - now_ms),
-          error: Map.get(retry, :error)
-        }
-      end)
-
     blocked =
       Enum.map(state.dispatch_failures, fn {fiber_id, entry} ->
         %{
@@ -756,7 +705,10 @@ defmodule Shuttle.Poller do
       eligible: eligible,
       blocked: blocked,
       orphans: state.orphans,
-      retrying: retrying,
+      # Retries collapsed into the poll loop (slice 6): a status:active fiber with
+      # no live tmux session is simply eligible again on the next tick. The key
+      # stays (empty) for snapshot-shape stability with API/kanban consumers.
+      retrying: [],
       standing_roles: standing_role_snapshots(state.standing_roles, state.running, now, state),
       claimed_count: MapSet.size(state.claimed),
       max_concurrent: state.max_concurrent_workers,
@@ -766,33 +718,15 @@ defmodule Shuttle.Poller do
     Map.put(snap, :runtime, runtime_by_fiber(state, snap, now))
   end
 
+  # The per-fiber runtime index is derived from the live `running` map (tmux
+  # liveness) and the standing-role snapshots (cron-computed due-ness). There is
+  # no persisted lifecycle base (slice 6: runtime store gone): a oneshot's phase
+  # is "running" iff its watcher is live, and a standing role's phase comes from
+  # status/tempered/cron/liveness.
   defp runtime_by_fiber(%State{} = state, snap, now) do
-    state.lifecycle
-    |> Enum.reduce(%{}, fn {fiber_id, metadata}, acc ->
-      Map.put(
-        acc,
-        runtime_entry_key(state, fiber_id, metadata),
-        lifecycle_runtime(fiber_id, metadata, state)
-      )
-    end)
+    %{}
     |> merge_running_runtime(snap.eligible, state)
-    |> merge_retry_runtime(snap.retrying, state)
     |> merge_standing_runtime(snap.standing_roles, now, state)
-  end
-
-  defp lifecycle_runtime(fiber_id, metadata, state) do
-    %{
-      fiber_id: fiber_id,
-      uid: uid_for_fiber(state, fiber_id, metadata),
-      kind: Map.get(metadata, :kind, "oneshot"),
-      phase: Map.get(metadata, :phase) || "scheduled",
-      run_id: Map.get(metadata, :run_id),
-      run_kind: Map.get(metadata, :run_kind),
-      session: stringify_keys(Map.get(metadata, :session, %{})),
-      next_due_at: unix_ms(Map.get(metadata, :next_due_at)),
-      last_run_at: unix_ms(Map.get(metadata, :last_run_at))
-    }
-    |> compact_runtime()
   end
 
   defp merge_running_runtime(runtime, running, state) do
@@ -820,33 +754,6 @@ defmodule Shuttle.Poller do
       started_at: worker.started_at,
       last_activity_at: worker.last_activity_at,
       runtime_seconds: worker.runtime_seconds
-    }
-    |> compact_runtime()
-  end
-
-  defp merge_retry_runtime(runtime, retrying, state) do
-    Enum.reduce(retrying, runtime, fn retry, acc ->
-      fiber_id = retry.fiber_id
-      runtime_key = runtime_entry_key(state, fiber_id, retry)
-
-      Map.update(acc, runtime_key, retry_runtime(retry, state), fn existing ->
-        existing
-        |> Map.merge(retry_runtime(retry, state))
-        |> Map.put(:phase, "retrying")
-      end)
-    end)
-  end
-
-  defp retry_runtime(retry, state) do
-    %{
-      fiber_id: retry.fiber_id,
-      uid: uid_for_fiber(state, retry.fiber_id, retry),
-      phase: "retrying",
-      retry: %{
-        attempt: retry.attempt,
-        due_in_ms: retry.due_in_ms,
-        error: retry.error
-      }
     }
     |> compact_runtime()
   end
@@ -912,10 +819,6 @@ defmodule Shuttle.Poller do
 
   defp due_in_ms(_, _now), do: nil
 
-  defp unix_ms(%DateTime{} = datetime), do: DateTime.to_unix(datetime, :millisecond)
-  defp unix_ms(value) when is_integer(value), do: value
-  defp unix_ms(_), do: nil
-
   defp uid_for_fiber(%State{} = state, fiber_id, metadata \\ %{}) do
     case metadata_uid(metadata) || Map.get(state.fiber_uid_cache, fiber_id) do
       uid when is_binary(uid) and uid != "" -> uid
@@ -930,10 +833,6 @@ defmodule Shuttle.Poller do
   defp runtime_key_for_fiber(fiber) when is_map(fiber) do
     fiber_id = fiber_address(fiber)
     metadata_uid(fiber) || fiber_id
-  end
-
-  defp runtime_key_for_address(%State{} = state, fiber_id, metadata) do
-    uid_for_fiber(state, fiber_id, metadata) || fiber_id
   end
 
   defp address_for_identifier(%State{} = state, identifier) when is_binary(identifier) do
@@ -958,14 +857,11 @@ defmodule Shuttle.Poller do
   end
 
   defp address_from_runtime_maps(%State{} = state, identifier) do
-    [state.running, state.retry_queue, state.lifecycle]
-    |> Enum.find_value(fn records ->
-      Enum.find_value(records, fn {_key, metadata} ->
-        address = fiber_address(metadata)
-        uid = metadata_uid(metadata)
+    Enum.find_value(state.running, fn {_key, metadata} ->
+      address = fiber_address(metadata)
+      uid = metadata_uid(metadata)
 
-        if identifier in [address, uid], do: address
-      end)
+      if identifier in [address, uid], do: address
     end)
   end
 
@@ -1005,54 +901,6 @@ defmodule Shuttle.Poller do
     case running_key(state, fiber_id) do
       nil -> nil
       key -> Map.get(state.running, key)
-    end
-  end
-
-  defp retry_key(%State{} = state, fiber_id) when is_binary(fiber_id) do
-    cond do
-      Map.has_key?(state.retry_queue, fiber_id) ->
-        fiber_id
-
-      true ->
-        Enum.find_value(state.retry_queue, fn {key, metadata} ->
-          address = fiber_address(metadata)
-          uid = metadata_uid(metadata)
-
-          if fiber_id in [address, uid], do: key
-        end)
-    end
-  end
-
-  defp retry_key(_, _), do: nil
-
-  defp retry_record(%State{} = state, fiber_id) do
-    case retry_key(state, fiber_id) do
-      nil -> nil
-      key -> Map.get(state.retry_queue, key)
-    end
-  end
-
-  defp lifecycle_key(%State{} = state, fiber_id) when is_binary(fiber_id) do
-    cond do
-      Map.has_key?(state.lifecycle, fiber_id) ->
-        fiber_id
-
-      true ->
-        Enum.find_value(state.lifecycle, fn {key, metadata} ->
-          address = fiber_address(metadata)
-          uid = metadata_uid(metadata)
-
-          if fiber_id in [address, uid], do: key
-        end)
-    end
-  end
-
-  defp lifecycle_key(_, _), do: nil
-
-  defp lifecycle_record(%State{} = state, fiber_id) do
-    case lifecycle_key(state, fiber_id) do
-      nil -> nil
-      key -> Map.get(state.lifecycle, key)
     end
   end
 
@@ -1111,12 +959,11 @@ defmodule Shuttle.Poller do
   end
 
   # Apply an observed `world` (from `poll_reads/1`) to the GenServer's CURRENT
-  # state. This is the only place the poll cycle reconciles, dispatches, or
-  # schedules retries, and it runs on the live GenServer process — so anything
-  # that changed during the Task's read is reflected in `state` and respected
-  # here, never overwritten from a stale snapshot. Reconcile is reordered after
-  # discovery (it was before, in the old single-pass `maybe_dispatch`); the two
-  # are independent given refreshed felt stores, and reconcile now sees current
+  # state. This is the only place the poll cycle reconciles and dispatches, and
+  # it runs on the live GenServer process — so anything that changed during the
+  # Task's read is reflected in `state` and respected here, never overwritten
+  # from a stale snapshot. Reconcile is reordered after discovery; the two are
+  # independent given refreshed felt stores, and reconcile now sees current
   # `running` rather than the Task's snapshot.
   defp apply_poll_cycle(%State{} = state, %{
          felt_stores: felt_stores,
@@ -1128,16 +975,11 @@ defmodule Shuttle.Poller do
        }) do
     state = reconcile(%{state | felt_stores: felt_stores})
 
+    standing_roles = standing_roles_from_candidates(candidates, state)
+
     # Merge newly resolved host entries into the cache. Existing entries
     # are not evicted — earlier-configured hosts win for ID collisions,
     # and cache entries are stable for the daemon's lifetime.
-    state =
-      state
-      |> reconcile_persisted_running(candidates, new_uid_map)
-      |> reconcile_persisted_lifecycle(candidates, new_uid_map)
-
-    {standing_roles, lifecycle} = standing_roles_from_candidates(candidates, state)
-
     state = %{
       state
       | fiber_host_cache: Map.merge(new_host_map, state.fiber_host_cache),
@@ -1146,16 +988,17 @@ defmodule Shuttle.Poller do
         document_cache_stats: document_cache_stats,
         document_cache_ready: true,
         standing_roles: standing_roles,
-        lifecycle: Map.merge(state.lifecycle, lifecycle),
         dispatch_failures: evict_stale_dispatch_failures(state.dispatch_failures, candidates)
     }
 
-    # Resurrect orphaned dispatched fibers — workers whose tmux sessions
-    # exited while the daemon was down (or otherwise not watching) so the
-    # worker_exited path never fired. Runs unconditionally on slots so
-    # orphans get back into the retry queue even when the dispatch budget
-    # is exhausted; the retry timer waits for capacity.
-    state = reconcile_dispatched_dead_fibers(state, candidates)
+    # Downtime recovery: a standing role whose tmux session is gone but whose
+    # document is still armed (status:active, no verdict) never fired
+    # `handle_worker_exit` (the daemon was down across the exit). Scan tmux and
+    # mark such roles awaiting (status:closed) so the armed document does not
+    # re-fire. Oneshots need no analog: a status:active oneshot with no live
+    # session is simply eligible again on the next tick — retries collapsed into
+    # the poll loop (slice 6).
+    state = reconcile_dead_standing_roles(state, candidates)
 
     if available_slots(state) > 0 do
       dispatchable = candidates |> filter_eligible(state) |> sort_candidates()
@@ -1175,27 +1018,20 @@ defmodule Shuttle.Poller do
 
   # ── Orphan Resurrection ──
 
-  # Detect fibers that were dispatched at least once (runtime session.id set)
-  # but whose tmux sessions are no longer alive AND aren't being tracked by a
-  # WorkerWatcher. This happens when the worker exits while the daemon is down
-  # — `worker_watcher` never fires `worker_exited`, the continuation retry
-  # never schedules, and the fiber sits forever in a "dispatched but dead"
-  # limbo. Without this pass the human ends up with a kanban card that says
-  # in-flight for a session that ended hours ago.
+  # Downtime recovery for standing roles, on the tmux-scan substrate (slice 6:
+  # replaces the runtime-store-keyed `reconcile_dispatched_dead_fibers` +
+  # `maybe_resurrect_orphan`). A standing role whose worker exited while the
+  # daemon was down never fired `handle_worker_exit`, so its document stays armed
+  # (status:active, no verdict) and would re-fire on the next poll. Scan tmux: an
+  # owned, armed standing role with NO live session and NO live watcher → mark it
+  # awaiting (status:closed). Oneshots need no analog here — a status:active
+  # oneshot with no live session is simply eligible again next tick (retries
+  # collapsed into the poll loop), and the cron window gates standing redispatch.
   #
   # `adopt_orphans` (init) and `reconcile_orphaned_sessions` (per-poll) handle
-  # the *live* analog: a tmux session exists, we just aren't watching it.
-  # This pass is the *dead* analog: no tmux session, but the fiber thinks it
-  # was dispatched. Mirrors what `handle_worker_exit` would have done if the
-  # daemon had been up.
-  #
-  # Standing roles are excluded *here* because their dead-worker outcome is not
-  # resurrection (a continuation retry) but awaiting review: the document flips
-  # to `status: closed`. That mark is written upstream, in
-  # `record_orphaned_running_worker`, the moment the dead running entry is
-  # detected — so by the time this pass runs the role is already closed and the
-  # `status == "closed"` clause below leaves it alone.
-  defp reconcile_dispatched_dead_fibers(%State{} = state, candidates) do
+  # the *live* analog: a tmux session exists, we just aren't watching it. This
+  # pass is the *dead* analog for the kind that must NOT re-fire on its own.
+  defp reconcile_dead_standing_roles(%State{} = state, candidates) do
     # list_shuttle_sessions returns {:ok, []} on tmux-server-absent today (never
     # errors), so this match is total; if it ever grows an error tuple, the
     # compiler will surface the missing clause.
@@ -1203,81 +1039,109 @@ defmodule Shuttle.Poller do
     live = MapSet.new(sessions)
 
     Enum.reduce(candidates, state, fn fiber, acc ->
-      maybe_resurrect_orphan(acc, fiber, live)
+      maybe_mark_dead_standing_role(acc, fiber, live)
     end)
   end
 
-  defp maybe_resurrect_orphan(%State{} = state, fiber, live_sessions) do
+  defp maybe_mark_dead_standing_role(%State{} = state, fiber, live_sessions) do
     fiber_id = Map.get(fiber, "id", "")
     shuttle = Map.get(fiber, "shuttle", %{})
     status = Map.get(fiber, "status", "")
     kind = Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot"))
 
-    lifecycle = runtime_lifecycle(state, fiber_id)
-    session_id = stored_session_id(state, fiber_id, fiber)
-    lifecycle_dispatched? = Map.get(lifecycle, :phase) == "dispatched"
-
     cond do
-      # Only the owning daemon may resurrect. A fiber owned by another host
-      # (or unowned — absent host:) is not this daemon's orphan; leave it for
-      # the owning daemon or the kanban. This is the load-bearing gate: a
-      # remote restart must never re-grab a Mac-owned fiber whose loom-synced
-      # runtime store carries a stale session UUID (the 2026-05-30 incident).
+      # Only the owning daemon writes a fiber's document. A fiber owned by
+      # another host (or unowned — absent host:) is not this daemon's to mark.
+      # Load-bearing gate: a remote restart must never reach across hosts.
       not host_owned?(shuttle, state.own_host_id) ->
         state
 
-      # A declared project_dir absent on this host disqualifies resurrection
-      # too — same rule as the poll path.
-      not project_dir_available?(shuttle) ->
+      # Oneshots: no awaiting-on-down handling — status:active + no live session
+      # just re-dispatches next tick (retries are the poll loop now).
+      kind != "standing" ->
         state
 
-      # Standing roles don't resurrect — a dead standing worker becomes
-      # awaiting review (status:closed), written in
-      # `record_orphaned_running_worker` before this pass. Never retry one.
-      kind == "standing" ->
+      # Only an armed role can regress into a phantom re-fire; closed/tempered
+      # roles are already terminal/awaiting.
+      status != "active" or not is_nil(Map.get(fiber, "tempered")) ->
         state
 
-      # Never dispatched — nothing to resurrect. A runtime row with
-      # phase=dispatched is also a dispatch marker: session capture is
-      # best-effort, and if it failed we still need to move the dead launch into
-      # retry instead of leaving the card in "dispatched" forever.
-      session_id == nil and not lifecycle_dispatched? ->
-        state
-
-      # Closed — work is done.
-      status == "closed" ->
-        state
-
-      # Already tracking (a WorkerWatcher is alive for this fiber).
+      # A live watcher means the daemon is tracking this worker; its exit will
+      # flip the document through `handle_worker_exit`. Not a dead orphan.
       running_key(state, fiber_id) != nil ->
         state
 
-      # Retry already queued.
-      MapSet.member?(state.claimed, fiber_id) ->
-        state
-
-      # tmux session for this fiber is live (either name form) — `adopt_orphans`
-      # / `reconcile_orphaned_sessions` will pick it up; not our problem.
+      # A live tmux session (either name form) means the worker is still up —
+      # `reconcile_orphaned_sessions`/`adopt_orphans` will adopt it. Not dead.
       Enum.any?(
         Dispatcher.session_names(fiber_id, Map.get(fiber, "uid")),
         &MapSet.member?(live_sessions, &1)
       ) ->
         state
 
+      # The felt-history discriminator (slice 6 replaces slice 1's "stored
+      # session.id"): only a role that was actually DISPATCHED but never observed
+      # EXITING is a dead orphan. felt history records "worker dispatched ..." at
+      # spawn and "worker exited ..." at exit; a trailing dispatch with no exit
+      # after it is the daemon-down-across-exit case. An armed role whose last run
+      # already exited (the daily-practice "armed, not-yet-due, never-dispatched-
+      # this-cycle" shape) is left alone so its next cron tick fires.
+      not standing_role_dispatched_unexited?(fiber_id, state) ->
+        state
+
       true ->
         Logger.info(
-          "Resurrecting orphan dispatch: fiber_id=#{fiber_id} " <>
-            "session_id=#{session_id} — worker exited while daemon was down " <>
-            "or unwatched; scheduling continuation retry"
+          "Standing role #{fiber_id} armed with an un-exited dispatch but no live tmux " <>
+            "session/watcher — worker exited while daemon was down; marking awaiting (status:closed)"
         )
 
-        attempt = next_retry_attempt(state, fiber_id)
-
-        schedule_retry(state, fiber_id, attempt, %{
-          delay_type: :continuation,
-          reason: :orphan_resurrected
-        })
+        mark_standing_awaiting(fiber_id)
+        state
     end
+  end
+
+  # True iff the fiber's most recent worker lifecycle event in felt history is a
+  # "worker dispatched" with no "worker exited" after it — i.e., a run that began
+  # but whose exit the daemon never observed (it was down across the exit). This
+  # is the felt-native marker that a worker actually ran this cycle, replacing
+  # slice 1's runtime-store session.id check. felt history is the durable
+  # substrate (slice 6); a never-dispatched-this-cycle armed role has a trailing
+  # "exited" (last cycle completed) and is left alone.
+  defp standing_role_dispatched_unexited?(fiber_id, state) do
+    case host_for_fiber(fiber_id, state) do
+      {:ok, felt_store} ->
+        # Read felt history directly (System.cmd, like log_worker_exit) rather
+        # than through the injected runner — history is real-felt substrate, not a
+        # mocked dispatch surface.
+        args = ["-C", felt_store, "history", fiber_id, "--last", "20", "--json"]
+
+        case System.cmd("felt", args, stderr_to_stdout: true) do
+          {output, 0} ->
+            with {:ok, events} when is_list(events) <- Jason.decode(output) do
+              events
+              |> Enum.find_value(fn event ->
+                text = get_in(event, ["payload", "text"]) || ""
+
+                cond do
+                  String.contains?(text, "worker exited") -> :exited
+                  String.contains?(text, "worker dispatched") -> :dispatched
+                  true -> nil
+                end
+              end)
+              |> Kernel.==(:dispatched)
+            else
+              _ -> false
+            end
+
+          _ ->
+            false
+        end
+
+      {:error, _} ->
+        false
+    end
+  rescue
+    _ -> false
   end
 
   # Drops dispatch_failures entries for fibers shuttle no longer intends to
@@ -1875,29 +1739,22 @@ defmodule Shuttle.Poller do
   # init/handle_call code.
   defp resolve_own_host_id, do: own_host_id()
 
+  # Parse the standing roles straight from the candidate documents (slice 6: no
+  # runtime lifecycle row to persist). The role's display next_due is computed
+  # from cron in `standing_role_snapshots`, and awaiting/accepted are document
+  # facts (status + tempered), so nothing daemon-owned is written.
   defp standing_roles_from_candidates(candidates, state) do
     candidates
-    |> Enum.reduce({[], %{}}, fn fiber, {roles, lifecycle} ->
+    |> Enum.reduce([], fn fiber, roles ->
       case standing_role_from_fiber(fiber, state) do
         {:ok, role} ->
-          if StandingRole.standing?(role) do
-            metadata =
-              role
-              |> lifecycle_metadata_from_role()
-              |> Map.put(:uid, Map.get(fiber, "uid"))
-
-            persist_lifecycle(state, role.fiber_id, metadata)
-            runtime_key = runtime_key_for_address(state, role.fiber_id, metadata)
-            {[role | roles], Map.put(lifecycle, runtime_key, metadata)}
-          else
-            {roles, lifecycle}
-          end
+          if StandingRole.standing?(role), do: [role | roles], else: roles
 
         {:error, _} ->
-          {roles, lifecycle}
+          roles
       end
     end)
-    |> then(fn {roles, lifecycle} -> {Enum.reverse(roles), lifecycle} end)
+    |> Enum.reverse()
   end
 
   # Standing roles are parsed straight from the felt document's `shuttle:` block
@@ -2062,14 +1919,13 @@ defmodule Shuttle.Poller do
            prompt_context: prompt_context,
            felt_store: felt_store,
            force_fresh: Keyword.get(opts, :force_fresh, false),
-           force: Keyword.get(opts, :force, false),
-           runtime_session_id: stored_session_id(state, fiber_id, fiber)
+           force: Keyword.get(opts, :force, false)
          ) do
       {:ok, :human_no_op} ->
         # Human-worker fibers don't need a watcher or running-state entry —
         # the user is doing the work themselves. Return state unchanged so
-        # the kanban shows the card in inFlight (status:active, enabled:true)
-        # without any tmux session to watch.
+        # the kanban shows the card in inFlight (status:active) without any
+        # tmux session to watch.
         Logger.info("Human-worker fiber #{fiber_id} accepted; no watcher started")
         {state, {:ok, "human"}}
 
@@ -2093,8 +1949,9 @@ defmodule Shuttle.Poller do
 
         case start_watcher(state, fiber_id, running_meta) do
           {:ok, running_meta} ->
+            # `running` is an in-memory watcher registry, not persisted (slice 6:
+            # tmux is the source of truth; a restart re-adopts live sessions).
             running = Map.put(state.running, runtime_key, running_meta)
-            persist_running(state, fiber_id, running_meta)
 
             state = %{
               state
@@ -2107,14 +1964,11 @@ defmodule Shuttle.Poller do
             {state, {:ok, session}}
 
           {:error, reason} ->
+            # Watcher start failed: the worker may be alive in tmux. Record the
+            # failure for the `blocked` snapshot; the next poll re-evaluates the
+            # fiber (status:active + no watcher → eligible / adopted again).
             Logger.error("Failed to start watcher for #{fiber_id}: #{inspect(reason)}")
-
-            state =
-              schedule_retry(state, fiber_id, 1, %{
-                uid: Map.get(fiber, "uid"),
-                error: "watcher start failed: #{inspect(reason)}"
-              })
-
+            state = release_claim(state, fiber_id)
             state = record_dispatch_failure(state, fiber_id, :watcher_start_failed)
             {state, {:error, :watcher_start_failed}}
         end
@@ -2286,288 +2140,6 @@ defmodule Shuttle.Poller do
 
   defp standing_block?(_), do: false
 
-  defp rehydrate_runtime_store(%State{} = state) do
-    state.runtime_store_path
-    |> RuntimeStore.list_running()
-    |> Enum.reduce(state, fn %{fiber_id: fiber_id, runtime_key: runtime_key, metadata: metadata},
-                             state_acc ->
-      rehydrate_running_record(state_acc, fiber_id, runtime_key, metadata)
-    end)
-  end
-
-  defp rehydrate_retry_queue(%State{} = state) do
-    state.runtime_store_path
-    |> RuntimeStore.list_retries()
-    |> Enum.reduce(state, fn %{fiber_id: fiber_id, metadata: metadata}, state_acc ->
-      rehydrate_retry_record(state_acc, fiber_id, metadata)
-    end)
-  end
-
-  defp rehydrate_lifecycle_store(%State{} = state) do
-    lifecycle =
-      state.runtime_store_path
-      |> RuntimeStore.list_lifecycle()
-      |> Map.new(fn %{fiber_id: fiber_id, runtime_key: runtime_key, metadata: metadata} ->
-        {runtime_key, metadata |> Map.put_new(:fiber_id, fiber_id)}
-      end)
-
-    %{state | lifecycle: lifecycle}
-  end
-
-  defp reconcile_persisted_lifecycle(%State{} = state, candidates, uid_map) do
-    {candidate_ids, uid_to_address} = runtime_reconcile_indexes(candidates, uid_map)
-
-    lifecycle =
-      Enum.reduce(state.lifecycle, %{}, fn {runtime_key, metadata}, acc ->
-        address =
-          case fiber_address(metadata) do
-            "" -> Map.get(uid_to_address, runtime_key, runtime_key)
-            fiber_id -> fiber_id
-          end
-
-        uid = metadata_uid(metadata) || Map.get(uid_map, address)
-
-        known? =
-          MapSet.member?(candidate_ids, address) or Map.has_key?(uid_to_address, runtime_key)
-
-        cond do
-          known? and is_binary(uid) and uid != "" and
-              (runtime_key != uid or metadata_uid(metadata) != uid or
-                 fiber_address(metadata) != address) ->
-            migrated = metadata |> Map.put(:fiber_id, address) |> Map.put(:uid, uid)
-
-            if runtime_key != uid do
-              RuntimeStore.delete_lifecycle_key(state.runtime_store_path, runtime_key)
-            end
-
-            RuntimeStore.upsert_lifecycle(state.runtime_store_path, address, migrated)
-            Map.put(acc, uid, migrated)
-
-          true ->
-            Map.put(acc, runtime_key, metadata)
-        end
-      end)
-
-    %{state | lifecycle: lifecycle}
-  end
-
-  defp reconcile_persisted_running(%State{} = state, candidates, uid_map) do
-    {candidate_ids, uid_to_address} = runtime_reconcile_indexes(candidates, uid_map)
-
-    running =
-      Enum.reduce(state.running, %{}, fn {runtime_key, metadata}, acc ->
-        address =
-          case fiber_address(metadata) do
-            "" -> Map.get(uid_to_address, runtime_key, runtime_key)
-            fiber_id -> fiber_id
-          end
-
-        uid = metadata_uid(metadata) || Map.get(uid_map, address)
-
-        known? =
-          MapSet.member?(candidate_ids, address) or Map.has_key?(uid_to_address, runtime_key)
-
-        cond do
-          known? and is_binary(uid) and uid != "" and
-              (runtime_key != uid or metadata_uid(metadata) != uid or
-                 fiber_address(metadata) != address) ->
-            migrated = metadata |> Map.put(:fiber_id, address) |> Map.put(:uid, uid)
-
-            if runtime_key != uid do
-              RuntimeStore.delete_running_key(state.runtime_store_path, runtime_key)
-            end
-
-            RuntimeStore.upsert_running(state.runtime_store_path, address, migrated)
-            Map.put(acc, uid, migrated)
-
-          true ->
-            Map.put(acc, runtime_key, metadata)
-        end
-      end)
-
-    %{state | running: running}
-  end
-
-  defp runtime_reconcile_indexes(candidates, uid_map) do
-    candidate_ids =
-      candidates
-      |> Enum.map(&Map.get(&1, "id", ""))
-      |> MapSet.new()
-
-    uid_to_address = Map.new(uid_map, fn {address, uid} -> {uid, address} end)
-
-    {candidate_ids, uid_to_address}
-  end
-
-  defp runtime_lifecycle(%State{} = state, fiber_id) do
-    RuntimeStore.fetch_lifecycle(state.runtime_store_path, fiber_id) ||
-      lifecycle_record(state, fiber_id) ||
-      %{}
-  end
-
-  # Refresh a single fiber's in-memory lifecycle entry from the runtime store
-  # after an external transition wrote it. Keeps `state.lifecycle` in lock-step
-  # with the DB so the runtime row's session id / phase stay current for the
-  # callers that still read it (orphan resurrection, retry rehydration).
-  defp refresh_lifecycle_entry(%State{} = state, fiber_id) do
-    case RuntimeStore.fetch_lifecycle(state.runtime_store_path, fiber_id) do
-      metadata when is_map(metadata) ->
-        runtime_key = runtime_key_for_address(state, fiber_id, metadata)
-
-        %{
-          state
-          | lifecycle:
-              state.lifecycle
-              |> Map.delete(fiber_id)
-              |> Map.put(runtime_key, metadata)
-        }
-
-      _ ->
-        case lifecycle_key(state, fiber_id) do
-          nil -> state
-          runtime_key -> %{state | lifecycle: Map.delete(state.lifecycle, runtime_key)}
-        end
-    end
-  end
-
-  defp lifecycle_session_id(metadata) when is_map(metadata) do
-    case Map.get(metadata, :session) do
-      %{"id" => id} when is_binary(id) and id != "" -> id
-      %{id: id} when is_binary(id) and id != "" -> id
-      _ -> nil
-    end
-  end
-
-  defp lifecycle_session_id(_), do: nil
-
-  defp legacy_frontmatter_session_id(fiber) do
-    case get_in(fiber, ["shuttle", "session", "id"]) do
-      uuid when is_binary(uuid) and uuid != "" -> uuid
-      _ -> nil
-    end
-  end
-
-  defp stored_session_id(%State{} = state, fiber_id, fiber) do
-    runtime_session_id =
-      state
-      |> runtime_lifecycle(fiber_id)
-      |> lifecycle_session_id()
-
-    runtime_session_id || legacy_frontmatter_session_id(fiber)
-  end
-
-  defp rehydrate_retry_record(%State{} = state, fiber_id, metadata) do
-    cond do
-      running_key(state, fiber_id) != nil ->
-        delete_persisted_retry(state, fiber_id)
-
-      retry_key(state, fiber_id) != nil ->
-        state
-
-      true ->
-        attempt = Map.get(metadata, :attempt, 1)
-
-        due_at_ms =
-          Map.get(metadata, :due_at_ms, DateTime.to_unix(DateTime.utc_now(), :millisecond))
-
-        delay_ms = max(0, due_at_ms - DateTime.to_unix(DateTime.utc_now(), :millisecond))
-        retry_token = make_ref()
-        timer_ref = Process.send_after(state.self_ref, {:retry, fiber_id, retry_token}, delay_ms)
-
-        retry = %{
-          fiber_id: fiber_id,
-          uid: Map.get(metadata, :uid),
-          attempt: attempt,
-          timer_ref: timer_ref,
-          retry_token: retry_token,
-          due_at_ms: due_at_ms,
-          error: Map.get(metadata, :error),
-          delay_type: Map.get(metadata, :delay_type, :failure)
-        }
-
-        runtime_key = runtime_key_for_address(state, fiber_id, retry)
-
-        Logger.info(
-          "Rehydrated retry: fiber_id=#{fiber_id} in #{delay_ms}ms (attempt #{attempt})"
-        )
-
-        %{
-          state
-          | retry_queue: Map.put(state.retry_queue, runtime_key, retry),
-            claimed: MapSet.put(state.claimed, fiber_id)
-        }
-    end
-  end
-
-  defp rehydrate_running_record(%State{} = state, fiber_id, runtime_key, metadata) do
-    session =
-      Map.get(metadata, :session) ||
-        Dispatcher.session_name(fiber_id, uid_for_fiber(state, fiber_id, metadata))
-    existing_key = running_key(state, fiber_id)
-
-    cond do
-      existing_key != nil and metadata_uid(metadata) != nil and existing_key != runtime_key ->
-        RuntimeStore.delete_running_key(state.runtime_store_path, existing_key)
-        running_meta = Map.merge(Map.fetch!(state.running, existing_key), metadata)
-
-        %{
-          state
-          | running:
-              state.running
-              |> Map.delete(existing_key)
-              |> Map.put(runtime_key, running_meta)
-        }
-
-      existing_key != nil ->
-        RuntimeStore.delete_running_key(state.runtime_store_path, runtime_key)
-        state
-
-      not already_running_session?(state, session) ->
-        Logger.info(
-          "Runtime store record has no live tmux session: #{fiber_id} session=#{session}"
-        )
-
-        state
-        |> record_orphaned_running_worker(fiber_id, metadata)
-        |> delete_persisted_running(fiber_id)
-
-      true ->
-        case fetch_fiber_full(fiber_id, state) do
-          {:ok, fiber} ->
-            if Map.get(fiber, "status") == "closed" do
-              Logger.info(
-                "Runtime store record is closed in felt; killing stale session: #{session}"
-              )
-
-              _ =
-                state.runner.cmd("tmux", ["kill-session", "-t", session], stderr_to_stdout: true)
-
-              delete_persisted_running(state, fiber_id)
-            else
-              case start_watcher(state, fiber_id, metadata) do
-                {:ok, running_meta} ->
-                  Logger.info("Rehydrated runtime worker: #{fiber_id} session=#{session}")
-                  runtime_key = runtime_key_for_address(state, fiber_id, running_meta)
-
-                  %{
-                    state
-                    | running: Map.put(state.running, runtime_key, running_meta),
-                      claimed: MapSet.put(state.claimed, fiber_id)
-                  }
-
-                {:error, reason} ->
-                  Logger.warning("Failed to rehydrate #{session}: #{inspect(reason)}")
-                  state
-              end
-            end
-
-          {:error, _} ->
-            Logger.debug("Runtime store record points at unknown fiber: #{fiber_id}")
-            delete_persisted_running(state, fiber_id)
-        end
-    end
-  end
-
   defp adopt_orphans(%State{} = state) do
     {:ok, sessions} = list_shuttle_sessions(state)
     lookup = candidate_session_lookup(state)
@@ -2608,7 +2180,6 @@ defmodule Shuttle.Poller do
             {:ok, running_meta} ->
               runtime_key = runtime_key_for_fiber(fiber)
               running = Map.put(state.running, runtime_key, running_meta)
-              persist_running(state, fiber_id, running_meta)
 
               Logger.info("Adopted orphan session: #{session}")
               %{state | running: running, claimed: MapSet.put(state.claimed, fiber_id)}
@@ -2685,23 +2256,17 @@ defmodule Shuttle.Poller do
                     release_claim(state, fiber_id)
 
                   true ->
-                    # Still active — schedule continuation retry
-                    attempt = next_retry_attempt(state, fiber_id)
-
-                    schedule_retry(state, fiber_id, attempt, %{
-                      uid: metadata_uid(meta),
-                      delay_type: :continuation
-                    })
+                    # Still active (multi-session oneshot continuation): just
+                    # release the claim. The next poll re-picks it (status:active
+                    # + no live session → eligible) and starts a fresh session,
+                    # because no `resume_mode:previous` directive is on file —
+                    # retries collapsed into the poll loop (slice 6).
+                    release_claim(state, fiber_id)
                 end
 
               {:error, _} ->
-                # Can't read fiber — schedule failure retry
-                attempt = next_retry_attempt(state, fiber_id)
-
-                schedule_retry(state, fiber_id, attempt, %{
-                  uid: metadata_uid(meta),
-                  error: "fiber read failed after exit"
-                })
+                # Can't read fiber — release the claim; the next poll re-reads it.
+                release_claim(state, fiber_id)
             end
         end
     end
@@ -2763,149 +2328,6 @@ defmodule Shuttle.Poller do
     end
   end
 
-  defp handle_retry(%State{} = state, fiber_id, retry) do
-    state = release_claim(state, fiber_id)
-
-    case fetch_fiber_full(fiber_id, state) do
-      {:ok, fiber} ->
-        state =
-          if eligible?(fiber, state) do
-            opts =
-              if Map.get(retry, :delay_type) == :continuation do
-                [force_fresh: true]
-              else
-                []
-              end
-
-            {new_state, _result} = do_dispatch_fiber(state, fiber, opts)
-            new_state
-          else
-            Logger.debug("Retry no longer eligible: #{fiber_id}")
-
-            state
-            |> clear_stale_orphan_lifecycle(fiber_id, retry)
-            |> release_claim(fiber_id)
-          end
-
-        {:noreply, state}
-
-      {:error, _} ->
-        Logger.debug("Retry fiber not found: #{fiber_id}")
-        {:noreply, release_claim(state, fiber_id)}
-    end
-  end
-
-  defp clear_stale_orphan_lifecycle(%State{} = state, fiber_id, retry) do
-    lifecycle = runtime_lifecycle(state, fiber_id)
-    kind = Map.get(lifecycle, :kind, "oneshot")
-
-    if Map.get(retry, :delay_type) == :continuation and kind == "oneshot" and
-         Map.get(lifecycle, :phase) == "dispatched" do
-      Logger.info("Clearing stale orphan dispatch lifecycle: fiber_id=#{fiber_id}")
-      RuntimeStore.delete_lifecycle(state.runtime_store_path, fiber_id)
-      refresh_lifecycle_entry(state, fiber_id)
-    else
-      state
-    end
-  end
-
-  defp schedule_retry(%State{} = state, fiber_id, attempt, metadata) when is_map(metadata) do
-    previous_key = retry_key(state, fiber_id)
-    previous = if previous_key, do: Map.get(state.retry_queue, previous_key), else: nil
-    previous = previous || %{attempt: 0}
-    next_attempt = if is_integer(attempt), do: attempt, else: previous.attempt + 1
-    delay_ms = retry_delay(next_attempt, metadata, state.max_retry_backoff_ms)
-    retry_token = make_ref()
-    due_at_ms = DateTime.to_unix(DateTime.utc_now(), :millisecond) + delay_ms
-
-    # Cancel old timer if present
-    if is_reference(previous[:timer_ref]) do
-      Process.cancel_timer(previous.timer_ref)
-    end
-
-    # Target the poller via its registered name/pid (`state.self_ref`, captured
-    # in init/1), not `self()`. Retry scheduling now always runs on the GenServer
-    # — worker-exit, retry-firing, and the poll cycle's `apply_poll_cycle/2` all
-    # execute in-process — so `self()` would in fact be the poller here. We keep
-    # `self_ref` regardless: it is correct unconditionally, survives a restart,
-    # and removes any dependence on which process armed the timer.
-    timer_ref = Process.send_after(state.self_ref, {:retry, fiber_id, retry_token}, delay_ms)
-
-    error = Map.get(metadata, :error)
-    delay_type = Map.get(metadata, :delay_type, :failure)
-
-    error_suffix = if is_binary(error), do: " error=#{error}", else: ""
-
-    Logger.info(
-      "Retry scheduled: fiber_id=#{fiber_id} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}"
-    )
-
-    retry = %{
-      fiber_id: fiber_id,
-      uid: Map.get(metadata, :uid) || Map.get(state.fiber_uid_cache, fiber_id),
-      attempt: next_attempt,
-      timer_ref: timer_ref,
-      retry_token: retry_token,
-      due_at_ms: due_at_ms,
-      error: error,
-      delay_type: delay_type
-    }
-
-    runtime_key = runtime_key_for_address(state, fiber_id, retry)
-
-    retry_queue =
-      state.retry_queue
-      |> maybe_delete_key(previous_key)
-      |> Map.put(runtime_key, retry)
-
-    persist_retry(state, fiber_id, %{
-      uid: Map.get(retry, :uid),
-      attempt: next_attempt,
-      due_at_ms: due_at_ms,
-      error: error,
-      delay_type: delay_type
-    })
-
-    state = %{state | retry_queue: retry_queue, claimed: MapSet.put(state.claimed, fiber_id)}
-    broadcast_snapshot(state)
-    state
-  end
-
-  defp pop_retry(%State{} = state, fiber_id, retry_token) when is_reference(retry_token) do
-    key = retry_key(state, fiber_id)
-
-    case key && Map.get(state.retry_queue, key) do
-      %{retry_token: ^retry_token} = retry ->
-        fiber_id = fiber_address(retry)
-
-        state =
-          state
-          |> delete_persisted_retry(fiber_id)
-          |> Map.put(:retry_queue, Map.delete(state.retry_queue, key))
-
-        {:ok, retry, state}
-
-      _ ->
-        :missing
-    end
-  end
-
-  defp retry_delay(attempt, %{delay_type: :continuation}, _max_backoff) when attempt == 1 do
-    @continuation_retry_delay_ms
-  end
-
-  defp retry_delay(attempt, _metadata, max_backoff) when is_integer(attempt) and attempt > 0 do
-    max_delay_power = min(attempt - 1, 10)
-    min(@failure_retry_base_ms * (1 <<< max_delay_power), max_backoff)
-  end
-
-  defp next_retry_attempt(state, fiber_id) do
-    case retry_record(state, fiber_id) do
-      %{attempt: attempt} when is_integer(attempt) and attempt > 0 -> attempt + 1
-      _ -> 1
-    end
-  end
-
   # ── Helpers ──
 
   defp already_running_session?(%State{} = state, session) do
@@ -2942,9 +2364,6 @@ defmodule Shuttle.Poller do
     %{state | claimed: MapSet.delete(state.claimed, fiber_id)}
   end
 
-  defp maybe_delete_key(map, nil), do: map
-  defp maybe_delete_key(map, key), do: Map.delete(map, key)
-
   defp replace_matching_waiter(waiters, nil, nil), do: waiters
 
   defp replace_matching_waiter(waiters, channel_topic, notify_pid) do
@@ -2967,7 +2386,6 @@ defmodule Shuttle.Poller do
   defp remove_running(%State{} = state, fiber_id) do
     metadata = Map.get(state.running, fiber_id, %{})
     address = fiber_address(metadata)
-    delete_persisted_running(state, fiber_id)
 
     %{
       state
@@ -2994,44 +2412,22 @@ defmodule Shuttle.Poller do
     end
   end
 
-  defp persist_running(%State{} = state, fiber_id, metadata) do
-    RuntimeStore.upsert_running(state.runtime_store_path, fiber_id, metadata)
-  end
-
-  defp delete_persisted_running(%State{} = state, fiber_id) do
-    RuntimeStore.delete_running(state.runtime_store_path, fiber_id)
-    state
-  end
-
-  defp persist_retry(%State{} = state, fiber_id, metadata) do
-    RuntimeStore.upsert_retry(state.runtime_store_path, fiber_id, metadata)
-  end
-
-  defp delete_persisted_retry(%State{} = state, fiber_id) do
-    RuntimeStore.delete_retry(state.runtime_store_path, fiber_id)
-    state
-  end
-
-  # Append a felt history event noting the worker exit, including the
-  # Claude/codex session UUID so it's archivally findable. Best-effort:
-  # if felt isn't available or the index is busy, swallow the error and
-  # log; the daemon's state machine must not be blocked on history writes.
+  # Append a "worker exited" felt history event. This event is the run-window
+  # boundary the dispatcher reads (`last_worker_exit_at`/`run_window_start`): a
+  # resume directive filed after it falls inside the next run's window. The
+  # session UUID lives in the separate "worker dispatched" event the dispatcher
+  # writes at spawn (slice 6: felt history is the only durable session-id home),
+  # which `latest_history_session_id` scans for resume — so the exit event no
+  # longer needs to carry the UUID. Best-effort: a felt failure must not block
+  # the exit-handling state machine.
   #
-  # Surface for the user: `felt history <fiber-id>` lists every run with
-  # its session UUID, agent, and reason. From there they can reattach
-  # (`claude --resume <uuid>` directly) or shape a refinement via
-  # `shuttle-ctl resume`.
-  defp log_worker_exit(fiber_id, fiber, meta, reason, state) do
-    session_uuid = stored_session_id(state, fiber_id, fiber)
-
+  # Surface for the user: `felt history <fiber-id>` lists every run's dispatch
+  # (with session UUID + agent) and exit (with reason). From there they can
+  # reattach (`claude --resume <uuid>`) or shape a refinement via `shuttle-ctl
+  # resume`.
+  defp log_worker_exit(fiber_id, _fiber, meta, reason, state) do
     agent_id = Map.get(meta, :agent_id, "unknown")
-
-    summary =
-      if session_uuid do
-        "worker exited (#{inspect(reason)}); agent=#{agent_id} session=#{session_uuid}"
-      else
-        "worker exited (#{inspect(reason)}); agent=#{agent_id} session=<unknown>"
-      end
+    summary = "worker exited (#{inspect(reason)}); agent=#{agent_id}"
 
     case host_for_fiber(fiber_id, state) do
       {:ok, felt_store} ->
@@ -3235,23 +2631,6 @@ defmodule Shuttle.Poller do
     end
   end
 
-  # The runtime lifecycle row no longer carries review (slice 4). Phase is the
-  # schedule-derived label; awaiting/accepted are document facts, not stored.
-  defp lifecycle_metadata_from_role(%StandingRole{} = role) do
-    %{
-      fiber_id: role.fiber_id,
-      kind: role.mode || "standing",
-      phase: "scheduled",
-      run_id: role.run_id,
-      next_due_at: role.next_due_at,
-      last_run_at: role.last_run_at
-    }
-  end
-
-  defp persist_lifecycle(%State{} = state, fiber_id, metadata) do
-    RuntimeStore.upsert_lifecycle(state.runtime_store_path, fiber_id, metadata)
-  end
-
   defp stringify_keys(value) when is_map(value) do
     Map.new(value, fn {key, value} -> {to_string(key), value} end)
   end
@@ -3433,21 +2812,6 @@ defmodule Shuttle.Poller do
   # take precedence via init/1 (and disable the per-poll refresh in that case).
   defp default_felt_stores do
     Shuttle.FeltStores.configured_hosts()
-  end
-
-  defp default_runtime_store_path do
-    case System.get_env("SHUTTLE_RUNTIME_STORE") do
-      path when is_binary(path) and path != "" ->
-        Path.expand(path)
-
-      _ ->
-        if Application.get_env(:shuttle, :env) == :test do
-          suffix = :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
-          Path.join(System.tmp_dir!(), "shuttle-runtime-#{suffix}.db")
-        else
-          RuntimeStore.default_path()
-        end
-    end
   end
 
   # Re-reads the configured host list and updates state.felt_stores if the list

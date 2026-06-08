@@ -3,8 +3,6 @@ defmodule ShuttleWeb.LifecycleControllerTest do
   import Plug.Conn
   import Phoenix.ConnTest
 
-  alias Shuttle.RuntimeStore
-
   @endpoint ShuttleWeb.Endpoint
 
   test "install forwards interactive through shuttle-ctl" do
@@ -111,13 +109,14 @@ defmodule ShuttleWeb.LifecycleControllerTest do
       |> Path.join("shuttle-lifecycle-accept-#{System.unique_integer([:positive])}")
 
     store = Path.join(root, "loom")
-    runtime_store = Path.join(root, "runtime.db")
     fiber_dir = Path.join([store, ".felt", "tests", "standing-accept"])
     File.mkdir_p!(fiber_dir)
     path = Path.join(fiber_dir, "standing-accept.md")
 
-    # Slice 4: awaiting is the document itself — `status: closed` + untempered.
-    # accept re-arms straight from the doc schedule; there is no `review` axis.
+    # Awaiting is the document itself — `status: closed` + untempered. accept
+    # re-arms straight from the doc schedule; there is no `review` axis and no
+    # runtime row (slice 6: runtime store gone). next_due is recomputed from the
+    # cron schedule on the next poll.
     File.write!(path, """
     ---
     name: Standing accept
@@ -125,7 +124,6 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     outcome: digest
     closed-at: 2026-06-01T09:30:00Z
     shuttle:
-      enabled: true
       kind: standing
       host: #{Shuttle.Poller.own_host_id()}
       project_dir: #{store}
@@ -137,7 +135,7 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     Body.
     """)
 
-    with_env(%{"LOOM_HOMES" => store, "SHUTTLE_RUNTIME_STORE" => runtime_store}, fn ->
+    with_env(%{"LOOM_HOMES" => store}, fn ->
       conn =
         post(
           api_conn(),
@@ -150,6 +148,9 @@ defmodule ShuttleWeb.LifecycleControllerTest do
 
       assert conn.status == 200
       assert conn.resp_body =~ "accepted run for tests/standing-accept"
+      # accept re-arms to the next occurrence AFTER now (cron.next(now)) — the
+      # message carries the computed future tick.
+      assert conn.resp_body =~ "next due:"
 
       text = File.read!(path)
       frontmatter = frontmatter(text)
@@ -158,97 +159,6 @@ defmodule ShuttleWeb.LifecycleControllerTest do
       assert frontmatter =~ "status: active"
       assert frontmatter =~ ~s(outcome: "")
       assert frontmatter =~ "schedule:"
-
-      assert [
-               %{
-                 fiber_id: "tests/standing-accept",
-                 metadata: metadata
-               }
-             ] = RuntimeStore.list_lifecycle(runtime_store)
-
-      assert metadata.phase == "scheduled"
-      refute Map.has_key?(metadata, :review)
-
-      # accept re-arms to the next occurrence AFTER now (cron.next(now)), a real
-      # future 09:00 weekday tick — never a stale past value (morning-post drift).
-      next_due_at = metadata.next_due_at
-      now = DateTime.utc_now()
-      assert DateTime.compare(next_due_at, now) == :gt
-      assert next_due_at.hour == 9 and next_due_at.minute == 0
-    end)
-
-    File.rm_rf(root)
-  end
-
-  test "reset-review clears the runtime lifecycle row for a standing role" do
-    # The runtime half of the close/reopen review reset. A standing role that
-    # finished a run carries `review.state: awaiting` in the runtime store; close
-    # never cleared it (RuntimeStore.delete_lifecycle had no production caller),
-    # so the stale row survived and the poll overlay re-injected it on reopen,
-    # re-composting the un-tempered card. This endpoint (driven by the Go
-    # close/reopen writer) clears that row in-process.
-    root =
-      System.tmp_dir!()
-      |> Path.join("shuttle-lifecycle-reset-#{System.unique_integer([:positive])}")
-
-    store = Path.join(root, "loom")
-    runtime_store = Path.join(root, "runtime.db")
-    fiber_dir = Path.join([store, ".felt", "tests", "standing-reset"])
-    File.mkdir_p!(fiber_dir)
-    path = Path.join(fiber_dir, "standing-reset.md")
-
-    # Closed standing role with a stale awaiting review (the composted-role state
-    # that re-composts on un-temper). Frontmatter review was already reset to
-    # scheduled by the Go close writer; the runtime row is what we clear here.
-    File.write!(path, """
-    ---
-    name: Standing reset
-    status: closed
-    tempered: false
-    closed-at: 2026-06-01T09:30:00Z
-    shuttle:
-      enabled: true
-      kind: standing
-      host: #{Shuttle.Poller.own_host_id()}
-      project_dir: #{store}
-      schedule:
-        expr: 0 9 * * 1-5
-        tz: UTC
-      review:
-        state: scheduled
-    ---
-
-    Body.
-    """)
-
-    RuntimeStore.upsert_lifecycle(runtime_store, "tests/standing-reset", %{
-      kind: "standing",
-      phase: "awaiting",
-      run_id: "run-1",
-      review: %{"state" => "awaiting", "run_id" => "run-1"}
-    })
-
-    with_env(%{"LOOM_HOMES" => store, "SHUTTLE_RUNTIME_STORE" => runtime_store}, fn ->
-      assert RuntimeStore.fetch_lifecycle(runtime_store, "tests/standing-reset") != nil
-
-      conn =
-        post(
-          api_conn(),
-          "/api/v1/lifecycle",
-          Jason.encode!(%{
-            "action" => "reset-review",
-            "fiber" => "tests/standing-reset"
-          })
-        )
-
-      assert conn.status == 200
-      assert conn.resp_body =~ "reset review lifecycle for tests/standing-reset"
-      assert conn.resp_body =~ "cleared runtime row"
-
-      # The runtime row is gone, so nothing lingers for a reader to revive. The
-      # document (status + tempered) is the lifecycle truth.
-      assert RuntimeStore.fetch_lifecycle(runtime_store, "tests/standing-reset") == nil
-      assert RuntimeStore.list_lifecycle(runtime_store) == []
     end)
 
     File.rm_rf(root)
@@ -260,7 +170,6 @@ defmodule ShuttleWeb.LifecycleControllerTest do
       |> Path.join("shuttle-lifecycle-accept-reenable-#{System.unique_integer([:positive])}")
 
     store = Path.join(root, "loom")
-    runtime_store = Path.join(root, "runtime.db")
     fiber_dir = Path.join([store, ".felt", "tests", "standing-accept-reenable"])
     File.mkdir_p!(fiber_dir)
     path = Path.join(fiber_dir, "standing-accept-reenable.md")
@@ -287,7 +196,7 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     Body.
     """)
 
-    with_env(%{"LOOM_HOMES" => store, "SHUTTLE_RUNTIME_STORE" => runtime_store}, fn ->
+    with_env(%{"LOOM_HOMES" => store}, fn ->
       conn =
         post(
           api_conn(),
@@ -309,19 +218,18 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     File.rm_rf(root)
   end
 
-  test "resume for standing roles writes immediate lifecycle store and evicts runtime frontmatter" do
+  test "resume for standing roles re-arms from the doc and evicts runtime frontmatter" do
     root =
       System.tmp_dir!()
       |> Path.join("shuttle-lifecycle-resume-#{System.unique_integer([:positive])}")
 
     store = Path.join(root, "loom")
-    runtime_store = Path.join(root, "runtime.db")
     fiber_dir = Path.join([store, ".felt", "tests", "standing-resume"])
     File.mkdir_p!(fiber_dir)
     path = Path.join(fiber_dir, "standing-resume.md")
 
-    # Slice 4: awaiting is `status: closed` + untempered. resume re-arms from the
-    # doc for immediate dispatch — no review axis, no preserved run_id.
+    # Awaiting is `status: closed` + untempered. resume re-arms from the doc for
+    # immediate dispatch — no review axis, no runtime row (slice 6).
     File.write!(path, """
     ---
     name: Standing resume
@@ -329,7 +237,6 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     outcome: digest
     closed-at: 2026-06-01T09:12:00Z
     shuttle:
-      enabled: true
       kind: standing
       host: #{Shuttle.Poller.own_host_id()}
       project_dir: #{store}
@@ -341,7 +248,7 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     Body.
     """)
 
-    with_env(%{"LOOM_HOMES" => store, "SHUTTLE_RUNTIME_STORE" => runtime_store}, fn ->
+    with_env(%{"LOOM_HOMES" => store}, fn ->
       conn =
         post(
           api_conn(),
@@ -360,44 +267,31 @@ defmodule ShuttleWeb.LifecycleControllerTest do
       refute frontmatter =~ "closed-at:"
       assert frontmatter =~ "status: active"
       assert frontmatter =~ "outcome: digest"
-
-      assert [
-               %{
-                 fiber_id: "tests/standing-resume",
-                 metadata: metadata
-               }
-             ] = RuntimeStore.list_lifecycle(runtime_store)
-
-      assert metadata.phase == "scheduled"
-      assert %DateTime{} = metadata.next_due_at
-      refute Map.has_key?(metadata, :review)
     end)
 
     File.rm_rf(root)
   end
 
-  test "accept refuses a status:active role even with a stale awaiting runtime overlay (overlay is dead)" do
-    # Slice 4 deleted the runtime review overlay. Accept reads ONLY the document:
-    # an armed (`status: active`) role is not awaiting, so accept refuses — even
-    # if a stale runtime row still carries `review.state: awaiting`. This pins
-    # that no path revives the overlay to drive a transition.
+  test "accept refuses a status:active role (armed is not awaiting)" do
+    # Accept reads ONLY the document (slice 4 deleted the review overlay, slice 6
+    # the runtime store): an armed (`status: active`) role is not awaiting, so
+    # accept refuses. This pins that no path revives a transition from anything
+    # but the document's status + tempered.
     root =
       System.tmp_dir!()
-      |> Path.join("shuttle-lifecycle-accept-overlay-#{System.unique_integer([:positive])}")
+      |> Path.join("shuttle-lifecycle-accept-armed-#{System.unique_integer([:positive])}")
 
     store = Path.join(root, "loom")
-    runtime_store = Path.join(root, "runtime.db")
-    fiber_dir = Path.join([store, ".felt", "tests", "standing-accept-overlay"])
+    fiber_dir = Path.join([store, ".felt", "tests", "standing-accept-armed"])
     File.mkdir_p!(fiber_dir)
-    path = Path.join(fiber_dir, "standing-accept-overlay.md")
+    path = Path.join(fiber_dir, "standing-accept-armed.md")
 
     File.write!(path, """
     ---
-    name: Standing accept overlay
+    name: Standing accept armed
     status: active
     outcome: digest
     shuttle:
-      enabled: true
       kind: standing
       host: #{Shuttle.Poller.own_host_id()}
       project_dir: #{store}
@@ -409,27 +303,14 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     Body.
     """)
 
-    with_env(%{"LOOM_HOMES" => store, "SHUTTLE_RUNTIME_STORE" => runtime_store}, fn ->
-      RuntimeStore.upsert_lifecycle(runtime_store, "tests/standing-accept-overlay", %{
-        kind: "standing",
-        phase: "awaiting",
-        run_id: "run-overlay",
-        next_due_at: ~U[2026-06-01 09:00:00Z],
-        last_run_at: ~U[2026-06-01 09:12:00Z],
-        review: %{
-          "state" => "awaiting",
-          "run_id" => "run-overlay",
-          "completed_at" => "2026-06-01T09:12:00Z"
-        }
-      })
-
+    with_env(%{"LOOM_HOMES" => store}, fn ->
       conn =
         post(
           api_conn(),
           "/api/v1/lifecycle",
           Jason.encode!(%{
             "action" => "accept",
-            "fiber" => "tests/standing-accept-overlay"
+            "fiber" => "tests/standing-accept-armed"
           })
         )
 
