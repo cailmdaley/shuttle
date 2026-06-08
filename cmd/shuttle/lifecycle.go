@@ -202,14 +202,27 @@ tempered/composted close — use 'shuttle reopen' to requeue a finished fiber.`,
 			// File a review-comment so the dispatcher's check_resume_intent/3
 			// can detect resume intent. The summary is intentionally empty:
 			// render_user_message_block/2 in the dispatcher suppresses the
-			// "From User" prompt block when the latest review-comment has
-			// empty text, so we keep `resume_mode: previous` in the payload
-			// without surfacing meaningless machinery as a directive. The prior
-			// session id lives in felt history (the worker-exit event), not a
-			// doc-resident block (slice 6); the dispatcher parses it back via
-			// extract_session_id, so resume intent is filed unconditionally.
-			_ = appendFeltHistoryReviewComment(host, fiberID, "", "previous")
-			fmt.Println("  resume_mode: previous (session read from felt history)")
+			// "From User" prompt block when the latest review-comment has empty
+			// text, so we keep the resume_mode in the payload without surfacing
+			// meaningless machinery as a directive.
+			//
+			// Request `previous` only when felt history actually holds a
+			// resumable session id (a "worker dispatched … session=<uuid>"
+			// event). Arming a never-run fiber has no such session, so a
+			// `previous` directive would resolve to {:error, :missing_session_id}
+			// in check_resume_intent/3 and re-fail on every poll, forever (the
+			// permanent-block failure mode that left morning-post stuck 5 days).
+			// File `fresh` there so arming a never-run fiber dispatches fresh.
+			resumeMode := "fresh"
+			if latestResumableSessionID(host, fiberID) != "" {
+				resumeMode = "previous"
+			}
+			_ = appendFeltHistoryReviewComment(host, fiberID, "", resumeMode)
+			if resumeMode == "previous" {
+				fmt.Println("  resume_mode: previous (session read from felt history)")
+			} else {
+				fmt.Println("  resume_mode: fresh (no prior session in felt history)")
+			}
 			return nil
 		},
 	}
