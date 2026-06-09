@@ -460,7 +460,7 @@ defmodule Shuttle.Dispatcher do
       render_block(
         "Interactive Mode",
         nil,
-        "A human will attach to this session shortly. Complete the initial task as the constitution describes, then leave the fiber active and the agent alive at a clean checkpoint. In this mode, the usual close-for-review + `kill $PPID` handoff waits until the human is done with the live session."
+        "A human will attach to this live session. Read the From User block and the constitution for what they expect before doing anything heavy: if they signal they want to talk first, or the scope of the autonomous portion is at all unclear, do only a light survey (constitution + last handoff) and wait for them — do not burn context on research or work they may redirect. Only when the constitution describes a clear autonomous portion they expect completed should you drive it to a checkpoint first. Either way, leave the fiber active and the agent alive; the usual close-for-review + `kill $PPID` handoff waits until the human is done with the live session."
       )
     else
       ""
