@@ -8,14 +8,14 @@ defmodule ShuttleWeb.LifecycleController do
   identical `/lifecycle` (origin stripped) and relayed verbatim. The local
   branch delegates to the existing shuttle-ctl Go CLI, so the validated offline
   frontmatter writer remains the single implementation of
-  install/pause/resume/repeat/accept/set-model/set-interactive/set-outcome/uninstall.
+  install/pause/resume/repeat/accept/set-model/set-outcome/uninstall.
   """
 
   use Phoenix.Controller, formats: [:json]
 
   alias Shuttle.{FeltStores, LifecycleService, OriginRouter}
 
-  @allowed ~w(install pause resume repeat accept set-model set-interactive set-outcome uninstall)
+  @allowed ~w(install pause resume repeat accept set-model set-outcome uninstall)
 
   def create(conn, params) do
     case OriginRouter.route(Map.get(params, "origin")) do
@@ -76,7 +76,7 @@ defmodule ShuttleWeb.LifecycleController do
   end
 
   defp execute(action, %{"fiber" => fiber} = params)
-       when action in ~w(pause set-model set-interactive set-outcome uninstall) do
+       when action in ~w(pause set-model set-outcome uninstall) do
     with {:ok, fiber_id} <- fiber_address(fiber) do
       action
       |> args_for(%{params | "fiber" => fiber_id})
@@ -105,7 +105,6 @@ defmodule ShuttleWeb.LifecycleController do
     args = add_string_flag(args, "--model", params["model"])
     args = add_string_flag(args, "--project-dir", params["project_dir"])
     args = add_bool_flag(args, "--disabled", params["disabled"])
-    args = add_bool_flag(args, "--interactive", params["interactive"])
     {:ok, args}
   end
 
@@ -137,13 +136,6 @@ defmodule ShuttleWeb.LifecycleController do
        when is_binary(outcome),
        do: {:ok, ["set-outcome", fiber, "--outcome", outcome]}
 
-  defp args_for("set-interactive", %{"fiber" => fiber, "interactive" => interactive})
-       when is_boolean(interactive) do
-    with {:ok, host} <- host_for_fiber(fiber) do
-      {:ok, ["--felt-store", host, "set-interactive", fiber, to_string(interactive)]}
-    end
-  end
-
   defp args_for("uninstall", %{"fiber" => fiber}), do: {:ok, ["uninstall", fiber]}
   defp args_for(action, _), do: {:error, "missing required fields for #{action}"}
 
@@ -166,17 +158,5 @@ defmodule ShuttleWeb.LifecycleController do
     end
   rescue
     e in ErlangError -> {:error, Exception.message(e)}
-  end
-
-  # Resolve the felt store owning `fiber_id` by asking felt for the carried path
-  # (FeltStores.host_for_fiber), the same resolution /api/v1/fibers advertises —
-  # so a host-routed lifecycle verb resolves the exact id the kanban sent,
-  # including project-resident ("prefix-drop") fibers whose addressable id is a
-  # bare leaf. Keeps the user-facing "fiber not found" message on a genuine miss.
-  defp host_for_fiber(fiber_id) do
-    case FeltStores.host_for_fiber(fiber_id) do
-      {:ok, host} -> {:ok, host}
-      {:error, :not_found} -> {:error, "fiber not found: #{fiber_id}"}
-    end
   end
 end

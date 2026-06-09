@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -206,12 +207,14 @@ Body.
 	}
 }
 
-func TestInstallCmd_WritesInteractive(t *testing.T) {
+// Interactivity is retired as a dispatch mode. The --interactive flag no longer
+// exists, so install rejects it as an unknown flag rather than writing a field.
+func TestInstallCmd_RejectsRetiredInteractiveFlag(t *testing.T) {
 	host, cleanup := withTempHost(t)
 	defer cleanup()
 
 	projectDir := t.TempDir()
-	path := writeFiber(t, host, "install-interactive", `---
+	writeFiber(t, host, "install-interactive", `---
 name: Install interactive
 status: open
 ---
@@ -221,20 +224,20 @@ Body.
 
 	cmd := newInstallCmd()
 	cmd.SetArgs([]string{"install-interactive", "--project-dir", projectDir, "--interactive"})
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("Execute: %v", err)
+	cmd.SetErr(io.Discard)
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatalf("expected --interactive to be rejected as an unknown flag")
 	}
-
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read fiber: %v", err)
-	}
-	if !strings.Contains(string(raw), "interactive: true") {
-		t.Fatalf("interactive not written:\n%s", raw)
+	if !strings.Contains(err.Error(), "interactive") {
+		t.Fatalf("expected unknown-flag error to name interactive, got: %v", err)
 	}
 }
 
-func TestSetInteractiveCmd_WritesAndClearsField(t *testing.T) {
+// set-interactive is retired: it stays registered (hidden) so muscle-memory
+// invocations land on a clear pointer at the directive/resume channels rather
+// than mutating a fiber.
+func TestSetInteractiveCmd_Retired(t *testing.T) {
 	host, cleanup := withTempHost(t)
 	defer cleanup()
 
@@ -242,34 +245,25 @@ func TestSetInteractiveCmd_WritesAndClearsField(t *testing.T) {
 name: Toggle interactive
 status: active
 shuttle:
-  enabled: true
   kind: oneshot
   project_dir: /tmp
 ---
 
 Body.
 `)
+	before, _ := os.ReadFile(path)
 
-	if err := setInteractiveCmd.RunE(setInteractiveCmd, []string{"toggle-interactive", "true"}); err != nil {
-		t.Fatalf("set true: %v", err)
+	err := setInteractiveCmd.RunE(setInteractiveCmd, []string{"toggle-interactive", "true"})
+	if err == nil {
+		t.Fatalf("expected set-interactive to return a retirement error")
 	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read fiber: %v", err)
-	}
-	if !strings.Contains(string(raw), "interactive: true") {
-		t.Fatalf("interactive true not written:\n%s", raw)
+	if !strings.Contains(err.Error(), "retired") || !strings.Contains(err.Error(), "directive") {
+		t.Fatalf("expected retirement error pointing at the directive channel, got: %v", err)
 	}
 
-	if err := setInteractiveCmd.RunE(setInteractiveCmd, []string{"toggle-interactive", "false"}); err != nil {
-		t.Fatalf("set false: %v", err)
-	}
-	raw, err = os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read fiber: %v", err)
-	}
-	if strings.Contains(string(raw), "interactive:") {
-		t.Fatalf("interactive field not cleared:\n%s", raw)
+	after, _ := os.ReadFile(path)
+	if string(before) != string(after) {
+		t.Fatalf("set-interactive must not mutate the fiber; got:\n%s", after)
 	}
 }
 

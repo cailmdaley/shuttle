@@ -332,41 +332,12 @@ func TestWriteBlock_PreservesProjectDirAndUnknownShuttleFields(t *testing.T) {
 	}
 }
 
-func TestWriteBlock_RoundTripsInteractive(t *testing.T) {
-	path := writeTmpFiber(t, sampleFiber)
-	f, err := ReadFiber(path)
-	if err != nil {
-		t.Fatalf("ReadFiber: %v", err)
-	}
-
-	if err := f.WriteBlock(&Block{
-		Kind:        "oneshot",
-		Interactive: true,
-		ProjectDir:  "/tmp/project",
-	}); err != nil {
-		t.Fatalf("WriteBlock: %v", err)
-	}
-
-	raw, _ := os.ReadFile(path)
-	if !strings.Contains(string(raw), "interactive: true") {
-		t.Fatalf("expected interactive=true in rewritten fiber, got:\n%s", raw)
-	}
-
-	f2, err := ReadFiber(path)
-	if err != nil {
-		t.Fatalf("re-read: %v", err)
-	}
-	if f2.Block == nil || !f2.Block.Interactive {
-		t.Fatalf("expected interactive block after re-read, got %+v", f2.Block)
-	}
-}
-
 func TestWriteBlock_RemovesKnownFieldsWhenCleared(t *testing.T) {
 	// A legacy block carrying enabled + review (slice 5 dropped both) plus a
 	// legacy session block (slice 6 dropped it — resume reads felt history) and
-	// interactive. A Go rewrite wipes every recognized key not present in the
-	// encoded block (clean cutover) while preserving an unknown forward-
-	// compatible key.
+	// the retired interactive axis. A Go rewrite wipes every recognized key not
+	// present in the encoded block (clean cutover) while preserving an unknown
+	// forward-compatible key.
 	content := `---
 name: Session Test
 status: active
@@ -395,7 +366,6 @@ Body.
 		t.Fatalf("expected shuttle block, got %+v", f.Block)
 	}
 
-	f.Block.Interactive = false
 	if err := f.WriteBlock(f.Block); err != nil {
 		t.Fatalf("WriteBlock: %v", err)
 	}
@@ -500,9 +470,9 @@ func TestValidate_UnknownAgent(t *testing.T) {
 
 func TestBlockUnmarshalJSON_NewFormat(t *testing.T) {
 	var block Block
-	// A felt JSON view may still carry legacy enabled/review keys; slice 5
-	// drops them silently (no read-tolerance, no struct field) — they must not
-	// error, and the live fields decode normally.
+	// A felt JSON view may still carry legacy/retired keys (enabled, review, and
+	// the retired interactive axis); they drop silently (no read-tolerance, no
+	// struct field) — they must not error, and the live fields decode normally.
 	data := []byte(`{
 	  "enabled": true,
 	  "kind": "standing",
@@ -516,9 +486,6 @@ func TestBlockUnmarshalJSON_NewFormat(t *testing.T) {
 	}
 	if block.Kind != "standing" || block.Agent != "claude-sonnet" {
 		t.Fatalf("unexpected block: %+v", block)
-	}
-	if !block.Interactive {
-		t.Fatalf("expected interactive=true, got %+v", block)
 	}
 	if block.Schedule == nil || block.Schedule.TZ != "Europe/Paris" {
 		t.Fatalf("unexpected schedule: %+v", block.Schedule)

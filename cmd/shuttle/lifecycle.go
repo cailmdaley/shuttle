@@ -524,49 +524,22 @@ agent registry before writing. Removes any existing agent:* felt tag
 	},
 }
 
+// setInteractiveCmd is retired: interactivity is no longer a dispatch mode. It
+// stays registered (hidden) so muscle-memory invocations land on a clear pointer
+// rather than cobra's generic "unknown command".
 var setInteractiveCmd = &cobra.Command{
-	Use:   "set-interactive <fiber> <true|false>",
-	Short: "Change interactive dispatch mode for a fiber",
-	Long: `Updates shuttle.interactive. When true, the dispatcher renders the
-Interactive Mode prompt block and the worker stays alive after its initial
-task for a human to attach. False removes the field; absent and false are
-both autonomous dispatch.`,
-	Args: cobra.ExactArgs(2),
+	Use:    "set-interactive <fiber> <true|false>",
+	Short:  "(retired) interactivity is no longer a dispatch mode",
+	Hidden: true,
+	Args:   cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		path, _, _ := resolveFiber(args[0])
-		f := readFiber(path)
-		if f.Block == nil {
-			return fmt.Errorf("fiber %s has no shuttle: block (use 'shuttle install' first)", args[0])
-		}
-
-		if err := ensureOwnedHere(f, args[0]); err != nil {
-			return err
-		}
-
-		value, err := parseBoolArg(args[1])
-		if err != nil {
-			return err
-		}
-
-		f.Block.Interactive = value
-		if err := f.WriteBlock(f.Block); err != nil {
-			return fmt.Errorf("writing fiber: %w", err)
-		}
-
-		fmt.Printf("set interactive for %s → %v\n", args[0], value)
-		return nil
+		return fmt.Errorf(`set-interactive is retired: interactivity is no longer a dispatch mode.
+  - Per-dispatch "talk to me first" intent goes in the From User directive
+    (the kanban requeue/resume box, or a felt review-comment event).
+  - Structural human-gates (2FA, send-in-his-voice) belong in the constitution
+    text — the worker reads Desired State / Context and waits there.
+  - To talk to any worker, finished or not, resume it from the kanban.`)
 	},
-}
-
-func parseBoolArg(value string) (bool, error) {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "true", "1", "yes", "on":
-		return true, nil
-	case "false", "0", "no", "off":
-		return false, nil
-	default:
-		return false, fmt.Errorf("expected true or false, got %q", value)
-	}
 }
 
 var uninstallCmd = &cobra.Command{

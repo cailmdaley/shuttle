@@ -20,12 +20,11 @@ import (
 // it dispatches iff the felt-native status is "active". Lifecycle is status +
 // tempered, uniform across kinds (slice 5: enabled/review dropped).
 type Block struct {
-	Kind        string    `json:"kind" yaml:"kind"`
-	Interactive bool      `json:"interactive,omitempty" yaml:"interactive,omitempty"`
-	Host        string    `json:"host,omitempty" yaml:"host,omitempty"`
-	ProjectDir  string    `json:"project_dir,omitempty" yaml:"project_dir,omitempty"`
-	Agent       string    `json:"agent,omitempty" yaml:"agent,omitempty"`
-	Schedule    *Schedule `json:"schedule,omitempty" yaml:"schedule,omitempty"`
+	Kind       string    `json:"kind" yaml:"kind"`
+	Host       string    `json:"host,omitempty" yaml:"host,omitempty"`
+	ProjectDir string    `json:"project_dir,omitempty" yaml:"project_dir,omitempty"`
+	Agent      string    `json:"agent,omitempty" yaml:"agent,omitempty"`
+	Schedule   *Schedule `json:"schedule,omitempty" yaml:"schedule,omitempty"`
 }
 
 // Schedule holds the recurrence definition for a standing role.
@@ -81,19 +80,21 @@ func (s *Schedule) UnmarshalJSON(data []byte) error {
 // UnmarshalJSON accepts the canonical `kind` field as well as the legacy
 // `mode` alias used by pre-CLI shuttle blocks serialized through felt's JSON
 // view. Output always normalizes to `Kind`. Legacy daemon-owned fields
-// (enabled, review, next_due_at, last_run_at, session) are NOT decoded — slices
-// 5/6 dropped them outright (clean cutover, no read-tolerance): a felt JSON view
-// that still carries them simply ignores them, and the next Go rewrite wipes
-// them. Resume reads the session id from felt history, not a doc-resident block.
+// (enabled, review, next_due_at, last_run_at, session) and the retired
+// `interactive` axis are NOT decoded — clean cutover, no read-tolerance: a felt
+// JSON view that still carries them simply ignores them, and the next Go rewrite
+// wipes them. Interactivity is no longer a dispatch mode — per-dispatch intent
+// rides the From User directive, structural human-gates live in the constitution
+// text, and resume-from-kanban is the universal way to talk to a worker. Resume
+// reads the session id from felt history, not a doc-resident block.
 func (b *Block) UnmarshalJSON(data []byte) error {
 	var aux struct {
-		Kind        string    `json:"kind"`
-		Mode        string    `json:"mode"`
-		Interactive bool      `json:"interactive"`
-		Host        string    `json:"host"`
-		ProjectDir  string    `json:"project_dir"`
-		Agent       string    `json:"agent"`
-		Schedule    *Schedule `json:"schedule"`
+		Kind       string    `json:"kind"`
+		Mode       string    `json:"mode"`
+		Host       string    `json:"host"`
+		ProjectDir string    `json:"project_dir"`
+		Agent      string    `json:"agent"`
+		Schedule   *Schedule `json:"schedule"`
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
@@ -102,7 +103,6 @@ func (b *Block) UnmarshalJSON(data []byte) error {
 	if b.Kind == "" {
 		b.Kind = aux.Mode
 	}
-	b.Interactive = aux.Interactive
 	b.Host = aux.Host
 	b.ProjectDir = aux.ProjectDir
 	b.Agent = aux.Agent

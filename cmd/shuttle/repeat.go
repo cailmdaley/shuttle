@@ -47,10 +47,9 @@ The running daemon picks it up on its next poll.`,
 		}
 
 		block := &schema.Block{
-			Kind:        "standing",
-			Interactive: true,
-			ProjectDir:  projectDir,
-			Host:        host,
+			Kind:       "standing",
+			ProjectDir: projectDir,
+			Host:       host,
 			Schedule: &schema.Schedule{
 				Expr: repeatSchedule,
 				TZ:   repeatTZ,
@@ -107,7 +106,6 @@ The running daemon picks it up on its next poll.`,
 		if block.Agent != "" {
 			fmt.Printf("  agent:    %s\n", block.Agent)
 		}
-		fmt.Println("  interactive: true")
 		fmt.Printf("  project_dir: %s\n", block.ProjectDir)
 		fmt.Printf("  next due: %s\n", next.Format(time.RFC3339))
 		if statusChanged {

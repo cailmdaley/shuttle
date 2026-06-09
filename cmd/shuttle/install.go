@@ -13,11 +13,10 @@ import (
 
 func newInstallCmd() *cobra.Command {
 	var (
-		installModel       string
-		installProjectDir  string
-		installHost        string
-		installDisabled    bool
-		installInteractive bool
+		installModel      string
+		installProjectDir string
+		installHost       string
+		installDisabled   bool
 	)
 
 	cmd := &cobra.Command{
@@ -28,7 +27,6 @@ picks up on its next poll.
 
   shuttle install <fiber> --project-dir "$PWD"                      # armed, default agent
   shuttle install <fiber> --project-dir "$PWD" --model claude-opus  # explicit agent
-  shuttle install <fiber> --project-dir "$PWD" --interactive        # human attaches after initial task
   shuttle install <fiber> --disabled                                # land in drafts (status: open)
 
 The shuttle: block is validated before any file is touched.
@@ -42,9 +40,8 @@ Idempotent: if the fiber already has a shuttle: block, install reports its
 current state and exits 0 when no conflicting flags are passed — useful
 right after writing the block by hand in the constitution markdown. If a
 flag conflicts with the existing block (--model differs from the current
-agent, --interactive differs from current interactive state, --project-dir
-differs), install exits non-zero and points at the right mutation verb
-(pause / resume / set-model / set-interactive / uninstall).
+agent, --project-dir differs), install exits non-zero and points at the
+right mutation verb (pause / resume / set-model / uninstall).
 
 Use 'shuttle repeat' for standing (recurring) roles.`,
 		Args: cobra.ExactArgs(1),
@@ -59,7 +56,7 @@ Use 'shuttle repeat' for standing (recurring) roles.`,
 			// dispatch it"; the failure case is "I passed a flag that
 			// conflicts with what's already there."
 			if f.Block != nil {
-				return reportExistingBlock(cmd, args[0], f, installModel, installDisabled, installProjectDir, installInteractive, installHost)
+				return reportExistingBlock(cmd, args[0], f, installModel, installDisabled, installProjectDir, installHost)
 			}
 
 			// Stamp host so the block is born owned. Default to the local
@@ -71,9 +68,8 @@ Use 'shuttle repeat' for standing (recurring) roles.`,
 			}
 
 			block := &schema.Block{
-				Kind:        "oneshot",
-				Interactive: installInteractive,
-				Host:        host,
+				Kind: "oneshot",
+				Host: host,
 			}
 
 			if installModel != "" {
@@ -141,9 +137,6 @@ Use 'shuttle repeat' for standing (recurring) roles.`,
 			if block.ProjectDir != "" {
 				fmt.Fprintf(cmd.OutOrStdout(), "  project_dir: %s\n", block.ProjectDir)
 			}
-			if block.Interactive {
-				fmt.Fprintln(cmd.OutOrStdout(), "  interactive: true")
-			}
 			if statusChanged {
 				want := "active"
 				if installDisabled {
@@ -162,7 +155,6 @@ Use 'shuttle repeat' for standing (recurring) roles.`,
 	cmd.Flags().StringVar(&installProjectDir, "project-dir", "", "Worker cwd on the target host (required unless --disabled)")
 	cmd.Flags().StringVar(&installHost, "host", "", "Owning daemon's host id (default: local daemon's own_host_id; set for cross-host install)")
 	cmd.Flags().BoolVar(&installDisabled, "disabled", false, "Install as a draft (status: open); use 'shuttle resume' to arm it")
-	cmd.Flags().BoolVar(&installInteractive, "interactive", false, "Dispatch in interactive mode (worker stays alive after initial task)")
 	return cmd
 }
 
@@ -174,7 +166,7 @@ Use 'shuttle repeat' for standing (recurring) roles.`,
 // conflicts, so a plain `install <fiber>` with no flags is always a pure state
 // query. The dispatch gate is the felt-native status: active is armed, open is a
 // draft (slice 5 — no enabled flag).
-func reportExistingBlock(cmd *cobra.Command, fiberID string, f *schema.FiberFile, model string, disabled bool, projectDir string, interactive bool, host string) error {
+func reportExistingBlock(cmd *cobra.Command, fiberID string, f *schema.FiberFile, model string, disabled bool, projectDir string, host string) error {
 	b := f.Block
 	out := cmd.OutOrStdout()
 	errOut := cmd.ErrOrStderr()
@@ -212,7 +204,6 @@ func reportExistingBlock(cmd *cobra.Command, fiberID string, f *schema.FiberFile
 	modelChanged := cmd.Flags().Changed("model")
 	disabledChanged := cmd.Flags().Changed("disabled")
 	projectDirChanged := cmd.Flags().Changed("project-dir")
-	interactiveChanged := cmd.Flags().Changed("interactive")
 	hostChanged := cmd.Flags().Changed("host")
 
 	var mismatches []string
@@ -243,12 +234,6 @@ func reportExistingBlock(cmd *cobra.Command, fiberID string, f *schema.FiberFile
 					expanded, b.ProjectDir, fiberID, fiberID, expanded))
 		}
 	}
-	if interactiveChanged && interactive != b.Interactive {
-		mismatches = append(mismatches,
-			fmt.Sprintf("--interactive %v ≠ current interactive %v  →  shuttle-ctl set-interactive %s %v",
-				interactive, b.Interactive, fiberID, interactive))
-	}
-
 	if len(mismatches) > 0 {
 		fmt.Fprintln(errOut, "")
 		fmt.Fprintln(errOut, "Conflicts with current block:")
@@ -268,9 +253,6 @@ func writeBlockSummary(out io.Writer, b *schema.Block, statusNow string, armed b
 	fmt.Fprintln(out, "Current block:")
 	fmt.Fprintf(out, "  kind:        %s\n", nonEmpty(b.Kind, "(unset)"))
 	fmt.Fprintf(out, "  host:        %s\n", nonEmpty(b.Host, "(unset — NOT eligible on any daemon)"))
-	if b.Interactive {
-		fmt.Fprintln(out, "  interactive: true")
-	}
 	if b.Agent != "" {
 		fmt.Fprintf(out, "  agent:       %s\n", b.Agent)
 	}

@@ -542,52 +542,68 @@ defmodule Shuttle.DispatchIntegrationTest do
     refute history_text(host, "tests/codex-capture") =~ "wrong-human-session"
   end
 
-  test "interactive prelude names the active-fiber handoff exception", %{host: host} do
-    write_fiber(host, "tests/interactive-handoff", """
+  # Interactivity is retired as a dispatch mode: the prompt never renders an
+  # "Interactive Mode" block, and a legacy `interactive: true` still sitting in a
+  # fiber is inert — the worker reads the always-autonomous exit contract and
+  # honors any "wait for me" intent from the From User directive instead.
+  test "dispatch prompt stays autonomous and renders no Interactive Mode block, even with a legacy interactive flag",
+       %{host: host} do
+    write_fiber(host, "tests/legacy-interactive-flag", """
     ---
-    name: Interactive handoff
+    name: Legacy interactive flag
     status: active
     tags:
       - constitution
     shuttle:
-      enabled: true
       kind: oneshot
       agent: claude-sonnet
       interactive: true
     ---
-    A fiber dispatched for live human attachment.
+    A fiber carrying a retired interactive flag.
     """)
 
-    prelude = Dispatcher.render_interactive_prelude("tests/interactive-handoff", felt_store: host)
+    assert {:ok, _} =
+             Dispatcher.dispatch("tests/legacy-interactive-flag",
+               runner: IntegrationRunner,
+               felt_store: host
+             )
 
-    assert prelude =~ "Interactive Mode"
-    assert prelude =~ "leave the fiber active"
-    assert prelude =~ "close-for-review + `kill $PPID` handoff waits"
+    script = read_run_script()
+    refute script =~ "Interactive Mode"
+    assert script =~ "Exit Contract"
+    assert script =~ "autonomous Shuttle worker"
   end
 
-  test "interactive prelude ignores legacy review-comment payload", %{host: host} do
-    write_fiber(host, "tests/legacy-interactive-payload", """
+  # A "talk to me first" directive rides the From User block (the channel the
+  # kanban "wait for me" affordance prepends to) — the worker reads it at the top
+  # of context and waits, no dispatch-mode flag involved.
+  test "a talk-first From User directive surfaces in the dispatch prompt", %{host: host} do
+    write_fiber(host, "tests/talk-first", """
     ---
-    name: Legacy interactive payload
+    name: Talk first
     status: active
     tags:
       - constitution
     shuttle:
-      enabled: true
       kind: oneshot
       agent: claude-sonnet
     ---
-    A fiber whose old review-comment payload should not control interactivity.
+    A fiber whose dispatch should wait for the human.
     """)
 
-    append_review_comment(host, "tests/legacy-interactive-payload",
-      summary: "",
-      interactive: true
+    append_review_comment(host, "tests/talk-first",
+      summary: "Wait for me before doing anything heavy — let's talk first."
     )
 
-    assert Dispatcher.render_interactive_prelude("tests/legacy-interactive-payload",
-             felt_store: host
-           ) == ""
+    assert {:ok, _} =
+             Dispatcher.dispatch("tests/talk-first",
+               runner: IntegrationRunner,
+               felt_store: host
+             )
+
+    script = read_run_script()
+    assert script =~ "From User"
+    assert script =~ "talk first"
   end
 
   # Resume mode requested but no session UUID: fail loudly. "New session" is
@@ -1201,17 +1217,13 @@ defmodule Shuttle.DispatchIntegrationTest do
 
   # Appends a review-comment event to the fiber's felt history so that
   # check_resume_intent/3 and render_user_message_block/2 can read it.
-  # The interactive option is legacy regression coverage only; dispatcher
-  # interactivity now comes from shuttle.interactive.
   defp append_review_comment(host, id, opts) do
     summary = Keyword.get(opts, :summary, "Requeued")
     resume_mode = Keyword.get(opts, :resume_mode)
-    interactive = Keyword.get(opts, :interactive)
 
     fields =
       []
       |> maybe_field("resume_mode", resume_mode)
-      |> maybe_field("interactive", interactive)
 
     args =
       ["-C", host, "history", "append", id, "--kind", "review-comment", "-m", summary] ++

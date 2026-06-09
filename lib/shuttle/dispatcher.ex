@@ -97,8 +97,7 @@ defmodule Shuttle.Dispatcher do
           resume_intent ->
             create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent,
               felt_store: felt_store,
-              uid: uid,
-              shuttle: Map.get(fiber, "shuttle")
+              uid: uid
             )
         end
       end
@@ -441,61 +440,6 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
-  @doc """
-  Reads the fiber's `shuttle.interactive` field and returns a prelude block
-  instructing the worker to stay alive after its initial task when true.
-  Otherwise returns "".
-
-  Interactivity is a property of the shuttle block, not of the latest
-  review-comment. The review-comment channel carries directive text and
-  resume intent; the block carries the interactive/autonomous dispatch mode.
-
-  Pass `felt_store:` to control which `.felt/` index is queried.
-  """
-  @spec render_interactive_prelude(String.t(), keyword()) :: String.t()
-  def render_interactive_prelude(fiber_id, opts \\ []) do
-    shuttle = Keyword.get(opts, :shuttle) || query_shuttle_block(fiber_id, opts)
-
-    if interactive_flag?(Map.get(shuttle || %{}, "interactive")) do
-      render_block(
-        "Interactive Mode",
-        nil,
-        "A human will attach to this live session. Read the From User block and the constitution for what they expect before doing anything heavy: if they signal they want to talk first, or the scope of the autonomous portion is at all unclear, do only a light survey (constitution + last handoff) and wait for them — do not burn context on research or work they may redirect. Only when the constitution describes a clear autonomous portion they expect completed should you drive it to a checkpoint first. Either way, leave the fiber active and the agent alive; the usual close-for-review + `kill $PPID` handoff waits until the human is done with the live session."
-      )
-    else
-      ""
-    end
-  end
-
-  defp query_shuttle_block(fiber_id, opts) do
-    felt_store = Keyword.get(opts, :felt_store, default_felt_store())
-
-    case System.cmd("felt", ["-C", felt_store, "show", fiber_id, "--json"],
-           stderr_to_stdout: true
-         ) do
-      {output, 0} ->
-        case Jason.decode(output) do
-          {:ok, %{} = fiber} ->
-            case Map.get(fiber, "shuttle") do
-              shuttle when is_map(shuttle) -> shuttle
-              _ -> %{}
-            end
-
-          _ ->
-            %{}
-        end
-
-      _ ->
-        %{}
-    end
-  end
-
-  # felt's `--field key=value` stores the value as a string. Treat the
-  # string "true" (and the boolean true, just in case) as truthy.
-  defp interactive_flag?(true), do: true
-  defp interactive_flag?("true"), do: true
-  defp interactive_flag?(_), do: false
-
   # Render a labeled rule-bordered block. Header is "┌─ <label>[ · <time>] ─…",
   # content is indented two spaces, closed with a matching bottom rule.
   # Total visual width is fixed at @rule_width chars so blocks align in the
@@ -677,10 +621,7 @@ defmodule Shuttle.Dispatcher do
   defp compose_prompt(header, fiber_id, opts) do
     felt_store = Keyword.get(opts, :felt_store, default_felt_store())
 
-    felt_opts = [
-      felt_store: felt_store,
-      shuttle: Keyword.get(opts, :shuttle)
-    ]
+    felt_opts = [felt_store: felt_store]
 
     # The store line is the worker's absolute anchor. `prompt_fiber_id`
     # translates the global id to the work_dir-local view when it can, but
@@ -699,13 +640,13 @@ defmodule Shuttle.Dispatcher do
           String.trim(header)
       end
 
-    # Order: header, exit contract, interactive exception (when set), user
-    # message block. The exit contract is always present; the prelude is an
-    # explicit exception that tells the worker to stay alive.
+    # Order: header, exit contract, user message block. The exit contract is
+    # always present; the From User block carries the per-dispatch intent
+    # (including any "talk to me first" signal) and renders only when there's a
+    # fresh directive.
     [
       header,
       render_exit_contract(),
-      render_interactive_prelude(fiber_id, felt_opts),
       render_user_message_block(fiber_id, felt_opts)
     ]
     |> Enum.reject(&(&1 == ""))
@@ -717,7 +658,7 @@ defmodule Shuttle.Dispatcher do
     render_block(
       "Exit Contract",
       nil,
-      "This is an autonomous Shuttle worker unless an Interactive Mode block explicitly says otherwise. After you update outcome/history, file findings, and commit at a clean checkpoint, your final action must be `kill $PPID`. Do not substitute a normal chat final response for worker exit; the handoff belongs in the fiber."
+      "This is an autonomous Shuttle worker. After you update outcome/history, file findings, and commit at a clean checkpoint, your final action must be `kill $PPID` — unless the dispatch directive or the constitution explicitly asks you to wait for a human (a 2FA gate, a send-in-his-voice step, a \"talk to me first\" signal); then drive to that checkpoint and stay alive there instead. Do not substitute a normal chat final response for worker exit; the handoff belongs in the fiber."
     )
   end
 

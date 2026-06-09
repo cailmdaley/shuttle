@@ -5,7 +5,9 @@ defmodule ShuttleWeb.LifecycleControllerTest do
 
   @endpoint ShuttleWeb.Endpoint
 
-  test "install forwards interactive through shuttle-ctl" do
+  # Interactivity is retired: install never forwards --interactive, even if a
+  # stale client still posts the key. The flag is silently dropped, not relayed.
+  test "install drops a stale interactive key rather than forwarding it" do
     args_file = install_fake_shuttle_ctl!()
 
     conn =
@@ -23,28 +25,12 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     assert conn.status == 200
 
     assert File.read!(args_file) ==
-             "install\ntests/interactive\n--project-dir\n/tmp/project\n--interactive\n"
+             "install\ntests/interactive\n--project-dir\n/tmp/project\n"
   end
 
-  test "set-interactive delegates to shuttle-ctl" do
-    root =
-      System.tmp_dir!()
-      |> Path.join("shuttle-lifecycle-store-#{System.unique_integer([:positive])}")
-
-    store = Path.join(root, "loom")
-    fiber_dir = Path.join([store, ".felt", "tests", "interactive"])
-    File.mkdir_p!(fiber_dir)
-    File.write!(Path.join(fiber_dir, "interactive.md"), "---\nname: Interactive\n---\n\n")
-
-    args_file = install_fake_shuttle_ctl!()
-    old_loom_homes = System.get_env("LOOM_HOMES")
-    System.put_env("LOOM_HOMES", store)
-
-    on_exit(fn ->
-      restore_env("LOOM_HOMES", old_loom_homes)
-      File.rm_rf(root)
-    end)
-
+  # set-interactive is retired: the controller no longer allows the action, so a
+  # stale client gets a clean rejection rather than a shuttle-ctl invocation.
+  test "set-interactive is rejected as an unknown lifecycle action" do
     conn =
       post(
         api_conn(),
@@ -56,51 +42,8 @@ defmodule ShuttleWeb.LifecycleControllerTest do
         })
       )
 
-    assert conn.status == 200
-
-    assert File.read!(args_file) ==
-             "--felt-store\n#{store}\nset-interactive\ntests/interactive\nfalse\n"
-  end
-
-  test "set-interactive accepts an intrinsic UID and delegates with the slug address" do
-    root =
-      System.tmp_dir!()
-      |> Path.join("shuttle-lifecycle-store-uid-#{System.unique_integer([:positive])}")
-
-    store = Path.join(root, "loom")
-    uid = "01KTCWNXD1JH4Z5GVMAG1T5P0H"
-    fiber_dir = Path.join([store, ".felt", "tests", "interactive-uid"])
-    File.mkdir_p!(fiber_dir)
-
-    File.write!(
-      Path.join(fiber_dir, "interactive-uid.md"),
-      "---\nid: #{uid}\nname: Interactive UID\n---\n\n"
-    )
-
-    args_file = install_fake_shuttle_ctl!()
-    old_loom_homes = System.get_env("LOOM_HOMES")
-    System.put_env("LOOM_HOMES", store)
-
-    on_exit(fn ->
-      restore_env("LOOM_HOMES", old_loom_homes)
-      File.rm_rf(root)
-    end)
-
-    conn =
-      post(
-        api_conn(),
-        "/api/v1/lifecycle",
-        Jason.encode!(%{
-          "action" => "set-interactive",
-          "fiber" => uid,
-          "interactive" => false
-        })
-      )
-
-    assert conn.status == 200
-
-    assert File.read!(args_file) ==
-             "--felt-store\n#{store}\nset-interactive\ntests/interactive-uid\nfalse\n"
+    assert conn.status == 400
+    assert conn.resp_body =~ "unknown lifecycle action"
   end
 
   test "set-outcome delegates to shuttle-ctl, preserving a multi-line value as one arg" do

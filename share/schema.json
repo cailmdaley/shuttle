@@ -11,10 +11,6 @@
       "enum": ["oneshot", "standing"],
       "description": "Dispatch mode. oneshot: dispatched once, then status:closed at exit (terminus on accept). standing: recurring per schedule; accept re-arms it. kind exists only to make accept kind-aware."
     },
-    "interactive": {
-      "type": "boolean",
-      "description": "When true, the dispatcher renders the Interactive Mode prompt block and the worker leaves the fiber active and the agent alive after its initial autonomous task. Absent or false means autonomous dispatch."
-    },
     "host": {
       "type": "string",
       "minLength": 1,
@@ -58,8 +54,9 @@
   ],
   "notes": {
     "lifecycle": "Lifecycle is status + tempered, uniform across kinds. status:open = draft/paused (not dispatched). status:active + no tempered = armed (oneshot dispatches when deps met; standing when cron.next(now) is due). A live tmux session = running (read from tmux, never stored). Worker exit = status:closed + no tempered = awaiting review (this closed state is the don't-re-fire / anti-oscillation gate). accept: oneshot -> tempered:true (terminus); standing -> status:active + closed-at cleared (re-armed). reject -> tempered:false = composted (terminus, both kinds). The sole dispatch gate is status:active.",
-    "writer_ownership": "Document fields the CLI writes to synced frontmatter: kind, interactive, agent, schedule, host, project_dir. The felt-native status field drives dispatch — the CLI mutates it (open=draft, active=armed, closed=terminus/awaiting) through the lifecycle verbs.",
+    "writer_ownership": "Document fields the CLI writes to synced frontmatter: kind, agent, schedule, host, project_dir. The felt-native status field drives dispatch — the CLI mutates it (open=draft, active=armed, closed=terminus/awaiting) through the lifecycle verbs.",
     "schema_tz_migration": "Pre-CLI standing roles used schedule.timezone. Migration renames to schedule.tz. The Elixir daemon reads tz after migration.",
-    "kind_migration": "Pre-CLI standing roles used shuttle.mode instead of shuttle.kind. Migration renames to kind."
+    "kind_migration": "Pre-CLI standing roles used shuttle.mode instead of shuttle.kind. Migration renames to kind.",
+    "interactive_retired": "The `interactive` axis is retired. Per-dispatch 'talk to me first' intent rides the From User directive; structural human-gates (2FA, send-in-his-voice) live in the constitution text; resume-from-kanban is the universal way to talk to any worker. A legacy `interactive: true` in a fiber is inert — the daemon ignores it and the next Go rewrite wipes it."
   }
 }

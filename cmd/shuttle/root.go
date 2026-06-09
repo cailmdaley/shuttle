@@ -30,8 +30,6 @@ Write verbs (offline, validate-before-write):
   set-outcome  Set the outcome field on a shuttle-managed fiber
   accept       Accept a completed standing-role run and advance the schedule
   set-model    Change the agent for a fiber
-  set-interactive
-               Change whether a fiber dispatches in interactive mode
   uninstall    Remove the shuttle: block from a fiber
 
 Read verbs:
