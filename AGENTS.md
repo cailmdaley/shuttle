@@ -144,7 +144,11 @@ All prompt variants share this shape (`compose_prompt/3` in dispatcher.ex):
    do, how the practice loads. Per-prompt, not boilerplate. Goes first
    because in causal attention every downstream token sees the prefix.
 2. **`Fiber: <id>`** (and `Run: <run-id>` for standing) — identity lines.
-3. **`From User · <relative time>`** — the most recent `--kind
+3. **`Felt store: <path>`** — the worker's absolute anchor. When
+   `prompt_fiber_id`'s work_dir-local translation safe-fails, the id above
+   is global and doesn't resolve from cwd; the store line makes the
+   fallback mechanical (`felt -C <felt-store> show <id>`).
+4. **`From User · <relative time>`** — the most recent `--kind
    review-comment` event, if any. Pulled fresh at dispatch.
 
 The fiber's outcome and last editorial event are not inlined — they're
