@@ -5,6 +5,22 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
 
   @endpoint ShuttleWeb.Endpoint
 
+  alias Shuttle.{Remote, RemoteFiberRegistry}
+
+  # Deterministic HTTP stub for the cross-host composite test: scripts the
+  # remote daemon's `/api/v1/fibers?shuttle=true` response so the local
+  # RemoteFiberRegistry caches a known feed without a real tunnel.
+  defmodule StubFiberClient do
+    @behaviour Shuttle.RemoteRegistry.Client
+    use Agent
+
+    def start_link(_ \\ []), do: Agent.start_link(fn -> %{} end, name: __MODULE__)
+    def set(url, response), do: Agent.update(__MODULE__, &Map.put(&1, url, response))
+
+    @impl true
+    def get(url, _timeout_ms), do: Agent.get(__MODULE__, &Map.get(&1, url, {:error, :not_set}))
+  end
+
   setup do
     root =
       Path.join(
@@ -446,6 +462,93 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
     conn = get(api_conn(), "/api/v1/fibers/tests/absent")
     assert conn.status == 200
     assert Jason.decode!(conn.resp_body)["fibers"] == []
+  end
+
+  test "GET /api/v1/fibers/composite stamps origin and reports the local origin (no remotes)",
+       %{store: store} do
+    write_fiber!(store, "tests/managed", """
+    ---
+    name: Managed
+    status: active
+    shuttle:
+      kind: oneshot
+      host: test-host
+    ---
+
+    Body.
+    """)
+
+    conn = get(api_conn(), "/api/v1/fibers/composite")
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+
+    assert body["host"] == "test-host"
+
+    # Only this daemon's owned shuttle row, stamped with its origin.
+    assert [%{"fiber" => %{"name" => "Managed"}, "origin" => "test-host"}] = body["fibers"]
+
+    # The local origin is reported (kind: local); no remotes configured.
+    assert body["origins"]["test-host"]["kind"] == "local"
+    assert body["origins"]["test-host"]["stale"] == false
+    assert body["origins"]["test-host"]["fiber_count"] == 1
+    assert Map.keys(body["origins"]) == ["test-host"]
+  end
+
+  test "GET /api/v1/fibers/composite concatenates the local feed with a cached remote feed",
+       %{store: store} do
+    write_fiber!(store, "tests/managed", """
+    ---
+    name: Managed
+    status: active
+    shuttle:
+      kind: oneshot
+      host: test-host
+    ---
+
+    Body.
+    """)
+
+    remote = %Remote{name: "candide", url: "http://localhost:4001"}
+
+    remote_body =
+      Jason.encode!(%{
+        "host" => "candide",
+        "fibers" => [
+          %{
+            "felt_store" => "/loom",
+            "path" => "tests/remote/remote.md",
+            "fiber" => %{"id" => "tests/remote", "name" => "Remote work", "status" => "active"},
+            "runtime" => %{"tmux_session" => "shuttle-remote"}
+          }
+        ]
+      })
+
+    start_supervised!(StubFiberClient)
+    StubFiberClient.set(Remote.fibers_url(remote), {:ok, remote_body})
+
+    # Start the registry under its DEFAULT name so the controller's feeds/0
+    # call (which targets Shuttle.RemoteFiberRegistry) sees it.
+    start_supervised!(
+      {RemoteFiberRegistry, remotes: [remote], client: StubFiberClient, auto_poll: false}
+    )
+
+    :ok = RemoteFiberRegistry.refresh_now()
+
+    conn = get(api_conn(), "/api/v1/fibers/composite")
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+
+    by_origin = Map.new(body["fibers"], &{&1["origin"], &1})
+
+    assert by_origin["test-host"]["fiber"]["name"] == "Managed"
+    assert by_origin["candide"]["fiber"]["name"] == "Remote work"
+    # Remote liveness rides the owner-stamped runtime on the feed row.
+    assert by_origin["candide"]["runtime"]["tmux_session"] == "shuttle-remote"
+
+    assert body["origins"]["test-host"]["kind"] == "local"
+    assert body["origins"]["candide"]["kind"] == "remote"
+    assert body["origins"]["candide"]["stale"] == false
+    assert body["origins"]["candide"]["fiber_count"] == 1
   end
 
   defp write_fiber!(store, fiber_id, content) do

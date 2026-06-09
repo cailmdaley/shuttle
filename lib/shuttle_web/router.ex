@@ -24,6 +24,10 @@ defmodule ShuttleWeb.Router do
     get("/state", StateController, :show)
     get("/state/composite", StateController, :composite)
     get("/fibers", FiberDocumentsController, :index)
+    # Must precede the `/fibers/*id` wildcard, else "composite" resolves as a
+    # fiber id. The unified cross-host board: local owner feed + cached remote
+    # feeds, concatenated with reconciled per-host liveness.
+    get("/fibers/composite", FiberDocumentsController, :composite)
     get("/fibers/*id", FiberDocumentsController, :show)
     get("/origins", OriginsController, :show)
     post("/lifecycle", LifecycleController, :create)

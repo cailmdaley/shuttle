@@ -63,6 +63,88 @@ defmodule ShuttleWeb.FiberDocumentsController do
     end
   end
 
+  @doc """
+  `GET /api/v1/fibers/composite` — the unified cross-host kanban board.
+
+  Concatenates this daemon's local owner feed (from the poller's document cache,
+  which stamps local tmux liveness) with each remote daemon's cached owner feed
+  (`Shuttle.RemoteFiberRegistry`, which stamps the remote's own liveness at the
+  remote's serve time). The result is a flat per-fiber list where every fiber's
+  liveness was resolved by its OWNING host — one observer per fiber, no
+  cross-observer disagreement, so the kanban can classify directly without a
+  second tmux read.
+
+  Each fiber row carries an `origin` field (the owning host/remote name) so the
+  view can route worker-badge focus and transitions without re-deriving owner
+  from the `shuttle.host` block. `origins` reports per-origin staleness so the
+  view can mark an unreachable remote without dropping its last-known cards.
+
+  This is the local-composer counterpart of `/state/composite`: the kanban talks
+  to ONE (local) Shuttle and sees local + every configured remote.
+  """
+  def composite(conn, _params) do
+    {local_origin, local_entries, local_stale} = local_feed()
+    remote_feeds = Shuttle.RemoteFiberRegistry.feeds()
+
+    fibers =
+      Enum.map(local_entries, &Map.put(&1, :origin, local_origin)) ++
+        Enum.flat_map(remote_feeds, fn {name, feed} ->
+          Enum.map(feed.fibers, &stamp_origin(&1, name))
+        end)
+
+    origins =
+      remote_feeds
+      |> Map.new(fn {name, feed} ->
+        {name,
+         %{
+           kind: "remote",
+           stale: feed.stale,
+           last_polled_at: format_dt(feed.last_polled_at),
+           last_error: render_error(feed.last_error),
+           fiber_count: length(feed.fibers)
+         }}
+      end)
+      |> Map.put(local_origin, %{
+        kind: "local",
+        stale: local_stale,
+        fiber_count: length(local_entries)
+      })
+
+    json(conn, %{
+      host: local_origin,
+      generated_at: DateTime.to_iso8601(DateTime.utc_now()),
+      fibers: fibers,
+      origins: origins
+    })
+  end
+
+  # The local owner feed: same body as `GET /api/v1/fibers?shuttle=true`, served
+  # from the poller's runtime-stamped document cache (falling back to a direct
+  # felt list while the cache is cold). On any failure the local origin reports
+  # stale with zero fibers rather than 500ing the whole board.
+  defp local_feed do
+    case list_fibers(false, true) do
+      {:ok, %{host: host, fibers: entries}} -> {host, entries, false}
+      {:ok, %{fibers: entries}} -> {own_host_id(), entries, false}
+      {:error, _errors} -> {own_host_id(), [], true}
+    end
+  end
+
+  # Remote entries arrive as raw decoded JSON (string keys); stamp origin with a
+  # string key so the wire shape matches the atom-keyed local rows after JSON
+  # encoding.
+  defp stamp_origin(entry, origin) when is_map(entry), do: Map.put(entry, "origin", origin)
+
+  defp own_host_id, do: Shuttle.Poller.own_host_id()
+
+  defp format_dt(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
+  defp format_dt(_), do: nil
+
+  defp render_error(nil), do: nil
+  defp render_error(reason) when is_binary(reason), do: reason
+  defp render_error(reason) when is_atom(reason), do: to_string(reason)
+  defp render_error(reason), do: inspect(reason)
+
   defp list_fibers(false, true) do
     case Process.whereis(Shuttle.Poller) do
       nil ->

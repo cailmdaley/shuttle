@@ -103,6 +103,19 @@ defmodule Shuttle.Remote do
   end
 
   @doc """
+  The full `GET /api/v1/fibers?shuttle=true` URL for this remote — the
+  owner-only kanban feed (this host's owned shuttle fibers, each carrying
+  serve-time tmux liveness). The local daemon composes these per-origin feeds
+  into the unified cross-host board (`Shuttle.RemoteFiberRegistry`).
+  """
+  @spec fibers_url(t()) :: String.t()
+  def fibers_url(%__MODULE__{url: url}) do
+    url
+    |> String.trim_trailing("/")
+    |> Kernel.<>("/api/v1/fibers?shuttle=true")
+  end
+
+  @doc """
   Returns `true` when `last_polled_at` is older than
   `stale_multiplier × poll_interval_ms` from `now`. A `nil`
   `last_polled_at` is always stale.

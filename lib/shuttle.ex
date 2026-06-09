@@ -37,12 +37,20 @@ defmodule Shuttle.Application do
 
     children = [
       {Phoenix.PubSub, name: Shuttle.PubSub},
+      {Task.Supervisor, name: Shuttle.TaskSupervisor},
       {DynamicSupervisor, strategy: :one_for_one, name: Shuttle.WatcherSupervisor}
     ]
 
     children =
       if Application.get_env(:shuttle, :start_remote_registry, true) do
         children ++ [Shuttle.RemoteRegistry]
+      else
+        children
+      end
+
+    children =
+      if Application.get_env(:shuttle, :start_remote_fiber_registry, true) do
+        children ++ [Shuttle.RemoteFiberRegistry]
       else
         children
       end
