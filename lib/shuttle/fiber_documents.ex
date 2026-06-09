@@ -17,13 +17,39 @@ defmodule Shuttle.FiberDocuments do
           optional(:report_path) => String.t()
         }
 
+  # The metadata fields the kanban board needs from each fiber. Shared by the
+  # owner (`--has-field shuttle`) and human-due (`--has-field due`) narrowed
+  # walks so both feeds carry the same shape Portolan's reader expects.
+  @kanban_json_fields Enum.join(
+                        ~w(id uid name status tags created_at closed_at modified_at
+                           outcome due horizon cold kind priority depends_on tempered
+                           shuttle path),
+                        ","
+                      )
+
   @spec list(keyword()) :: {:ok, map()} | {:error, term()}
   def list(opts \\ []) do
-    stores = Keyword.get_lazy(opts, :felt_stores, &FeltStores.configured_hosts/0)
-    with_body? = Keyword.get(opts, :with_body, false)
-    shuttle_only? = Keyword.get(opts, :shuttle_only, false)
+    mode = if Keyword.get(opts, :shuttle_only, false), do: :owned, else: :all
+    collect(opts, Keyword.get(opts, :with_body, false), mode)
+  end
 
-    results = Enum.map(stores, &list_store(&1, with_body?, shuttle_only?))
+  @doc """
+  Local human due-date cards: open/active fibers carrying a `due:` but NO
+  `shuttle:` block. These are the Portolan-local todo drafts the owner feed
+  (`?shuttle=true`) deliberately omits — they name no host and never cross the
+  tunnel — so the composite BOARD endpoint re-includes them from the local
+  store, preserving the due-date cards the kanban showed back when Portolan
+  walked felt itself. Local only by nature; there is no remote human-due analog.
+  """
+  @spec list_human_due(keyword()) :: {:ok, map()} | {:error, term()}
+  def list_human_due(opts \\ []) do
+    collect(opts, false, :human_due)
+  end
+
+  defp collect(opts, with_body?, mode) do
+    stores = Keyword.get_lazy(opts, :felt_stores, &FeltStores.configured_hosts/0)
+
+    results = Enum.map(stores, &list_store(&1, with_body?, mode))
     errors = Enum.flat_map(results, &store_errors/1)
 
     if errors == [] do
@@ -131,7 +157,7 @@ defmodule Shuttle.FiberDocuments do
   # so the entry shape (canonical id, store-relative path, report_path) is
   # byte-identical to the list endpoint.
   defp scan_lookup(stores, id, with_body?) do
-    results = Enum.map(stores, &list_store(&1, with_body?, false))
+    results = Enum.map(stores, &list_store(&1, with_body?, :all))
     errors = Enum.flat_map(results, &store_errors/1)
 
     match =
@@ -149,8 +175,8 @@ defmodule Shuttle.FiberDocuments do
     end
   end
 
-  defp list_store(store, with_body?, shuttle_only?) do
-    args = list_args(with_body?, shuttle_only?)
+  defp list_store(store, with_body?, mode) do
+    args = list_args(with_body?, mode)
 
     # Do NOT fold stderr into stdout: felt prints `warning: failed to parse …`
     # for stray non-fiber `.md` files (SPEC.md, README.md) to stderr while still
@@ -160,57 +186,31 @@ defmodule Shuttle.FiberDocuments do
     # instead; only stdout is parsed.
     case System.cmd("felt", args, cd: store) do
       {output, 0} ->
-        decode_store(store, output, shuttle_only?)
+        decode_store(store, output, mode)
 
       {output, status} ->
         {:error, %{felt_store: store, status: status, error: String.trim(output)}}
     end
   end
 
-  defp list_args(true, _shuttle_only?) do
-    ["ls", "-s", "all", "-j", "--body"]
+  # `with_body? == true` is the content/search reader path: every field, body
+  # included, no narrowing. The narrowed walks (`:owned` / `:human_due`) carry
+  # only the kanban metadata fields and never the body.
+  defp list_args(true, _mode), do: ["ls", "-s", "all", "-j", "--body"]
+
+  defp list_args(false, :owned) do
+    ["ls", "-s", "all", "-j", "--has-field", "shuttle", "--json-field", @kanban_json_fields]
   end
 
-  defp list_args(false, true) do
-    [
-      "ls",
-      "-s",
-      "all",
-      "-j",
-      "--has-field",
-      "shuttle",
-      "--json-field",
-      Enum.join(
-        [
-          "id",
-          "uid",
-          "name",
-          "status",
-          "tags",
-          "created_at",
-          "closed_at",
-          "modified_at",
-          "outcome",
-          "due",
-          "horizon",
-          "cold",
-          "kind",
-          "priority",
-          "depends_on",
-          "tempered",
-          "shuttle",
-          "path"
-        ],
-        ","
-      )
-    ]
+  defp list_args(false, :human_due) do
+    ["ls", "-s", "all", "-j", "--has-field", "due", "--json-field", @kanban_json_fields]
   end
 
-  defp list_args(false, false), do: ["ls", "-s", "all", "-j"]
+  defp list_args(false, :all), do: ["ls", "-s", "all", "-j"]
 
-  defp decode_store(store, output, shuttle_only?) do
+  defp decode_store(store, output, mode) do
     with {:ok, decoded} when is_list(decoded) <- Jason.decode(output) do
-      rows = if shuttle_only?, do: Enum.filter(decoded, &owned_kanban_fiber?/1), else: decoded
+      rows = filter_rows(decoded, mode)
       {:ok, rows |> Enum.flat_map(&entry_for(store, &1))}
     else
       {:ok, _} -> {:error, %{felt_store: store, error: "felt ls returned non-list JSON"}}
@@ -218,22 +218,28 @@ defmodule Shuttle.FiberDocuments do
     end
   end
 
+  defp filter_rows(rows, :owned), do: Enum.filter(rows, &owned_kanban_fiber?/1)
+  defp filter_rows(rows, :human_due), do: Enum.filter(rows, &human_due_fiber?/1)
+  defp filter_rows(rows, _all), do: rows
+
   # The kanban (`?shuttle=true`) feed serves only the rows THIS daemon owns:
   # a non-empty `shuttle:` block AND `shuttle.host == own_host_id`. The feed is
   # consumed cross-tunnel as a REMOTE origin, and the owner-only contract is that
   # each daemon answers strictly for its host-owned fibers — a viewer concatenates
   # owners' answers and never merges, because no fiber is authoritatively present
   # on two hosts. A fiber physically rooted here but pinned to another host's
-  # `shuttle.host:` belongs to that host's feed, never this one's mirror. (A
-  # viewer's LOCAL origin additionally surfaces unowned-but-local drafts by
-  # walking felt directly; that is a Portolan-side concern, not this endpoint.)
+  # `shuttle.host:` belongs to that host's feed, never this one's mirror. The
+  # non-shuttle human due-date drafts the kanban also shows are served by
+  # `list_human_due/1` into the composite BOARD endpoint, never by this owner
+  # feed — they name no host and never cross the tunnel.
   defp owned_kanban_fiber?(fiber) do
     shuttle_fiber?(fiber) and host_owned?(fiber)
   end
 
-  # A fiber is kanban-relevant to Portolan iff it carries a non-empty `shuttle:`
-  # block. Non-shuttle due-dated todos are a Portolan-local concern and never
-  # live on a remote, so this drops nothing the kanban shows.
+  # A fiber is owner-feed-relevant iff it carries a non-empty `shuttle:` block.
+  # Non-shuttle due-dated todos are served by `list_human_due/1` for the
+  # composite board, never by this owner feed; this predicate drops nothing the
+  # board shows.
   defp shuttle_fiber?(%{"shuttle" => shuttle}) when is_map(shuttle) and map_size(shuttle) > 0,
     do: true
 
@@ -249,6 +255,20 @@ defmodule Shuttle.FiberDocuments do
   end
 
   defp host_owned?(_), do: false
+
+  # A Portolan-local todo card: an open/active fiber carrying a `due:` and NO
+  # `shuttle:` block — the human-tracked drafts the kanban shows alongside
+  # shuttle work. Mirrors Portolan's `shouldIncludeInKanban` second branch.
+  # Status gates first (closed/tempered due cards are off the board); a fiber
+  # with a `shuttle:` block is the owner feed's job, never this one's.
+  defp human_due_fiber?(%{"status" => status} = fiber) when status in ["open", "active"] do
+    has_due?(fiber) and not shuttle_fiber?(fiber)
+  end
+
+  defp human_due_fiber?(_), do: false
+
+  defp has_due?(%{"due" => due}), do: due not in [nil, ""]
+  defp has_due?(_), do: false
 
   defp entry_for(store, %{"id" => id} = fiber) when is_binary(id) and id != "" do
     # Three values, all read from felt, none reverse-derived or guessed by Shuttle:

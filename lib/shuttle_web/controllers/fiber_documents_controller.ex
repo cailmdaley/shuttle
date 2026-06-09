@@ -83,7 +83,14 @@ defmodule ShuttleWeb.FiberDocumentsController do
   to ONE (local) Shuttle and sees local + every configured remote.
   """
   def composite(conn, _params) do
-    {local_origin, local_entries, local_stale} = local_feed()
+    {local_origin, local_owner_entries, local_stale} = local_feed()
+    # The local board is owner shuttle work (runtime-stamped, from the poller
+    # cache) PLUS the human-tracked due-date drafts the owner feed omits. They
+    # are disjoint by construction — owner rows carry a `shuttle:` block, human-
+    # due rows never do — so concatenation can't double-count. Remotes carry no
+    # human-due analog (those cards name no host and never cross the tunnel), so
+    # this only widens the LOCAL portion.
+    local_entries = local_owner_entries ++ local_human_due_entries()
     remote_feeds = Shuttle.RemoteFiberRegistry.feeds()
 
     fibers =
@@ -127,6 +134,20 @@ defmodule ShuttleWeb.FiberDocumentsController do
       {:ok, %{host: host, fibers: entries}} -> {host, entries, false}
       {:ok, %{fibers: entries}} -> {own_host_id(), entries, false}
       {:error, _errors} -> {own_host_id(), [], true}
+    end
+  end
+
+  # Local human due-date cards (open/active + `due:`, no `shuttle:` block): the
+  # Portolan-local todo drafts the owner feed omits by design. Served by a
+  # narrow `felt ls --has-field due` (this is a read endpoint, not the hot
+  # dispatch loop; the poller cache holds only shuttle fibers so there is
+  # nothing to serve them from). A felt failure degrades to `[]` — the owner
+  # feed already governs the local origin's stale flag — so a due-walk hiccup
+  # never blanks the whole board.
+  defp local_human_due_entries do
+    case Shuttle.FiberDocuments.list_human_due() do
+      {:ok, %{fibers: entries}} -> entries
+      {:error, _} -> []
     end
   end
 

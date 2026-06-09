@@ -551,6 +551,82 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
     assert body["origins"]["candide"]["fiber_count"] == 1
   end
 
+  test "GET /api/v1/fibers/composite includes local human due-date cards the owner feed omits",
+       %{store: store} do
+    # Owner shuttle work — in both the owner feed and the composite.
+    write_fiber!(store, "tests/managed", """
+    ---
+    name: Managed
+    status: active
+    shuttle:
+      kind: oneshot
+      host: test-host
+    ---
+
+    Body.
+    """)
+
+    # A human-tracked todo: open + due, NO shuttle block. The owner feed
+    # (`?shuttle=true`) drops it; the composite board must re-include it.
+    write_fiber!(store, "tests/human-todo", """
+    ---
+    name: Human todo
+    status: open
+    due: 2026-12-01
+    ---
+
+    Body.
+    """)
+
+    # A shuttle fiber that ALSO carries a due: must appear exactly once (owner
+    # feed), never double-counted into the human-due path.
+    write_fiber!(store, "tests/owner-due", """
+    ---
+    name: Owner with due
+    status: active
+    due: 2026-11-01
+    shuttle:
+      kind: oneshot
+      host: test-host
+    ---
+
+    Body.
+    """)
+
+    # A closed due card is off the board — status gates before due.
+    write_fiber!(store, "tests/done-todo", """
+    ---
+    name: Done todo
+    status: closed
+    due: 2026-01-01
+    ---
+
+    Body.
+    """)
+
+    conn = get(api_conn(), "/api/v1/fibers/composite")
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+
+    names = body["fibers"] |> Enum.map(& &1["fiber"]["name"]) |> Enum.sort()
+    assert names == ["Human todo", "Managed", "Owner with due"]
+
+    # Every local row — owner and human-due alike — is stamped the local origin.
+    assert Enum.all?(body["fibers"], &(&1["origin"] == "test-host"))
+
+    # The shuttle+due fiber is present exactly once (no double-count).
+    assert Enum.count(body["fibers"], &(&1["fiber"]["name"] == "Owner with due")) == 1
+
+    # fiber_count reflects owner + human-due together.
+    assert body["origins"]["test-host"]["fiber_count"] == 3
+
+    # The owner feed itself stays strictly owner-only — the human todo never
+    # leaks into `?shuttle=true`.
+    only = get(api_conn(), "/api/v1/fibers?shuttle=true")
+    owner_names = Jason.decode!(only.resp_body)["fibers"] |> Enum.map(& &1["fiber"]["name"]) |> Enum.sort()
+    assert owner_names == ["Managed", "Owner with due"]
+  end
+
   defp write_fiber!(store, fiber_id, content) do
     segments = String.split(fiber_id, "/")
     basename = List.last(segments)
