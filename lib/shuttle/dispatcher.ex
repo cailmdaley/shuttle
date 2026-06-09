@@ -620,7 +620,7 @@ defmodule Shuttle.Dispatcher do
 
     orientation =
       if ad_hoc? do
-        "The orchestration system Shuttle dispatched you for an ad-hoc run of this standing role. Standing roles are recurring responsibilities; this dispatch is right-now work and must not consume or advance the scheduled occurrence. On completion, set review.state to awaiting with this ad-hoc run id and preserve next_due_at. The `shuttle` and `felt` skills carry the practice — activate them next."
+        "The orchestration system Shuttle dispatched you for an ad-hoc run of this standing role. Standing roles are recurring responsibilities; this dispatch is right-now work and does not consume or advance the scheduled occurrence. Exit like any standing run: write the work product into outcome, append a felt history event carrying this run id, then kill $PPID — the daemon owns the awaiting transition. The `shuttle` and `felt` skills carry the practice — activate them next."
       else
         "The orchestration system Shuttle dispatched you for a scheduled run of this standing role. Standing roles are recurring responsibilities — this dispatch is one due occurrence, not a new fiber. The `shuttle` and `felt` skills carry the practice — activate them next; the skill's \"Standing Roles\" section covers the awaiting-review handoff at run completion."
       end

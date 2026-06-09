@@ -619,8 +619,13 @@ defmodule Shuttle.DispatcherTest do
       Dispatcher.render_standing_run_prompt("tests/haiku", "adhoc-1770000000000", ad_hoc: true)
 
     assert prompt =~ "ad-hoc run of this standing role"
-    assert prompt =~ "must not consume or advance the scheduled occurrence"
-    assert prompt =~ "preserve next_due_at"
+    assert prompt =~ "does not consume or advance the scheduled occurrence"
+    # The slice-5 schema freeze removed review.state and next_due_at; the
+    # prompt must not instruct the worker to write either. The daemon owns
+    # the awaiting transition (standing-roles.md, "Worker exit handoff").
+    refute prompt =~ "review.state"
+    refute prompt =~ "next_due_at"
+    assert prompt =~ "daemon owns the awaiting transition"
     assert prompt =~ "Run:   adhoc-1770000000000"
   end
 
