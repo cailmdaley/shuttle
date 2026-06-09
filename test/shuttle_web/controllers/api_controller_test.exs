@@ -227,6 +227,26 @@ defmodule ShuttleWeb.APIControllerTest do
     end
   end
 
+  # POST transport stub for the cross-host /transition forward test. Records the
+  # last (url, body) it was asked to POST and replays a scripted response, so the
+  # forward leg is exercised without a real tunnel. Implements `post/4` only —
+  # the read `get/2` callback isn't needed here, so it doesn't declare the
+  # behaviour (which would warn about the missing required `get/2`).
+  defmodule StubPostClient do
+    use Agent
+
+    def start_link(_ \\ []),
+      do: Agent.start_link(fn -> %{response: nil, last: nil} end, name: __MODULE__)
+
+    def set_response(response), do: Agent.update(__MODULE__, &Map.put(&1, :response, response))
+    def last, do: Agent.get(__MODULE__, & &1.last)
+
+    def post(url, body, _content_type, _timeout_ms) do
+      Agent.update(__MODULE__, &Map.put(&1, :last, %{url: url, body: body}))
+      Agent.get(__MODULE__, & &1.response)
+    end
+  end
+
   # ── Setup ──
 
   setup do
@@ -274,6 +294,9 @@ defmodule ShuttleWeb.APIControllerTest do
       end
     end)
   end
+
+  defp restore_app_env(key, nil), do: Application.delete_env(:shuttle, key)
+  defp restore_app_env(key, value), do: Application.put_env(:shuttle, key, value)
 
   # ── GET /api/v1/workers/:fiber_id ──
 
@@ -748,6 +771,180 @@ defmodule ShuttleWeb.APIControllerTest do
     assert "close" in captured
     assert "tests/action-felt-store" in captured
     assert "--tempered=true" in captured
+  end
+
+  # ── POST /api/v1/transition ──
+
+  # The unified write-plane: one call resolves the kanban target to an action
+  # AND invokes it (no separate resolve leg). A closed oneshot dragged to the
+  # tempered column resolves to close-tempered and shells the offline writer —
+  # threading --felt-store through the extracted Transition pipeline.
+  @tag :capture_log
+  test "transition resolves the target and invokes in one call (local)" do
+    with_actions_host()
+
+    MockRunner.set_shuttle(
+      "tests/transition-local",
+      "enabled: true\nkind: oneshot\nreview:\n  state: awaiting\n",
+      "closed"
+    )
+
+    stub_dir =
+      Path.join(System.tmp_dir!(), "shuttle-transition-stub-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(stub_dir)
+    argv_log = Path.join(stub_dir, "argv.log")
+
+    File.write!(Path.join(stub_dir, "shuttle-ctl"), """
+    #!/usr/bin/env bash
+    printf '%s\\n' "$@" >> "#{argv_log}"
+    exit 0
+    """)
+
+    File.chmod!(Path.join(stub_dir, "shuttle-ctl"), 0o755)
+
+    previous_path = System.get_env("PATH")
+    System.put_env("PATH", "#{stub_dir}:#{previous_path}")
+
+    on_exit(fn ->
+      if previous_path, do: System.put_env("PATH", previous_path), else: System.delete_env("PATH")
+      File.rm_rf!(stub_dir)
+    end)
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/transition",
+        Jason.encode!(%{fiber_id: "tests/transition-local", target: "tempered"})
+      )
+
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+    assert body["invoked"] == true
+    assert body["action"] == "close-tempered"
+    assert body["target"] == "tempered"
+
+    captured = argv_log |> File.read!() |> String.split("\n", trim: true)
+    assert Enum.take(captured, 2) == ["--felt-store", "/tmp"]
+    assert "close" in captured
+    assert "--tempered=true" in captured
+  end
+
+  test "transition for an unknown target returns 400" do
+    with_actions_host()
+    MockRunner.set_shuttle("tests/transition-bad-target", @oneshot_shuttle)
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/transition",
+        Jason.encode!(%{fiber_id: "tests/transition-bad-target", target: "nowhere"})
+      )
+
+    assert conn.status == 400
+    body = Jason.decode!(conn.resp_body)
+    assert body["error"] == "unknown_target"
+    assert body["invoked"] == false
+  end
+
+  test "transition for an unknown fiber returns 404" do
+    with_actions_host()
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/transition",
+        Jason.encode!(%{fiber_id: "tests/transition-missing", target: "drafts"})
+      )
+
+    assert conn.status == 404
+    body = Jason.decode!(conn.resp_body)
+    assert body["error"] == "not_found"
+    assert body["invoked"] == false
+  end
+
+  # A remote-owned fiber: the local daemon forwards to the OWNING remote's
+  # /transition over the tunnel and relays its response verbatim, re-stamped with
+  # the origin the caller routed to. The forwarded payload carries no origin (so
+  # the remote runs its own local branch); only fiber_id + target cross the wire.
+  test "transition forwards a remote-owned fiber to the owning daemon" do
+    start_supervised!(StubPostClient)
+
+    StubPostClient.set_response(
+      {:ok, 200,
+       Jason.encode!(%{
+         "fiber_id" => "tests/remote-work",
+         "target" => "drafts",
+         "origin" => "local",
+         "action" => "pause",
+         "invoked" => true
+       })}
+    )
+
+    previous_remotes = Application.get_env(:shuttle, :remotes)
+    previous_client = Application.get_env(:shuttle, :transition_client)
+    Application.put_env(:shuttle, :remotes, [%{name: "candide", url: "http://localhost:4001"}])
+    Application.put_env(:shuttle, :transition_client, StubPostClient)
+
+    on_exit(fn ->
+      restore_app_env(:remotes, previous_remotes)
+      restore_app_env(:transition_client, previous_client)
+    end)
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/transition",
+        Jason.encode!(%{
+          fiber_id: "tests/remote-work",
+          target: "drafts",
+          origin: "candide"
+        })
+      )
+
+    assert conn.status == 200
+    body = Jason.decode!(conn.resp_body)
+    assert body["invoked"] == true
+    assert body["action"] == "pause"
+    # Origin re-stamped to what the caller routed to, not the remote's "local".
+    assert body["origin"] == "candide"
+
+    # Forwarded to the owning remote's /transition, fiber_id + target only.
+    last = StubPostClient.last()
+    assert last.url == "http://localhost:4001/api/v1/transition"
+    forwarded = Jason.decode!(last.body)
+    assert forwarded == %{"fiber_id" => "tests/remote-work", "target" => "drafts"}
+  end
+
+  test "transition relays a remote owner's error status" do
+    start_supervised!(StubPostClient)
+
+    StubPostClient.set_response(
+      {:ok, 409, Jason.encode!(%{"invoked" => false, "error" => "action_not_available"})}
+    )
+
+    previous_remotes = Application.get_env(:shuttle, :remotes)
+    previous_client = Application.get_env(:shuttle, :transition_client)
+    Application.put_env(:shuttle, :remotes, [%{name: "cineca", url: "http://localhost:4002"}])
+    Application.put_env(:shuttle, :transition_client, StubPostClient)
+
+    on_exit(fn ->
+      restore_app_env(:remotes, previous_remotes)
+      restore_app_env(:transition_client, previous_client)
+    end)
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/transition",
+        Jason.encode!(%{fiber_id: "tests/remote-err", target: "tempered", origin: "cineca"})
+      )
+
+    assert conn.status == 409
+    body = Jason.decode!(conn.resp_body)
+    assert body["invoked"] == false
+    assert body["error"] == "action_not_available"
+    assert body["origin"] == "cineca"
   end
 
   # ── POST /api/v1/wait ──

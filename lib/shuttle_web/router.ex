@@ -19,6 +19,10 @@ defmodule ShuttleWeb.Router do
     get("/actions/*fiber_id", ActionsController, :show)
     post("/actions/resolve", ActionsController, :resolve)
     post("/actions/invoke", ActionsController, :invoke)
+    # The unified kanban write-plane: one call hides resolve + invoke +
+    # owner-routing (local invoke, or forward to the owning remote daemon's
+    # own /transition). Supersedes the kanban's prior two-leg resolve/invoke.
+    post("/transition", TransitionController, :create)
     post("/wait", WaitController, :create)
     post("/reserve", ReserveController, :create)
     get("/state", StateController, :show)

@@ -815,12 +815,29 @@ end
 
 defmodule Shuttle.RemoteRegistry.Client do
   @moduledoc """
-  Behaviour for remote daemon HTTP fetches. Default implementation
+  Behaviour for remote daemon HTTP requests. Default implementation
   wraps `:httpc`; tests substitute a stub via the `:client` opt.
+
+  `get/2` is the read transport the registries poll with. `post/4` is the
+  write transport `Shuttle.Transition` forwards a cross-host transition with —
+  it returns the remote's status so the local daemon can relay it verbatim,
+  rather than collapsing every non-200 to `{:error, _}` the way `get/2` does.
   """
 
   @callback get(url :: String.t(), timeout_ms :: non_neg_integer()) ::
               {:ok, body :: String.t()} | {:error, term()}
+
+  @callback post(
+              url :: String.t(),
+              body :: String.t(),
+              content_type :: String.t(),
+              timeout_ms :: non_neg_integer()
+            ) ::
+              {:ok, status :: non_neg_integer(), body :: String.t()} | {:error, term()}
+
+  # Only the write transport (Transition forwarding) needs post/4; the
+  # read-only registry stubs implement get/2 alone.
+  @optional_callbacks post: 4
 end
 
 defmodule Shuttle.RemoteRegistry.Client.Default do
@@ -842,6 +859,29 @@ defmodule Shuttle.RemoteRegistry.Client.Default do
 
       {:ok, {{_, status, _}, _headers, _body}} ->
         {:error, {:http_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  rescue
+    e -> {:error, {:exception, Exception.message(e)}}
+  end
+
+  @impl true
+  def post(url, body, content_type, timeout_ms)
+      when is_binary(url) and is_binary(body) and is_binary(content_type) and is_integer(timeout_ms) do
+    {:ok, _} = Application.ensure_all_started(:inets)
+    {:ok, _} = Application.ensure_all_started(:ssl)
+
+    request =
+      {String.to_charlist(url), [], String.to_charlist(content_type), body}
+
+    http_opts = [{:timeout, timeout_ms}, {:connect_timeout, timeout_ms}]
+
+    case :httpc.request(:post, request, http_opts, []) do
+      {:ok, {{_, status, _}, _headers, resp_body}} ->
+        body_str = if is_list(resp_body), do: List.to_string(resp_body), else: resp_body
+        {:ok, status, body_str}
 
       {:error, reason} ->
         {:error, reason}
