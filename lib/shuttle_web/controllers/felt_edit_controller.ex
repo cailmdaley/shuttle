@@ -1,17 +1,19 @@
 defmodule ShuttleWeb.FeltEditController do
   @moduledoc """
-  Daemon-local felt-document surface edits for host-routed kanban cards.
+  Felt-document surface edits (tags, opaque scalar frontmatter, native `due:`)
+  for kanban cards — tag/horizon writes the kanban posts directly to Shuttle.
 
-  The owner-only kanban feed serves a fiber only when its `shuttle.host`
-  resolves to this daemon, so a viewer's tag edit on a remote-owned card routes
-  here over the SSH tunnel instead of editing the viewer's own loom mirror.
-  Single-writer at the document holds: the owner daemon is the lone writer of a
-  fiber it owns, and `felt edit` is the single felt-native writer (the same CLI
-  Portolan shells for local cards) for tags, opaque scalar frontmatter, and the
-  native `due:` date.
+  Owner-routed via `Shuttle.OriginRouter`: the request carries the `origin` the
+  composite board stamped. A local-owned card is edited here; a remote-owned
+  card is forwarded to the owning daemon's identical `/felt-edit` over the SSH
+  tunnel (origin stripped, so the owner edits its own loom mirror), and its
+  response is relayed verbatim. Single-writer at the document holds — the owner
+  daemon is the lone writer of a fiber it owns, and `felt edit` is the single
+  felt-native writer (the same CLI Portolan shells for local cards).
 
-  `POST /api/v1/felt-edit` body: `{ "fiber_id": "...", "add": [...],
-  "remove": [...], "set": {"key": scalar, ...}, "unset": [...], "due": "..." }`.
+  `POST /api/v1/felt-edit` body: `{ "fiber_id": "...", "origin": "...",
+  "add": [...], "remove": [...], "set": {"key": scalar, ...}, "unset": [...],
+  "due": "..." }`.
 
     * `add` / `remove` — tag diff (`felt edit --tag/--untag`).
     * `set` — opaque top-level scalar frontmatter (`felt edit --set key=value`);
@@ -29,9 +31,25 @@ defmodule ShuttleWeb.FeltEditController do
 
   use Phoenix.Controller, formats: [:json]
 
-  alias Shuttle.FeltStores
+  alias Shuttle.{FeltStores, OriginRouter}
 
   def create(conn, %{"fiber_id" => fiber_id} = params) when is_binary(fiber_id) do
+    case OriginRouter.route(Map.get(params, "origin")) do
+      {:remote, remote} ->
+        relay_text(conn, OriginRouter.forward(remote, "/api/v1/felt-edit", conn.body_params))
+
+      :local ->
+        create_local(conn, fiber_id, params)
+    end
+  end
+
+  def create(conn, _params) do
+    conn
+    |> put_resp_content_type("text/plain")
+    |> send_resp(400, "fiber_id is required")
+  end
+
+  defp create_local(conn, fiber_id, params) do
     add = string_list(params["add"])
     remove = string_list(params["remove"])
     unset = string_list(params["unset"])
@@ -56,10 +74,15 @@ defmodule ShuttleWeb.FeltEditController do
     end
   end
 
-  def create(conn, _params) do
+  # Relay a forwarded remote response verbatim, or surface a tunnel failure.
+  defp relay_text(conn, {:forwarded, status, body}) do
+    conn |> put_resp_content_type("text/plain") |> send_resp(status, body)
+  end
+
+  defp relay_text(conn, {:error, {:forward_failed, name, reason}}) do
     conn
     |> put_resp_content_type("text/plain")
-    |> send_resp(400, "fiber_id is required")
+    |> send_resp(502, "forward to #{name} failed: #{inspect(reason)}")
   end
 
   defp host_for_fiber(fiber_id) do

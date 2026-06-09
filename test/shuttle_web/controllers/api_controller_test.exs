@@ -882,13 +882,13 @@ defmodule ShuttleWeb.APIControllerTest do
     )
 
     previous_remotes = Application.get_env(:shuttle, :remotes)
-    previous_client = Application.get_env(:shuttle, :transition_client)
+    previous_client = Application.get_env(:shuttle, :write_forward_client)
     Application.put_env(:shuttle, :remotes, [%{name: "candide", url: "http://localhost:4001"}])
-    Application.put_env(:shuttle, :transition_client, StubPostClient)
+    Application.put_env(:shuttle, :write_forward_client, StubPostClient)
 
     on_exit(fn ->
       restore_app_env(:remotes, previous_remotes)
-      restore_app_env(:transition_client, previous_client)
+      restore_app_env(:write_forward_client, previous_client)
     end)
 
     conn =
@@ -924,13 +924,13 @@ defmodule ShuttleWeb.APIControllerTest do
     )
 
     previous_remotes = Application.get_env(:shuttle, :remotes)
-    previous_client = Application.get_env(:shuttle, :transition_client)
+    previous_client = Application.get_env(:shuttle, :write_forward_client)
     Application.put_env(:shuttle, :remotes, [%{name: "cineca", url: "http://localhost:4002"}])
-    Application.put_env(:shuttle, :transition_client, StubPostClient)
+    Application.put_env(:shuttle, :write_forward_client, StubPostClient)
 
     on_exit(fn ->
       restore_app_env(:remotes, previous_remotes)
-      restore_app_env(:transition_client, previous_client)
+      restore_app_env(:write_forward_client, previous_client)
     end)
 
     conn =
@@ -945,6 +945,150 @@ defmodule ShuttleWeb.APIControllerTest do
     assert body["invoked"] == false
     assert body["error"] == "action_not_available"
     assert body["origin"] == "cineca"
+  end
+
+  # ── Owner-routing for the non-drag write verbs (Shuttle.OriginRouter) ──
+  #
+  # The kanban posts tag/horizon edits, promote/requeue lifecycle, and
+  # review-comment history directly to Shuttle, carrying the `origin` the
+  # composite board stamped. A remote-owned card forwards to the owning daemon's
+  # IDENTICAL endpoint over the tunnel (origin stripped, so the owner runs its
+  # own local branch) and relays the response verbatim — the same one-hop shape
+  # /transition uses, via the shared forwarder.
+
+  defp stub_forward(remote_name, remote_url, response) do
+    start_supervised!(StubPostClient)
+    StubPostClient.set_response(response)
+
+    previous_remotes = Application.get_env(:shuttle, :remotes)
+    previous_client = Application.get_env(:shuttle, :write_forward_client)
+    Application.put_env(:shuttle, :remotes, [%{name: remote_name, url: remote_url}])
+    Application.put_env(:shuttle, :write_forward_client, StubPostClient)
+
+    on_exit(fn ->
+      restore_app_env(:remotes, previous_remotes)
+      restore_app_env(:write_forward_client, previous_client)
+    end)
+  end
+
+  test "felt-edit forwards a remote-owned card to the owning daemon" do
+    stub_forward("candide", "http://localhost:4001", {:ok, 200, "edited"})
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/felt-edit",
+        Jason.encode!(%{fiber_id: "tests/remote-card", origin: "candide", add: ["idea"]})
+      )
+
+    assert conn.status == 200
+    assert conn.resp_body == "edited"
+
+    last = StubPostClient.last()
+    assert last.url == "http://localhost:4001/api/v1/felt-edit"
+    # origin stripped so the owner treats the fiber as local; the rest crosses.
+    assert Jason.decode!(last.body) == %{"fiber_id" => "tests/remote-card", "add" => ["idea"]}
+  end
+
+  test "lifecycle forwards a remote-owned card to the owning daemon" do
+    stub_forward("candide", "http://localhost:4001", {:ok, 200, "paused"})
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/lifecycle",
+        Jason.encode!(%{action: "pause", fiber: "tests/remote-card", origin: "candide"})
+      )
+
+    assert conn.status == 200
+    assert conn.resp_body == "paused"
+
+    last = StubPostClient.last()
+    assert last.url == "http://localhost:4001/api/v1/lifecycle"
+    assert Jason.decode!(last.body) == %{"action" => "pause", "fiber" => "tests/remote-card"}
+  end
+
+  test "felt-history forwards a remote-owned card to the owning daemon" do
+    stub_forward("cineca", "http://localhost:4002", {:ok, 200, "appended"})
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/felt-history",
+        Jason.encode!(%{
+          fiber_id: "tests/remote-card",
+          kind: "review-comment",
+          summary: "do the thing",
+          origin: "cineca"
+        })
+      )
+
+    assert conn.status == 200
+    assert conn.resp_body == "appended"
+
+    last = StubPostClient.last()
+    assert last.url == "http://localhost:4002/api/v1/felt-history"
+
+    assert Jason.decode!(last.body) == %{
+             "fiber_id" => "tests/remote-card",
+             "kind" => "review-comment",
+             "summary" => "do the thing"
+           }
+  end
+
+  test "dispatch forwards a remote-owned card and relays its JSON" do
+    stub_forward(
+      "candide",
+      "http://localhost:4001",
+      {:ok, 200, Jason.encode!(%{"dispatched" => true, "fiber_id" => "tests/remote-card"})}
+    )
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/dispatch",
+        Jason.encode!(%{fiber_id: "tests/remote-card", origin: "candide"})
+      )
+
+    assert conn.status == 200
+    assert Jason.decode!(conn.resp_body)["dispatched"] == true
+
+    last = StubPostClient.last()
+    assert last.url == "http://localhost:4001/api/v1/dispatch"
+    assert Jason.decode!(last.body) == %{"fiber_id" => "tests/remote-card"}
+  end
+
+  test "felt-edit relays a tunnel failure as 502" do
+    stub_forward("candide", "http://localhost:4001", {:error, :econnrefused})
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/felt-edit",
+        Jason.encode!(%{fiber_id: "tests/remote-card", origin: "candide", add: ["x"]})
+      )
+
+    assert conn.status == 502
+    assert conn.resp_body =~ "forward to candide failed"
+  end
+
+  test "an unknown origin falls through to local — no forward, local arbitrates" do
+    stub_forward("candide", "http://localhost:4001", {:ok, 200, "should-not-be-used"})
+
+    # origin "ghost" matches no configured remote → :local. The fiber isn't in
+    # the local store, so the local branch returns a clean not-found rather than
+    # forwarding anywhere.
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/felt-edit",
+        Jason.encode!(%{fiber_id: "tests/nonexistent", origin: "ghost", add: ["x"]})
+      )
+
+    assert conn.status == 400
+    assert conn.resp_body =~ "fiber not found"
+    # The forwarder was never touched — no silent mis-route to the wrong host.
+    assert StubPostClient.last() == nil
   end
 
   # ── POST /api/v1/wait ──

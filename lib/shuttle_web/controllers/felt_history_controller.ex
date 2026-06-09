@@ -1,19 +1,38 @@
 defmodule ShuttleWeb.FeltHistoryController do
   @moduledoc """
-  Daemon-local felt history writes for host-routed Shuttle launches.
+  Felt history writes for kanban cards — the review-comment directive the kanban
+  files before (re)dispatching, landing in the same loom the worker reads.
 
-  Portolan uses this before dispatching through a remote daemon so
-  review-comment directives land in the same loom the worker will read.
+  Owner-routed via `Shuttle.OriginRouter`: a local-owned card's event is
+  appended here; a remote-owned card's request is forwarded to the owning
+  daemon's identical `/felt-history` (origin stripped), so the event lands in the
+  owner's loom, and the response is relayed verbatim.
   """
 
   use Phoenix.Controller, formats: [:json]
 
-  alias Shuttle.FeltStores
+  alias Shuttle.{FeltStores, OriginRouter}
 
   def create(conn, %{"fiber_id" => fiber_id, "kind" => kind, "summary" => summary} = params)
       when is_binary(fiber_id) and is_binary(kind) and is_binary(summary) do
+    case OriginRouter.route(Map.get(params, "origin")) do
+      {:remote, remote} ->
+        relay_text(conn, OriginRouter.forward(remote, "/api/v1/felt-history", conn.body_params))
+
+      :local ->
+        create_local(conn, fiber_id, kind, summary, Map.get(params, "fields", %{}))
+    end
+  end
+
+  def create(conn, _params) do
+    conn
+    |> put_resp_content_type("text/plain")
+    |> send_resp(400, "fiber_id, kind, and summary are required")
+  end
+
+  defp create_local(conn, fiber_id, kind, summary, fields) do
     with {:ok, host, address} <- host_for_fiber(fiber_id),
-         {:ok, output} <- run(host, address, kind, summary, Map.get(params, "fields", %{})) do
+         {:ok, output} <- run(host, address, kind, summary, fields) do
       conn
       |> put_resp_content_type("text/plain")
       |> send_resp(200, output)
@@ -30,10 +49,14 @@ defmodule ShuttleWeb.FeltHistoryController do
     end
   end
 
-  def create(conn, _params) do
+  defp relay_text(conn, {:forwarded, status, body}) do
+    conn |> put_resp_content_type("text/plain") |> send_resp(status, body)
+  end
+
+  defp relay_text(conn, {:error, {:forward_failed, name, reason}}) do
     conn
     |> put_resp_content_type("text/plain")
-    |> send_resp(400, "fiber_id, kind, and summary are required")
+    |> send_resp(502, "forward to #{name} failed: #{inspect(reason)}")
   end
 
   defp host_for_fiber(fiber_id) do

@@ -1,20 +1,33 @@
 defmodule ShuttleWeb.LifecycleController do
   @moduledoc """
-  Agent-API endpoint for daemon-local shuttle lifecycle mutations.
+  Agent-API endpoint for shuttle lifecycle mutations — the kanban's promote /
+  requeue / pause / resume writes, posted directly to Shuttle.
 
-  Cross-host lifecycle requests from Portolan land here on the selected
-  daemon. The endpoint delegates to the existing shuttle-ctl Go CLI, so the
-  validated offline frontmatter writer remains the single implementation of
+  Owner-routed via `Shuttle.OriginRouter`: a local-owned card's mutation runs
+  here; a remote-owned card's request is forwarded to the owning daemon's
+  identical `/lifecycle` (origin stripped) and relayed verbatim. The local
+  branch delegates to the existing shuttle-ctl Go CLI, so the validated offline
+  frontmatter writer remains the single implementation of
   install/pause/resume/repeat/accept/set-model/set-interactive/set-outcome/uninstall.
   """
 
   use Phoenix.Controller, formats: [:json]
 
-  alias Shuttle.{FeltStores, LifecycleService}
+  alias Shuttle.{FeltStores, LifecycleService, OriginRouter}
 
   @allowed ~w(install pause resume repeat accept set-model set-interactive set-outcome uninstall)
 
   def create(conn, params) do
+    case OriginRouter.route(Map.get(params, "origin")) do
+      {:remote, remote} ->
+        relay_text(conn, OriginRouter.forward(remote, "/api/v1/lifecycle", conn.body_params))
+
+      :local ->
+        create_local(conn, params)
+    end
+  end
+
+  defp create_local(conn, params) do
     with {:ok, action} <- action(params),
          {:ok, output} <- execute(action, params) do
       conn
@@ -31,6 +44,16 @@ defmodule ShuttleWeb.LifecycleController do
         |> put_resp_content_type("text/plain")
         |> send_resp(422, "shuttle exited #{status}: #{output}")
     end
+  end
+
+  defp relay_text(conn, {:forwarded, status, body}) do
+    conn |> put_resp_content_type("text/plain") |> send_resp(status, body)
+  end
+
+  defp relay_text(conn, {:error, {:forward_failed, name, reason}}) do
+    conn
+    |> put_resp_content_type("text/plain")
+    |> send_resp(502, "forward to #{name} failed: #{inspect(reason)}")
   end
 
   defp action(%{"action" => action}) when action in @allowed, do: {:ok, action}

@@ -2,14 +2,32 @@ defmodule ShuttleWeb.DispatchController do
   @moduledoc """
   Agent-API endpoint: POST /api/v1/dispatch
 
-  Dispatches a sub-fiber worker. Used by the `confer` pattern:
-  Worker A asks Shuttle to dispatch Worker B and subscribes to
-  `shuttle:worker:<fiber_id>` for exit notification.
+  Dispatches a worker. Two callers:
+
+    * the `confer` pattern — Worker A asks Shuttle to dispatch Worker B and
+      subscribes to `shuttle:worker:<fiber_id>` for exit notification. No
+      `origin`, so it always runs locally (the channel is on this daemon).
+    * the kanban's requeue verb — re-dispatch a remote-owned card. It carries
+      the `origin` the composite board stamped, so `Shuttle.OriginRouter`
+      forwards to the owning daemon's identical `/dispatch` (origin stripped),
+      where the worker must run, and relays the response verbatim.
   """
 
   use Phoenix.Controller, formats: [:json]
 
+  alias Shuttle.OriginRouter
+
   def create(conn, params) do
+    case OriginRouter.route(Map.get(params, "origin")) do
+      {:remote, remote} ->
+        relay_json(conn, OriginRouter.forward(remote, "/api/v1/dispatch", conn.body_params))
+
+      :local ->
+        create_local(conn, params)
+    end
+  end
+
+  defp create_local(conn, params) do
     fiber_id = Map.get(params, "fiber_id")
     notify_on_exit = Map.get(params, "notify_on_exit", false)
     force = truthy?(Map.get(params, "force", false))
@@ -73,6 +91,18 @@ defmodule ShuttleWeb.DispatchController do
           |> json(%{dispatched: false, reason: inspect(reason), fiber_id: fiber_id})
       end
     end
+  end
+
+  # Relay a forwarded remote response verbatim (the body is already JSON the
+  # owning daemon produced), or surface a tunnel failure as JSON.
+  defp relay_json(conn, {:forwarded, status, body}) do
+    conn |> put_resp_content_type("application/json") |> send_resp(status, body)
+  end
+
+  defp relay_json(conn, {:error, {:forward_failed, name, reason}}) do
+    conn
+    |> put_status(502)
+    |> json(%{dispatched: false, reason: "forward_failed", origin: name, error: inspect(reason)})
   end
 
   defp truthy?(value) when value in [true, "true", "1", 1], do: true

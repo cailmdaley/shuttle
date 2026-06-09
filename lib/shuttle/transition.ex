@@ -26,19 +26,18 @@ defmodule Shuttle.Transition do
 
     3. **Forward branch** = `POST <remote>/api/v1/transition` with `origin`
        omitted, so the owning daemon runs its OWN local branch against its
-       authoritative state. Terminating in one hop: a fiber has exactly one
-       owner, and the owner never re-forwards. No felt-store registration is
-       needed — a remote only serves a fiber in its owner feed when it already
-       owns the store, so the store is configured by construction.
+       authoritative state. The owner-routing (route + forward) is
+       `Shuttle.OriginRouter`, the one forwarder every write endpoint shares;
+       this service only adds the resolve+invoke local branch and re-stamps the
+       relayed response's `origin`. Terminating in one hop: a fiber has exactly
+       one owner, and the owner never re-forwards.
 
   Both this service's `/transition` endpoint and the legacy `/actions/invoke`
   endpoint share `invoke/2` and `http_error/1`, so the invoke pipeline and its
   status mapping have a single implementation.
   """
 
-  alias Shuttle.{Actions, FeltStores, LifecycleService, Poller, Remote}
-
-  @default_forward_timeout_ms 30_000
+  alias Shuttle.{Actions, FeltStores, LifecycleService, OriginRouter, Poller, Remote}
 
   @typedoc """
   The local outcome of a transition: `{:ok, action_id}` on success, a structured
@@ -59,37 +58,10 @@ defmodule Shuttle.Transition do
   """
   @spec transition(String.t(), String.t(), String.t() | nil, keyword()) :: result()
   def transition(fiber_id, target, origin, opts \\ []) do
-    case route(origin, opts) do
+    case OriginRouter.route(origin, opts) do
       :local -> transition_local(fiber_id, target)
       {:remote, %Remote{} = remote} -> forward(remote, fiber_id, target, origin, opts)
     end
-  end
-
-  # ── Routing ──
-
-  defp route(origin, opts) do
-    own = Keyword.get(opts, :own_host_id) || Poller.own_host_id()
-
-    cond do
-      origin in [nil, "", "local", own] ->
-        :local
-
-      true ->
-        case find_remote(origin, opts) do
-          %Remote{} = remote -> {:remote, remote}
-          # Unknown origin: the local daemon is the final arbiter. If it owns the
-          # fiber it acts; if not, its availability gate returns a clean error
-          # rather than a silent mis-route.
-          nil -> :local
-        end
-    end
-  end
-
-  defp find_remote(origin, opts) do
-    opts
-    |> Keyword.get(:remotes, Application.get_env(:shuttle, :remotes, []))
-    |> Remote.from_config_list()
-    |> Enum.find(&(&1.name == origin))
   end
 
   # ── Local branch: resolve + invoke ──
@@ -209,32 +181,18 @@ defmodule Shuttle.Transition do
 
   # ── Forward branch: relay to the owning remote daemon ──
 
+  # Delegate route+POST to OriginRouter (the shared forwarder), then re-stamp
+  # `origin` on the decoded body: the remote computed its response treating the
+  # fiber as local, so its `origin` would read "local"/its own id. The kanban
+  # always sees the origin it routed to.
   defp forward(%Remote{} = remote, fiber_id, target, origin, opts) do
-    client = Keyword.get(opts, :client) || forward_client()
-    timeout = Keyword.get(opts, :forward_timeout_ms, @default_forward_timeout_ms)
-    url = transition_url(remote)
-    payload = Jason.encode!(%{fiber_id: fiber_id, target: target})
-
-    case client.post(url, payload, "application/json", timeout) do
-      {:ok, status, body} ->
-        # Re-stamp origin with what the caller sent: the remote computed its own
-        # response treating the fiber as local, so its `origin` would read
-        # "local"/its own id. The kanban always sees the origin it routed to.
+    case OriginRouter.forward(remote, "/api/v1/transition", %{fiber_id: fiber_id, target: target}, opts) do
+      {:forwarded, status, body} ->
         {:forwarded, status, Map.put(decode_body(body), "origin", origin)}
 
-      {:error, reason} ->
-        {:error, {:forward_failed, remote.name, reason}}
+      {:error, _reason} = error ->
+        error
     end
-  end
-
-  defp transition_url(%Remote{url: url}) do
-    url
-    |> String.trim_trailing("/")
-    |> Kernel.<>("/api/v1/transition")
-  end
-
-  defp forward_client do
-    Application.get_env(:shuttle, :transition_client, Shuttle.RemoteRegistry.Client.Default)
   end
 
   defp decode_body(body) when is_binary(body) do
