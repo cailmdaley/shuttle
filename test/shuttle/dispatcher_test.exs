@@ -183,6 +183,18 @@ defmodule Shuttle.DispatcherTest do
     refute prompt =~ "Exit before context is half-full"
   end
 
+  test "render_prompt names the felt store so the safe-fail global id stays resolvable" do
+    # When prompt_fiber_id's local translation misses, the worker holds a
+    # global id that doesn't resolve from cwd. The store line makes the
+    # fallback mechanical: `felt -C <felt-store> show <id>`.
+    prompt = Dispatcher.render_prompt("tests/haiku", felt_store: "/tmp/some-loom")
+    assert prompt =~ "Felt store: /tmp/some-loom"
+
+    # Default store renders too — the line is unconditional.
+    default_prompt = Dispatcher.render_prompt("tests/haiku")
+    assert default_prompt =~ "Felt store: "
+  end
+
   test "render_prompt omits the From User block when there's no review-comment" do
     # tests/haiku has no felt index; the user-message block suppresses to
     # an empty string, leaving just the header.

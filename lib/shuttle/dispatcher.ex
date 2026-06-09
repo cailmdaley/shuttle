@@ -675,16 +675,35 @@ defmodule Shuttle.Dispatcher do
   # `felt history` on arrival, and duplicating either here risks drift
   # between the prompt's snapshot and felt's view.
   defp compose_prompt(header, fiber_id, opts) do
+    felt_store = Keyword.get(opts, :felt_store, default_felt_store())
+
     felt_opts = [
-      felt_store: Keyword.get(opts, :felt_store, default_felt_store()),
+      felt_store: felt_store,
       shuttle: Keyword.get(opts, :shuttle)
     ]
+
+    # The store line is the worker's absolute anchor. `prompt_fiber_id`
+    # translates the global id to the work_dir-local view when it can, but
+    # its safe-fail hands the worker a *global* id that doesn't resolve from
+    # cwd either — historically the worker then groped for the fiber. With
+    # the store named, the fallback read is mechanical:
+    # `felt -C <felt-store> show <id>`. (When local resolution succeeded,
+    # plain `felt show <id>` from the project dir works and the line is
+    # simply unused.)
+    header =
+      case felt_store do
+        store when is_binary(store) and store != "" ->
+          String.trim(header) <> "\nFelt store: #{store}"
+
+        _ ->
+          String.trim(header)
+      end
 
     # Order: header, exit contract, interactive exception (when set), user
     # message block. The exit contract is always present; the prelude is an
     # explicit exception that tells the worker to stay alive.
     [
-      String.trim(header),
+      header,
       render_exit_contract(),
       render_interactive_prelude(fiber_id, felt_opts),
       render_user_message_block(fiber_id, felt_opts)

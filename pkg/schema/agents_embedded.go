@@ -10,7 +10,7 @@ var embeddedAgentJSON = []byte(`
     "cli": "claude",
     "wrapper": "claude",
     "model": "sonnet",
-    "extra_flags": "--dangerously-skip-permissions",
+    "extra_flags": "--permission-mode auto",
     "aliases": [],
     "default": true
   },
@@ -19,7 +19,16 @@ var embeddedAgentJSON = []byte(`
     "cli": "claude",
     "wrapper": "claude",
     "model": "opus",
-    "extra_flags": "--dangerously-skip-permissions",
+    "extra_flags": "--permission-mode auto",
+    "aliases": [],
+    "default": false
+  },
+  {
+    "id": "claude-fable",
+    "cli": "claude",
+    "wrapper": "claude",
+    "model": "fable",
+    "extra_flags": "--permission-mode auto",
     "aliases": [],
     "default": false
   },
@@ -28,7 +37,7 @@ var embeddedAgentJSON = []byte(`
     "cli": "claude",
     "wrapper": "claude",
     "model": "opus",
-    "extra_flags": "--dangerously-skip-permissions --chrome",
+    "extra_flags": "--permission-mode auto --chrome",
     "aliases": [],
     "default": false
   },
@@ -37,7 +46,7 @@ var embeddedAgentJSON = []byte(`
     "cli": "claude",
     "wrapper": "claude",
     "model": "haiku",
-    "extra_flags": "--dangerously-skip-permissions",
+    "extra_flags": "--permission-mode auto",
     "aliases": [],
     "default": false
   },
