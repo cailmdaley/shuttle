@@ -109,6 +109,48 @@ defmodule ShuttleWeb.LifecycleControllerTest do
              "set-outcome\ntests/outcome-edit\n--outcome\nBlocked: waiting on ADS token\nsecond line\n"
   end
 
+  # set-agent composes base agent × effort × chrome in one validated write.
+  # The agent positional is optional and the axes ride as flags; chrome always
+  # renders explicitly (`--chrome=true|false`) so a toggle-off is unambiguous,
+  # and effort passes through verbatim.
+  test "set-agent forwards agent plus effort and chrome axes to shuttle-ctl" do
+    root =
+      System.tmp_dir!()
+      |> Path.join("shuttle-lifecycle-set-agent-#{System.unique_integer([:positive])}")
+
+    store = Path.join(root, "loom")
+    fiber_dir = Path.join([store, ".felt", "tests", "axes-edit"])
+    File.mkdir_p!(fiber_dir)
+    File.write!(Path.join(fiber_dir, "axes-edit.md"), "---\nname: Axes edit\n---\n\n")
+
+    args_file = install_fake_shuttle_ctl!()
+    old_loom_homes = System.get_env("LOOM_HOMES")
+    System.put_env("LOOM_HOMES", store)
+
+    on_exit(fn ->
+      restore_env("LOOM_HOMES", old_loom_homes)
+      File.rm_rf(root)
+    end)
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/lifecycle",
+        Jason.encode!(%{
+          "action" => "set-agent",
+          "fiber" => "tests/axes-edit",
+          "agent" => "claude-opus",
+          "effort" => "xhigh",
+          "chrome" => true
+        })
+      )
+
+    assert conn.status == 200
+
+    assert File.read!(args_file) ==
+             "set-agent\ntests/axes-edit\nclaude-opus\n--effort\nxhigh\n--chrome=true\n"
+  end
+
   test "accept for standing roles re-arms from the doc and evicts runtime frontmatter" do
     root =
       System.tmp_dir!()

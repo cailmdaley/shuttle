@@ -1450,6 +1450,48 @@ Body.
 	}
 }
 
+func TestReopenCmd_AsDraftReopensToOpenNotArmed(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	// --as-draft is the kanban's "plan this again" verb: a closed card dragged
+	// to Drafts / a future date / the stash reopens as a PAUSED DRAFT
+	// (status:open, verdict + closed-at cleared) — never status:active, which
+	// is the dispatch gate and would auto-spawn a worker (the slides
+	// snap-back; Portolan kanban-ux-rework/placement-pipeline-invariants).
+	path := writeFiber(t, host, "slides", `---
+name: Slides
+status: closed
+tempered: true
+closed-at: 2026-06-01T09:30:00Z
+shuttle:
+  kind: oneshot
+---
+
+Body.
+`)
+
+	reopenAsDraft = true
+	defer func() { reopenAsDraft = false }()
+	if err := reopenCmd.RunE(reopenCmd, []string{"slides"}); err != nil {
+		t.Fatalf("RunE: %v", err)
+	}
+
+	text := readFiberText(t, path)
+	if !strings.Contains(text, "status: open") {
+		t.Fatalf("expected status: open after reopen --as-draft:\n%s", text)
+	}
+	if strings.Contains(text, "status: active") {
+		t.Fatalf("reopen --as-draft must NOT arm the dispatch gate:\n%s", text)
+	}
+	if strings.Contains(text, "tempered") {
+		t.Fatalf("reopen --as-draft should clear the verdict:\n%s", text)
+	}
+	if strings.Contains(text, "closed-at") || strings.Contains(text, "closed_at") {
+		t.Fatalf("reopen --as-draft should clear closed-at:\n%s", text)
+	}
+}
+
 func TestCloseCmd_OneshotWritesNoReviewBlock(t *testing.T) {
 	host, cleanup := withTempHost(t)
 	defer cleanup()

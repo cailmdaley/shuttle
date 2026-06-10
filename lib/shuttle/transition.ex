@@ -144,6 +144,13 @@ defmodule Shuttle.Transition do
 
   defp invoke_action(fiber_id, "reopen", host), do: run_offline(["reopen", fiber_id], host)
 
+  # reopen-draft: status:open + verdict cleared — a paused draft, NOT armed.
+  # The kanban's "drag a closed card to Drafts" verb, and the park-as-draft
+  # half it composes before a planning-surface drop on a closed card (the
+  # slides snap-back fix; see Portolan kanban-ux-rework/placement-pipeline-invariants).
+  defp invoke_action(fiber_id, "reopen-draft", host),
+    do: run_offline(["reopen", fiber_id, "--as-draft"], host)
+
   # accept-run goes through the in-process lifecycle path so the felt-document
   # re-arm happens atomically against poll cycles, not the Go `shuttle-ctl
   # accept` (which can race a concurrent poll's document read).

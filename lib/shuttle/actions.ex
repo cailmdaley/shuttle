@@ -10,6 +10,7 @@ defmodule Shuttle.Actions do
   @type action_id ::
           :pause
           | :reopen
+          | :reopen_draft
           | :accept_run
           | :dispatch_ad_hoc
           | :close_awaiting_review
@@ -17,7 +18,7 @@ defmodule Shuttle.Actions do
           | :close_composted
 
   @transition_targets ~w(drafts inFlight queued active awaitingReview tempered composted)
-  @action_ids ~w(pause reopen accept-run dispatch-ad-hoc close-awaiting-review close-tempered close-composted)
+  @action_ids ~w(pause reopen reopen-draft accept-run dispatch-ad-hoc close-awaiting-review close-tempered close-composted)
 
   @spec actions_for(map(), boolean()) :: [map()]
   def actions_for(fiber, running? \\ false) when is_map(fiber) do
@@ -97,8 +98,10 @@ defmodule Shuttle.Actions do
       # pending a human verdict" — felt-native, no `review.state`. Only a
       # STANDING role re-arms (a oneshot closes for good). The verdict gestures:
       # inFlight/tempered = keep it (accept-run → advance the schedule),
-      # drafts/composted = reject (close-composted), awaitingReview = no-op (a
-      # same-column drop stays in review). This clause MUST precede the generic
+      # composted = reject (close-composted), drafts = park the role as a
+      # paused draft (reopen-draft — stopping a role for now is not the same
+      # verdict as composting it), awaitingReview = no-op (a same-column drop
+      # stays in review). This clause MUST precede the generic
       # `status == "closed"` clauses below — those resolve a closed fiber to
       # reopen/close, which would TERMINATE the role instead of re-arming it
       # (the slice-1 entanglement). Tempered-true and composted (tempered:false)
@@ -108,23 +111,35 @@ defmodule Shuttle.Actions do
         :accept_run
 
       status == "closed" and cyclical?(shuttle) and untempered?(fiber) and
-          target in ["drafts", "composted"] ->
+          target == "composted" ->
         :close_composted
 
       status == "closed" and cyclical?(shuttle) and untempered?(fiber) and
           target == "awaitingReview" ->
         :close_awaiting_review
 
-      # A closed fiber's only forward move is reopen (which clears closed_at /
-      # tempered); shuttle-ctl refuses a direct pause/close on an already-closed
-      # fiber. Portolan's un-temper sequence drags through inFlight first for
-      # the other open-lifecycle targets, so every non-close target collapses to
-      # reopen here. The close columns re-close with the chosen verdict. This
-      # group now catches oneshot termini and tempered/composted standing
-      # termini; the awaiting (closed + untempered + standing) case is handled
-      # above and never reaches here.
-      status == "closed" and target in ["drafts", "inFlight", "awaitingReview"] ->
+      # A closed fiber dragged to Drafts reopens AS A DRAFT (status:open,
+      # verdict cleared — `shuttle reopen --as-draft`): the gesture means
+      # "plan this again," not "run it now," so it must not arm the dispatch
+      # gate. This is also the park-as-draft verb the kanban composes before
+      # a planning-surface drop (timeline date / stash) on a closed card —
+      # the slides snap-back fix (see Portolan
+      # kanban-ux-rework/placement-pipeline-invariants).
+      status == "closed" and target == "drafts" ->
+        :reopen_draft
+
+      # inFlight is the one closed-card target that ARMS: reopen → active.
+      # (The kanban actually launches via force-dispatch, which reopens en
+      # route; this mapping keeps the bare transition coherent.)
+      status == "closed" and target == "inFlight" ->
         :reopen
+
+      # Dragging a tempered/composted card back to Awaiting review revokes the
+      # verdict but keeps the card closed: re-close with tempered cleared.
+      # (Resolving this to reopen — as it once did — armed the card and
+      # snapped it to In flight instead of Awaiting review.)
+      status == "closed" and target == "awaitingReview" ->
+        :close_awaiting_review
 
       status == "closed" and target == "tempered" ->
         :close_tempered
@@ -134,9 +149,13 @@ defmodule Shuttle.Actions do
 
       # A draft (`status: open`) is paused/not-yet-armed (slice 5: status is the
       # sole gate, no enabled flag). Dragging it out of drafts arms it via
-      # reopen (→ status:active); a drop back in drafts is a no-op pause. The
-      # close columns close it with the chosen verdict.
-      status == "open" and target in ["drafts", "inFlight"] ->
+      # reopen (→ status:active). A drop ON drafts (reachable from the timeline
+      # / stash surfaces) parks it — pause, an idempotent no-op for an open
+      # fiber — never reopen, which would arm and snap the card to In flight.
+      status == "open" and target == "drafts" ->
+        :pause
+
+      status == "open" and target == "inFlight" ->
         :reopen
 
       # An armed fiber (`status: active`). drafts parks it (pause → status:open).
@@ -166,6 +185,7 @@ defmodule Shuttle.Actions do
 
   defp invocation(:pause), do: %{verb: "pause"}
   defp invocation(:reopen), do: %{verb: "reopen"}
+  defp invocation(:reopen_draft), do: %{verb: "reopen", as_draft: true}
   defp invocation(:accept_run), do: %{verb: "accept"}
   defp invocation(:dispatch_ad_hoc), do: %{verb: "dispatch", ad_hoc: true}
   defp invocation(:close_awaiting_review), do: %{verb: "close"}

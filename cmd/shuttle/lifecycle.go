@@ -285,6 +285,8 @@ until they are reopened.`,
 	},
 }
 
+var reopenAsDraft bool
+
 var reopenCmd = &cobra.Command{
 	Use:   "reopen <fiber>",
 	Short: "Requeue a closed or reviewed fiber back into active work",
@@ -293,7 +295,12 @@ card re-enters the in-flight loop. status:active is the sole dispatch gate
 (slice 5: no enabled flag).
 
 This is the canonical reopen path for Kanban requeues from Awaiting review,
-Tempered, or Composted back to In flight.`,
+Tempered, or Composted back to In flight.
+
+With --as-draft, sets status = open instead: the card reopens as a PAUSED
+DRAFT — visible on the board, never auto-dispatched. This is the verb behind
+the kanban's "drag a closed card onto Drafts / a future date / the stash"
+gestures, where the user means "plan this again," not "run it now."`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		path, _, _ := resolveFiber(args[0])
@@ -306,19 +313,23 @@ Tempered, or Composted back to In flight.`,
 			return err
 		}
 
+		status := "active"
+		if reopenAsDraft {
+			status = "open"
+		}
 		statusBefore := f.Status()
-		f.SetStatus("active")
+		f.SetStatus(status)
 		f.SetTempered(nil)
 		f.ClearClosedAt()
 		if err := f.WriteBlock(f.Block); err != nil {
 			return fmt.Errorf("writing fiber: %w", err)
 		}
 
-		fmt.Printf("reopened %s (status: active)\n", args[0])
+		fmt.Printf("reopened %s (status: %s)\n", args[0], status)
 		if statusBefore == "" {
-			fmt.Println("  status: active (set; was missing)")
-		} else if statusBefore != "active" {
-			fmt.Printf("  status: %s → active\n", statusBefore)
+			fmt.Printf("  status: %s (set; was missing)\n", status)
+		} else if statusBefore != status {
+			fmt.Printf("  status: %s → %s\n", statusBefore, status)
 		}
 		fmt.Println("  cleared: tempered, closed-at")
 		return nil
@@ -676,6 +687,8 @@ func init() {
 	rootCmd.AddCommand(pauseCmd)
 	rootCmd.AddCommand(resumeCmd)
 	rootCmd.AddCommand(closeCmd)
+	reopenCmd.Flags().BoolVar(&reopenAsDraft, "as-draft", false,
+		"reopen to status: open (a paused draft, not auto-dispatched) instead of status: active")
 	rootCmd.AddCommand(reopenCmd)
 	rootCmd.AddCommand(setOutcomeCmd)
 	rootCmd.AddCommand(acceptCmd)

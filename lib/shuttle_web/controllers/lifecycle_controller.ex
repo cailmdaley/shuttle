@@ -21,7 +21,7 @@ defmodule ShuttleWeb.LifecycleController do
 
   alias Shuttle.{FeltStores, LifecycleService, OriginRouter}
 
-  @allowed ~w(install pause resume repeat pin accept set-model set-outcome uninstall)
+  @allowed ~w(install pause resume repeat pin accept set-model set-agent set-outcome uninstall)
 
   def create(conn, params) do
     case OriginRouter.route(Map.get(params, "origin")) do
@@ -87,7 +87,7 @@ defmodule ShuttleWeb.LifecycleController do
   end
 
   defp execute(action, %{"fiber" => fiber} = params)
-       when action in ~w(pause set-model set-outcome uninstall) do
+       when action in ~w(pause set-model set-agent set-outcome uninstall) do
     with {:ok, fiber_id} <- fiber_address(fiber) do
       action
       |> args_for(%{params | "fiber" => fiber_id})
@@ -155,6 +155,31 @@ defmodule ShuttleWeb.LifecycleController do
 
   defp args_for("set-model", %{"fiber" => fiber, "agent" => agent}),
     do: {:ok, ["set-model", fiber, agent]}
+
+  # set-agent composes base agent × effort × chrome in one validated write.
+  # The agent positional is optional (omit to mutate only axes); effort and
+  # chrome are forwarded only when present so an unspecified axis is left
+  # untouched. Chrome renders `--chrome` / `--chrome=false` (cobra reads
+  # Changed), and effort passes through verbatim — including `--effort ""` to
+  # clear back to the harness default.
+  defp args_for("set-agent", %{"fiber" => fiber} = params) do
+    args = ["set-agent", fiber]
+    args = if(is_binary(params["agent"]) and params["agent"] != "", do: args ++ [params["agent"]], else: args)
+
+    args =
+      case params do
+        %{"effort" => effort} when is_binary(effort) -> args ++ ["--effort", effort]
+        _ -> args
+      end
+
+    args =
+      case params do
+        %{"chrome" => chrome} when is_boolean(chrome) -> args ++ ["--chrome=#{chrome}"]
+        _ -> args
+      end
+
+    {:ok, args}
+  end
 
   # The outcome string round-trips as a single argv element, so multi-line
   # values (block scalars) survive without stdin piping. set-outcome refuses a

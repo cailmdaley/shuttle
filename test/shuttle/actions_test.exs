@@ -38,7 +38,10 @@ defmodule Shuttle.ActionsTest do
     assert {:ok, %{id: "close-composted", invocation: %{verb: "close", tempered: false}}} =
              Actions.resolve_transition(fiber, "composted")
 
-    assert {:ok, %{id: "close-composted"}} = Actions.resolve_transition(fiber, "drafts")
+    # Drafts parks the role as a paused draft — a "stop for now," not a
+    # compost verdict (reopen-draft → status:open, never armed).
+    assert {:ok, %{id: "reopen-draft", invocation: %{verb: "reopen", as_draft: true}}} =
+             Actions.resolve_transition(fiber, "drafts")
 
     assert {:ok, %{id: "close-awaiting-review"}} =
              Actions.resolve_transition(fiber, "awaitingReview")
@@ -229,11 +232,18 @@ defmodule Shuttle.ActionsTest do
       assert {:ok, %{id: "close-composted", invocation: %{verb: "close", tempered: false}}} =
                Actions.resolve_transition(fiber, "composted")
 
-      # The open-lifecycle columns still reopen (clears closed_at / tempered);
-      # accept-run must NOT appear for a closed role that already has a verdict.
-      for target <- ~w(drafts inFlight awaitingReview) do
-        assert {:ok, %{id: "reopen"}} = Actions.resolve_transition(fiber, target)
-      end
+      # The open-lifecycle columns clear the verdict, each with the meaning of
+      # its own column: inFlight arms (reopen → active), drafts parks as a
+      # paused draft (reopen-draft → open), awaitingReview re-closes with the
+      # verdict cleared (back to review). accept-run must NOT appear for a
+      # closed role that already has a verdict.
+      assert {:ok, %{id: "reopen"}} = Actions.resolve_transition(fiber, "inFlight")
+
+      assert {:ok, %{id: "reopen-draft", invocation: %{verb: "reopen", as_draft: true}}} =
+               Actions.resolve_transition(fiber, "drafts")
+
+      assert {:ok, %{id: "close-awaiting-review"}} =
+               Actions.resolve_transition(fiber, "awaitingReview")
 
       available = Actions.actions_for(fiber) |> Enum.map(& &1.id)
       refute "accept-run" in available
