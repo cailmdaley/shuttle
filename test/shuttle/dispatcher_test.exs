@@ -537,6 +537,69 @@ defmodule Shuttle.DispatcherTest do
     assert cmd =~ "--model 'moonshotai/kimi-k2.6'"
   end
 
+  # ── Axis rendering (effort × chrome) per harness ──
+
+  test "claude effort renders --effort and chrome renders --chrome" do
+    {:ok, agent} = Agents.resolve_with_axes("claude-opus", "xhigh", true)
+    cmd = Agents.build_command(agent, "hi")
+    assert cmd =~ "--effort 'xhigh'"
+    assert cmd =~ "--chrome"
+  end
+
+  test "claude with no axes renders neither --effort nor --chrome" do
+    {:ok, agent} = Agents.resolve_with_axes("claude-opus", nil, false)
+    cmd = Agents.build_command(agent, "hi")
+    refute cmd =~ "--effort"
+    refute cmd =~ "--chrome"
+  end
+
+  test "pi renders effort as :level suffix on the model" do
+    {:ok, agent} = Agents.resolve_with_axes("pi-gpt-5.4", "high", false)
+    cmd = Agents.build_command(agent, "hi")
+    assert cmd =~ "--model 'gpt-5.4:high'"
+    refute cmd =~ "--effort"
+  end
+
+  test "pi default effort preserves the legacy suffix (pi-sonnet :high)" do
+    {:ok, agent} = Agents.resolve_with_axes("pi-sonnet", nil, false)
+    cmd = Agents.build_command(agent, "hi")
+    assert cmd =~ "--model 'claude-sonnet-4.6:high'"
+  end
+
+  test "codex renders effort via -c model_reasoning_effort" do
+    {:ok, agent} = Agents.resolve_with_axes("codex", "high", false)
+    cmd = Agents.build_command(agent, "hi")
+    assert cmd =~ ~s(-c model_reasoning_effort='high')
+  end
+
+  test "claude-opus-chrome alias expands to claude-opus + --chrome" do
+    {:ok, agent} = Agents.resolve_with_axes("claude-opus-chrome", nil, false)
+    assert agent.id == "claude-opus"
+    cmd = Agents.build_command(agent, "hi")
+    assert cmd =~ "--model 'opus'"
+    assert cmd =~ "--chrome"
+  end
+
+  test "effort out of range is rejected (Copilot Sonnet capped at high)" do
+    assert {:error, msg} = Agents.resolve_with_axes("pi-sonnet", "xhigh", false)
+    assert msg =~ "not allowed"
+  end
+
+  test "chrome on a non-claude harness is rejected" do
+    assert {:error, msg} = Agents.resolve_with_axes("codex", nil, true)
+    assert msg =~ "chrome not supported"
+  end
+
+  test "effort on an agent without an effort axis is rejected" do
+    assert {:error, msg} = Agents.resolve_with_axes("pi-kimi", "high", false)
+    assert msg =~ "does not support an effort"
+  end
+
+  test "resolve_with_axes accepts a registry alias (codex → codex base)" do
+    {:ok, agent} = Agents.resolve_with_axes("codex", nil, false)
+    assert agent.cli == "codex"
+  end
+
   # ── Resume command shape ──
 
   test "build_resume_command for claude with empty prompt: --resume only, no stdin pipe" do

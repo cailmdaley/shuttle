@@ -8,13 +8,19 @@ defmodule Shuttle.Agents do
 
   @type agent_record :: %{
           id: String.t(),
-          cli: String.t(),
-          wrapper: String.t(),
+          cli: String.t() | nil,
+          wrapper: String.t() | nil,
           provider: String.t() | nil,
           model: String.t() | nil,
           base_url: String.t() | nil,
           extra_flags: String.t() | nil,
           requires_model: boolean(),
+          effort_levels: [String.t()],
+          default_effort: String.t() | nil,
+          chrome_capable: boolean(),
+          cost_class: String.t() | nil,
+          alias_of: String.t() | nil,
+          axes: map() | nil,
           aliases: [String.t()],
           default: boolean()
         }
@@ -89,19 +95,47 @@ defmodule Shuttle.Agents do
   end
 
   defp normalize_agent(agent) when is_list(agent) do
+    alias_of = optional_string(agent, :alias_of)
+    # Alias records (alias_of set) carry no cli/wrapper/model — only the base id
+    # and an axes overlay. Base agents require cli/wrapper.
+    {cli, wrapper} =
+      if alias_of do
+        {optional_string(agent, :cli), optional_string(agent, :wrapper)}
+      else
+        {required_string(agent, :cli), required_string(agent, :wrapper)}
+      end
+
     %{
       id: required_string(agent, :id),
-      cli: required_string(agent, :cli),
-      wrapper: required_string(agent, :wrapper),
+      cli: cli,
+      wrapper: wrapper,
       provider: optional_string(agent, :provider),
       model: optional_string(agent, :model),
       base_url: optional_string(agent, :base_url),
       extra_flags: optional_string(agent, :extra_flags),
       requires_model: Keyword.get(agent, :requires_model, false),
+      effort_levels: normalized_aliases(Keyword.get(agent, :effort_levels, [])),
+      default_effort: optional_string(agent, :default_effort),
+      chrome_capable: Keyword.get(agent, :chrome_capable, false),
+      cost_class: optional_string(agent, :cost_class),
+      alias_of: alias_of,
+      axes: normalize_axes(Keyword.get(agent, :axes)),
       aliases: normalized_aliases(Keyword.get(agent, :aliases, [])),
       default: Keyword.get(agent, :default, false)
     }
   end
+
+  defp normalize_axes(nil), do: nil
+
+  defp normalize_axes(axes) when is_map(axes) do
+    %{
+      effort: axes |> Map.get(:effort) |> normalize_optional_string(),
+      chrome: Map.get(axes, :chrome, false)
+    }
+  end
+
+  defp normalize_optional_string(nil), do: nil
+  defp normalize_optional_string(v) when is_binary(v), do: v
 
   defp required_string(agent, key) do
     case Keyword.fetch(agent, key) do
@@ -160,10 +194,89 @@ defmodule Shuttle.Agents do
         agent -> {:ok, agent}
       end
     else
-      case find_by_id(agents, name) do
+      # Match by id first, then by alias — mirrors the Go registry's Find so a
+      # block the Go CLI accepts (e.g. agent: codex, an alias of codex-gpt-5.5)
+      # also resolves on the Elixir dispatch path.
+      case find_by_id(agents, name) || find_by_alias(agents, name) do
         nil -> {:error, "unknown agent: #{name}"}
         agent -> {:ok, agent}
       end
+    end
+  end
+
+  @doc """
+  Resolves an agent name plus the block-declared axes (effort, chrome) into the
+  base agent record augmented with the effective, validated `:effort` and
+  `:chrome` keys.
+
+  An alias record (`alias_of` set) expands to its base agent with the alias's
+  `axes` overlaid *beneath* the block axes (block wins). Effort falls back
+  through: block → alias overlay → base `default_effort`. Validation rejects an
+  effort token outside the base agent's `effort_levels` (or any effort on an
+  agent with none) and chrome on a non-chrome-capable harness.
+
+  `block_effort` may be `nil`/`""`; `block_chrome` is a boolean.
+  """
+  @spec resolve_with_axes(String.t() | nil, String.t() | nil, boolean()) ::
+          {:ok, agent_record()} | {:error, String.t()}
+  def resolve_with_axes(name, block_effort, block_chrome) do
+    with {:ok, rec} <- resolve_by_name(name) do
+      apply_axes(rec, block_effort, block_chrome)
+    end
+  end
+
+  @doc """
+  Overlays axes onto a (possibly alias) agent record. See `resolve_with_axes/3`.
+  """
+  @spec apply_axes(agent_record(), String.t() | nil, boolean()) ::
+          {:ok, agent_record()} | {:error, String.t()}
+  def apply_axes(rec, block_effort, block_chrome) do
+    {base, overlay} =
+      if rec[:alias_of] do
+        case find_by_id(list(), rec.alias_of) do
+          nil -> {nil, %{}}
+          base -> {base, rec[:axes] || %{}}
+        end
+      else
+        {rec, %{}}
+      end
+
+    cond do
+      base == nil ->
+        {:error, "agent #{rec.id} aliases unknown base #{rec[:alias_of]}"}
+
+      true ->
+        effort =
+          first_present([block_effort, overlay[:effort], base[:default_effort]])
+
+        chrome = !!block_chrome or !!overlay[:chrome]
+
+        with :ok <- validate_axes(base, effort, chrome) do
+          {:ok, Map.merge(base, %{effort: effort, chrome: chrome})}
+        end
+    end
+  end
+
+  defp first_present(values) do
+    Enum.find(values, fn v -> is_binary(v) and v != "" end)
+  end
+
+  defp validate_axes(base, effort, chrome) do
+    levels = base[:effort_levels] || []
+
+    cond do
+      is_binary(effort) and effort != "" and levels == [] ->
+        {:error, "agent #{base.id} does not support an effort axis"}
+
+      is_binary(effort) and effort != "" and effort not in levels ->
+        {:error,
+         "effort #{effort} not allowed for agent #{base.id} (allowed: #{Enum.join(levels, ", ")})"}
+
+      chrome and not base[:chrome_capable] ->
+        {:error, "chrome not supported by agent #{base.id} (claude harness only)"}
+
+      true ->
+        :ok
     end
   end
 
@@ -181,15 +294,7 @@ defmodule Shuttle.Agents do
   @spec build_command(agent_record(), String.t(), keyword()) :: String.t()
   def build_command(agent, prompt, opts \\ []) do
     session_id = Keyword.get(opts, :session_id)
-
-    flags =
-      [
-        flag("--provider", agent.provider),
-        flag("--model", agent.model),
-        agent.extra_flags
-      ]
-      |> Enum.reject(&is_nil/1)
-      |> Enum.join(" ")
+    flags = render_flags(agent)
 
     # The wrapper is a shell function sourced via bash -l.
     # For claude: stdin via here-string; --session-id can be pre-specified.
@@ -235,14 +340,7 @@ defmodule Shuttle.Agents do
   """
   @spec build_resume_command(agent_record(), String.t(), String.t()) :: String.t()
   def build_resume_command(agent, session_id, prompt \\ "") do
-    flags =
-      [
-        flag("--provider", agent.provider),
-        flag("--model", agent.model),
-        agent.extra_flags
-      ]
-      |> Enum.reject(&is_nil/1)
-      |> Enum.join(" ")
+    flags = render_flags(agent)
 
     has_prompt = is_binary(prompt) and String.trim(prompt) != ""
 
@@ -270,6 +368,46 @@ defmodule Shuttle.Agents do
         "#{agent.wrapper} #{flags} #{shell_escape("Resume session #{session_id} if possible.")}"
     end
   end
+
+  # Renders the harness invocation flags, folding the resolved axes (effort,
+  # chrome) into each CLI's native form:
+  #   claude → `--effort <level>` flag + `--chrome`
+  #   pi     → `:level` suffix on the model string (preserves today's behaviour)
+  #   codex  → `-c model_reasoning_effort="<level>"`
+  # Effort/chrome come from the agent map's `:effort`/`:chrome` keys set by
+  # apply_axes/3; absent (raw record) means no axis rendering.
+  defp render_flags(agent) do
+    effort = agent[:effort]
+    chrome = agent[:chrome] == true
+    model = effective_model(agent, effort)
+
+    [
+      flag("--provider", agent.provider),
+      flag("--model", model),
+      effort_flag(agent.cli, effort),
+      if(chrome, do: "--chrome", else: nil),
+      agent.extra_flags
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(" ")
+  end
+
+  # pi renders effort as a `:level` suffix on the model string; other harnesses
+  # keep the bare model.
+  defp effective_model(%{cli: "pi", model: model}, effort)
+       when is_binary(model) and is_binary(effort) and effort != "" do
+    "#{model}:#{effort}"
+  end
+
+  defp effective_model(agent, _effort), do: agent.model
+
+  defp effort_flag("claude", effort) when is_binary(effort) and effort != "",
+    do: "--effort #{shell_escape(effort)}"
+
+  defp effort_flag("codex", effort) when is_binary(effort) and effort != "",
+    do: "-c model_reasoning_effort=#{shell_escape(effort)}"
+
+  defp effort_flag(_cli, _effort), do: nil
 
   defp flag(_key, nil), do: nil
   defp flag(key, value), do: "#{key} #{shell_escape(value)}"

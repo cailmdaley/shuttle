@@ -22,7 +22,15 @@
     },
     "agent": {
       "type": "string",
-      "description": "Agent ID from the agent registry. Defaults to the registry's default agent when absent."
+      "description": "Base agent ID from the agent registry (harness + model). Defaults to the registry's default agent when absent. Orthogonal axes (effort, chrome) layer on top via the sibling fields. Legacy combination ids like 'claude-opus-chrome' still resolve — they are registry aliases expanding to a base agent + axes."
+    },
+    "effort": {
+      "type": "string",
+      "description": "Reasoning-effort axis. A harness-native token (e.g. low|medium|high|xhigh|max) validated against the resolved base agent's allowed set. Rendered per-harness at dispatch: claude --effort, pi :level model suffix, codex -c model_reasoning_effort. Omitted = the agent's default_effort or the harness default."
+    },
+    "chrome": {
+      "type": "boolean",
+      "description": "Chrome axis (claude harness only). true renders --chrome; rejected at install/set time on non-claude agents."
     },
     "schedule": {
       "type": "object",

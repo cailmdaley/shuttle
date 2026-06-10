@@ -989,13 +989,24 @@ defmodule Shuttle.Dispatcher do
     # `felt show --json` rounds-trip-the-bytes (felt v1.0.4+): tool-owned
     # frontmatter namespaces like `shuttle:` and `tags:` appear as flat
     # top-level JSON keys.
-    case get_in(fiber, ["shuttle", "agent"]) do
-      name when is_binary(name) and name != "" ->
-        Agents.resolve_by_name(name)
+    effort = get_in(fiber, ["shuttle", "effort"])
+    chrome = get_in(fiber, ["shuttle", "chrome"]) == true
 
-      _ ->
-        tags = Map.get(fiber, "tags", [])
-        Agents.resolve(tags)
+    base =
+      case get_in(fiber, ["shuttle", "agent"]) do
+        name when is_binary(name) and name != "" ->
+          Agents.resolve_by_name(name)
+
+        _ ->
+          tags = Map.get(fiber, "tags", [])
+          Agents.resolve(tags)
+      end
+
+    # Overlay the block's effort/chrome axes onto the resolved base agent,
+    # validating against per-harness constraints. apply_axes also expands an
+    # alias record (e.g. claude-opus-chrome → claude-opus + chrome).
+    with {:ok, agent} <- base do
+      Agents.apply_axes(agent, effort, chrome)
     end
   end
 

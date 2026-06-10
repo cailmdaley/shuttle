@@ -510,8 +510,11 @@ agent registry before writing. Removes any existing agent:* felt tag
 		}
 
 		agentID := args[1]
-		if _, ok := agents.Find(agentID); !ok {
-			return fmt.Errorf("unknown agent %q (known: %s)", agentID, joinIDs(agents.IDs()))
+		// Resolve the new base agent together with the block's existing axes:
+		// switching to an agent that can't carry the current effort/chrome fails
+		// loud here rather than silently at dispatch.
+		if _, _, err := agents.Resolve(agentID, f.Block.Effort, f.Block.Chrome); err != nil {
+			return err
 		}
 
 		f.Block.Agent = agentID
@@ -522,6 +525,86 @@ agent registry before writing. Removes any existing agent:* felt tag
 		fmt.Printf("set agent for %s → %s\n", args[0], agentID)
 		return nil
 	},
+}
+
+var (
+	setAgentEffort string
+	setAgentChrome bool
+)
+
+// setAgentCmd is the axis-aware mutation verb: it composes base agent × effort ×
+// chrome in one transition. set-model stays as the narrow base-agent verb; this
+// is the superset (the alternative — separate set-effort/set-chrome verbs — was
+// rejected to keep a single validated write that sees all three axes together).
+var setAgentCmd = &cobra.Command{
+	Use:   "set-agent <fiber> [agent]",
+	Short: "Set the dispatch agent and/or axes (effort, chrome) for a fiber",
+	Long: `Composes a fiber's dispatch axes — base agent, effort, chrome — and
+writes them to the shuttle: block after validating the combination against the
+agent registry's per-harness constraints (allowed effort levels, chrome
+support). The base agent argument is optional: omit it to mutate only the axes
+of the current agent. Pass --effort "" to clear effort back to the harness
+default.`,
+	Args: cobra.RangeArgs(1, 2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		agents := loadAgents()
+		path, _, _ := resolveFiber(args[0])
+		f := readFiber(path)
+		if f.Block == nil {
+			return fmt.Errorf("fiber %s has no shuttle: block (use 'shuttle repeat' to install first)", args[0])
+		}
+		if err := ensureOwnedHere(f, args[0]); err != nil {
+			return err
+		}
+
+		agentID := f.Block.Agent
+		if len(args) == 2 {
+			agentID = args[1]
+		}
+		effort := f.Block.Effort
+		if cmd.Flags().Changed("effort") {
+			effort = setAgentEffort
+		}
+		chrome := f.Block.Chrome
+		if cmd.Flags().Changed("chrome") {
+			chrome = setAgentChrome
+		}
+
+		// Validate the full composition before writing.
+		name := agentID
+		if name == "" {
+			if def, err := agents.Default(); err == nil {
+				name = def.ID
+			}
+		}
+		if _, _, err := agents.Resolve(name, effort, chrome); err != nil {
+			return err
+		}
+
+		f.Block.Agent = agentID
+		f.Block.Effort = effort
+		f.Block.Chrome = chrome
+		if err := f.WriteBlock(f.Block); err != nil {
+			return fmt.Errorf("writing fiber: %w", err)
+		}
+
+		fmt.Printf("set agent for %s → %s", args[0], display(agentID, "(default)"))
+		if effort != "" {
+			fmt.Printf(" effort=%s", effort)
+		}
+		if chrome {
+			fmt.Printf(" chrome")
+		}
+		fmt.Println()
+		return nil
+	},
+}
+
+func display(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
 }
 
 // setInteractiveCmd is retired: interactivity is no longer a dispatch mode. It
@@ -597,6 +680,9 @@ func init() {
 	rootCmd.AddCommand(setOutcomeCmd)
 	rootCmd.AddCommand(acceptCmd)
 	rootCmd.AddCommand(setModelCmd)
+	setAgentCmd.Flags().StringVar(&setAgentEffort, "effort", "", `Effort level (harness-native token, e.g. low|medium|high|xhigh|max); "" clears`)
+	setAgentCmd.Flags().BoolVar(&setAgentChrome, "chrome", false, "Enable chrome (claude harness only)")
+	rootCmd.AddCommand(setAgentCmd)
 	rootCmd.AddCommand(setInteractiveCmd)
 	rootCmd.AddCommand(uninstallCmd)
 }

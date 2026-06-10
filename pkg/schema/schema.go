@@ -24,7 +24,12 @@ type Block struct {
 	Host       string    `json:"host,omitempty" yaml:"host,omitempty"`
 	ProjectDir string    `json:"project_dir,omitempty" yaml:"project_dir,omitempty"`
 	Agent      string    `json:"agent,omitempty" yaml:"agent,omitempty"`
-	Schedule   *Schedule `json:"schedule,omitempty" yaml:"schedule,omitempty"`
+	// Orthogonal dispatch axes layered on top of Agent (the base id). Effort is
+	// a token validated against the resolved base agent's allowed set; Chrome is
+	// claude-only. Both optional — omitted means the harness/registry default.
+	Effort   string    `json:"effort,omitempty" yaml:"effort,omitempty"`
+	Chrome   bool      `json:"chrome,omitempty" yaml:"chrome,omitempty"`
+	Schedule *Schedule `json:"schedule,omitempty" yaml:"schedule,omitempty"`
 }
 
 // Schedule holds the recurrence definition for a standing role.
@@ -94,6 +99,8 @@ func (b *Block) UnmarshalJSON(data []byte) error {
 		Host       string    `json:"host"`
 		ProjectDir string    `json:"project_dir"`
 		Agent      string    `json:"agent"`
+		Effort     string    `json:"effort"`
+		Chrome     bool      `json:"chrome"`
 		Schedule   *Schedule `json:"schedule"`
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
@@ -106,6 +113,8 @@ func (b *Block) UnmarshalJSON(data []byte) error {
 	b.Host = aux.Host
 	b.ProjectDir = aux.ProjectDir
 	b.Agent = aux.Agent
+	b.Effort = aux.Effort
+	b.Chrome = aux.Chrome
 	b.Schedule = aux.Schedule
 	return nil
 }
@@ -156,10 +165,18 @@ func Validate(b *Block, agents *AgentRegistry) ValidationErrors {
 		add("kind", fmt.Sprintf("must be one of %v, got %q", ValidKinds, b.Kind))
 	}
 
-	if b.Agent != "" && agents != nil {
-		if _, ok := agents.Find(b.Agent); !ok {
-			ids := agents.IDs()
-			add("agent", fmt.Sprintf("unknown agent %q (known: %s)", b.Agent, strings.Join(ids, ", ")))
+	if agents != nil && (b.Agent != "" || b.Effort != "" || b.Chrome) {
+		// Resolve the named agent (or registry default when unnamed) together
+		// with the block's axes, surfacing unknown-agent, dangling-alias, and
+		// axis-constraint violations in one shot.
+		name := b.Agent
+		if name == "" {
+			if def, err := agents.Default(); err == nil {
+				name = def.ID
+			}
+		}
+		if _, _, err := agents.Resolve(name, b.Effort, b.Chrome); err != nil {
+			add("agent", err.Error())
 		}
 	}
 
