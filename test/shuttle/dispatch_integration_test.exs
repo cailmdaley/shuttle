@@ -973,6 +973,18 @@ defmodule Shuttle.DispatchIntegrationTest do
           felt_stores: [host]
         )
 
+      # Let the first poll warm the document cache (card status comes from here).
+      assert eventually(fn ->
+               case Poller.cached_fiber_documents(poller) do
+                 {:ok, body} ->
+                   Enum.any?(body.fibers, &(get_in(&1, [:fiber, "id"]) == "tests/standing-awaiting-rearm"))
+
+                 _ ->
+                   false
+               end
+             end),
+             "expected the document cache to warm with the awaiting role"
+
       # The forced board action bypasses the awaiting gate and spawns.
       assert {:ok, _session} =
                Poller.dispatch_fiber(poller, "tests/standing-awaiting-rearm",
@@ -985,6 +997,17 @@ defmodule Shuttle.DispatchIntegrationTest do
       assert fm["status"] == "active"
       refute Map.has_key?(fm, "closed-at")
       refute Map.has_key?(fm, "tempered")
+
+      # SNAPPY-NOW: the kanban's post-dispatch refetch reads card status from the
+      # cached document feed. The inline cache patch must make it report active
+      # WITHOUT another poll — otherwise the card sits in "Awaiting review" until
+      # the next tick even though the worker is live. No send(:run_poll_cycle).
+      assert {:ok, body} = Poller.cached_fiber_documents(poller)
+      entry = Enum.find(body.fibers, &(get_in(&1, [:fiber, "id"]) == "tests/standing-awaiting-rearm"))
+      assert entry, "re-armed role should still be in the owned feed"
+      assert entry.fiber["status"] == "active"
+      refute Map.has_key?(entry.fiber, "closed-at")
+      refute Map.has_key?(entry.fiber, "tempered")
     after
       if prev_loom, do: System.put_env("LOOM_HOMES", prev_loom), else: System.delete_env("LOOM_HOMES")
     end

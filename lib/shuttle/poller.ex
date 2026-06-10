@@ -1931,23 +1931,58 @@ defmodule Shuttle.Poller do
   # this dispatch is coherent without an extra felt re-read. A failed re-arm
   # (non-standing, unreadable) is logged and the fiber passes through unchanged —
   # force-dispatch of a oneshot or a non-awaiting role still spawns as before.
-  defp maybe_force_rearm(fiber, opts) do
+  defp maybe_force_rearm(state, fiber, opts) do
     if Keyword.get(opts, :force, false) and Map.get(fiber, "status") != "active" do
       fiber_id = Map.get(fiber, "id", "")
 
       case LifecycleStore.rearm(fiber_id) do
         {:ok, msg} ->
           Logger.info("force-dispatch re-arm #{fiber_id}: #{String.trim(msg)}")
-          fiber |> Map.put("status", "active") |> Map.delete("tempered") |> Map.delete("closed-at")
+
+          rearmed =
+            fiber |> Map.put("status", "active") |> Map.delete("tempered") |> Map.delete("closed-at")
+
+          # Refresh this one fiber's document-cache entry inline so the kanban's
+          # post-dispatch refetch sees status:active immediately. Without this the
+          # card's status lags until the next poll re-reads the (mtime-bumped) file
+          # — the worker spawns and the live pill appears, but the card sits in
+          # "Awaiting review" for up to a poll interval. Liveness pushes live;
+          # document-derived fields must too on this path.
+          {patch_document_cache_status(state, fiber_id), rearmed}
 
         {:error, _reason} ->
           # Oneshots and non-standing fibers aren't re-armable; that's expected —
-          # force-dispatch still spawns them. Only log at debug to avoid noise.
-          fiber
+          # force-dispatch still spawns them.
+          {state, fiber}
       end
     else
-      fiber
+      {state, fiber}
     end
+  end
+
+  # Patch the `status`/`tempered`/`closed-at` of a single cached document entry
+  # to match a just-written re-arm, keyed by the entry's fiber id (robust whether
+  # the cache is uid- or id-keyed). The mtime is left as-is: the next poll's
+  # `reusable_document_cache_entry?` sees the file's newer mtime and re-reads to
+  # confirm, so this is a snappy-now patch the poll reconciles, not a divergent
+  # source of truth.
+  defp patch_document_cache_status(%State{} = state, fiber_id) do
+    cache =
+      Enum.into(state.document_cache, %{}, fn {key, %{entry: entry} = cached} ->
+        if get_in(entry, [:fiber, "id"]) == fiber_id do
+          patched_fiber =
+            entry.fiber
+            |> Map.put("status", "active")
+            |> Map.delete("tempered")
+            |> Map.delete("closed-at")
+
+          {key, %{cached | entry: %{entry | fiber: patched_fiber}}}
+        else
+          {key, cached}
+        end
+      end)
+
+    %{state | document_cache: cache}
   end
 
   defp do_dispatch_fiber(%State{} = state, fiber, opts \\ []) do
@@ -1958,8 +1993,8 @@ defmodule Shuttle.Poller do
     # one atomic, snappy action: the card leaves "Awaiting review" immediately and
     # the doc is coherent with the running worker — no waiting on the 15s poll and
     # no running-worker-on-an-awaiting-card split. No-op for active roles, oneshots,
-    # and non-forced dispatch.
-    fiber = maybe_force_rearm(fiber, opts)
+    # and non-forced dispatch. Returns the (possibly patched) state + re-armed fiber.
+    {state, fiber} = maybe_force_rearm(state, fiber, opts)
 
     felt_store =
       case host_for_fiber(fiber_id, state) do
