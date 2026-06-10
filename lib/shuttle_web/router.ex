@@ -37,6 +37,7 @@ defmodule ShuttleWeb.Router do
     post("/lifecycle", LifecycleController, :create)
     post("/felt-history", FeltHistoryController, :create)
     post("/felt-edit", FeltEditController, :create)
+    post("/felt-nest", FeltNestController, :create)
     get("/agents", AgentsController, :show)
     get("/version", VersionController, :show)
     post("/fiber/create", FiberController, :create)
