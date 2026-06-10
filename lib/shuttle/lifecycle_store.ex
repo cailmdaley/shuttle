@@ -26,13 +26,28 @@ defmodule Shuttle.LifecycleStore do
 
     with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
-         :ok <- require_standing(shuttle),
+         :ok <- require_cyclical(shuttle),
          :ok <- require_doc_awaiting(frontmatter) do
       # Awaiting is `status: closed` + untempered in the document itself — there
       # is no `review.state` (slice 4 removed the review axis). Recognize it
-      # straight from the doc and re-arm from the doc schedule.
-      accept_from_doc(fiber_id, path, frontmatter, body, shuttle, keep_outcome?)
+      # straight from the doc and re-arm. A standing role advances its cron
+      # recurrence (next_due from the schedule); a pinned role has no schedule,
+      # so it simply returns to its resting `status: active`.
+      if pinned_block?(shuttle) do
+        accept_pinned(fiber_id, path, frontmatter, body, keep_outcome?)
+      else
+        accept_from_doc(fiber_id, path, frontmatter, body, shuttle, keep_outcome?)
+      end
     end
+  end
+
+  # Pinned accept: re-arm to the resting `status: active` with no recurrence to
+  # advance. The document carries the whole lifecycle; there is no schedule and
+  # no next_due to compute (the poller never auto-dispatches a pinned role).
+  defp accept_pinned(fiber_id, path, frontmatter, body, keep_outcome?) do
+    {:ok, frontmatter} = update_document(frontmatter, keep_outcome?)
+    write_fiber!(path, evict_runtime_keys(frontmatter), body)
+    {:ok, "accepted run for #{fiber_id}\n  pinned role re-armed at rest (status: active)\n"}
   end
 
   defp accept_from_doc(fiber_id, path, frontmatter, body, shuttle, keep_outcome?) do
@@ -52,7 +67,7 @@ defmodule Shuttle.LifecycleStore do
   def resume(fiber_id) when is_binary(fiber_id) do
     with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
-         :ok <- require_standing(shuttle),
+         :ok <- require_cyclical(shuttle),
          :ok <- require_doc_awaiting(frontmatter) do
       resume_from_doc(fiber_id, path, frontmatter, body)
     end
@@ -92,7 +107,7 @@ defmodule Shuttle.LifecycleStore do
   def mark_awaiting(fiber_id) when is_binary(fiber_id) do
     with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
-         :ok <- require_standing(shuttle) do
+         :ok <- require_cyclical(shuttle) do
       frontmatter =
         frontmatter
         |> Map.put("status", "closed")
@@ -122,7 +137,7 @@ defmodule Shuttle.LifecycleStore do
   def rearm(fiber_id) when is_binary(fiber_id) do
     with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
-         :ok <- require_standing(shuttle) do
+         :ok <- require_cyclical(shuttle) do
       if Map.get(frontmatter, "status") == "active" do
         {:ok, "#{fiber_id} already active\n"}
       else
@@ -185,13 +200,21 @@ defmodule Shuttle.LifecycleStore do
     end
   end
 
-  defp require_standing(%{"kind" => "standing"}), do: :ok
-  defp require_standing(%{"mode" => "standing"}), do: :ok
+  # Cyclical = standing OR pinned: both have the active→closed→active lifecycle
+  # this module implements. Standing roles advance a cron recurrence on accept;
+  # pinned roles return to their resting active state. Oneshots and non-shuttle
+  # fibers are rejected — they have no re-arm.
+  defp require_cyclical(%{"kind" => kind}) when kind in ["standing", "pinned"], do: :ok
+  defp require_cyclical(%{"mode" => mode}) when mode in ["standing", "pinned"], do: :ok
 
-  defp require_standing(shuttle),
+  defp require_cyclical(shuttle),
     do:
       {:error,
-       "accept/resume store path only applies to standing roles (kind=#{inspect(Map.get(shuttle, "kind"))})"}
+       "accept/resume store path only applies to standing or pinned roles (kind=#{inspect(Map.get(shuttle, "kind"))})"}
+
+  defp pinned_block?(%{"kind" => "pinned"}), do: true
+  defp pinned_block?(%{"mode" => "pinned"}), do: true
+  defp pinned_block?(_), do: false
 
   defp require_schedule(%{"schedule" => schedule}) when is_map(schedule), do: {:ok, schedule}
   defp require_schedule(_), do: {:error, "fiber has no schedule"}

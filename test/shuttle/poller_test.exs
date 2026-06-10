@@ -225,6 +225,20 @@ defmodule Shuttle.PollerTest do
           remove_tmux_session(session)
           {"", 0}
 
+        command == "tmux" and hd(args) == "rename-session" ->
+          ["rename-session", "-t", "=" <> old_name, new_name] = args
+
+          Agent.update(__MODULE__, fn state ->
+            if MapSet.member?(state.tmux_sessions, old_name) do
+              sessions = state.tmux_sessions |> MapSet.delete(old_name) |> MapSet.put(new_name)
+              %{state | tmux_sessions: sessions}
+            else
+              state
+            end
+          end)
+
+          {"", 0}
+
         command == "tmux" and hd(args) == "ls" ->
           sessions = Agent.get(__MODULE__, & &1.tmux_sessions)
           output = sessions |> MapSet.to_list() |> Enum.join("\n")
@@ -655,6 +669,53 @@ defmodule Shuttle.PollerTest do
     assert %{tmux_session: session, state: _state, started_at: started} = runtime
     assert is_binary(session)
     assert is_integer(started)
+    # No waiting source by default → no phase.
+    refute Map.has_key?(runtime, :phase)
+  end
+
+  test "owner feed stamps phase: waiting when the live worker's session is waiting for input" do
+    uid = "01JZ00000000000000000000RW"
+
+    fiber =
+      make_fiber("tests/waiting", %{
+        "uid" => uid,
+        "modified_at" => "2026-06-08T01:00:00Z"
+      })
+
+    MockRunner.set_fiber("tests/waiting", fiber)
+    MockRunner.set_shuttle("tests/waiting", "enabled: true\nkind: oneshot\nhost: candide\n")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_runtime_waiting,
+        runner: MockRunner,
+        own_host_id: "candide",
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             snap = Poller.snapshot(poller)
+             length(snap.eligible) == 1 and
+               get_in(snap, [:document_cache, "entries"]) >= 1
+           end)
+
+    # Discover the running worker's session, then inject it as waiting.
+    assert {:ok, %{fibers: [%{runtime: %{tmux_session: session}}]}} =
+             Poller.cached_fiber_documents(poller)
+
+    Application.put_env(:shuttle, :waiting_sessions_source, fn -> MapSet.new([session]) end)
+    on_exit(fn -> Application.delete_env(:shuttle, :waiting_sessions_source) end)
+
+    assert {:ok, %{fibers: [%{runtime: runtime}]}} = Poller.cached_fiber_documents(poller)
+    assert runtime.phase == "waiting"
+
+    # Clearing the waiting set drops the phase — self-healing on the serve path.
+    Application.put_env(:shuttle, :waiting_sessions_source, fn -> MapSet.new() end)
+    assert {:ok, %{fibers: [%{runtime: cleared}]}} = Poller.cached_fiber_documents(poller)
+    refute Map.has_key?(cleared, :phase)
   end
 
   test "owner feed omits runtime for an owned fiber with no live worker" do
@@ -766,6 +827,34 @@ defmodule Shuttle.PollerTest do
     refute Enum.any?(commands, fn {cmd, args} ->
              cmd == "tmux" and hd(args) == "new-session"
            end)
+  end
+
+  test "poller never auto-dispatches an active pinned role" do
+    # A pinned role's steady state is status:active "at rest" — but unlike an
+    # active oneshot (which dispatches on the next poll) the poller must skip it
+    # entirely. It fires only on an explicit force-dispatch.
+    fiber = make_fiber("tests/pinned-at-rest", %{"status" => "active"})
+    MockRunner.set_fiber("tests/pinned-at-rest", fiber)
+    MockRunner.set_shuttle("tests/pinned-at-rest", "kind: pinned\n", "active")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_pinned_at_rest,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    send(poller, :run_poll_cycle)
+    Process.sleep(50)
+
+    refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
+
+    # And it is not counted eligible (the never-auto-dispatch gate, not a
+    # transient not-yet-due).
+    refute Enum.any?(Poller.snapshot(poller).eligible, &(&1.fiber_id == "tests/pinned-at-rest"))
   end
 
   test "poller does not dispatch a scheduled standing role before it is due" do
@@ -2905,5 +2994,130 @@ defmodule Shuttle.PollerTest do
     Process.sleep(50)
 
     assert Poller.snapshot(poller).felt_stores == ["/tmp/host-c"]
+  end
+
+  # ── Claim (write-and-claim) ──
+
+  test "claim registers a live external session: rename, runtime, exit handling" do
+    id = "tests/claim-me"
+    MockRunner.set_fiber(id, make_fiber(id, %{"uid" => "01CLAIMUID"}))
+    MockRunner.set_shuttle(id, @oneshot_shuttle)
+    MockRunner.add_tmux_session("capture-abc123")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_claim,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    assert {:ok, %{session: session}} =
+             Poller.claim_session(poller, id, "capture-abc123", session_uuid: "uuid-claim-1")
+
+    # Renamed to the canonical worker name — indistinguishable from a dispatch.
+    assert session == "claim-me-01CLAIMUID-shuttle"
+
+    assert Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "rename-session"
+           end)
+
+    snap = Poller.snapshot(poller)
+    assert Enum.any?(snap.eligible, &(&1.fiber_id == id))
+
+    # The dispatch-shaped history event landed with the session uuid token.
+    {out, 0} =
+      System.cmd("felt", ["-C", "/tmp", "history", id, "--last", "1", "--json"],
+        stderr_to_stdout: true
+      )
+
+    assert out =~ "worker claimed"
+    assert out =~ "session=uuid-claim-1"
+
+    # Exit handling works exactly as for a dispatched worker: the session
+    # dying is noticed by reconciliation and the running entry clears.
+    MockRunner.remove_tmux_session(session)
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             not Enum.any?(Poller.snapshot(poller).eligible, &(&1.fiber_id == id))
+           end)
+  end
+
+  test "claim refuses unknown fibers, dead sessions, and double claims" do
+    id = "tests/claim-guards"
+    MockRunner.set_fiber(id, make_fiber(id, %{"uid" => "01GUARDUID"}))
+    MockRunner.set_shuttle(id, @oneshot_shuttle)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_claim_guards,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    # Session not live in tmux.
+    assert {:error, :session_not_found} =
+             Poller.claim_session(poller, id, "capture-dead", [])
+
+    # Fiber unknown.
+    MockRunner.add_tmux_session("capture-live01")
+
+    assert {:error, :not_found} =
+             Poller.claim_session(poller, "tests/no-such-fiber", "capture-live01", [])
+
+    # First claim wins; the second is already_running.
+    assert {:ok, _} = Poller.claim_session(poller, id, "capture-live01", [])
+    MockRunner.add_tmux_session("capture-live02")
+    assert {:error, :already_running} = Poller.claim_session(poller, id, "capture-live02", [])
+  end
+
+  test "claim refuses closed fibers" do
+    id = "tests/claim-closed"
+    MockRunner.set_fiber(id, make_fiber(id, %{"status" => "closed"}))
+    MockRunner.set_shuttle(id, @oneshot_shuttle, "closed")
+    MockRunner.add_tmux_session("capture-closed1")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_claim_closed,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    assert {:error, :closed} = Poller.claim_session(poller, id, "capture-closed1", [])
+  end
+
+  # ── Capture (spawn-without-constitution) ──
+
+  test "capture spawns a tmux session from a free-text prompt" do
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_capture,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    assert {:ok, %{session: "capture-" <> _ = session, agent_id: "claude-opus"}} =
+             Poller.capture(poller, "build me a thing", work_dir: "/tmp")
+
+    # Right tmux command: detached session under the capture name, rooted in
+    # the requested project dir — the last free boundary before a real agent.
+    assert Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session" and
+               Enum.at(args, 3) == session and Enum.at(args, 5) == "/tmp"
+           end)
+
+    # Pre-claim, the capture session is invisible to the shuttle-session
+    # machinery (not `-shuttle`-suffixed): a poll does not adopt or kill it.
+    send(poller, :run_poll_cycle)
+    Process.sleep(50)
+
+    refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "kill-session" and Enum.at(args, 2) =~ "capture-"
+           end)
   end
 end

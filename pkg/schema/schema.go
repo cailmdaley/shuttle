@@ -111,7 +111,15 @@ func (b *Block) UnmarshalJSON(data []byte) error {
 }
 
 // ValidKinds enumerates the allowed kind values.
-var ValidKinds = []string{"oneshot", "standing"}
+//
+//   - oneshot  — one-time dispatch, picked up on the next poll when status:active.
+//   - standing — recurring; the cron `schedule` decides when the poller dispatches.
+//   - pinned   — schedule-less umbrella role the poller NEVER auto-dispatches; it
+//     fires only on an explicit force-dispatch (the kanban's "Dispatch ▸" / the
+//     `/dispatch` verb). Steady state is status:active "at rest"; a run closes to
+//     awaiting-review and an accept re-arms it back to rest (the standing-role
+//     lifecycle minus the cron).
+var ValidKinds = []string{"oneshot", "standing", "pinned"}
 
 // ---- Validation ------------------------------------------------------------
 
@@ -153,6 +161,13 @@ func Validate(b *Block, agents *AgentRegistry) ValidationErrors {
 			ids := agents.IDs()
 			add("agent", fmt.Sprintf("unknown agent %q (known: %s)", b.Agent, strings.Join(ids, ", ")))
 		}
+	}
+
+	// A pinned role has no recurrence — it never auto-dispatches, so a schedule
+	// would be meaningless (and misleading on the board). Reject the combination
+	// loudly rather than silently ignoring the schedule.
+	if b.Kind == "pinned" && b.Schedule != nil {
+		add("schedule", "not allowed for kind=pinned (pinned roles never auto-dispatch)")
 	}
 
 	if b.Kind == "standing" {

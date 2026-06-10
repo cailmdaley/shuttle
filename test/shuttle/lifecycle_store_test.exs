@@ -81,6 +81,42 @@ defmodule Shuttle.LifecycleStoreTest do
     end
   end
 
+  describe "pinned roles share the cyclical lifecycle (no schedule)" do
+    test "mark_awaiting → accept re-arms a pinned role back to its resting active state" do
+      with_pinned_role(
+        fn fiber_id, path ->
+          # A pinned run exits → awaiting review (status:closed, untempered).
+          assert {:ok, _} = LifecycleStore.mark_awaiting(fiber_id)
+          assert read_frontmatter(path)["status"] == "closed"
+
+          # Accept re-arms to rest. No schedule → no "next due"; the message names
+          # the pinned re-arm instead.
+          assert {:ok, message} = LifecycleStore.accept(fiber_id)
+          assert message =~ "pinned role re-armed at rest"
+          refute message =~ "next due:"
+
+          fm = read_frontmatter(path)
+          assert fm["status"] == "active"
+          refute Map.has_key?(fm, "tempered")
+          refute Map.has_key?(fm, "closed-at")
+        end,
+        status: "active"
+      )
+    end
+
+    test "rearm re-arms a closed pinned role for force-dispatch" do
+      with_pinned_role(
+        fn fiber_id, path ->
+          assert {:ok, _} = LifecycleStore.mark_awaiting(fiber_id)
+          assert {:ok, message} = LifecycleStore.rearm(fiber_id)
+          assert message =~ "re-armed"
+          assert read_frontmatter(path)["status"] == "active"
+        end,
+        status: "active"
+      )
+    end
+  end
+
   # Builds a real on-disk felt fiber (resolvable by the felt CLI) in the
   # new-model awaiting shape, points LOOM_HOMES at the fixture, and runs
   # `fun.(fiber_id, path)`. There is no runtime store anymore (slice 6): the
@@ -117,6 +153,43 @@ defmodule Shuttle.LifecycleStoreTest do
 
     try do
       fun.("life/french/practice", path)
+    after
+      restore_env("LOOM_HOMES", prev_loom)
+      File.rm_rf(loom)
+    end
+  end
+
+  # Pinned variant of with_doc_awaiting_role: a schedule-less pinned block. The
+  # pinned role's steady state is status:active "at rest".
+  defp with_pinned_role(fun, opts) do
+    status = Keyword.get(opts, :status, "active")
+    tempered = Keyword.get(opts, :tempered, nil)
+
+    loom = Path.join(System.tmp_dir!(), "shuttle-lifecycle-pin-test-#{System.unique_integer([:positive])}")
+    felt_dir = Path.join([loom, ".felt", "ai-futures", "tokenmaxxing", "operator"])
+    File.mkdir_p!(felt_dir)
+    path = Path.join(felt_dir, "operator.md")
+
+    tempered_line = if is_nil(tempered), do: "", else: "tempered: #{tempered}\n"
+
+    File.write!(path, """
+    ---
+    name: Operator
+    status: #{status}
+    #{tempered_line}shuttle:
+      kind: pinned
+      host: testhost
+      agent: claude-opus
+    ---
+
+    Body.
+    """)
+
+    prev_loom = System.get_env("LOOM_HOMES")
+    System.put_env("LOOM_HOMES", loom)
+
+    try do
+      fun.("ai-futures/tokenmaxxing/operator", path)
     after
       restore_env("LOOM_HOMES", prev_loom)
       File.rm_rf(loom)

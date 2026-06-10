@@ -49,6 +49,26 @@ defmodule Shuttle.StandingRole do
   def standing?(_), do: false
 
   @doc """
+  A pinned role: a schedule-less umbrella concern the poller never
+  auto-dispatches (it fires only on an explicit force-dispatch). It is NOT a
+  standing role — `standing?/1` stays false, so the cron due/dispatch paths skip
+  it — but it shares the standing lifecycle (`cyclical?/1`).
+  """
+  @spec pinned?(t() | nil) :: boolean()
+  def pinned?(%__MODULE__{mode: "pinned"}), do: true
+  def pinned?(_), do: false
+
+  @doc """
+  A cyclical role: standing OR pinned. Both have the active→closed→active
+  lifecycle (a run closes to awaiting-review; an accept re-arms). The lifecycle
+  machinery (mark-awaiting on exit, accept/resume/rearm) keys on this, not on
+  `standing?/1`, so pinned roles cycle exactly like standing ones — only their
+  dispatch trigger differs (cron vs. explicit force-dispatch).
+  """
+  @spec cyclical?(t() | nil) :: boolean()
+  def cyclical?(role), do: standing?(role) or pinned?(role)
+
+  @doc """
   The schedule-derived display phase for an armed role, computed from cron +
   liveness — NOT from `review.state` or `enabled` (slice 4/5: both axes gone).
   "Awaiting review", "accepted", and "paused/draft" are document facts

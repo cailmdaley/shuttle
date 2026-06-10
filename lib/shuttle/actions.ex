@@ -103,15 +103,15 @@ defmodule Shuttle.Actions do
       # reopen/close, which would TERMINATE the role instead of re-arming it
       # (the slice-1 entanglement). Tempered-true and composted (tempered:false)
       # closed roles are termini and fall through to the generic clauses.
-      status == "closed" and standing?(shuttle) and untempered?(fiber) and
+      status == "closed" and cyclical?(shuttle) and untempered?(fiber) and
           target in ["inFlight", "tempered"] ->
         :accept_run
 
-      status == "closed" and standing?(shuttle) and untempered?(fiber) and
+      status == "closed" and cyclical?(shuttle) and untempered?(fiber) and
           target in ["drafts", "composted"] ->
         :close_composted
 
-      status == "closed" and standing?(shuttle) and untempered?(fiber) and
+      status == "closed" and cyclical?(shuttle) and untempered?(fiber) and
           target == "awaitingReview" ->
         :close_awaiting_review
 
@@ -188,7 +188,12 @@ defmodule Shuttle.Actions do
     end
   end
 
-  defp standing?(shuttle), do: Map.get(shuttle, "kind", Map.get(shuttle, "mode")) == "standing"
+  # Cyclical = standing OR pinned: both close to awaiting-review after a run and
+  # re-arm on accept, so both honor the same verdict gestures (accept-run vs.
+  # compost). Pinned roles never auto-dispatch, but once a run has closed them to
+  # awaiting-review the board's keep/reject gestures resolve identically.
+  defp cyclical?(shuttle),
+    do: Map.get(shuttle, "kind", Map.get(shuttle, "mode")) in ["standing", "pinned"]
 
   # `tempered` absent (nil) is the no-verdict state — the awaiting signal for a
   # closed fiber. `tempered: true` (accepted oneshot terminus) and

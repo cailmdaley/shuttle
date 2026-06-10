@@ -1532,6 +1532,14 @@ defmodule Shuttle.Poller do
         MapSet.member?(state.claimed, fiber_id) ->
           false
 
+        # Pinned roles are NEVER auto-dispatched — not on status, not on a cron.
+        # An active pinned fiber is "at rest"; it fires only on an explicit
+        # force-dispatch (force_dispatch_eligible?, which bypasses this gate).
+        # This branch MUST precede the oneshot fallthrough below, or an active
+        # pinned role would dispatch as a oneshot.
+        Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot")) == "pinned" ->
+          false
+
         # Standing roles have additional preconditions; oneshots go to dep check.
         # Support both new-format (kind:) and old-format (mode:) shuttle blocks.
         Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot")) == "standing" ->
@@ -2242,7 +2250,7 @@ defmodule Shuttle.Poller do
     with {:ok, fiber} <- fetch_fiber_full(fiber_id, state),
          shuttle when is_map(shuttle) <- Map.get(fiber, "shuttle"),
          true <- host_owned?(shuttle, state.own_host_id),
-         true <- standing_block?(shuttle),
+         true <- cyclical_block?(shuttle),
          "active" <- Map.get(fiber, "status", ""),
          true <- is_nil(Map.get(fiber, "tempered")) do
       Logger.info(
@@ -2256,14 +2264,17 @@ defmodule Shuttle.Poller do
     end
   end
 
-  # Direct read of the standing signal from a shuttle: block, with no lifecycle
-  # overlay merge (unlike `standing_role?/2`). Supports both the new `kind:` and
-  # legacy `mode:` shapes.
-  defp standing_block?(shuttle) when is_map(shuttle) do
-    Map.get(shuttle, "kind", Map.get(shuttle, "mode")) == "standing"
+  # Direct read of the cyclical signal (standing OR pinned) from a shuttle: block,
+  # with no lifecycle overlay merge. Supports both the new `kind:` and legacy
+  # `mode:` shapes. Both share the active→closed→active lifecycle, so the
+  # dead-orphan reconciler must mark a pinned worker that died unobserved as
+  # awaiting too (else the resting `status: active` document looks like a
+  # never-ran role forever).
+  defp cyclical_block?(shuttle) when is_map(shuttle) do
+    Map.get(shuttle, "kind", Map.get(shuttle, "mode")) in ["standing", "pinned"]
   end
 
-  defp standing_block?(_), do: false
+  defp cyclical_block?(_), do: false
 
   defp adopt_orphans(%State{} = state) do
     {:ok, sessions} = list_shuttle_sessions(state)
@@ -2368,14 +2379,17 @@ defmodule Shuttle.Poller do
                     # Work complete or blocked — release claim
                     release_claim(state, fiber_id)
 
-                  standing_role?(fiber, state) ->
-                    # New model: a standing worker's exit makes the role
-                    # awaiting review by writing `status: closed` (untempered)
-                    # to the felt document — the don't-re-fire gate and the
-                    # human's accept anchor, both now doc-representable. Write
-                    # BEFORE release_claim so the document reflects awaiting
-                    # before the claim frees (a re-poll racing the release then
-                    # reads `status: closed` and skips re-dispatch).
+                  cyclical_role?(fiber, state) ->
+                    # New model: a cyclical (standing OR pinned) worker's exit
+                    # makes the role awaiting review by writing `status: closed`
+                    # (untempered) to the felt document — the don't-re-fire gate
+                    # and the human's accept anchor, both now doc-representable.
+                    # A pinned run lands here too: its exit closes the role to
+                    # awaiting-review just like a standing run, and an accept
+                    # re-arms it to its resting `status: active`. Write BEFORE
+                    # release_claim so the document reflects awaiting before the
+                    # claim frees (a re-poll racing the release then reads
+                    # `status: closed` and skips re-dispatch).
                     mark_standing_awaiting(fiber_id)
 
                     release_claim(state, fiber_id)
@@ -2675,10 +2689,14 @@ defmodule Shuttle.Poller do
     end
   end
 
-  defp standing_role?(fiber, state) do
-    # Tags no longer carry the standing signal; read the shuttle: block.
+  # A cyclical role — standing OR pinned — has the active→closed→active
+  # lifecycle: a run closes it to awaiting-review and an accept re-arms it. The
+  # only difference is *what* dispatches it (standing: the cron; pinned: an
+  # explicit force-dispatch), which `eligible?` already discriminates. The
+  # worker-exit closer treats them identically: both mark awaiting on exit.
+  defp cyclical_role?(fiber, state) do
     case fetch_standing_role(Map.get(fiber, "id", ""), state) do
-      {:ok, role} -> StandingRole.standing?(role)
+      {:ok, role} -> StandingRole.cyclical?(role)
       {:error, _} -> false
     end
   end
