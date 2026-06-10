@@ -8,14 +8,20 @@ defmodule ShuttleWeb.LifecycleController do
   identical `/lifecycle` (origin stripped) and relayed verbatim. The local
   branch delegates to the existing shuttle-ctl Go CLI, so the validated offline
   frontmatter writer remains the single implementation of
-  install/pause/resume/repeat/accept/set-model/set-outcome/uninstall.
+  install/pause/resume/repeat/pin/accept/set-model/set-outcome/uninstall.
+
+  `pin` reshapes a fiber to the schedule-less `kind: pinned` umbrella role
+  (the board's drag-onto-the-Pinned-strip gesture). Like a kind reshape, the
+  caller composes `uninstall` then `pin` client-side — `shuttle-ctl pin`
+  refuses to clobber an existing block — echoing the fiber's model / host /
+  project_dir so the block survives the round trip.
   """
 
   use Phoenix.Controller, formats: [:json]
 
   alias Shuttle.{FeltStores, LifecycleService, OriginRouter}
 
-  @allowed ~w(install pause resume repeat accept set-model set-outcome uninstall)
+  @allowed ~w(install pause resume repeat pin accept set-model set-outcome uninstall)
 
   def create(conn, params) do
     case OriginRouter.route(Map.get(params, "origin")) do
@@ -127,6 +133,14 @@ defmodule ShuttleWeb.LifecycleController do
   end
 
   defp args_for("resume", %{"fiber" => fiber}), do: {:ok, ["resume", fiber]}
+
+  defp args_for("pin", %{"fiber" => fiber} = params) do
+    {:ok,
+     ["pin", fiber]
+     |> add_string_flag("--model", params["model"])
+     |> add_string_flag("--project-dir", params["project_dir"])
+     |> add_string_flag("--host", params["host"])}
+  end
 
   defp args_for("repeat", %{"fiber" => fiber, "schedule" => schedule} = params) do
     {:ok,

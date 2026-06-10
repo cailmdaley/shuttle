@@ -28,6 +28,31 @@ defmodule ShuttleWeb.LifecycleControllerTest do
              "install\ntests/interactive\n--project-dir\n/tmp/project\n"
   end
 
+  # pin reshapes a fiber to the schedule-less kind:pinned role — the board's
+  # drag-onto-the-Pinned-strip gesture. The controller forwards model / project
+  # / host to `shuttle-ctl pin`; no schedule (a pinned block has none).
+  test "pin delegates to shuttle-ctl with model, project_dir and host" do
+    args_file = install_fake_shuttle_ctl!()
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/lifecycle",
+        Jason.encode!(%{
+          "action" => "pin",
+          "fiber" => "tests/operator",
+          "model" => "claude-fable",
+          "project_dir" => "/tmp/loom",
+          "host" => "dapmcw68"
+        })
+      )
+
+    assert conn.status == 200
+
+    assert File.read!(args_file) ==
+             "pin\ntests/operator\n--model\nclaude-fable\n--project-dir\n/tmp/loom\n--host\ndapmcw68\n"
+  end
+
   # set-interactive is retired: the controller no longer allows the action, so a
   # stale client gets a clean rejection rather than a shuttle-ctl invocation.
   test "set-interactive is rejected as an unknown lifecycle action" do
@@ -138,7 +163,9 @@ defmodule ShuttleWeb.LifecycleControllerTest do
       refute frontmatter =~ "review:"
       refute frontmatter =~ "closed-at:"
       assert frontmatter =~ "status: active"
-      assert frontmatter =~ ~s(outcome: "")
+      # accept PRESERVES the prior run's outcome — it stays the card headline
+      # until the next run overwrites it (accept no longer blanks it).
+      assert frontmatter =~ "outcome: digest"
       assert frontmatter =~ "schedule:"
     end)
 
