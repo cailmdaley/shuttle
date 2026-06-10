@@ -10,7 +10,7 @@ defmodule ShuttleWeb.ReserveController do
 
   def create(conn, params) do
     resource = Map.get(params, "resource")
-    host = Map.get(params, "host", hostname())
+    host = Map.get(params, "host", Shuttle.Poller.own_host_id())
     duration_ms = Map.get(params, "duration_ms", 3_600_000)
     fiber_id = Map.get(params, "fiber_id")
 
@@ -37,10 +37,4 @@ defmodule ShuttleWeb.ReserveController do
     end
   end
 
-  defp hostname do
-    case :inet.gethostname() do
-      {:ok, name} -> to_string(name)
-      _ -> "unknown"
-    end
-  end
 end

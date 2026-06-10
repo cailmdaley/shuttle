@@ -1662,16 +1662,29 @@ defmodule Shuttle.Poller do
   `ShuttleWeb.FiberController` when stamping a `host:` on a new fiber) share
   the exact same resolution.
 
+  This is THE one host-identity resolver. Every surface that stamps or
+  matches `shuttle.host` — the dispatch filter, the `/api/v1/fibers` owned
+  feed, the CLI's `host:` stamp on new fibers, the state/reserve/snapshot
+  endpoints — goes through here, so a daemon's advertised identity is
+  single-valued by construction. Do not re-derive `:inet.gethostname()`
+  anywhere else; that drift is exactly how candide came to own by `c03`
+  (the raw hostname) while its fibers were stamped `candide` (the alias),
+  and the owner-only feed silently dropped every one of them.
+
   Precedence:
 
-    1. `SHUTTLE_HOST` env var, if set and non-empty. Operators override here
-       when they want a friendly name distinct from `:inet.gethostname()`
-       (e.g. `SHUTTLE_HOST=mac` instead of `dapmcw68`, or `candide` instead
-       of `c03`). Also the seam for tests / smoke harnesses that need a
-       stable identity — `config/test.exs` calls `System.put_env/2` to pin
-       a value at test boot.
+    1. `SHUTTLE_HOST` env var, if set and non-empty. The explicit override
+       and the test seam — `config/test.exs` pins it via `System.put_env/2`,
+       and the daemon's tmux respawn loop can export it.
 
-    2. `:inet.gethostname()` — short OS hostname. Two separately-deployed
+    2. `~/.shuttle/host` file (first non-empty line), if present. The durable
+       per-host canonical identity: unlike the env var it survives every
+       daemon launch path (`make start`, a bare `bin/shuttle start`, a
+       respawn outside the loop), so the daemon *derives* its friendly name
+       (`candide` instead of `c03`) rather than depending on an operator
+       remembering to export it. Override the path with `SHUTTLE_HOST_FILE`.
+
+    3. `:inet.gethostname()` — short OS hostname. Two separately-deployed
        daemons get distinct ids automatically; no per-machine config needed.
 
   No `Application.get_env(:shuttle, :host)` step. An earlier iteration
@@ -1692,15 +1705,51 @@ defmodule Shuttle.Poller do
         env
 
       _ ->
-        case :inet.gethostname() do
-          {:ok, name} when name != [] ->
-            to_string(name)
+        case host_config_file_value() do
+          name when is_binary(name) and name != "" ->
+            name
 
-          other ->
-            raise "Shuttle.Poller could not resolve own_host_id: " <>
-                    ":inet.gethostname/0 returned #{inspect(other)}. " <>
-                    "Set SHUTTLE_HOST=<name> in the daemon environment."
+          _ ->
+            case :inet.gethostname() do
+              {:ok, name} when name != [] ->
+                to_string(name)
+
+              other ->
+                raise "Shuttle.Poller could not resolve own_host_id: " <>
+                        ":inet.gethostname/0 returned #{inspect(other)}. " <>
+                        "Set SHUTTLE_HOST=<name> or write ~/.shuttle/host."
+            end
         end
+    end
+  end
+
+  # First non-empty line of the `~/.shuttle/host` canonical-identity file,
+  # or nil when the file is absent/empty/unreadable.
+  @spec host_config_file_value() :: String.t() | nil
+  defp host_config_file_value do
+    path = host_config_file()
+
+    with true <- File.exists?(path),
+         {:ok, content} <- File.read(path) do
+      content
+      |> String.split("\n", parts: 2)
+      |> List.first()
+      |> to_string()
+      |> String.trim()
+      |> case do
+        "" -> nil
+        value -> value
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  @spec host_config_file() :: String.t()
+  defp host_config_file do
+    case System.get_env("SHUTTLE_HOST_FILE") do
+      v when is_binary(v) and v != "" -> Path.expand(v)
+      _ -> Path.expand("~/.shuttle/host")
     end
   end
 

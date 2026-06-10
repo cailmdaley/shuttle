@@ -441,11 +441,12 @@ defmodule Shuttle.PollerTest do
            end)
   end
 
-  # The Poller defaults `own_host_id` from a two-step precedence chain:
-  # SHUTTLE_HOST env var → :inet.gethostname(). Explicit `own_host_id:`
-  # opts always win; these tests cover the resolution chain that drives
-  # production daemons. There is intentionally no Application-config step
-  # and no "local" fallback — see Shuttle.Poller.own_host_id/0.
+  # The Poller defaults `own_host_id` from a three-step precedence chain:
+  # SHUTTLE_HOST env var → ~/.shuttle/host file → :inet.gethostname().
+  # Explicit `own_host_id:` opts always win; these tests cover the
+  # resolution chain that drives production daemons. There is intentionally
+  # no Application-config step and no "local" fallback — see
+  # Shuttle.Poller.own_host_id/0.
   test "poller resolves own_host_id from SHUTTLE_HOST env var when set" do
     prev = System.get_env("SHUTTLE_HOST")
     System.put_env("SHUTTLE_HOST", "candide")
@@ -467,9 +468,39 @@ defmodule Shuttle.PollerTest do
     end
   end
 
-  test "poller falls back to :inet.gethostname when SHUTTLE_HOST is unset" do
+  test "poller resolves own_host_id from ~/.shuttle/host file when SHUTTLE_HOST unset" do
     prev = System.get_env("SHUTTLE_HOST")
+    prev_file = System.get_env("SHUTTLE_HOST_FILE")
     System.delete_env("SHUTTLE_HOST")
+    path = Path.join(System.tmp_dir!(), "shuttle-host-#{System.unique_integer([:positive])}")
+    File.write!(path, "candide\n")
+    System.put_env("SHUTTLE_HOST_FILE", path)
+
+    try do
+      {:ok, poller} =
+        Poller.start_link(
+          name: :test_poller_host_file,
+          runner: MockRunner,
+          poll_interval_ms: 60_000,
+          felt_stores: ["/tmp"]
+        )
+
+      assert Poller.snapshot(poller).host == "candide"
+    after
+      File.rm(path)
+      if prev_file, do: System.put_env("SHUTTLE_HOST_FILE", prev_file), else: System.delete_env("SHUTTLE_HOST_FILE")
+      if prev, do: System.put_env("SHUTTLE_HOST", prev), else: System.delete_env("SHUTTLE_HOST")
+    end
+  end
+
+  test "poller falls back to :inet.gethostname when SHUTTLE_HOST and host file are unset" do
+    prev = System.get_env("SHUTTLE_HOST")
+    prev_file = System.get_env("SHUTTLE_HOST_FILE")
+    System.delete_env("SHUTTLE_HOST")
+    # Point the host-file source at a path that does not exist so the chain
+    # genuinely falls through to the OS hostname regardless of the dev
+    # machine's real ~/.shuttle/host.
+    System.put_env("SHUTTLE_HOST_FILE", Path.join(System.tmp_dir!(), "shuttle-host-absent-#{System.unique_integer([:positive])}"))
     {:ok, hostname} = :inet.gethostname()
     expected = to_string(hostname)
 
@@ -484,6 +515,7 @@ defmodule Shuttle.PollerTest do
 
       assert Poller.snapshot(poller).host == expected
     after
+      if prev_file, do: System.put_env("SHUTTLE_HOST_FILE", prev_file), else: System.delete_env("SHUTTLE_HOST_FILE")
       if prev, do: System.put_env("SHUTTLE_HOST", prev)
     end
   end

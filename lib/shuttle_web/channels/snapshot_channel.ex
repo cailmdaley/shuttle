@@ -26,7 +26,7 @@ defmodule ShuttleWeb.SnapshotChannel do
         :exit, _ ->
           %{
             poll_at: DateTime.to_unix(DateTime.utc_now(), :millisecond),
-            host: hostname(),
+            host: Shuttle.Poller.own_host_id(),
             eligible: [],
             blocked: [],
             orphans: [],
@@ -37,13 +37,6 @@ defmodule ShuttleWeb.SnapshotChannel do
       end
 
     {:ok, snap, socket}
-  end
-
-  defp hostname do
-    case :inet.gethostname() do
-      {:ok, name} -> to_string(name)
-      _ -> "unknown"
-    end
   end
 
   @impl true

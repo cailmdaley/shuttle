@@ -405,16 +405,8 @@ defmodule Shuttle.FiberDocuments do
   defp store_errors({:ok, _rows}), do: []
   defp store_errors({:error, error}), do: [error]
 
-  defp own_host_id do
-    case System.get_env("SHUTTLE_HOST") do
-      value when is_binary(value) and value != "" ->
-        value
-
-      _ ->
-        case :inet.gethostname() do
-          {:ok, name} -> List.to_string(name)
-          _ -> "unknown"
-        end
-    end
-  end
+  # The owned-feed predicate and the envelope `host:` must match exactly what
+  # the dispatcher owns by, so both resolve through the single canonical
+  # resolver rather than re-deriving the hostname here.
+  defp own_host_id, do: Shuttle.Poller.own_host_id()
 end

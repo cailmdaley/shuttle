@@ -209,7 +209,7 @@ defmodule Shuttle.CLI do
 
     fallback = %{
       daemon_down: true,
-      host: hostname(),
+      host: Shuttle.Poller.own_host_id(),
       poll_at: System.os_time(:millisecond),
       eligible: sessions,
       retrying: [],
@@ -278,10 +278,4 @@ defmodule Shuttle.CLI do
     System.get_env("SHUTTLE_PORT", "4000") |> String.to_integer()
   end
 
-  defp hostname do
-    case :inet.gethostname() do
-      {:ok, name} -> to_string(name)
-      _ -> "unknown"
-    end
-  end
 end

@@ -23,7 +23,7 @@ defmodule ShuttleWeb.StateController do
         conn
         |> put_status(:service_unavailable)
         |> json(%{
-          host: hostname(),
+          host: Shuttle.Poller.own_host_id(),
           error: "poller_unavailable",
           reason: render_error(reason),
           eligible: [],
@@ -70,7 +70,7 @@ defmodule ShuttleWeb.StateController do
   catch
     :exit, reason ->
       %{
-        host: hostname(),
+        host: Shuttle.Poller.own_host_id(),
         error: "poller_unavailable",
         reason: render_error(reason),
         eligible: [],
@@ -125,11 +125,4 @@ defmodule ShuttleWeb.StateController do
   defp render_error(reason) when is_binary(reason), do: reason
   defp render_error(reason) when is_atom(reason), do: to_string(reason)
   defp render_error(reason), do: inspect(reason)
-
-  defp hostname do
-    case :inet.gethostname() do
-      {:ok, name} -> List.to_string(name)
-      _ -> "unknown"
-    end
-  end
 end
