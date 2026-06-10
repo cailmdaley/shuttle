@@ -16,6 +16,12 @@ defmodule ShuttleWeb.Router do
 
     get("/workers/*fiber_id", WorkerController, :show)
     post("/dispatch", DispatchController, :create)
+    # Write-and-claim: register an externally-spawned live tmux session as a
+    # fiber's running worker (capture sessions claim themselves here).
+    post("/claim", ClaimController, :create)
+    # Spawn-without-constitution: launch a capture session from a free-text
+    # prompt; the session files the fiber and claims itself.
+    post("/capture", CaptureController, :create)
     get("/actions/*fiber_id", ActionsController, :show)
     post("/actions/resolve", ActionsController, :resolve)
     post("/actions/invoke", ActionsController, :invoke)

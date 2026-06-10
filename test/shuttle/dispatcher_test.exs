@@ -770,4 +770,60 @@ defmodule Shuttle.DispatcherTest do
     refute script =~ "tmux list-clients"
     refute script =~ "WAIT_DEADLINE"
   end
+
+  # ── Capture (spawn-without-constitution) ──
+
+  test "render_capture_prompt carries the yap, store, claim call, and contract" do
+    prompt =
+      Dispatcher.render_capture_prompt("make the board sing\nwith two lines",
+        session: "capture-ab12cd34",
+        felt_store: "/Users/x/loom",
+        port: 4123,
+        session_uuid: "uuid-cap-1",
+        agent_id: "claude-opus",
+        project_dir: "/Users/x/projects/portolan",
+        host: "test-host"
+      )
+
+    # The yap, verbatim, in the From User block.
+    assert prompt =~ "make the board sing\n  with two lines"
+    assert prompt =~ "From User"
+    # Crystallize instructions + anchors.
+    assert prompt =~ "Felt store: /Users/x/loom"
+    assert prompt =~ "Project dir: /Users/x/projects/portolan"
+    assert prompt =~ "kind: oneshot"
+    assert prompt =~ "agent: claude-opus"
+    assert prompt =~ "host: test-host"
+    # The claim callback, with this session's identity baked in.
+    assert prompt =~ "http://localhost:4123/api/v1/claim"
+    assert prompt =~ ~s("tmux_session": "capture-ab12cd34")
+    assert prompt =~ ~s("session_uuid": "uuid-cap-1")
+    # Worker exit contract present (capture sessions become ordinary workers).
+    assert prompt =~ "kill $PPID"
+  end
+
+  test "capture spawns a non-shuttle-suffixed session with the prompt in the run script" do
+    {:ok, %{session: session, session_uuid: uuid, agent_id: "claude-opus"}} =
+      Dispatcher.capture("an idea", runner: MockRunner, work_dir: "/tmp", felt_store: "/tmp")
+
+    assert session =~ ~r/^capture-[0-9a-f]{8}$/
+    refute String.ends_with?(session, "-shuttle")
+    assert is_binary(uuid)
+
+    {_, args} =
+      Enum.find(MockRunner.commands(), fn {cmd, args} ->
+        cmd == "tmux" and hd(args) == "new-session"
+      end)
+
+    assert Enum.at(args, 3) == session
+    assert Enum.at(args, 5) == "/tmp"
+
+    # The run script (written to disk, handed to tmux) carries the yap and
+    # the claim call with this session's identity baked in.
+    script = File.read!(List.last(args))
+    assert script =~ "an idea"
+    assert script =~ "/api/v1/claim"
+    assert script =~ session
+    assert script =~ uuid
+  end
 end

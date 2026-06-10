@@ -204,6 +204,47 @@ defmodule Shuttle.Poller do
     GenServer.call(server, {:dispatch, fiber_id, opts}, @dispatch_call_timeout_ms)
   end
 
+  @doc """
+  First-class claim: register an already-live tmux session as the running
+  worker for `fiber_id`, exactly as if the daemon had dispatched it.
+
+  The write-and-claim path for capture sessions (a session that authored its
+  own fiber claims itself), and generally any externally-spawned worker.
+  Validates the fiber (exists, not closed, no live worker) and the tmux
+  session, renames the session to the canonical `<leaf>-<uid>-shuttle` name
+  (so restart re-adoption, dual-recognition liveness, and the kanban treat it
+  identically to a dispatched worker), starts a watcher, and appends the same
+  `session=<uuid>` history event shape the dispatcher writes at spawn (when
+  `:session_uuid` is provided) so resume works.
+
+  Options: `:agent` (registry name; defaults to the fiber's shuttle.agent),
+  `:session_uuid` (the harness transcript UUID, for the history event).
+  """
+  @spec claim_session(String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def claim_session(fiber_id, tmux_session, opts \\ []),
+    do: claim_session(__MODULE__, fiber_id, tmux_session, opts)
+
+  @spec claim_session(GenServer.server(), String.t(), String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def claim_session(server, fiber_id, tmux_session, opts) do
+    GenServer.call(server, {:claim_session, fiber_id, tmux_session, opts}, @dispatch_call_timeout_ms)
+  end
+
+  @doc """
+  Spawn-without-constitution: launch a capture session (free-text prompt, no
+  pre-existing fiber) in `work_dir`. See `Shuttle.Dispatcher.capture/2`.
+
+  Options: `:agent`, `:work_dir` (required), `:felt_store` (defaults to the
+  daemon's primary store).
+  """
+  @spec capture(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def capture(yap, opts \\ []), do: capture(__MODULE__, yap, opts)
+
+  @spec capture(GenServer.server(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def capture(server, yap, opts) do
+    GenServer.call(server, {:capture, yap, opts}, @dispatch_call_timeout_ms)
+  end
+
   @spec actions_for(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
   def actions_for(fiber_id, opts \\ []), do: actions_for(__MODULE__, fiber_id, opts)
 
@@ -524,6 +565,28 @@ defmodule Shuttle.Poller do
   def handle_call({:worker_status, fiber_id}, _from, state) do
     fiber_id = address_for_identifier(state, fiber_id)
     {:reply, running_worker(state, fiber_id), state}
+  end
+
+  def handle_call({:claim_session, fiber_id, tmux_session, opts}, _from, state) do
+    fiber_id = address_for_identifier(state, fiber_id)
+    {state, reply} = do_claim_session(state, fiber_id, tmux_session, opts)
+    {:reply, reply, state}
+  end
+
+  def handle_call({:capture, yap, opts}, _from, state) do
+    felt_store = Keyword.get(opts, :felt_store) || hd(state.felt_stores)
+
+    result =
+      Dispatcher.capture(yap,
+        runner: state.runner,
+        work_dir: Keyword.fetch!(opts, :work_dir),
+        felt_store: felt_store,
+        agent: Keyword.get(opts, :agent),
+        port: Shuttle.CLI.daemon_port(),
+        host: state.own_host_id
+      )
+
+    {:reply, result, state}
   end
 
   def handle_call({:dispatch, fiber_id, opts}, _from, state) do
@@ -2142,6 +2205,143 @@ defmodule Shuttle.Poller do
         Logger.warning("Dispatch failed for #{fiber_id}: #{inspect(reason)}")
         state = record_dispatch_failure(state, fiber_id, reason)
         {state, {:error, reason}}
+    end
+  end
+
+  # The claim verb's local branch: validate fiber + live session, rename the
+  # session to the canonical worker name, register it in `running` with a
+  # watcher, log the dispatch-shaped history event, and refresh the document
+  # cache so the board reflects the claim immediately.
+  defp do_claim_session(%State{} = state, fiber_id, tmux_session, opts) do
+    state = reconcile_running_fiber(state, fiber_id)
+
+    cond do
+      running_key(state, fiber_id) != nil or fiber_session_live?(state, fiber_id) ->
+        {state, {:error, :already_running}}
+
+      not already_running_session?(state, tmux_session) ->
+        {state, {:error, :session_not_found}}
+
+      true ->
+        case fetch_fiber_full(fiber_id, state) do
+          {:error, _} ->
+            {state, {:error, :not_found}}
+
+          {:ok, fiber} ->
+            if Map.get(fiber, "status") == "closed" do
+              {state, {:error, :closed}}
+            else
+              register_claimed_session(state, fiber_id, fiber, tmux_session, opts)
+            end
+        end
+    end
+  end
+
+  defp register_claimed_session(%State{} = state, fiber_id, fiber, tmux_session, opts) do
+    agent_name = Keyword.get(opts, :agent) || fetch_shuttle_agent_name(fiber_id, state)
+
+    # Unknown agent names degrade to the registry default rather than crashing
+    # the claim — the session is already live; record it under our best label.
+    {:ok, agent} =
+      with {:error, _} <- Shuttle.Agents.resolve_by_name(agent_name) do
+        Shuttle.Agents.resolve_by_name("")
+      end
+
+    # Rename to the canonical `<leaf>-<uid>-shuttle` name so everything
+    # downstream — restart re-adoption, dual-recognition liveness, the kanban's
+    # runtime stamp — treats the claimed session exactly like a dispatched one.
+    canonical = Dispatcher.session_name(fiber_id, Map.get(fiber, "uid"))
+
+    session =
+      if tmux_session == canonical do
+        canonical
+      else
+        case state.runner.cmd(
+               "tmux",
+               ["rename-session", "-t", "=" <> tmux_session, canonical],
+               stderr_to_stdout: true
+             ) do
+          {_, 0} ->
+            canonical
+
+          {output, _} ->
+            # Watch the session under its given name rather than failing the
+            # claim; liveness still works (the stored name is checked directly).
+            Logger.warning("claim: rename #{tmux_session} → #{canonical} failed: #{output}")
+            tmux_session
+        end
+      end
+
+    now = DateTime.utc_now()
+
+    running_meta = %{
+      fiber_id: fiber_id,
+      session: session,
+      agent_id: agent.id,
+      uid: Map.get(fiber, "uid"),
+      started_at: now,
+      last_activity_at: now
+    }
+
+    case start_watcher(state, fiber_id, running_meta) do
+      {:ok, running_meta} ->
+        runtime_key = runtime_key_for_fiber(fiber)
+
+        state = %{
+          state
+          | running: Map.put(state.running, runtime_key, running_meta),
+            claimed: MapSet.put(state.claimed, fiber_id),
+            dispatch_failures: Map.delete(state.dispatch_failures, fiber_id)
+        }
+
+        log_worker_claim(fiber_id, agent.id, Keyword.get(opts, :session_uuid), state)
+        state = refresh_document_entry(state, fiber_id)
+        broadcast_snapshot(state)
+        Logger.info("Claimed session #{session} for #{fiber_id} (agent=#{agent.id})")
+        {state, {:ok, %{session: session, agent_id: agent.id}}}
+
+      {:error, reason} ->
+        Logger.error("Failed to start watcher for claimed #{fiber_id}: #{inspect(reason)}")
+        {state, {:error, :watcher_start_failed}}
+    end
+  end
+
+  # The claim-time analog of the dispatcher's "worker dispatched" event, with
+  # the same `session=<uuid>` token so `latest_history_session_id` recovers it
+  # for resume. Best-effort, like every felt-history write on this path.
+  defp log_worker_claim(fiber_id, agent_id, session_uuid, state) do
+    summary =
+      case session_uuid do
+        uuid when is_binary(uuid) and uuid != "" ->
+          "worker claimed (agent=#{agent_id}) session=#{uuid}"
+
+        _ ->
+          "worker claimed (agent=#{agent_id})"
+      end
+
+    case host_for_fiber(fiber_id, state) do
+      {:ok, felt_store} ->
+        args = ["-C", felt_store, "history", "append", fiber_id, "--summary", summary]
+
+        try do
+          case System.cmd("felt", args, stderr_to_stdout: true) do
+            {_, 0} ->
+              :ok
+
+            {output, code} ->
+              Logger.warning(
+                "log_worker_claim: felt history append exited #{code} for #{fiber_id}: #{String.trim(output)}"
+              )
+          end
+        rescue
+          e ->
+            Logger.warning(
+              "log_worker_claim: felt history append raised for #{fiber_id}: #{inspect(e)}"
+            )
+        end
+
+      {:error, _} ->
+        Logger.debug("log_worker_claim: no felt store found for #{fiber_id}; skipping")
     end
   end
 

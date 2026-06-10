@@ -662,6 +662,144 @@ defmodule Shuttle.Dispatcher do
     )
   end
 
+  # ── Capture (spawn-without-constitution) ──
+
+  @doc """
+  Spawns a tmux agent session from a free-text capture prompt — no
+  pre-existing fiber required.
+
+  The chat-to-card intake: the user's yap is carried verbatim into the
+  spawned session's prompt, together with the felt store and instructions to
+  crystallize the idea into a fiber, install a `shuttle:` block, claim the
+  session via `POST /api/v1/claim`, and then continue as the worker realizing
+  the new constitution. The session name (`capture-<hex>`) deliberately does
+  NOT end in `-shuttle`: the daemon's orphan/adoption machinery ignores it
+  until the worker claims it, at which point the claim verb renames the tmux
+  session to the canonical `<leaf>-<uid>-shuttle` form — from then on it is
+  indistinguishable from a dispatched worker.
+
+  Options:
+    * `:runner` — `Shuttle.Runner` impl (default `Shuttle.Runner.Default`)
+    * `:work_dir` — project directory to spawn in (required)
+    * `:felt_store` — felt store the worker should file into
+    * `:agent` — agent registry name (default `"claude-opus"`)
+    * `:port` — daemon HTTP port for the claim callback
+    * `:host` — owning host id to stamp into the shuttle block (optional)
+
+  Returns `{:ok, %{session:, session_uuid:, agent_id:}}` or `{:error, reason}`.
+  """
+  @spec capture(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def capture(yap, opts \\ []) when is_binary(yap) do
+    runner = Keyword.get(opts, :runner, Shuttle.Runner.Default)
+    work_dir = Keyword.fetch!(opts, :work_dir)
+    felt_store = Keyword.get(opts, :felt_store, default_felt_store())
+    agent_name = Keyword.get(opts, :agent) || "claude-opus"
+    port = Keyword.get(opts, :port, 4000)
+    host = Keyword.get(opts, :host)
+
+    with {:ok, agent} <- Agents.resolve_by_name(agent_name),
+         :ok <- validate_agent(agent) do
+      session = capture_session_name()
+
+      {command, session_uuid} =
+        case agent.cli do
+          "claude" ->
+            uuid = generate_uuid4()
+
+            prompt =
+              render_capture_prompt(yap,
+                session: session,
+                felt_store: felt_store,
+                port: port,
+                session_uuid: uuid,
+                agent_id: agent.id,
+                project_dir: work_dir,
+                host: host
+              )
+
+            {Agents.build_command(agent, prompt, session_id: uuid), uuid}
+
+          _ ->
+            prompt =
+              render_capture_prompt(yap,
+                session: session,
+                felt_store: felt_store,
+                port: port,
+                agent_id: agent.id,
+                project_dir: work_dir,
+                host: host
+              )
+
+            {Agents.build_command(agent, prompt), nil}
+        end
+
+      # No `session:` opt: capture sessions are headless by design (the user
+      # stays on the board), so the wait-for-client gate would only delay the
+      # worker by its 10s timeout.
+      run_script = build_run_script(session, command, agent.id, display_fiber_id: "capture")
+
+      Logger.info("Capture session via #{agent.id} → tmux session #{session}")
+
+      case spawn_tmux(session, work_dir, run_script, runner) do
+        {:ok, _} -> {:ok, %{session: session, session_uuid: session_uuid, agent_id: agent.id}}
+        error -> error
+      end
+    end
+  end
+
+  @doc false
+  # Public for tests. The prompt a capture session wakes to: the yap verbatim,
+  # then the crystallize → install → claim → realize instructions.
+  def render_capture_prompt(yap, opts) do
+    session = Keyword.fetch!(opts, :session)
+    felt_store = Keyword.fetch!(opts, :felt_store)
+    port = Keyword.get(opts, :port, 4000)
+    session_uuid = Keyword.get(opts, :session_uuid)
+    agent_id = Keyword.get(opts, :agent_id, "")
+    project_dir = Keyword.get(opts, :project_dir, "")
+    host = Keyword.get(opts, :host)
+
+    uuid_field =
+      if session_uuid, do: ~s(, "session_uuid": "#{session_uuid}"), else: ""
+
+    host_line =
+      if is_binary(host) and host != "",
+        do: "Set `host: #{host}` in the shuttle block.\n",
+        else: ""
+
+    header = """
+    Shuttle capture session. The user had an idea and spoke it into the board's capture box; you are the session it spawned. Your job: crystallize the idea into a fiber, claim this session as its worker, then realize it. The `felt` and `shuttle` skills carry the practice — activate them first.
+
+    Felt store: #{felt_store}
+    Project dir: #{project_dir}
+
+    Steps, in order:
+    1. **Crystallize.** Read the idea below and file it as a fiber in the felt store, nested under the right parent (felt-skill judgment — search for kin first). Write the lede and a `## Desired State` the idea has earned; don't over-spec a sketch.
+    2. **Install the shuttle block.** Add to the fiber's frontmatter: `shuttle:` with `kind: oneshot`, `agent: #{agent_id}`, `project_dir: #{project_dir}`. #{host_line}Set felt `status: active`.
+    3. **Claim this session** (registers you with the daemon as the fiber's worker — exit handling, liveness, and the kanban all flow from this):
+
+       curl -s -X POST http://localhost:#{port}/api/v1/claim -H 'Content-Type: application/json' -d '{"fiber_id": "<the fiber id you created>", "tmux_session": "#{session}"#{uuid_field}, "agent": "#{agent_id}"}'
+
+       A successful claim renames this tmux session to the fiber's canonical worker name — that is expected.
+    4. **Realize.** From here you are an ordinary Shuttle worker on that fiber: drive toward the Desired State, keep outcome/history current, and exit per the contract below.
+    """
+
+    [
+      String.trim(header),
+      render_exit_contract(),
+      render_block("From User", nil, String.trim(yap))
+    ]
+    |> Enum.join("\n\n")
+    |> String.trim()
+  end
+
+  # `capture-<hex>` — distinguishable, collision-free enough, and crucially
+  # not `-shuttle`-suffixed (see `capture/2`).
+  defp capture_session_name do
+    suffix = :crypto.strong_rand_bytes(4) |> Base.encode16(case: :lower)
+    "capture-" <> suffix
+  end
+
   @doc """
   Canonical tmux session name for a fiber, keyed by its uid.
 
