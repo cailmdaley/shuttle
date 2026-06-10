@@ -29,6 +29,9 @@ defmodule ShuttleWeb.Router do
     # owner-routing (local invoke, or forward to the owning remote daemon's
     # own /transition). Supersedes the kanban's prior two-leg resolve/invoke.
     post("/transition", TransitionController, :create)
+    # Hard-kill a fiber's live worker (owner-routed). The kanban fires this when
+    # a running card is dragged off the in-flight column; the column write follows.
+    post("/kill", KillController, :create)
     post("/wait", WaitController, :create)
     post("/reserve", ReserveController, :create)
     get("/state", StateController, :show)

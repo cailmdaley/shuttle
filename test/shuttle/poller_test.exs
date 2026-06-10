@@ -752,6 +752,63 @@ defmodule Shuttle.PollerTest do
     refute Map.has_key?(entry, :runtime)
   end
 
+  test "kill_session SIGKILLs a live worker and tears down runtime immediately, writing no status" do
+    uid = "01JZ00000000000000000000KS"
+
+    fiber =
+      make_fiber("tests/killme", %{
+        "uid" => uid,
+        "modified_at" => "2026-06-08T01:00:00Z"
+      })
+
+    MockRunner.set_fiber("tests/killme", fiber)
+    MockRunner.set_shuttle("tests/killme", "enabled: true\nkind: oneshot\nhost: candide\n")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_kill_session,
+        runner: MockRunner,
+        own_host_id: "candide",
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    send(poller, :run_poll_cycle)
+
+    # Wait until the fiber is live (stamped with runtime on the owner feed).
+    assert wait_until(fn ->
+             case Poller.cached_fiber_documents(poller) do
+               {:ok, %{fibers: [entry]}} -> Map.has_key?(entry, :runtime)
+               _ -> false
+             end
+           end)
+
+    {:ok, %{fibers: [live]}} = Poller.cached_fiber_documents(poller)
+    session = get_in(live, [:runtime, :tmux_session])
+    assert is_binary(session)
+
+    # Kill by fiber id — owner-routed at the controller; here we hit the Poller
+    # directly. Returns the session it killed.
+    assert {:ok, ^session} = Poller.kill_session(poller, "tests/killme")
+
+    # Runtime is gone NOW — not after the watcher's next poll. The fiber's
+    # document status is untouched (no awaiting-review verdict written): the
+    # owner feed still serves the row, just without a runtime stamp.
+    assert wait_until(fn ->
+             case Poller.cached_fiber_documents(poller) do
+               {:ok, %{fibers: [entry]}} -> not Map.has_key?(entry, :runtime)
+               _ -> false
+             end
+           end)
+
+    {:ok, %{fibers: [after_kill]}} = Poller.cached_fiber_documents(poller)
+    # status untouched by the kill (the drag's column write is the verdict).
+    assert get_in(after_kill, [:fiber, "status"]) in [nil, "active", "open"]
+
+    # Idempotent: killing again when nothing runs is a clean no-op.
+    assert {:ok, :no_session} = Poller.kill_session(poller, "tests/killme")
+  end
+
   test "snapshot remains responsive while poll cycle is reading felt" do
     fiber = make_fiber("tests/slow-felt-read")
     MockRunner.set_fiber("tests/slow-felt-read", fiber)

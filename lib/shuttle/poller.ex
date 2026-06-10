@@ -243,6 +243,28 @@ defmodule Shuttle.Poller do
   end
 
   @doc """
+  Hard-kill a fiber's live worker and tear down its runtime state synchronously.
+
+  The user-gesture twin of a natural worker exit: the kanban fires this when a
+  card is dragged off the in-flight column. `tmux kill-session` SIGKILLs the
+  worker, the liveness watcher is stopped, and the running entry + claim are
+  dropped NOW (not on the watcher's next 5s poll) so the very next composite
+  feed reads the card as not-running. Crucially this does NOT write a lifecycle
+  verdict — unlike `handle_worker_exit`, which marks a cyclical role
+  awaiting-review on a natural exit. A user kill-and-drag means the drag *target*
+  is the verdict, so the frontend's subsequent column write is the sole status
+  authority; the kill only stops the process. Idempotent: `{:ok, :no_session}`
+  when nothing is running for the fiber.
+  """
+  @spec kill_session(String.t()) :: {:ok, String.t() | :no_session}
+  def kill_session(fiber_id), do: kill_session(__MODULE__, fiber_id)
+
+  @spec kill_session(GenServer.server(), String.t()) :: {:ok, String.t() | :no_session}
+  def kill_session(server, fiber_id) do
+    GenServer.call(server, {:kill_session, fiber_id}, @dispatch_call_timeout_ms)
+  end
+
+  @doc """
   Spawn-without-constitution: launch a capture session (free-text prompt, no
   pre-existing fiber) in `work_dir`. See `Shuttle.Dispatcher.capture/2`.
 
@@ -583,6 +605,25 @@ defmodule Shuttle.Poller do
     fiber_id = address_for_identifier(state, fiber_id)
     {state, reply} = do_claim_session(state, fiber_id, tmux_session, opts)
     {:reply, reply, state}
+  end
+
+  def handle_call({:kill_session, fiber_id}, _from, state) do
+    case running_key(state, fiber_id) do
+      nil ->
+        {:reply, {:ok, :no_session}, state}
+
+      runtime_key ->
+        meta = Map.get(state.running, runtime_key)
+        session = meta.session
+        # Stop the watcher BEFORE the kill so its has-session poll doesn't also
+        # report the exit and double-handle through handle_worker_exit.
+        stop_watcher(meta)
+        _ = state.runner.cmd("tmux", ["kill-session", "-t", session], stderr_to_stdout: true)
+        # Pure runtime teardown — drop running entry + claim, no status write.
+        state = remove_running(state, runtime_key)
+        broadcast_snapshot(state)
+        {:reply, {:ok, session}, state}
+    end
   end
 
   def handle_call({:capture, yap, opts}, _from, state) do
