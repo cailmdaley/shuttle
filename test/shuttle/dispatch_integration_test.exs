@@ -936,6 +936,60 @@ defmodule Shuttle.DispatchIntegrationTest do
     end
   end
 
+  # The board's "New session" / "Resume" / drag-to-inFlight buttons force-dispatch
+  # (force+ad_hoc) an awaiting standing role. The forced path must re-arm the doc
+  # to status:active AS it spawns — one snappy action, no waiting on the 15s poll,
+  # no running-worker-on-an-awaiting-card incoherence. Regression for the kanban
+  # "New session refused with awaiting_review" bug.
+  test "forced ad-hoc dispatch re-arms an awaiting standing role to active", %{host: host} do
+    write_fiber(host, "tests/standing-awaiting-rearm", """
+    ---
+    name: Standing awaiting, force-dispatched
+    status: closed
+    closed-at: "2026-05-24T10:00:00Z"
+    tags:
+      - constitution
+      - standing
+    shuttle:
+      kind: standing
+      agent: claude-sonnet
+      host: test-host
+      schedule:
+        expr: "0 9 * * 1-5"
+        tz: Europe/Paris
+    ---
+    A standing role awaiting review; the human clicks New session.
+    """)
+
+    prev_loom = System.get_env("LOOM_HOMES")
+    System.put_env("LOOM_HOMES", host)
+
+    try do
+      {:ok, poller} =
+        Poller.start_link(
+          name: :test_poller_force_rearm,
+          runner: IntegrationRunner,
+          poll_interval_ms: 600_000,
+          felt_stores: [host]
+        )
+
+      # The forced board action bypasses the awaiting gate and spawns.
+      assert {:ok, _session} =
+               Poller.dispatch_fiber(poller, "tests/standing-awaiting-rearm",
+                 force: true,
+                 ad_hoc: true
+               )
+
+      # …and the doc is re-armed: status:active, closed-at cleared, untempered.
+      fm = read_frontmatter(host, "tests/standing-awaiting-rearm")
+      assert fm["status"] == "active"
+      refute Map.has_key?(fm, "closed-at")
+      refute Map.has_key?(fm, "tempered")
+    after
+      if prev_loom, do: System.put_env("LOOM_HOMES", prev_loom), else: System.delete_env("LOOM_HOMES")
+    end
+  end
+
   # review-comment with resume_mode=fresh explicitly requests a new session
   # even when a prior session UUID is stored.
   test "resume_mode=fresh takes fresh path even with stored session.id", %{host: host} do

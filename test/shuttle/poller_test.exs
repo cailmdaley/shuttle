@@ -1091,10 +1091,14 @@ defmodule Shuttle.PollerTest do
     assert new_session_count == 1
   end
 
-  test "direct ad-hoc dispatch refuses a standing role awaiting review" do
-    # Awaiting is felt-native (slice 5): status:closed + untempered. An ad-hoc
-    # dispatch against it is refused with the awaiting marker; the completed
-    # timestamp comes from closed-at (the run id lives in felt history now).
+  test "ad-hoc dispatch refuses an awaiting standing role only when NOT forced" do
+    # Awaiting is felt-native (slice 5): status:closed + untempered. The awaiting
+    # gate exists to stop the *autonomous poller* (non-forced ad_hoc) from
+    # re-firing a role pending a human verdict. A forced ad_hoc dispatch is the
+    # human's explicit "go" from the board (New session / Resume / drag) — it IS
+    # the verdict, so it bypasses the gate and spawns (re-arming the doc on the
+    # way; the re-arm itself is exercised in dispatch_integration_test against a
+    # real felt home). The completed timestamp comes from closed-at.
     fiber_id = "tests/standing-awaiting-refuses-adhoc"
 
     fiber =
@@ -1126,10 +1130,19 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
+    # Non-forced ad_hoc (the poller's own path) is still refused with the
+    # awaiting marker, and never spawns.
     assert {:error, {:awaiting_review, nil, "2026-05-24T10:00:00Z"}} =
-             Poller.dispatch_fiber(poller, fiber_id, force: true, ad_hoc: true)
+             Poller.dispatch_fiber(poller, fiber_id, ad_hoc: true)
 
     refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
+
+    # Forced ad_hoc (the human board action) bypasses the gate and spawns.
+    assert {:ok, _session} = Poller.dispatch_fiber(poller, fiber_id, force: true, ad_hoc: true)
+
+    assert Enum.any?(MockRunner.commands(), fn {cmd, args} ->
              cmd == "tmux" and hd(args) == "new-session"
            end)
   end

@@ -1594,12 +1594,18 @@ defmodule Shuttle.Poller do
     end
   end
 
-  # Awaiting review is felt-native (slice 5): `status: closed` + untempered. An
-  # ad-hoc dispatch against a standing role in that state is refused with the
-  # awaiting marker so the caller surfaces "pending a verdict" rather than a
-  # flat not-eligible.
+  # Awaiting review is felt-native (slice 5): `status: closed` + untempered. A
+  # NON-forced ad-hoc dispatch against a standing role in that state is refused
+  # with the awaiting marker so the caller surfaces "pending a verdict" rather
+  # than a flat not-eligible.
+  #
+  # `force: true` is the explicit human "go" from the board (New session /
+  # Resume / drag-to-inFlight) — it IS the verdict, so it skips this gate and
+  # `do_dispatch_fiber` re-arms the role to `status: active` as it spawns (see
+  # `force_rearm_standing_role`). The gate therefore only catches the autonomous
+  # poller's own ad-hoc path, which must never re-fire a role pending review.
   defp awaiting_ad_hoc_dispatch_error(fiber, state, opts) do
-    if Keyword.get(opts, :ad_hoc, false) do
+    if Keyword.get(opts, :ad_hoc, false) and not Keyword.get(opts, :force, false) do
       fiber_id = Map.get(fiber, "id", "")
       status = Map.get(fiber, "status", "")
       tempered = Map.get(fiber, "tempered")
@@ -1920,8 +1926,40 @@ defmodule Shuttle.Poller do
     end)
   end
 
+  # Re-arm a standing role on the forced path. Returns the fiber map with
+  # `status` reflected as "active" so the running-state snapshot built later in
+  # this dispatch is coherent without an extra felt re-read. A failed re-arm
+  # (non-standing, unreadable) is logged and the fiber passes through unchanged —
+  # force-dispatch of a oneshot or a non-awaiting role still spawns as before.
+  defp maybe_force_rearm(fiber, opts) do
+    if Keyword.get(opts, :force, false) and Map.get(fiber, "status") != "active" do
+      fiber_id = Map.get(fiber, "id", "")
+
+      case LifecycleStore.rearm(fiber_id) do
+        {:ok, msg} ->
+          Logger.info("force-dispatch re-arm #{fiber_id}: #{String.trim(msg)}")
+          fiber |> Map.put("status", "active") |> Map.delete("tempered") |> Map.delete("closed-at")
+
+        {:error, _reason} ->
+          # Oneshots and non-standing fibers aren't re-armable; that's expected —
+          # force-dispatch still spawns them. Only log at debug to avoid noise.
+          fiber
+      end
+    else
+      fiber
+    end
+  end
+
   defp do_dispatch_fiber(%State{} = state, fiber, opts \\ []) do
     fiber_id = Map.get(fiber, "id", "")
+
+    # A forced dispatch (the human's "go" from the board) re-arms a closed/awaiting
+    # standing role to `status: active` BEFORE spawning, so re-arm and dispatch are
+    # one atomic, snappy action: the card leaves "Awaiting review" immediately and
+    # the doc is coherent with the running worker — no waiting on the 15s poll and
+    # no running-worker-on-an-awaiting-card split. No-op for active roles, oneshots,
+    # and non-forced dispatch.
+    fiber = maybe_force_rearm(fiber, opts)
 
     felt_store =
       case host_for_fiber(fiber_id, state) do

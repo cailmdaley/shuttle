@@ -105,6 +105,34 @@ defmodule Shuttle.LifecycleStore do
     end
   end
 
+  @doc """
+  Re-arm a standing role to `status: active` regardless of its current verdict.
+
+  This is the **force-dispatch** re-arm: an explicit human "go" from the board
+  (force-dispatch) is the verdict, so unlike `accept`/`resume` it does not
+  require the awaiting precondition — it reopens a closed role whether it was
+  awaiting, tempered, or composted. Clears `tempered`/`closed-at`, keeps the
+  outcome, and wipes daemon-owned runtime keys. A no-op `{:ok, ...}` for a role
+  already active, and an `{:error, _}` for a non-standing or unreadable fiber so
+  the dispatch path can log without crashing.
+
+  Mirror of `mark_awaiting/1` (the worker-exit closer): this is the open.
+  """
+  @spec rearm(String.t()) :: {:ok, String.t()} | {:error, String.t()}
+  def rearm(fiber_id) when is_binary(fiber_id) do
+    with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
+         {:ok, shuttle} <- shuttle_block(frontmatter),
+         :ok <- require_standing(shuttle) do
+      if Map.get(frontmatter, "status") == "active" do
+        {:ok, "#{fiber_id} already active\n"}
+      else
+        {:ok, frontmatter} = update_document(frontmatter, true)
+        write_fiber!(path, evict_runtime_keys(frontmatter), body)
+        {:ok, "re-armed #{fiber_id} (status: active) for force-dispatch\n"}
+      end
+    end
+  end
+
   defp read_fiber(fiber_id) do
     with {:ok, path} <- resolve_fiber_path(fiber_id),
          {:ok, text} <- File.read(path),
