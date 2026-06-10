@@ -44,6 +44,11 @@ defmodule ShuttleWeb.DispatchController do
              ad_hoc: ad_hoc
            ) do
         {:ok, session} ->
+          # A forced dispatch may have re-armed the doc (status:active). Re-read it
+          # into the document cache so the board's post-dispatch refetch moves the
+          # card to inFlight immediately rather than after the next poll.
+          Shuttle.Poller.refresh_document(fiber_id)
+
           json(conn, %{
             dispatched: true,
             fiber_id: fiber_id,

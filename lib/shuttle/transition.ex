@@ -89,8 +89,15 @@ defmodule Shuttle.Transition do
   @spec invoke(String.t(), String.t()) :: :ok | {:error, term()}
   def invoke(fiber_id, action) do
     with :ok <- validate_action(action),
-         {:ok, host} <- validate_available(fiber_id, action) do
-      invoke_action(fiber_id, action, host)
+         {:ok, host} <- validate_available(fiber_id, action),
+         :ok <- invoke_action(fiber_id, action, host) do
+      # Every transition mutates the felt doc (status / tempered / closed-at).
+      # Re-read it into the daemon's document cache NOW so the kanban's
+      # post-transition refetch reflects the move instead of snapping the card
+      # back to its old column until the next poll. (dispatch-ad-hoc also re-reads
+      # here; the spawn path itself no longer patches the cache.)
+      Poller.refresh_document(fiber_id)
+      :ok
     end
   end
 

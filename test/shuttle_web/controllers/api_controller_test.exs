@@ -431,8 +431,15 @@ defmodule ShuttleWeb.APIControllerTest do
     assert body["error"] == "fiber_id is required"
   end
 
-  test "ad-hoc dispatch returns 422 for a standing role awaiting review" do
-    # Awaiting is felt-native (slice 5): status:closed + untempered.
+  test "HTTP ad-hoc dispatch of an awaiting standing role re-arms and runs (no longer 422)" do
+    # Awaiting is felt-native (slice 5): status:closed + untempered. The HTTP
+    # /dispatch path folds ad_hoc into force (`force: force or ad_hoc`), so an
+    # explicit dispatch IS the human verdict: it bypasses the awaiting gate,
+    # re-arms the doc, and spawns — instead of the old 422 that told the user to
+    # `shuttle-ctl accept/resume` first. (The autonomous poller, which calls
+    # dispatch_fiber in-process with ad_hoc and NOT force, is still gated — see
+    # PollerTest "ad-hoc dispatch refuses an awaiting standing role only when NOT
+    # forced".)
     fiber_id = "tests/api-awaiting-refuses-adhoc"
 
     fiber =
@@ -466,12 +473,10 @@ defmodule ShuttleWeb.APIControllerTest do
         })
       )
 
-    assert conn.status == 422
+    assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
-    assert body["dispatched"] == false
-    assert body["reason"] == "awaiting_review"
-    assert body["message"] =~ "shuttle-ctl accept #{fiber_id}"
-    assert body["message"] =~ "shuttle-ctl resume #{fiber_id}"
+    assert body["dispatched"] == true
+    assert body["fiber_id"] == fiber_id
   end
 
   # ── Shuttle actions ──

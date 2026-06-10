@@ -999,9 +999,11 @@ defmodule Shuttle.DispatchIntegrationTest do
       refute Map.has_key?(fm, "tempered")
 
       # SNAPPY-NOW: the kanban's post-dispatch refetch reads card status from the
-      # cached document feed. The inline cache patch must make it report active
-      # WITHOUT another poll — otherwise the card sits in "Awaiting review" until
-      # the next tick even though the worker is live. No send(:run_poll_cycle).
+      # cached document feed. The shared post-mutation refresh (which the dispatch
+      # endpoint calls right after Poller.dispatch_fiber) must make it report
+      # active WITHOUT another poll — otherwise the card sits in "Awaiting review"
+      # until the next tick even though the worker is live. No send(:run_poll_cycle).
+      assert :ok = Poller.refresh_document(poller, "tests/standing-awaiting-rearm")
       assert {:ok, body} = Poller.cached_fiber_documents(poller)
       entry = Enum.find(body.fibers, &(get_in(&1, [:fiber, "id"]) == "tests/standing-awaiting-rearm"))
       assert entry, "re-armed role should still be in the owned feed"
@@ -1011,6 +1013,71 @@ defmodule Shuttle.DispatchIntegrationTest do
     after
       if prev_loom, do: System.put_env("LOOM_HOMES", prev_loom), else: System.delete_env("LOOM_HOMES")
     end
+  end
+
+  # refresh_document/2 is the shared post-mutation seam every board action calls.
+  # It must re-read ANY field change off disk (not just status) and evict a fiber
+  # that no longer resolves — so the kanban refetch never snaps a card back to
+  # stale cached state while waiting on the poll.
+  test "refresh_document re-reads an out-of-band doc change and evicts a vanished fiber",
+       %{host: host} do
+    write_fiber(host, "tests/refresh-seam", """
+    ---
+    name: Refresh seam fiber
+    status: active
+    outcome: original outcome
+    tags:
+      - constitution
+    shuttle:
+      kind: oneshot
+      agent: claude-sonnet
+      host: test-host
+    ---
+    A fiber whose doc changes out of band.
+    """)
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_refresh_seam,
+        runner: IntegrationRunner,
+        poll_interval_ms: 600_000,
+        felt_stores: [host]
+      )
+
+    assert eventually(fn ->
+             case Poller.cached_fiber_documents(poller) do
+               {:ok, body} -> Enum.any?(body.fibers, &(get_in(&1, [:fiber, "id"]) == "tests/refresh-seam"))
+               _ -> false
+             end
+           end),
+           "expected the document cache to warm"
+
+    # Mutate a NON-status field out of band, then refresh — no poll cycle.
+    write_fiber(host, "tests/refresh-seam", """
+    ---
+    name: Refresh seam fiber
+    status: active
+    outcome: changed outcome
+    tags:
+      - constitution
+    shuttle:
+      kind: oneshot
+      agent: claude-sonnet
+      host: test-host
+    ---
+    A fiber whose doc changes out of band.
+    """)
+
+    assert :ok = Poller.refresh_document(poller, "tests/refresh-seam")
+    assert {:ok, body} = Poller.cached_fiber_documents(poller)
+    entry = Enum.find(body.fibers, &(get_in(&1, [:fiber, "id"]) == "tests/refresh-seam"))
+    assert entry.fiber["outcome"] == "changed outcome"
+
+    # Delete the fiber on disk; refresh evicts it from the feed (no poll).
+    File.rm_rf!(Path.join([host, ".felt", "tests", "refresh-seam"]))
+    assert :ok = Poller.refresh_document(poller, "tests/refresh-seam")
+    assert {:ok, body} = Poller.cached_fiber_documents(poller)
+    refute Enum.any?(body.fibers, &(get_in(&1, [:fiber, "id"]) == "tests/refresh-seam"))
   end
 
   # review-comment with resume_mode=fresh explicitly requests a new session

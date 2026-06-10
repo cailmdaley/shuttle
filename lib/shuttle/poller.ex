@@ -159,6 +159,32 @@ defmodule Shuttle.Poller do
     GenServer.call(server, {:cached_fiber_documents, opts}, @orchestrator_state_call_timeout_ms)
   end
 
+  @doc """
+  Re-read one fiber from disk and replace (or evict) its entry in the document
+  cache — the single post-mutation seam.
+
+  The kanban serves card state (status, tempered, outcome, tags, …) from this
+  cache, refreshed on the poll. Any action that mutates a fiber document
+  (transition pause/reopen/close, accept-run, force-dispatch re-arm, set-outcome,
+  set-model) must call this immediately after the write so the UI's
+  post-mutation refetch sees the new state instead of snapping back to stale
+  cached state until the next poll tick. A re-read (not a field patch) keeps the
+  cache a faithful mirror of disk for every field, with no per-verb drift. A
+  fiber that no longer resolves (uninstalled / deleted) is evicted. Always
+  `:ok` — a refresh failure logs and leaves the stale entry for the poll to
+  reconcile rather than failing the mutation the user already committed.
+  """
+  @spec refresh_document(GenServer.server(), String.t()) :: :ok
+  def refresh_document(server \\ __MODULE__, fiber_id) when is_binary(fiber_id) do
+    GenServer.call(server, {:refresh_document, fiber_id}, @orchestrator_state_call_timeout_ms)
+  catch
+    # Best-effort by contract: if the Poller is unavailable (not started, e.g. a
+    # controller unit test, or restarting), the mutation the caller already
+    # committed must still succeed — the next poll reconciles the cache. Never
+    # let a cache refresh fail the write.
+    :exit, _ -> :ok
+  end
+
   # ── Agent-API Client ──
 
   @spec worker_status(String.t()) :: map() | nil
@@ -482,6 +508,16 @@ defmodule Shuttle.Poller do
       {:reply, {:ok, Shuttle.FiberDocuments.envelope(stores, entries)}, state}
     else
       {:reply, {:error, :cold_document_cache}, state}
+    end
+  end
+
+  def handle_call({:refresh_document, fiber_id}, _from, state) do
+    # A cold cache means no poll has populated it yet; the first poll will read
+    # disk fresh, so there is nothing to patch. Once warm, re-read this one fiber.
+    if state.document_cache_ready do
+      {:reply, :ok, refresh_document_entry(state, fiber_id)}
+    else
+      {:reply, :ok, state}
     end
   end
 
@@ -1197,6 +1233,37 @@ defmodule Shuttle.Poller do
       started_at: DateTime.to_unix(meta.started_at, :millisecond),
       last_activity_at: DateTime.to_unix(meta.last_activity_at, :millisecond)
     }
+  end
+
+  # Re-read one fiber from disk and replace its document-cache entry (or evict it
+  # if the fiber no longer resolves). Backs `refresh_document/2`, the shared
+  # post-mutation seam. Keyed identically to the poll's `refresh_document_cache`
+  # (uid when present, else id), and any prior entries for this fiber id under a
+  # different key are dropped first so a re-key can't leave a duplicate card. The
+  # mtime is carried so the next poll's `reusable_document_cache_entry?` reuses
+  # this fresh read instead of re-shelling felt.
+  defp refresh_document_entry(%State{} = state, fiber_id) do
+    without_fiber =
+      :maps.filter(
+        fn _key, %{entry: entry} -> get_in(entry, [:fiber, "id"]) != fiber_id end,
+        state.document_cache
+      )
+
+    case Shuttle.FiberDocuments.get(fiber_id, felt_stores: state.felt_stores) do
+      {:ok, %{fibers: [entry | _]}} ->
+        fiber = Map.get(entry, :fiber, %{})
+        key = document_cache_key(fiber)
+        cached = %{modified_at: Map.get(fiber, "modified_at"), entry: entry}
+        %{state | document_cache: Map.put(without_fiber, key, cached)}
+
+      {:ok, %{fibers: []}} ->
+        # Fiber no longer resolves (uninstalled / deleted): drop it from the feed.
+        %{state | document_cache: without_fiber}
+
+      {:error, reason} ->
+        Logger.warning("refresh_document #{fiber_id} skipped: #{inspect(reason)}")
+        state
+    end
   end
 
   defp refresh_document_cache(%State{} = state, candidates, host_map) do
@@ -1931,70 +1998,36 @@ defmodule Shuttle.Poller do
   # this dispatch is coherent without an extra felt re-read. A failed re-arm
   # (non-standing, unreadable) is logged and the fiber passes through unchanged —
   # force-dispatch of a oneshot or a non-awaiting role still spawns as before.
-  defp maybe_force_rearm(state, fiber, opts) do
+  defp maybe_force_rearm(fiber, opts) do
     if Keyword.get(opts, :force, false) and Map.get(fiber, "status") != "active" do
       fiber_id = Map.get(fiber, "id", "")
 
       case LifecycleStore.rearm(fiber_id) do
         {:ok, msg} ->
           Logger.info("force-dispatch re-arm #{fiber_id}: #{String.trim(msg)}")
-
-          rearmed =
-            fiber |> Map.put("status", "active") |> Map.delete("tempered") |> Map.delete("closed-at")
-
-          # Refresh this one fiber's document-cache entry inline so the kanban's
-          # post-dispatch refetch sees status:active immediately. Without this the
-          # card's status lags until the next poll re-reads the (mtime-bumped) file
-          # — the worker spawns and the live pill appears, but the card sits in
-          # "Awaiting review" for up to a poll interval. Liveness pushes live;
-          # document-derived fields must too on this path.
-          {patch_document_cache_status(state, fiber_id), rearmed}
+          fiber |> Map.put("status", "active") |> Map.delete("tempered") |> Map.delete("closed-at")
 
         {:error, _reason} ->
           # Oneshots and non-standing fibers aren't re-armable; that's expected —
           # force-dispatch still spawns them.
-          {state, fiber}
+          fiber
       end
     else
-      {state, fiber}
+      fiber
     end
-  end
-
-  # Patch the `status`/`tempered`/`closed-at` of a single cached document entry
-  # to match a just-written re-arm, keyed by the entry's fiber id (robust whether
-  # the cache is uid- or id-keyed). The mtime is left as-is: the next poll's
-  # `reusable_document_cache_entry?` sees the file's newer mtime and re-reads to
-  # confirm, so this is a snappy-now patch the poll reconciles, not a divergent
-  # source of truth.
-  defp patch_document_cache_status(%State{} = state, fiber_id) do
-    cache =
-      Enum.into(state.document_cache, %{}, fn {key, %{entry: entry} = cached} ->
-        if get_in(entry, [:fiber, "id"]) == fiber_id do
-          patched_fiber =
-            entry.fiber
-            |> Map.put("status", "active")
-            |> Map.delete("tempered")
-            |> Map.delete("closed-at")
-
-          {key, %{cached | entry: %{entry | fiber: patched_fiber}}}
-        else
-          {key, cached}
-        end
-      end)
-
-    %{state | document_cache: cache}
   end
 
   defp do_dispatch_fiber(%State{} = state, fiber, opts \\ []) do
     fiber_id = Map.get(fiber, "id", "")
 
     # A forced dispatch (the human's "go" from the board) re-arms a closed/awaiting
-    # standing role to `status: active` BEFORE spawning, so re-arm and dispatch are
-    # one atomic, snappy action: the card leaves "Awaiting review" immediately and
-    # the doc is coherent with the running worker — no waiting on the 15s poll and
-    # no running-worker-on-an-awaiting-card split. No-op for active roles, oneshots,
-    # and non-forced dispatch. Returns the (possibly patched) state + re-armed fiber.
-    {state, fiber} = maybe_force_rearm(state, fiber, opts)
+    # standing role to `status: active` BEFORE spawning, so the doc is coherent with
+    # the running worker. The kanban's snappy reflection of that re-arm rides the
+    # shared post-mutation cache refresh (`refresh_document/1`) the dispatch endpoint
+    # and the transition pipeline both call — NOT an inline patch here, so the
+    # autonomous poll path (which rebuilds the whole cache anyway) pays nothing.
+    # No-op for active roles, oneshots, and non-forced dispatch.
+    fiber = maybe_force_rearm(fiber, opts)
 
     felt_store =
       case host_for_fiber(fiber_id, state) do

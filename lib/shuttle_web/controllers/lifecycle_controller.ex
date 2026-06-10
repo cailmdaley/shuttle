@@ -30,6 +30,11 @@ defmodule ShuttleWeb.LifecycleController do
   defp create_local(conn, params) do
     with {:ok, action} <- action(params),
          {:ok, output} <- execute(action, params) do
+      # Every lifecycle verb here mutates the fiber doc (status/outcome/model/
+      # shuttle block). Re-read it into the document cache so the kanban's
+      # post-action refetch reflects the change now, not after the next poll.
+      refresh_card(params)
+
       conn
       |> put_resp_content_type("text/plain")
       |> send_resp(200, output)
@@ -89,6 +94,15 @@ defmodule ShuttleWeb.LifecycleController do
     |> args_for(params)
     |> run_elem()
   end
+
+  defp refresh_card(%{"fiber" => fiber}) do
+    case fiber_address(fiber) do
+      {:ok, fiber_id} -> Shuttle.Poller.refresh_document(fiber_id)
+      _ -> :ok
+    end
+  end
+
+  defp refresh_card(_), do: :ok
 
   defp fiber_address(identifier) do
     case FeltStores.resolve_fiber(identifier) do
