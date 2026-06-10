@@ -773,15 +773,16 @@ defmodule Shuttle.Dispatcher do
     Felt store: #{felt_store}
     Project dir: #{project_dir}
 
-    Steps, in order:
+    Steps, in order (the order is load-bearing — claim BEFORE activating, or the poll loop dispatches a duplicate worker in the gap):
     1. **Crystallize.** Read the idea below and file it as a fiber in the felt store, nested under the right parent (felt-skill judgment — search for kin first). Write the lede and a `## Desired State` the idea has earned; don't over-spec a sketch.
-    2. **Install the shuttle block.** Add to the fiber's frontmatter: `shuttle:` with `kind: oneshot`, `agent: #{agent_id}`, `project_dir: #{project_dir}`. #{host_line}Set felt `status: active`.
+    2. **Install the shuttle block.** Add to the fiber's frontmatter: `shuttle:` with `kind: oneshot`, `agent: #{agent_id}`, `project_dir: #{project_dir}`. #{host_line}Leave felt `status` as `open` for now.
     3. **Claim this session** (registers you with the daemon as the fiber's worker — exit handling, liveness, and the kanban all flow from this):
 
        curl -s -X POST http://localhost:#{port}/api/v1/claim -H 'Content-Type: application/json' -d '{"fiber_id": "<the fiber id you created>", "tmux_session": "#{session}"#{uuid_field}, "agent": "#{agent_id}"}'
 
-       A successful claim renames this tmux session to the fiber's canonical worker name — that is expected.
-    4. **Realize.** From here you are an ordinary Shuttle worker on that fiber: drive toward the Desired State, keep outcome/history current, and exit per the contract below.
+       A successful claim renames this tmux session to the fiber's canonical worker name — that is expected. The claim is idempotent: if the response is lost, retry with the same body.
+    4. **Activate.** Now set felt `status: active`. (Doing this before the claim would make the fiber dispatch-eligible while the daemon cannot yet see this session — a duplicate worker would spawn.)
+    5. **Realize.** From here you are an ordinary Shuttle worker on that fiber: drive toward the Desired State, keep outcome/history current, and exit per the contract below.
     """
 
     [

@@ -576,10 +576,22 @@ defmodule Shuttle.Poller do
   def handle_call({:capture, yap, opts}, _from, state) do
     felt_store = Keyword.get(opts, :felt_store) || hd(state.felt_stores)
 
+    # Guard rather than fetch!: a malformed call must fail the request, not
+    # crash the Poller (and its in-memory running map) with it.
+    work_dir = Keyword.get(opts, :work_dir)
+
+    if not (is_binary(work_dir) and work_dir != "") do
+      {:reply, {:error, :work_dir_required}, state}
+    else
+      do_capture(state, yap, work_dir, felt_store, opts)
+    end
+  end
+
+  defp do_capture(%State{} = state, yap, work_dir, felt_store, opts) do
     result =
       Dispatcher.capture(yap,
         runner: state.runner,
-        work_dir: Keyword.fetch!(opts, :work_dir),
+        work_dir: work_dir,
         felt_store: felt_store,
         agent: Keyword.get(opts, :agent),
         port: Shuttle.CLI.daemon_port(),
@@ -1133,6 +1145,9 @@ defmodule Shuttle.Poller do
                 cond do
                   String.contains?(text, "worker exited") -> :exited
                   String.contains?(text, "worker dispatched") -> :dispatched
+                  # The claim verb's spawn-equivalent event — a claimed
+                  # standing worker's unobserved death must mark awaiting too.
+                  String.contains?(text, "worker claimed") -> :dispatched
                   true -> nil
                 end
               end)
@@ -2215,8 +2230,32 @@ defmodule Shuttle.Poller do
   defp do_claim_session(%State{} = state, fiber_id, tmux_session, opts) do
     state = reconcile_running_fiber(state, fiber_id)
 
+    running =
+      case running_key(state, fiber_id) do
+        nil -> nil
+        key -> Map.get(state.running, key)
+      end
+
+    live_session = live_session_for_fiber(state, fiber_id)
+
     cond do
-      running_key(state, fiber_id) != nil or fiber_session_live?(state, fiber_id) ->
+      # Idempotent retry: the fiber's running worker is this very session —
+      # either by name, or the requested name no longer exists because the
+      # first (successful) claim already renamed it. A lost claim response
+      # must be retryable with the same body.
+      running != nil and
+          (running.session == tmux_session or
+             not already_running_session?(state, tmux_session)) ->
+        {state, {:ok, %{session: running.session, agent_id: Map.get(running, :agent_id)}}}
+
+      running != nil ->
+        {state, {:error, :already_running}}
+
+      # A live canonical-name session that is NOT the claimer means another
+      # worker is already on the fiber. When the claimer *is* the canonical
+      # session (a prior claim renamed it but the watcher failed to start),
+      # fall through — registration is the recovery path.
+      live_session != nil and live_session != tmux_session ->
         {state, {:error, :already_running}}
 
       not already_running_session?(state, tmux_session) ->
@@ -2252,9 +2291,9 @@ defmodule Shuttle.Poller do
     # runtime stamp — treats the claimed session exactly like a dispatched one.
     canonical = Dispatcher.session_name(fiber_id, Map.get(fiber, "uid"))
 
-    session =
+    rename_result =
       if tmux_session == canonical do
-        canonical
+        {:ok, canonical}
       else
         case state.runner.cmd(
                "tmux",
@@ -2262,16 +2301,29 @@ defmodule Shuttle.Poller do
                stderr_to_stdout: true
              ) do
           {_, 0} ->
-            canonical
+            {:ok, canonical}
 
           {output, _} ->
-            # Watch the session under its given name rather than failing the
-            # claim; liveness still works (the stored name is checked directly).
+            # Fail the claim rather than registering under a non-canonical
+            # name: the restart re-adoption scan and dual-recognition liveness
+            # only see `-shuttle`-suffixed canonical names, so a degraded
+            # registration would go invisible on daemon restart and a
+            # duplicate worker would dispatch alongside it.
             Logger.warning("claim: rename #{tmux_session} → #{canonical} failed: #{output}")
-            tmux_session
+            {:error, :rename_failed}
         end
       end
 
+    case rename_result do
+      {:error, _} = error ->
+        {state, error}
+
+      {:ok, session} ->
+        register_renamed_session(state, fiber_id, fiber, session, agent, opts)
+    end
+  end
+
+  defp register_renamed_session(%State{} = state, fiber_id, fiber, session, agent, opts) do
     now = DateTime.utc_now()
 
     running_meta = %{

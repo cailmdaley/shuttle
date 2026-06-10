@@ -3067,10 +3067,16 @@ defmodule Shuttle.PollerTest do
     assert {:error, :not_found} =
              Poller.claim_session(poller, "tests/no-such-fiber", "capture-live01", [])
 
-    # First claim wins; the second is already_running.
-    assert {:ok, _} = Poller.claim_session(poller, id, "capture-live01", [])
+    # First claim wins; a different session claiming the same fiber is refused.
+    assert {:ok, %{session: canonical}} = Poller.claim_session(poller, id, "capture-live01", [])
     MockRunner.add_tmux_session("capture-live02")
     assert {:error, :already_running} = Poller.claim_session(poller, id, "capture-live02", [])
+
+    # Idempotent retry: re-claiming with the original (now-renamed-away) name
+    # or with the canonical name returns the registered session, not an error —
+    # a lost claim response must be retryable with the same body.
+    assert {:ok, %{session: ^canonical}} = Poller.claim_session(poller, id, "capture-live01", [])
+    assert {:ok, %{session: ^canonical}} = Poller.claim_session(poller, id, canonical, [])
   end
 
   test "claim refuses closed fibers" do
