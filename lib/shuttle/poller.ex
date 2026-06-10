@@ -121,7 +121,19 @@ defmodule Shuttle.Poller do
       # the poll-cycle warning to scroll unread in the daemon log. Entries
       # clear on successful dispatch or when the fiber's eligibility changes
       # (frontmatter edit, pause, close).
-      dispatch_failures: %{}
+      dispatch_failures: %{},
+      # %{fiber_id => unix_ms} — the instant a standing role was re-armed by
+      # accept/resume. The cron due-window's backward edge is clamped to this
+      # (`window_start = max(now - window, rearmed_at)`) so the occurrence that
+      # JUST ran — whose tick is still inside the ~90s backward window — is not
+      # re-served the moment accept flips closed→active. Without it, accept
+      # clears the `closed` "already-ran" gate while the served tick is still in
+      # window, and the role re-fires immediately, popping straight back to
+      # awaiting review (the standing-role temper oscillation). NOT persisted:
+      # entries go stale harmlessly once `now - rearmed_at` exceeds the window
+      # (the clamp degrades to `now - window`), and a restart loses nothing the
+      # window wouldn't already have aged out.
+      rearmed_at: %{}
     ]
   end
 
@@ -676,6 +688,19 @@ defmodule Shuttle.Poller do
         :accept -> LifecycleStore.accept(fiber_id, opts)
         :resume -> LifecycleStore.resume(fiber_id)
         other -> {:error, "unknown lifecycle transition #{inspect(other)}"}
+      end
+
+    # On a successful re-arm, stamp the instant so the due-window clamp in
+    # `standing_role_due?` won't re-serve the occurrence that just ran (the
+    # standing-role temper oscillation). accept/resume both flip closed→active.
+    state =
+      case result do
+        {:ok, _} when verb in [:accept, :resume] ->
+          now_ms = DateTime.utc_now() |> DateTime.to_unix(:millisecond)
+          %{state | rearmed_at: Map.put(state.rearmed_at, fiber_id, now_ms)}
+
+        _ ->
+          state
       end
 
     {:reply, result, state}
@@ -2994,9 +3019,27 @@ defmodule Shuttle.Poller do
          true <- is_nil(Map.get(fiber, "tempered")),
          true <- dependencies_satisfied?(fiber_id, state),
          {:ok, role} <- fetch_standing_role(fiber_id, state) do
-      StandingRole.due_by_cron?(role, DateTime.utc_now(), due_window_ms(state))
+      now = DateTime.utc_now()
+      window = rearm_clamped_window(state, fiber_id, now)
+      StandingRole.due_by_cron?(role, now, window)
     else
       _ -> false
+    end
+  end
+
+  # The due-window, with its backward edge clamped to the role's last re-arm
+  # instant: `window_start = max(now - base_window, rearmed_at)`, expressed as a
+  # window length `min(base_window, now - rearmed_at)`. A role re-armed `n` ms
+  # ago can only serve ticks newer than `n` ms — so the occurrence that just ran
+  # (whose tick is at-or-before the re-arm) is never re-served. `due_by_cron?`
+  # treats a non-positive window as "not due", which is correct at the instant
+  # of re-arm. Roles never re-armed (or re-armed long ago) get the full window.
+  defp rearm_clamped_window(state, fiber_id, now) do
+    base = due_window_ms(state)
+
+    case Map.get(state.rearmed_at, fiber_id) do
+      nil -> base
+      rearmed_ms -> min(base, DateTime.to_unix(now, :millisecond) - rearmed_ms)
     end
   end
 

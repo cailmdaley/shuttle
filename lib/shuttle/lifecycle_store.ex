@@ -21,9 +21,7 @@ defmodule Shuttle.LifecycleStore do
   @runtime_keys ~w(enabled review next_due_at last_run_at session)
 
   @spec accept(String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
-  def accept(fiber_id, opts \\ []) when is_binary(fiber_id) do
-    keep_outcome? = Keyword.get(opts, :keep_outcome, false)
-
+  def accept(fiber_id, _opts \\ []) when is_binary(fiber_id) do
     with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
          :ok <- require_cyclical(shuttle),
@@ -32,11 +30,13 @@ defmodule Shuttle.LifecycleStore do
       # is no `review.state` (slice 4 removed the review axis). Recognize it
       # straight from the doc and re-arm. A standing role advances its cron
       # recurrence (next_due from the schedule); a pinned role has no schedule,
-      # so it simply returns to its resting `status: active`.
+      # so it simply returns to its resting `status: active`. The previous run's
+      # outcome is preserved — it stays the card's headline until the next run
+      # overwrites it (accept no longer blanks it; see update_document).
       if pinned_block?(shuttle) do
-        accept_pinned(fiber_id, path, frontmatter, body, keep_outcome?)
+        accept_pinned(fiber_id, path, frontmatter, body)
       else
-        accept_from_doc(fiber_id, path, frontmatter, body, shuttle, keep_outcome?)
+        accept_from_doc(fiber_id, path, frontmatter, body, shuttle)
       end
     end
   end
@@ -44,16 +44,16 @@ defmodule Shuttle.LifecycleStore do
   # Pinned accept: re-arm to the resting `status: active` with no recurrence to
   # advance. The document carries the whole lifecycle; there is no schedule and
   # no next_due to compute (the poller never auto-dispatches a pinned role).
-  defp accept_pinned(fiber_id, path, frontmatter, body, keep_outcome?) do
-    {:ok, frontmatter} = update_document(frontmatter, keep_outcome?)
+  defp accept_pinned(fiber_id, path, frontmatter, body) do
+    {:ok, frontmatter} = update_document(frontmatter)
     write_fiber!(path, evict_runtime_keys(frontmatter), body)
     {:ok, "accepted run for #{fiber_id}\n  pinned role re-armed at rest (status: active)\n"}
   end
 
-  defp accept_from_doc(fiber_id, path, frontmatter, body, shuttle, keep_outcome?) do
+  defp accept_from_doc(fiber_id, path, frontmatter, body, shuttle) do
     with {:ok, schedule} <- require_schedule(shuttle),
          {:ok, next_due_at} <- Cron.next_occurrence(schedule, DateTime.utc_now()),
-         {:ok, frontmatter} <- update_document(frontmatter, keep_outcome?) do
+         {:ok, frontmatter} <- update_document(frontmatter) do
       # The document carries the entire lifecycle: writing `status: active` re-arms
       # the role, and `next_due` is recomputed from the cron schedule on the next
       # poll. There is no runtime row to upsert (slice 6).
@@ -75,7 +75,7 @@ defmodule Shuttle.LifecycleStore do
 
   defp resume_from_doc(fiber_id, path, frontmatter, body) do
     now = DateTime.utc_now()
-    {:ok, frontmatter} = update_document(frontmatter, true)
+    {:ok, frontmatter} = update_document(frontmatter)
 
     # Re-arm by writing `status: active`; the next poll's cron window picks the
     # role up immediately (the active document IS the re-queue). No runtime row
@@ -141,7 +141,7 @@ defmodule Shuttle.LifecycleStore do
       if Map.get(frontmatter, "status") == "active" do
         {:ok, "#{fiber_id} already active\n"}
       else
-        {:ok, frontmatter} = update_document(frontmatter, true)
+        {:ok, frontmatter} = update_document(frontmatter)
         write_fiber!(path, evict_runtime_keys(frontmatter), body)
         {:ok, "re-armed #{fiber_id} (status: active) for force-dispatch\n"}
       end
@@ -223,16 +223,18 @@ defmodule Shuttle.LifecycleStore do
   # to the document — the sole dispatch gate (slice 5: no enabled flag, no
   # review block). tempered and closed-at are cleared so the card leaves the
   # Awaiting/Tempered/Composted columns.
-  defp update_document(frontmatter, keep_outcome?) do
+  defp update_document(frontmatter) do
     frontmatter =
       frontmatter
       |> Map.put("status", "active")
       |> Map.delete("tempered")
       |> Map.delete("closed-at")
 
-    frontmatter =
-      if keep_outcome?, do: frontmatter, else: Map.put(frontmatter, "outcome", "")
-
+    # The outcome is never blanked on re-arm: the last run's digest stays the
+    # card headline until the next run overwrites it. (Accept used to clear it
+    # as a "fresh precondition for the next run", but that left a re-armed role
+    # with an empty headline for the whole inter-run gap — the doc carries the
+    # lifecycle, the outcome carries the latest result.)
     {:ok, frontmatter}
   end
 

@@ -1015,6 +1015,88 @@ defmodule Shuttle.DispatchIntegrationTest do
     end
   end
 
+  # Accepting an awaiting standing role re-arms it (status:active) for its NEXT
+  # tick — it must NOT re-fire the occurrence that just ran. Regression for the
+  # standing-role "temper oscillation": before the fix, accept flipped
+  # closed→active while the just-served cron tick was still inside the ~90s
+  # backward due-window, so the next poll re-dispatched it and the card popped
+  # straight back to awaiting review. An every-minute schedule (always a tick in
+  # the window) is the sharpest probe; the poller's rearm-instant clamp keeps it
+  # at rest. Also asserts the second half of the fix: accept preserves the prior
+  # run's outcome (no longer blanks it).
+  test "accept re-arms a standing role without re-firing the just-served tick", %{host: host} do
+    write_fiber(host, "tests/standing-temper-rest", """
+    ---
+    name: Standing temper-and-rest
+    status: closed
+    closed-at: "2026-05-24T10:00:00Z"
+    outcome: "prior run digest — kept across accept"
+    tags:
+      - constitution
+      - standing
+    shuttle:
+      kind: standing
+      agent: claude-sonnet
+      host: test-host
+      schedule:
+        expr: "* * * * *"
+        tz: Europe/Paris
+    ---
+    A standing role awaiting review; the human drags it to tempered (accept).
+    """)
+
+    prev_loom = System.get_env("LOOM_HOMES")
+    System.put_env("LOOM_HOMES", host)
+
+    try do
+      {:ok, poller} =
+        Poller.start_link(
+          name: :test_poller_temper_rest,
+          runner: IntegrationRunner,
+          poll_interval_ms: 600_000,
+          felt_stores: [host]
+        )
+
+      assert eventually(fn ->
+               case Poller.cached_fiber_documents(poller) do
+                 {:ok, body} ->
+                   Enum.any?(body.fibers, &(get_in(&1, [:fiber, "id"]) == "tests/standing-temper-rest"))
+
+                 _ ->
+                   false
+               end
+             end),
+             "expected the document cache to warm with the awaiting role"
+
+      # The kanban drag-to-tempered on a standing awaiting role resolves to accept.
+      assert {:ok, _} = Poller.lifecycle_transition(poller, :accept, "tests/standing-temper-rest", [])
+
+      # Re-armed AND the prior outcome survives (accept no longer blanks it).
+      fm = read_frontmatter(host, "tests/standing-temper-rest")
+      assert fm["status"] == "active"
+      refute Map.has_key?(fm, "tempered")
+      refute Map.has_key?(fm, "closed-at")
+      assert fm["outcome"] == "prior run digest — kept across accept"
+
+      # Now poll: the just-served tick must NOT re-fire. Clear recorded commands
+      # so the assertion isolates this poll cycle's dispatch behavior.
+      IntegrationRunner.reset(host)
+      session = Dispatcher.session_name("tests/standing-temper-rest")
+      send(poller, :run_poll_cycle)
+      Process.sleep(150)
+
+      refute Enum.any?(IntegrationRunner.commands(), fn {cmd, args} ->
+               cmd == "tmux" and Enum.any?(args, &(&1 == session))
+             end),
+             "a freshly-accepted standing role must rest until its next tick, not re-fire the served one"
+
+      # It stays armed-and-resting (active), not re-fired back to awaiting.
+      assert read_frontmatter(host, "tests/standing-temper-rest")["status"] == "active"
+    after
+      if prev_loom, do: System.put_env("LOOM_HOMES", prev_loom), else: System.delete_env("LOOM_HOMES")
+    end
+  end
+
   # refresh_document/2 is the shared post-mutation seam every board action calls.
   # It must re-read ANY field change off disk (not just status) and evict a fiber
   # that no longer resolves — so the kanban refetch never snaps a card back to
