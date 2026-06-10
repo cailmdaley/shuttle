@@ -14,7 +14,7 @@ defmodule ShuttleWeb.CaptureController do
 
   Body: `prompt` (required, the yap verbatim), `project_dir` (required,
   absolute path on the owning host), `agent` (optional registry name,
-  default claude-opus), `origin` (optional owner-routing key).
+  default claude-fable), `origin` (optional owner-routing key).
   """
 
   use Phoenix.Controller, formats: [:json]

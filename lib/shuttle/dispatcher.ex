@@ -682,7 +682,7 @@ defmodule Shuttle.Dispatcher do
     * `:runner` — `Shuttle.Runner` impl (default `Shuttle.Runner.Default`)
     * `:work_dir` — project directory to spawn in (required)
     * `:felt_store` — felt store the worker should file into
-    * `:agent` — agent registry name (default `"claude-opus"`)
+    * `:agent` — agent registry name (default `"claude-fable"`)
     * `:port` — daemon HTTP port for the claim callback
     * `:host` — owning host id to stamp into the shuttle block (optional)
 
@@ -693,11 +693,11 @@ defmodule Shuttle.Dispatcher do
     runner = Keyword.get(opts, :runner, Shuttle.Runner.Default)
     work_dir = Keyword.fetch!(opts, :work_dir)
     felt_store = Keyword.get(opts, :felt_store, default_felt_store())
-    agent_name = Keyword.get(opts, :agent) || "claude-opus"
+    agent_name = Keyword.get(opts, :agent) || "claude-fable"
     port = Keyword.get(opts, :port, 4000)
     host = Keyword.get(opts, :host)
 
-    with {:ok, agent} <- Agents.resolve_by_name(agent_name),
+    with {:ok, agent} <- Agents.resolve_with_axes(agent_name, nil, false),
          :ok <- validate_agent(agent) do
       session = capture_session_name()
 
