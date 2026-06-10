@@ -77,6 +77,21 @@ defmodule Shuttle.WaitingTrackerTest do
     refute MapSet.member?(WaitingTracker.waiting_sessions(name), "stale-01J-shuttle")
   end
 
+  test "a partial line (no trailing newline yet) is not consumed until complete", %{events: events} do
+    name = start(events)
+
+    # Write a notification record WITHOUT its trailing newline — a record still
+    # mid-write. It must not be parsed-and-dropped; the session stays unseen.
+    line = Jason.encode!(%{type: "notification", tmuxSession: "foo-01J-shuttle"})
+    File.write!(events, line, [:append])
+    Process.sleep(40)
+    refute MapSet.member?(WaitingTracker.waiting_sessions(name), "foo-01J-shuttle")
+
+    # Complete the line — now it registers.
+    File.write!(events, "\n", [:append])
+    assert wait_until(fn -> MapSet.member?(WaitingTracker.waiting_sessions(name), "foo-01J-shuttle") end)
+  end
+
   test "file truncation resets the tail offset without crashing", %{events: events} do
     name = start(events)
     append(events, "notification", "foo-01J-shuttle")

@@ -120,8 +120,20 @@ defmodule Shuttle.WaitingTracker do
       {:ok, %{size: size}} when size > offset ->
         case read_range(path, offset, size - offset) do
           {:ok, chunk} ->
-            waiting = Enum.reduce(String.split(chunk, "\n", trim: true), state.waiting, &apply_event/2)
-            %{state | offset: size, waiting: waiting}
+            # Consume only up to the last newline; a trailing partial line (a
+            # record still being written) is left unconsumed so the next poll
+            # re-reads it whole. Advancing past it would silently drop the event.
+            case :binary.matches(chunk, "\n") do
+              [] ->
+                state
+
+              matches ->
+                {last_nl, _} = List.last(matches)
+                consumed = last_nl + 1
+                complete = binary_part(chunk, 0, consumed)
+                waiting = Enum.reduce(String.split(complete, "\n", trim: true), state.waiting, &apply_event/2)
+                %{state | offset: offset + consumed, waiting: waiting}
+            end
 
           _ ->
             state

@@ -3,6 +3,7 @@ import Config
 config :shuttle,
   env: :test,
   start_poller: false,
+  start_waiting_tracker: false,
   start_remote_registry: false,
   start_remote_fiber_registry: false,
   start_loom_sync: false,
