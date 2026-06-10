@@ -56,6 +56,13 @@ defmodule Shuttle.Application do
       end
 
     children =
+      if Application.get_env(:shuttle, :start_waiting_tracker, true) do
+        children ++ [Shuttle.WaitingTracker]
+      else
+        children
+      end
+
+    children =
       if Application.get_env(:shuttle, :start_poller, true) do
         children ++ [Shuttle.Poller]
       else

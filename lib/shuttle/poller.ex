@@ -1198,13 +1198,28 @@ defmodule Shuttle.Poller do
   defp stamp_runtime(entries, running) when map_size(running) == 0, do: entries
 
   defp stamp_runtime(entries, running) do
-    index = runtime_index(running)
+    # `waiting` is the set of tmux sessions blocked on human input (hook
+    # Notification events tailed from this host's events.jsonl). Only running
+    # workers get stamped, so a session that goes waiting and then dies never
+    # leaves a stale "waiting" phase — it's already gone from `running`.
+    waiting = waiting_sessions()
+    index = runtime_index(running, waiting)
     Enum.map(entries, &put_runtime(&1, index))
   end
 
-  defp runtime_index(running) do
+  # The waiting-session source. Defaults to the host-local WaitingTracker;
+  # overridable via app env so tests inject a deterministic set without writing
+  # to the real events.jsonl.
+  defp waiting_sessions do
+    case Application.get_env(:shuttle, :waiting_sessions_source) do
+      fun when is_function(fun, 0) -> fun.()
+      _ -> Shuttle.WaitingTracker.waiting_sessions()
+    end
+  end
+
+  defp runtime_index(running, waiting) do
     Enum.reduce(running, %{}, fn {runtime_key, meta}, acc ->
-      payload = runtime_payload(meta)
+      payload = runtime_payload(meta, waiting)
 
       [runtime_key, metadata_uid(meta), fiber_address(meta)]
       |> Enum.filter(&(is_binary(&1) and &1 != ""))
@@ -1224,7 +1239,9 @@ defmodule Shuttle.Poller do
   # The eligible-row subset of a worker's meta, as a wire payload. Mirrors the
   # `eligible` snapshot row so the feed's `runtime` and the snapshot agree on
   # shape; the viewer reads `tmux_session` for liveness and may surface the rest.
-  defp runtime_payload(meta) do
+  # `phase: "waiting"` is added when this worker's session is blocked on human
+  # input; it's omitted otherwise so the viewer treats absence as "busy".
+  defp runtime_payload(meta, waiting) do
     %{
       tmux_session: meta.session,
       agent: Map.get(meta, :agent_id),
@@ -1233,6 +1250,15 @@ defmodule Shuttle.Poller do
       started_at: DateTime.to_unix(meta.started_at, :millisecond),
       last_activity_at: DateTime.to_unix(meta.last_activity_at, :millisecond)
     }
+    |> maybe_put_waiting_phase(meta.session, waiting)
+  end
+
+  defp maybe_put_waiting_phase(payload, session, waiting) do
+    if is_binary(session) and MapSet.member?(waiting, session) do
+      Map.put(payload, :phase, "waiting")
+    else
+      payload
+    end
   end
 
   # Re-read one fiber from disk and replace its document-cache entry (or evict it
