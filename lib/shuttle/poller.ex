@@ -1169,6 +1169,20 @@ defmodule Shuttle.Poller do
 
                 cond do
                   String.contains?(text, "worker exited") -> :exited
+                  # A human re-arm (accept / resume / force-dispatch re-arm) more
+                  # recent than the last dispatch SUPERSEDES the dead-orphan
+                  # inference: the human has declared the run done and re-armed
+                  # the role, so it is not an un-exited orphan no matter what the
+                  # worker's free-form exit text said (or whether the daemon ever
+                  # wrote a canonical "worker exited" — interactive/ad-hoc/claimed
+                  # exits, and exits the daemon missed across a restart, often
+                  # don't). Without this, a role whose exit produced only a
+                  # free-form summary gets re-closed to awaiting on every reconcile
+                  # — the standing-role temper oscillation Cail hit on his real
+                  # morning-post / weekly-arxiv roles.
+                  String.contains?(text, "accepted run") -> :rearmed
+                  String.contains?(text, "resumed ") -> :rearmed
+                  String.contains?(text, "re-armed ") -> :rearmed
                   String.contains?(text, "worker dispatched") -> :dispatched
                   # The claim verb's spawn-equivalent event — a claimed
                   # standing worker's unobserved death must mark awaiting too.

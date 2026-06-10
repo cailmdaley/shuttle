@@ -936,6 +936,81 @@ defmodule Shuttle.DispatchIntegrationTest do
     end
   end
 
+  # A standing role whose last dispatch was followed by a free-form worker exit
+  # summary (no canonical "worker exited" marker) AND a human accept must be left
+  # armed — the human's accept supersedes the dead-orphan inference. Regression
+  # for the real morning-post / weekly-arxiv oscillation: interactive/ad-hoc runs
+  # the daemon didn't observe exiting wrote only a free-form summary, so the
+  # dead-orphan reconciler walked past it to the "worker dispatched" event and
+  # re-closed the role to awaiting on every restart/reconcile, undoing each
+  # accept.
+  #
+  # The CONTROL role (dispatch + free-form exit, NO accept) flips to awaiting in
+  # the same poll — proving the reconciler actually ran this cycle, so the
+  # accepted role staying active is the fix at work, not a reconcile that never
+  # fired.
+  test "an accepted standing role is left armed despite a non-canonical exit summary",
+       %{host: host} do
+    for {slug, accept?} <- [{"standing-accepted-freeform", true}, {"standing-dead-freeform", false}] do
+      write_fiber(host, "tests/#{slug}", """
+      ---
+      name: #{slug}
+      status: active
+      tags:
+        - constitution
+        - standing
+      shuttle:
+        kind: standing
+        agent: claude-sonnet
+        host: test-host
+        schedule:
+          expr: "0 8 * * *"
+          tz: Europe/Paris
+      ---
+      A standing role with a free-form (non-canonical) exit summary.
+      """)
+
+      # Dispatch, then a FREE-FORM exit summary (no "worker exited").
+      append_dispatch_event(host, "tests/#{slug}", agent: "claude-fable", session: "#{slug}-uuid")
+
+      append_freeform_exit(host, "tests/#{slug}",
+        "Ad-hoc interactive run adhoc-123 complete; inbox at intended residue."
+      )
+
+      # Only the fix-target role gets the human accept after the exit.
+      if accept?, do: append_accept_event(host, "tests/#{slug}")
+    end
+
+    prev_loom = System.get_env("LOOM_HOMES")
+    System.put_env("LOOM_HOMES", host)
+
+    try do
+      {:ok, _poller} =
+        Poller.start_link(
+          name: :test_poller_accepted_freeform,
+          runner: IntegrationRunner,
+          poll_interval_ms: 600_000,
+          felt_stores: [host]
+        )
+
+      # CONTROL: a dispatched-and-exited-but-never-accepted role flips to awaiting
+      # — this proves the dead-orphan reconciler ran on this candidate set.
+      assert eventually(fn ->
+               read_frontmatter(host, "tests/standing-dead-freeform")["status"] == "closed"
+             end),
+             "expected the un-accepted control role to be marked awaiting (proves reconcile ran)"
+
+      # FIX: the accepted role — same free-form exit, plus a human accept — stays
+      # armed. The accept supersedes the dead-orphan inference.
+      fm = read_frontmatter(host, "tests/standing-accepted-freeform")
+      assert fm["status"] == "active",
+             "an accepted role must stay armed, not be re-marked awaiting by the dead-orphan reconciler"
+      refute Map.has_key?(fm, "closed-at")
+    after
+      if prev_loom, do: System.put_env("LOOM_HOMES", prev_loom), else: System.delete_env("LOOM_HOMES")
+    end
+  end
+
   # The board's "New session" / "Resume" / drag-to-inFlight buttons force-dispatch
   # (force+ad_hoc) an awaiting standing role. The forced path must re-arm the doc
   # to status:active AS it spawns — one snappy action, no waiting on the 15s poll,
@@ -1494,6 +1569,28 @@ defmodule Shuttle.DispatchIntegrationTest do
 
     {out, code} =
       System.cmd("felt", ["-C", host, "history", "append", id, "-m", summary],
+        stderr_to_stdout: true
+      )
+
+    if code != 0, do: raise("felt history append failed (#{code}): #{out}")
+  end
+
+  # A worker's own free-form exit summary (NOT the daemon's canonical "worker
+  # exited ..." marker) followed by the human's accept — the real morning-post /
+  # weekly-arxiv shape after an interactive/ad-hoc run the daemon didn't observe
+  # exiting.
+  defp append_freeform_exit(host, id, summary) do
+    {out, code} =
+      System.cmd("felt", ["-C", host, "history", "append", id, "-m", summary],
+        stderr_to_stdout: true
+      )
+
+    if code != 0, do: raise("felt history append failed (#{code}): #{out}")
+  end
+
+  defp append_accept_event(host, id) do
+    {out, code} =
+      System.cmd("felt", ["-C", host, "history", "append", id, "-m", "accepted run for #{id}"],
         stderr_to_stdout: true
       )
 
