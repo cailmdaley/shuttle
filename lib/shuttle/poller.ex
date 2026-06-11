@@ -647,6 +647,8 @@ defmodule Shuttle.Poller do
         work_dir: work_dir,
         felt_store: felt_store,
         agent: Keyword.get(opts, :agent),
+        effort: Keyword.get(opts, :effort),
+        chrome: Keyword.get(opts, :chrome) == true,
         port: Shuttle.CLI.daemon_port(),
         host: state.own_host_id
       )

@@ -889,4 +889,53 @@ defmodule Shuttle.DispatcherTest do
     assert script =~ session
     assert script =~ uuid
   end
+
+  test "capture renders requested axes into the command and the install-block step" do
+    {:ok, %{session: _}} =
+      Dispatcher.capture("an idea",
+        runner: MockRunner,
+        work_dir: "/tmp",
+        felt_store: "/tmp",
+        agent: "claude-opus",
+        effort: "xhigh",
+        chrome: true
+      )
+
+    {_, args} =
+      Enum.find(MockRunner.commands(), fn {cmd, args} ->
+        cmd == "tmux" and hd(args) == "new-session"
+      end)
+
+    script = File.read!(List.last(args))
+    # Axes rendered on the CLI invocation.
+    assert script =~ "--effort 'xhigh'"
+    assert script =~ "--chrome"
+    # Axes recorded in the crystallize instructions so the fiber reproduces them.
+    assert script =~ "`effort: xhigh`"
+    assert script =~ "`chrome: true`"
+  end
+
+  test "capture rejects axes outside the agent's constraints" do
+    assert {:error, reason} =
+             Dispatcher.capture("an idea",
+               runner: MockRunner,
+               work_dir: "/tmp",
+               felt_store: "/tmp",
+               agent: "codex",
+               chrome: true
+             )
+
+    assert reason =~ "chrome not supported"
+
+    assert {:error, reason2} =
+             Dispatcher.capture("an idea",
+               runner: MockRunner,
+               work_dir: "/tmp",
+               felt_store: "/tmp",
+               agent: "claude-opus",
+               effort: "bogus"
+             )
+
+    assert reason2 =~ "effort bogus not allowed"
+  end
 end

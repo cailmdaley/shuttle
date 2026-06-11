@@ -683,6 +683,9 @@ defmodule Shuttle.Dispatcher do
     * `:work_dir` — project directory to spawn in (required)
     * `:felt_store` — felt store the worker should file into
     * `:agent` — agent registry name (default `"claude-fable"`)
+    * `:effort` — reasoning-effort token, validated against the agent's
+      `effort_levels` (same contract as `shuttle.effort` on a fiber)
+    * `:chrome` — boolean; claude harness only (same as `shuttle.chrome`)
     * `:port` — daemon HTTP port for the claim callback
     * `:host` — owning host id to stamp into the shuttle block (optional)
 
@@ -694,10 +697,12 @@ defmodule Shuttle.Dispatcher do
     work_dir = Keyword.fetch!(opts, :work_dir)
     felt_store = Keyword.get(opts, :felt_store, default_felt_store())
     agent_name = Keyword.get(opts, :agent) || "claude-fable"
+    effort = Keyword.get(opts, :effort)
+    chrome = Keyword.get(opts, :chrome) == true
     port = Keyword.get(opts, :port, 4000)
     host = Keyword.get(opts, :host)
 
-    with {:ok, agent} <- Agents.resolve_with_axes(agent_name, nil, false),
+    with {:ok, agent} <- Agents.resolve_with_axes(agent_name, effort, chrome),
          :ok <- validate_agent(agent) do
       session = capture_session_name()
 
@@ -714,7 +719,9 @@ defmodule Shuttle.Dispatcher do
                 session_uuid: uuid,
                 agent_id: agent.id,
                 project_dir: work_dir,
-                host: host
+                host: host,
+                effort: effort,
+                chrome: chrome
               )
 
             {Agents.build_command(agent, prompt, session_id: uuid), uuid}
@@ -727,7 +734,9 @@ defmodule Shuttle.Dispatcher do
                 port: port,
                 agent_id: agent.id,
                 project_dir: work_dir,
-                host: host
+                host: host,
+                effort: effort,
+                chrome: chrome
               )
 
             {Agents.build_command(agent, prompt), nil}
@@ -767,6 +776,19 @@ defmodule Shuttle.Dispatcher do
         do: "Set `host: #{host}` in the shuttle block.\n",
         else: ""
 
+    # Explicitly-requested axes ride into the crystallized fiber's shuttle
+    # block so redispatches reproduce the launch shape. Defaults stay
+    # implicit — the block records intent, not resolved configuration.
+    effort = Keyword.get(opts, :effort)
+
+    axes_yaml =
+      [
+        if(is_binary(effort) and effort != "", do: ", `effort: #{effort}`"),
+        if(Keyword.get(opts, :chrome) == true, do: ", `chrome: true`")
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join()
+
     header = """
     Shuttle capture session. The user had an idea and spoke it into the board's capture box; you are the session it spawned. Your job: crystallize the idea into a fiber, claim this session as its worker, then realize it. The `felt` and `shuttle` skills carry the practice — activate them first.
 
@@ -775,7 +797,7 @@ defmodule Shuttle.Dispatcher do
 
     Steps, in order (the order is load-bearing — claim BEFORE activating, or the poll loop dispatches a duplicate worker in the gap):
     1. **Crystallize.** Read the idea below and file it as a fiber in the felt store, nested under the right parent (felt-skill judgment — search for kin first). Write the lede and a `## Desired State` the idea has earned; don't over-spec a sketch.
-    2. **Install the shuttle block.** Add to the fiber's frontmatter: `shuttle:` with `kind: oneshot`, `agent: #{agent_id}`, `project_dir: #{project_dir}`. #{host_line}Leave felt `status` as `open` for now.
+    2. **Install the shuttle block.** Add to the fiber's frontmatter: `shuttle:` with `kind: oneshot`, `agent: #{agent_id}`#{axes_yaml}, `project_dir: #{project_dir}`. #{host_line}Leave felt `status` as `open` for now.
     3. **Claim this session** (registers you with the daemon as the fiber's worker — exit handling, liveness, and the kanban all flow from this):
 
        curl -s -X POST http://localhost:#{port}/api/v1/claim -H 'Content-Type: application/json' -d '{"fiber_id": "<the fiber id you created>", "tmux_session": "#{session}"#{uuid_field}, "agent": "#{agent_id}"}'

@@ -35,6 +35,11 @@ defmodule ShuttleWeb.CaptureControllerTest do
     assert Jason.decode!(conn.resp_body)["reason"] == "project_dir_missing"
   end
 
+  # Axes constraint rejection (effort outside effort_levels, chrome on a
+  # non-claude harness) is covered at the Dispatcher layer
+  # (dispatcher_test.exs "capture rejects axes outside the agent's
+  # constraints"); the controller maps any string reason to a 422.
+
   defp api_conn do
     build_conn() |> put_req_header("content-type", "application/json")
   end

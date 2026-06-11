@@ -14,7 +14,9 @@ defmodule ShuttleWeb.CaptureController do
 
   Body: `prompt` (required, the yap verbatim), `project_dir` (required,
   absolute path on the owning host), `agent` (optional registry name,
-  default claude-fable), `origin` (optional owner-routing key).
+  default claude-fable), `effort` (optional reasoning-effort token, validated
+  against the agent's `effort_levels`), `chrome` (optional boolean, claude
+  harness only), `origin` (optional owner-routing key).
   """
 
   use Phoenix.Controller, formats: [:json]
@@ -50,14 +52,20 @@ defmodule ShuttleWeb.CaptureController do
       true ->
         case Shuttle.Poller.capture(prompt,
                work_dir: project_dir,
-               agent: Map.get(params, "agent")
+               agent: Map.get(params, "agent"),
+               effort: Map.get(params, "effort"),
+               chrome: Map.get(params, "chrome") == true
              ) do
           {:ok, %{session: session, agent_id: agent_id}} ->
             json(conn, %{spawned: true, tmux_session: session, agent: agent_id})
 
           {:error, reason} ->
+            # Axes-validation failures are client errors (bad effort token,
+            # chrome on a non-claude harness) — 422 naming the constraint.
+            status = if is_binary(reason), do: 422, else: 500
+
             conn
-            |> put_status(500)
+            |> put_status(status)
             |> json(%{spawned: false, reason: error_code(reason)})
         end
     end
