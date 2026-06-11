@@ -59,13 +59,14 @@ defmodule ShuttleWeb.CaptureController do
           {:ok, %{session: session, agent_id: agent_id}} ->
             json(conn, %{spawned: true, tmux_session: session, agent: agent_id})
 
-          {:error, reason} ->
+          {:error, {:invalid_axes, msg}} ->
             # Axes-validation failures are client errors (bad effort token,
             # chrome on a non-claude harness) — 422 naming the constraint.
-            status = if is_binary(reason), do: 422, else: 500
+            conn |> put_status(422) |> json(%{spawned: false, reason: msg})
 
+          {:error, reason} ->
             conn
-            |> put_status(status)
+            |> put_status(500)
             |> json(%{spawned: false, reason: error_code(reason)})
         end
     end

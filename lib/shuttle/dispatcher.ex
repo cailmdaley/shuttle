@@ -702,7 +702,7 @@ defmodule Shuttle.Dispatcher do
     port = Keyword.get(opts, :port, 4000)
     host = Keyword.get(opts, :host)
 
-    with {:ok, agent} <- Agents.resolve_with_axes(agent_name, effort, chrome),
+    with {:ok, agent} <- capture_resolve_axes(agent_name, effort, chrome),
          :ok <- validate_agent(agent) do
       session = capture_session_name()
 
@@ -753,6 +753,16 @@ defmodule Shuttle.Dispatcher do
         {:ok, _} -> {:ok, %{session: session, session_uuid: session_uuid, agent_id: agent.id}}
         error -> error
       end
+    end
+  end
+
+  # Tags axes-constraint violations as `{:error, {:invalid_axes, msg}}` so the
+  # HTTP layer can answer 422 (client error) without string-sniffing — other
+  # capture failures (tmux spawn, missing model config) stay 500-shaped.
+  defp capture_resolve_axes(agent_name, effort, chrome) do
+    case Agents.resolve_with_axes(agent_name, effort, chrome) do
+      {:error, msg} when is_binary(msg) -> {:error, {:invalid_axes, msg}}
+      other -> other
     end
   end
 

@@ -916,7 +916,7 @@ defmodule Shuttle.DispatcherTest do
   end
 
   test "capture rejects axes outside the agent's constraints" do
-    assert {:error, reason} =
+    assert {:error, {:invalid_axes, reason}} =
              Dispatcher.capture("an idea",
                runner: MockRunner,
                work_dir: "/tmp",
@@ -927,7 +927,7 @@ defmodule Shuttle.DispatcherTest do
 
     assert reason =~ "chrome not supported"
 
-    assert {:error, reason2} =
+    assert {:error, {:invalid_axes, reason2}} =
              Dispatcher.capture("an idea",
                runner: MockRunner,
                work_dir: "/tmp",
