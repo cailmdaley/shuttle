@@ -5,12 +5,12 @@ defmodule ShuttleWeb.ActionsController do
 
   use Phoenix.Controller, formats: [:json]
 
-  alias Shuttle.{Actions, Poller, Transition}
+  alias Shuttle.{ActionQueries, Actions, Transition}
 
   def show(conn, %{"fiber_id" => parts}) do
     fiber_id = Path.join(parts)
 
-    case Poller.actions_for(fiber_id) do
+    case ActionQueries.actions_for(fiber_id) do
       {:ok, actions} ->
         json(conn, %{fiber_id: fiber_id, actions: actions})
 
@@ -35,7 +35,7 @@ defmodule ShuttleWeb.ActionsController do
   end
 
   def resolve(conn, %{"fiber_id" => fiber_id, "target" => target}) do
-    case Poller.resolve_action(fiber_id, target) do
+    case ActionQueries.resolve_action(fiber_id, target) do
       {:ok, action} ->
         json(conn, %{fiber_id: fiber_id, target: target, action: action})
 

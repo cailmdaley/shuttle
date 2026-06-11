@@ -250,6 +250,13 @@ defmodule ShuttleWeb.APIControllerTest do
   # ── Setup ──
 
   setup do
+    previous_action_runner = Application.get_env(:shuttle, :action_query_runner)
+    Application.put_env(:shuttle, :action_query_runner, MockRunner)
+
+    on_exit(fn ->
+      restore_app_env(:action_query_runner, previous_action_runner)
+    end)
+
     start_supervised!(MockRunner)
     MockRunner.reset()
 
@@ -482,7 +489,7 @@ defmodule ShuttleWeb.APIControllerTest do
   # ── Shuttle actions ──
 
   @tag :capture_log
-  test "actions resolve returns the canonical lifecycle action via the Poller" do
+  test "actions resolve returns the canonical lifecycle action via ActionQueries" do
     with_actions_host()
 
     # Awaiting is felt-native (slice 5): status:closed + untempered standing.
@@ -505,11 +512,52 @@ defmodule ShuttleWeb.APIControllerTest do
     assert body["target"] == "tempered"
     assert body["action"]["id"] == "accept-run"
 
-    # Resolution runs through the Poller, which fetches the fiber rather than
-    # parsing the frontmatter inline in the controller.
+    # Resolution reads the felt document through ActionQueries/FiberDocuments,
+    # not through the Poller runner; the injected runner is used only for the
+    # fast tmux liveness probe.
+    refute Enum.any?(MockRunner.commands(), fn {command, _args} -> command == "felt" end)
+
     assert Enum.any?(MockRunner.commands(), fn {command, args} ->
-             command == "felt" and "show" in args
+             command == "tmux" and hd(args) == "has-session"
            end)
+  end
+
+  @tag :capture_log
+  test "actions show classifies a closed oneshot through the shared query path" do
+    with_actions_host()
+
+    MockRunner.set_shuttle(
+      "tests/action-closed-oneshot",
+      "kind: oneshot\n",
+      "closed"
+    )
+
+    conn = get(api_conn(), "/api/v1/actions/tests/action-closed-oneshot")
+
+    assert conn.status == 200
+    ids = conn.resp_body |> Jason.decode!() |> Map.fetch!("actions") |> Enum.map(& &1["id"])
+    assert "reopen-draft" in ids
+    assert "close-awaiting-review" in ids
+    assert "close-tempered" in ids
+  end
+
+  @tag :capture_log
+  test "actions show classifies a scheduled standing role through the shared query path" do
+    with_actions_host()
+
+    MockRunner.set_shuttle(
+      "tests/action-scheduled-standing",
+      "kind: standing\nschedule: \"0 9 * * 1-5\"\ntimezone: Europe/Paris\n",
+      "closed"
+    )
+
+    conn = get(api_conn(), "/api/v1/actions/tests/action-scheduled-standing")
+
+    assert conn.status == 200
+    ids = conn.resp_body |> Jason.decode!() |> Map.fetch!("actions") |> Enum.map(& &1["id"])
+    assert "accept-run" in ids
+    assert "close-composted" in ids
+    refute "reopen" in ids
   end
 
   # Inline-fiber mode: the caller (Portolan) already has the fiber map in
@@ -631,16 +679,14 @@ defmodule ShuttleWeb.APIControllerTest do
   end
 
   # Single-source invariant (C1/C2 dual-source fix). The by-fiber-id resolve
-  # (`Poller.resolve_action`) and the by-fiber-id availability
-  # (`Poller.actions_for`, which `validate_available` gates on) BOTH derive
-  # `running?` from `state.running` and overlay the runtime lifecycle from the
-  # SAME state — so for a RUNNING fiber, every resolved action is guaranteed to
-  # be in the availability set. Portolan routes local daemon-owned transitions
-  # through this by-id path precisely so resolve ⊆ availability holds across the
-  # process boundary; the inline-fiber path can't promise this because its
-  # `running?`/`review.state` are caller-supplied and may disagree with the
-  # daemon's registry. This pins that no kanban target can resolve to an action
-  # the invoke leg then rejects with 409 for a running fiber.
+  # and availability paths BOTH go through ActionQueries: felt document + tmux
+  # liveness, outside the Poller mailbox. So for a RUNNING fiber, every resolved
+  # action is guaranteed to be in the availability set. Portolan routes local
+  # daemon-owned transitions through this by-id path precisely so resolve ⊆
+  # availability holds across the process boundary; the inline-fiber path can't
+  # promise this because its `running?` is caller-supplied and may disagree with
+  # live tmux. This pins that no kanban target can resolve to an action the
+  # invoke leg then rejects with 409 for a running fiber.
   @tag :capture_log
   test "by-fiber-id resolve ⊆ availability for a RUNNING fiber across all kanban targets" do
     with_actions_host()
@@ -795,7 +841,10 @@ defmodule ShuttleWeb.APIControllerTest do
     )
 
     stub_dir =
-      Path.join(System.tmp_dir!(), "shuttle-transition-stub-#{System.unique_integer([:positive])}")
+      Path.join(
+        System.tmp_dir!(),
+        "shuttle-transition-stub-#{System.unique_integer([:positive])}"
+      )
 
     File.mkdir_p!(stub_dir)
     argv_log = Path.join(stub_dir, "argv.log")

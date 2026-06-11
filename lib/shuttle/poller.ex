@@ -35,7 +35,7 @@ defmodule Shuttle.Poller do
   require Logger
 
   alias Shuttle.{
-    Actions,
+    ActionQueries,
     Dispatcher,
     LifecycleStore,
     StandingRole,
@@ -239,7 +239,11 @@ defmodule Shuttle.Poller do
   @spec claim_session(GenServer.server(), String.t(), String.t(), keyword()) ::
           {:ok, map()} | {:error, term()}
   def claim_session(server, fiber_id, tmux_session, opts) do
-    GenServer.call(server, {:claim_session, fiber_id, tmux_session, opts}, @dispatch_call_timeout_ms)
+    GenServer.call(
+      server,
+      {:claim_session, fiber_id, tmux_session, opts},
+      @dispatch_call_timeout_ms
+    )
   end
 
   @doc """
@@ -280,7 +284,7 @@ defmodule Shuttle.Poller do
   end
 
   @spec actions_for(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
-  def actions_for(fiber_id, opts \\ []), do: actions_for(__MODULE__, fiber_id, opts)
+  def actions_for(fiber_id, opts \\ []), do: ActionQueries.actions_for(fiber_id, opts)
 
   @spec actions_for(GenServer.server(), String.t(), keyword()) ::
           {:ok, [map()]} | {:error, term()}
@@ -296,7 +300,7 @@ defmodule Shuttle.Poller do
 
   @spec resolve_action(String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def resolve_action(fiber_id, target, opts \\ []),
-    do: resolve_action(__MODULE__, fiber_id, target, opts)
+    do: ActionQueries.resolve_action(fiber_id, target, opts)
 
   @spec resolve_action(GenServer.server(), String.t(), String.t(), keyword()) ::
           {:ok, map()} | {:error, term()}
@@ -640,22 +644,6 @@ defmodule Shuttle.Poller do
     end
   end
 
-  defp do_capture(%State{} = state, yap, work_dir, felt_store, opts) do
-    result =
-      Dispatcher.capture(yap,
-        runner: state.runner,
-        work_dir: work_dir,
-        felt_store: felt_store,
-        agent: Keyword.get(opts, :agent),
-        effort: Keyword.get(opts, :effort),
-        chrome: Keyword.get(opts, :chrome) == true,
-        port: Shuttle.CLI.daemon_port(),
-        host: state.own_host_id
-      )
-
-    {:reply, result, state}
-  end
-
   def handle_call({:dispatch, fiber_id, opts}, _from, state) do
     fiber_id = address_for_identifier(state, fiber_id)
     state = reconcile_running_fiber(state, fiber_id)
@@ -700,27 +688,15 @@ defmodule Shuttle.Poller do
   def handle_call({:actions, fiber_id, opts}, _from, state) do
     fiber_id = address_for_identifier(state, fiber_id)
 
-    case fetch_fiber_full(fiber_id, state) do
-      {:ok, fiber} ->
-        running? = Keyword.get(opts, :running, live_running?(state, fiber_id))
-        {:reply, {:ok, Actions.actions_for(fiber, running?)}, state}
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
+    opts = Keyword.merge([felt_stores: state.felt_stores, runner: state.runner], opts)
+    {:reply, ActionQueries.actions_for(fiber_id, opts), state}
   end
 
   def handle_call({:resolve_action, fiber_id, target, opts}, _from, state) do
     fiber_id = address_for_identifier(state, fiber_id)
 
-    case fetch_fiber_full(fiber_id, state) do
-      {:ok, fiber} ->
-        running? = Keyword.get(opts, :running, live_running?(state, fiber_id))
-        {:reply, Actions.resolve_transition(fiber, target, running?), state}
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
+    opts = Keyword.merge([felt_stores: state.felt_stores, runner: state.runner], opts)
+    {:reply, ActionQueries.resolve_action(fiber_id, target, opts), state}
   end
 
   def handle_call({:lifecycle_transition, verb, fiber_id, opts}, _from, state) do
@@ -832,6 +808,22 @@ defmodule Shuttle.Poller do
 
   def handle_call({:bust_fiber_host_cache, fiber_id}, _from, state) do
     {:reply, :ok, %{state | fiber_host_cache: Map.delete(state.fiber_host_cache, fiber_id)}}
+  end
+
+  defp do_capture(%State{} = state, yap, work_dir, felt_store, opts) do
+    result =
+      Dispatcher.capture(yap,
+        runner: state.runner,
+        work_dir: work_dir,
+        felt_store: felt_store,
+        agent: Keyword.get(opts, :agent),
+        effort: Keyword.get(opts, :effort),
+        chrome: Keyword.get(opts, :chrome) == true,
+        port: Shuttle.CLI.daemon_port(),
+        host: state.own_host_id
+      )
+
+    {:reply, result, state}
   end
 
   # Detects fibers that opted out of agent dispatch by setting
@@ -2199,7 +2191,11 @@ defmodule Shuttle.Poller do
       case LifecycleStore.rearm(fiber_id) do
         {:ok, msg} ->
           Logger.info("force-dispatch re-arm #{fiber_id}: #{String.trim(msg)}")
-          fiber |> Map.put("status", "active") |> Map.delete("tempered") |> Map.delete("closed-at")
+
+          fiber
+          |> Map.put("status", "active")
+          |> Map.delete("tempered")
+          |> Map.delete("closed-at")
 
         {:error, _reason} ->
           # Oneshots and non-standing fibers aren't re-armable; that's expected —
@@ -2789,23 +2785,6 @@ defmodule Shuttle.Poller do
 
   # ── Retry ──
 
-  # Whether a fiber is GENUINELY running right now: in the registry AND its tmux
-  # session is actually alive. The read legs (:actions / :resolve_action) use
-  # this instead of a raw `Map.has_key?(state.running, …)`, so a resolved action
-  # agrees with what the dispatch leg's `reconcile_running_fiber` would conclude.
-  # Unlike reconcile, this is a PURE read — no watcher teardown, no state
-  # mutation — so resolve/actions stay side-effect-free; the actual eviction
-  # happens on the next poll tick or the dispatch leg. Without it, in the window
-  # after a worker's session dies the registry still reports it running, so a
-  # drag→inFlight resolves to `pause` for a worker that no longer exists and the
-  # matching invoke (which reconciles) 409s. (C1-adjacent.)
-  defp live_running?(%State{} = state, fiber_id) do
-    case running_worker(state, fiber_id) do
-      nil -> false
-      %{session: session} -> already_running_session?(state, session)
-    end
-  end
-
   defp reconcile_running_fiber(%State{} = state, fiber_id) do
     case {running_key(state, fiber_id), running_worker(state, fiber_id)} do
       {nil, _} ->
@@ -3105,8 +3084,9 @@ defmodule Shuttle.Poller do
   # slack, with a floor) so consecutive polls' windows overlap and no tick falls
   # between them, while a tick that fired before the window — daemon down across
   # it — is skipped, not replayed (the morning-post-drift rule).
-  defp due_window_ms(%State{poll_interval_ms: interval}) when is_integer(interval) and interval > 0,
-    do: max(interval * 2, @min_due_window_ms)
+  defp due_window_ms(%State{poll_interval_ms: interval})
+       when is_integer(interval) and interval > 0,
+       do: max(interval * 2, @min_due_window_ms)
 
   defp due_window_ms(_), do: @min_due_window_ms
 

@@ -15,14 +15,14 @@ defmodule Shuttle.Transition do
        gates are the final arbiter (mirroring Portolan's prior
        `resolveShuttleDaemonUrl` fallback).
 
-    2. **Local branch** = resolve + invoke, in one process. `resolve_action`
-       reads the daemon's own state (registry `running?` + the live felt
-       document's `status`/`tempered`) to map `target` → a canonical action id;
-       the same source the availability gate reads, so the resolved action is in
-       the availability set by construction (the `resolve ⊆ availability`
-       invariant — see `gotcha-shuttle-resolve-invoke-daemon-split`). Then the
-       invoke pipeline mutates: pause/reopen/close shell the offline frontmatter
-       writer, accept-run / dispatch-ad-hoc go through the in-process lifecycle.
+    2. **Local branch** = resolve + invoke, in one process. `ActionQueries`
+       reads the live felt document and tmux liveness outside the Poller
+       mailbox to map `target` → a canonical action id; the same query path the
+       availability gate reads, so the resolved action is in the availability
+       set by construction (the `resolve ⊆ availability` invariant — see
+       `gotcha-shuttle-resolve-invoke-daemon-split`). Then the invoke pipeline
+       mutates: pause/reopen/close shell the offline frontmatter writer,
+       accept-run / dispatch-ad-hoc go through the in-process lifecycle.
 
     3. **Forward branch** = `POST <remote>/api/v1/transition` with `origin`
        omitted, so the owning daemon runs its OWN local branch against its
@@ -37,7 +37,15 @@ defmodule Shuttle.Transition do
   status mapping have a single implementation.
   """
 
-  alias Shuttle.{Actions, FeltStores, LifecycleService, OriginRouter, Poller, Remote}
+  alias Shuttle.{
+    ActionQueries,
+    Actions,
+    FeltStores,
+    LifecycleService,
+    OriginRouter,
+    Poller,
+    Remote
+  }
 
   @typedoc """
   The local outcome of a transition: `{:ok, action_id}` on success, a structured
@@ -67,7 +75,7 @@ defmodule Shuttle.Transition do
   # ── Local branch: resolve + invoke ──
 
   defp transition_local(fiber_id, target) do
-    case Poller.resolve_action(fiber_id, target) do
+    case ActionQueries.resolve_action(fiber_id, target) do
       {:ok, %{id: action_id}} ->
         with :ok <- invoke(fiber_id, action_id), do: {:ok, action_id}
 
@@ -105,14 +113,12 @@ defmodule Shuttle.Transition do
     if Actions.known_action?(action), do: :ok, else: {:error, :unknown_action}
   end
 
-  # Action availability is resolved by the Poller, which overlays the
-  # daemon-owned runtime lifecycle. Reading availability anywhere else — e.g.
-  # parsing the frontmatter here — sees the default review state and wrongly
-  # rejects valid standing-role transitions (accept-run) as
-  # `action_not_available`. The host is resolved separately for the shuttle-ctl
-  # verbs that still shell out (close / pause / reopen).
+  # Action availability resolves through the same fast query path as
+  # transition_local/2: felt document + tmux liveness, outside the Poller
+  # mailbox. The host is resolved separately for the shuttle-ctl verbs that
+  # still shell out (close / pause / reopen).
   defp validate_available(fiber_id, action) do
-    case Poller.actions_for(fiber_id) do
+    case ActionQueries.actions_for(fiber_id) do
       {:ok, actions} ->
         if Enum.any?(actions, &(Map.get(&1, :id) == action || Map.get(&1, "id") == action)) do
           host_for_fiber(fiber_id)
@@ -200,7 +206,12 @@ defmodule Shuttle.Transition do
   # fiber as local, so its `origin` would read "local"/its own id. The kanban
   # always sees the origin it routed to.
   defp forward(%Remote{} = remote, fiber_id, target, origin, opts) do
-    case OriginRouter.forward(remote, "/api/v1/transition", %{fiber_id: fiber_id, target: target}, opts) do
+    case OriginRouter.forward(
+           remote,
+           "/api/v1/transition",
+           %{fiber_id: fiber_id, target: target},
+           opts
+         ) do
       {:forwarded, status, body} ->
         {:forwarded, status, Map.put(decode_body(body), "origin", origin)}
 

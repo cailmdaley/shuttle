@@ -308,7 +308,6 @@ defmodule Shuttle.PollerTest do
     end)
   end
 
-
   defp restore_env(key, nil), do: System.delete_env(key)
   defp restore_env(key, value), do: System.put_env(key, value)
 
@@ -502,7 +501,11 @@ defmodule Shuttle.PollerTest do
       assert Poller.snapshot(poller).host == "candide"
     after
       File.rm(path)
-      if prev_file, do: System.put_env("SHUTTLE_HOST_FILE", prev_file), else: System.delete_env("SHUTTLE_HOST_FILE")
+
+      if prev_file,
+        do: System.put_env("SHUTTLE_HOST_FILE", prev_file),
+        else: System.delete_env("SHUTTLE_HOST_FILE")
+
       if prev, do: System.put_env("SHUTTLE_HOST", prev), else: System.delete_env("SHUTTLE_HOST")
     end
   end
@@ -514,7 +517,11 @@ defmodule Shuttle.PollerTest do
     # Point the host-file source at a path that does not exist so the chain
     # genuinely falls through to the OS hostname regardless of the dev
     # machine's real ~/.shuttle/host.
-    System.put_env("SHUTTLE_HOST_FILE", Path.join(System.tmp_dir!(), "shuttle-host-absent-#{System.unique_integer([:positive])}"))
+    System.put_env(
+      "SHUTTLE_HOST_FILE",
+      Path.join(System.tmp_dir!(), "shuttle-host-absent-#{System.unique_integer([:positive])}")
+    )
+
     {:ok, hostname} = :inet.gethostname()
     expected = to_string(hostname)
 
@@ -529,7 +536,10 @@ defmodule Shuttle.PollerTest do
 
       assert Poller.snapshot(poller).host == expected
     after
-      if prev_file, do: System.put_env("SHUTTLE_HOST_FILE", prev_file), else: System.delete_env("SHUTTLE_HOST_FILE")
+      if prev_file,
+        do: System.put_env("SHUTTLE_HOST_FILE", prev_file),
+        else: System.delete_env("SHUTTLE_HOST_FILE")
+
       if prev, do: System.put_env("SHUTTLE_HOST", prev)
     end
   end
@@ -657,6 +667,7 @@ defmodule Shuttle.PollerTest do
     # The fiber dispatches (lands in state.running) AND its document caches.
     assert wait_until(fn ->
              snap = Poller.snapshot(poller)
+
              length(snap.eligible) == 1 and
                get_in(snap, [:document_cache, "entries"]) >= 1
            end)
@@ -698,6 +709,7 @@ defmodule Shuttle.PollerTest do
 
     assert wait_until(fn ->
              snap = Poller.snapshot(poller)
+
              length(snap.eligible) == 1 and
                get_in(snap, [:document_cache, "entries"]) >= 1
            end)
@@ -2283,10 +2295,14 @@ defmodule Shuttle.PollerTest do
   test "poller does not re-dispatch a closed oneshot whose worker is dead" do
     fiber_id = "tests/closed-with-session"
 
-    MockRunner.set_shuttle(fiber_id, """
-    kind: oneshot
-    agent: claude-sonnet
-    """, "closed")
+    MockRunner.set_shuttle(
+      fiber_id,
+      """
+      kind: oneshot
+      agent: claude-sonnet
+      """,
+      "closed"
+    )
 
     append_dispatch_session(fiber_id, "closed-uuid")
 
@@ -3091,14 +3107,26 @@ defmodule Shuttle.PollerTest do
     assert out =~ "worker claimed"
     assert out =~ "session=uuid-claim-1"
 
-    # Exit handling works exactly as for a dispatched worker: the session
-    # dying is noticed by reconciliation and the running entry clears.
+    new_sessions_before =
+      Enum.count(MockRunner.commands(), fn {cmd, args} ->
+        cmd == "tmux" and hd(args) == "new-session" and Enum.at(args, 3) == session
+      end)
+
+    # Exit handling works exactly as for a dispatched active oneshot: the dead
+    # session is noticed by reconciliation, the stale running entry clears, and
+    # the same poll tick retries the active fiber under its canonical name.
     MockRunner.remove_tmux_session(session)
     send(poller, :run_poll_cycle)
 
-    assert wait_until(fn ->
-             not Enum.any?(Poller.snapshot(poller).eligible, &(&1.fiber_id == id))
-           end)
+    assert wait_until(
+             fn ->
+               Enum.count(MockRunner.commands(), fn {cmd, args} ->
+                 cmd == "tmux" and hd(args) == "new-session" and Enum.at(args, 3) == session
+               end) > new_sessions_before and
+                 Enum.any?(Poller.snapshot(poller).eligible, &(&1.fiber_id == id))
+             end,
+             80
+           )
   end
 
   test "claim refuses unknown fibers, dead sessions, and double claims" do

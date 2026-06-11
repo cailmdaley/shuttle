@@ -9,7 +9,10 @@ defmodule Shuttle.WorkerWatcher do
   See SPEC §9 for the tmux-watcher architecture.
   """
 
-  use GenServer
+  # A watcher is bound to one concrete tmux session. Once that session exits,
+  # or the owning poller/test runner is gone, restarting the watcher only
+  # replays stale notifications and can crash-loop the app-wide supervisor.
+  use GenServer, restart: :temporary
   require Logger
 
   @default_heartbeat_interval_ms 5_000

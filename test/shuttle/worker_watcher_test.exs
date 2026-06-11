@@ -113,6 +113,10 @@ defmodule Shuttle.WorkerWatcherTest do
 
   # ── Tests ──
 
+  test "watcher children are temporary" do
+    assert WorkerWatcher.child_spec([]).restart == :temporary
+  end
+
   test "watcher detects session death and notifies poller" do
     session = Dispatcher.session_name("tests/haiku")
     MockRunner.add_session(session)
