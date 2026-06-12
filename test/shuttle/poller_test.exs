@@ -2088,6 +2088,42 @@ defmodule Shuttle.PollerTest do
     assert Enum.any?(snap.eligible, &(&1.fiber_id == fiber_id and &1.state == "running"))
   end
 
+  test "poller adopts a live orphan session for a resting pinned role (no dispatch-rescue)" do
+    # Regression for the daemon-restart-drops-all-adoptions bug. After a restart,
+    # `candidate_session_lookup` must record the fiber_id for a session name seen
+    # exactly once — every uid-keyed name is unique to one fiber. A `Map.update/4`
+    # misuse inserted the default grouped sets VERBATIM (the update fun is not
+    # applied to the default), so a single-occurrence session kept empty sets,
+    # resolved to nil, and the live worker was never adopted.
+    #
+    # Oneshots MASKED this: the poll's dispatch attempt hits :already_running and
+    # `do_dispatch` adopts the session directly, bypassing the lookup. A pinned
+    # role never auto-dispatches, so `candidate_session_lookup` is its ONLY
+    # adoption path — exactly the case that broke in the field (operator/
+    # morning-post showed at-rest on the board while dispatch refused them as
+    # already_running).
+    fiber_id = "tests/pinned-orphan"
+    uid = "01KTHDNZS287ZSSG8X8V59XKWD"
+    MockRunner.set_fiber(fiber_id, make_fiber(fiber_id, %{"uid" => uid, "status" => "active"}))
+    MockRunner.set_shuttle(fiber_id, "kind: pinned\n", "active")
+    MockRunner.add_tmux_session(Dispatcher.session_name(fiber_id, uid))
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_pinned_orphan,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    Process.sleep(100)
+
+    snap = Poller.snapshot(poller)
+
+    assert Enum.any?(snap.eligible, &(&1.fiber_id == fiber_id and &1.state == "running")),
+           "a resting pinned role with a live orphan session must be adopted as running"
+  end
+
   # Retries collapsed into the poll loop (slice 6): a status:active oneshot whose
   # worker died while the daemon was down has no live tmux session, so it is
   # simply eligible again — the next poll re-dispatches it. There is no separate

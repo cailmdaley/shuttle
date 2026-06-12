@@ -3202,12 +3202,19 @@ defmodule Shuttle.Poller do
         {fiber_id, status} when is_binary(fiber_id) and fiber_id != "" ->
           bucket = if(status == "closed", do: :closed, else: :open)
 
+          # Record fiber_id in `bucket` of the session's grouped sets. `Map.update/4`
+          # inserts the default VERBATIM when the key is absent — the function is NOT
+          # applied to it — so the default must already carry fiber_id. Without this,
+          # a session name seen exactly once (every uid-keyed name is unique to one
+          # fiber) keeps empty sets, resolves to nil below, and the live worker is
+          # never adopted — the daemon-restart-drops-all-adoptions bug.
+          add_to_bucket = fn grouped -> Map.update!(grouped, bucket, &MapSet.put(&1, fiber_id)) end
+          singleton = add_to_bucket.(%{open: MapSet.new(), closed: MapSet.new()})
+
           fiber_id
           |> Dispatcher.session_names(Map.get(fiber, "uid"))
           |> Enum.reduce(acc, fn session, acc2 ->
-            Map.update(acc2, session, %{open: MapSet.new(), closed: MapSet.new()}, fn grouped ->
-              Map.update!(grouped, bucket, &MapSet.put(&1, fiber_id))
-            end)
+            Map.update(acc2, session, singleton, add_to_bucket)
           end)
 
         _ ->
