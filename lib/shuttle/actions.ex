@@ -76,6 +76,18 @@ defmodule Shuttle.Actions do
     status = Map.get(fiber, "status")
 
     cond do
+      # Temper on a cyclical role (standing/pinned) with no verdict is ACCEPT
+      # in every non-draft state — running (an interactive run just wrapped,
+      # worker alive or freshly killed), armed (`status: active`, exit not yet
+      # marked awaiting), or awaiting (`status: closed`). close_tempered is a
+      # ONESHOT terminus; resolving it here checked a standing role off for
+      # good (the morning-post temper bug, 2026-06-12). This clause MUST
+      # precede the generic `running?` clauses — a live or just-killed worker
+      # is exactly the state where status hasn't flipped to closed yet.
+      cyclical?(shuttle) and untempered?(fiber) and status != "open" and
+          target == "tempered" ->
+        :accept_run
+
       # A live worker: the close columns end it, drafts pauses it. inFlight is
       # the column it already lives in (a no-op same-column drop); resolve it to
       # `pause` so it stays a valid, non-destructive-on-its-own action that the

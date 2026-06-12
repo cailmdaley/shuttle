@@ -25,7 +25,7 @@ defmodule Shuttle.LifecycleStore do
     with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
          :ok <- require_cyclical(shuttle),
-         :ok <- require_doc_awaiting(frontmatter) do
+         :ok <- require_doc_acceptable(frontmatter) do
       # Awaiting is `status: closed` + untempered in the document itself — there
       # is no `review.state` (slice 4 removed the review axis). Recognize it
       # straight from the doc and re-arm. A standing role advances its cron
@@ -187,6 +187,25 @@ defmodule Shuttle.LifecycleStore do
   # no `review.state` to consult).
   defp doc_awaiting?(frontmatter) do
     Map.get(frontmatter, "status") == "closed" and is_nil(Map.get(frontmatter, "tempered"))
+  end
+
+  # Accept's wider precondition: any UNTEMPERED non-draft state re-arms. The
+  # kanban's Temper gesture on a cyclical role resolves to accept even while
+  # the run is still in flight (status: active, worker alive or just killed,
+  # exit not yet marked awaiting) — "I'm done, advance the schedule" doesn't
+  # wait for the exit writer. Verdict termini (tempered true/false) and drafts
+  # (status: open) still reject; re-arm from active is idempotent on status.
+  defp require_doc_acceptable(frontmatter) do
+    status = Map.get(frontmatter, "status")
+
+    if status in ["active", "closed"] and is_nil(Map.get(frontmatter, "tempered")) do
+      :ok
+    else
+      {:error,
+       "fiber is not acceptable (accept requires status active|closed + untempered; " <>
+         "status=#{inspect(status)}, " <>
+         "tempered=#{inspect(Map.get(frontmatter, "tempered"))})"}
+    end
   end
 
   defp require_doc_awaiting(frontmatter) do

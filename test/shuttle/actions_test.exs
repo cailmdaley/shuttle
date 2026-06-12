@@ -52,6 +52,37 @@ defmodule Shuttle.ActionsTest do
     refute Enum.any?(actions, &(&1.id == "reopen"))
   end
 
+  test "temper on a running or armed standing role resolves to accept-run, never close-tempered" do
+    # The morning-post temper bug (2026-06-12): Cail clicked Temper right as an
+    # interactive run wrapped — worker alive (or just killed by the kanban),
+    # `status: active` because the exit writer hadn't marked awaiting yet. The
+    # old `running? → close_tempered` clause checked the standing role off for
+    # good. Temper on an untempered cyclical role is ACCEPT in every non-draft
+    # state.
+    running = armed_standing()
+
+    assert {:ok, %{id: "accept-run", invocation: %{verb: "accept"}}} =
+             Actions.resolve_transition(running, "tempered", true)
+
+    # Armed but idle (worker killed, status not yet flipped) — same verb.
+    assert {:ok, %{id: "accept-run", invocation: %{verb: "accept"}}} =
+             Actions.resolve_transition(running, "tempered")
+
+    # Drag-safety invariant: the resolved action is in the available set.
+    assert Enum.any?(Actions.actions_for(running, true), &(&1.id == "accept-run"))
+
+    # A DRAFT standing role (status: open) does not accept — tempering a parked
+    # draft would arm it; it falls through to the generic close.
+    draft = Map.put(armed_standing(), "status", "open")
+
+    assert {:ok, %{id: "close-tempered"}} = Actions.resolve_transition(draft, "tempered")
+
+    # Oneshots keep the terminus: running + tempered = close-tempered.
+    oneshot = %{"id" => "work/once", "status" => "active", "shuttle" => %{"kind" => "oneshot"}}
+
+    assert {:ok, %{id: "close-tempered"}} = Actions.resolve_transition(oneshot, "tempered", true)
+  end
+
   test "closed + composted standing role (tempered:false) is a terminus, reopen to revive" do
     # A rejected standing role carries a verdict (`tempered: false`), so it is
     # NOT awaiting — it falls through to the generic closed clauses: reopen to

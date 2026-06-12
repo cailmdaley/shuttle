@@ -322,11 +322,13 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     File.rm_rf(root)
   end
 
-  test "accept refuses a status:active role (armed is not awaiting)" do
+  test "accept re-arms a status:active role idempotently (temper mid-run)" do
     # Accept reads ONLY the document (slice 4 deleted the review overlay, slice 6
-    # the runtime store): an armed (`status: active`) role is not awaiting, so
-    # accept refuses. This pins that no path revives a transition from anything
-    # but the document's status + tempered.
+    # the runtime store). An armed (`status: active`) untempered role ACCEPTS —
+    # the kanban's Temper gesture can land while the run is still in flight
+    # (worker alive or just killed, exit writer not yet run), and refusing here
+    # is what let the transition fall through to close-tempered (the
+    # morning-post temper bug, 2026-06-12). Re-arm from active is idempotent.
     root =
       System.tmp_dir!()
       |> Path.join("shuttle-lifecycle-accept-armed-#{System.unique_integer([:positive])}")
@@ -364,11 +366,12 @@ defmodule ShuttleWeb.LifecycleControllerTest do
           })
         )
 
-      assert conn.status == 400
-      assert conn.resp_body =~ "not awaiting review"
+      assert conn.status == 200
 
-      # The document is untouched — still armed.
-      assert frontmatter(File.read!(path)) =~ "status: active"
+      # The document stays armed and untempered — no verdict written.
+      fm = frontmatter(File.read!(path))
+      assert fm =~ "status: active"
+      refute fm =~ "tempered"
     end)
 
     File.rm_rf(root)
@@ -388,7 +391,8 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     File.write!(Path.join(fiber_dir, "standing-accept-fail.md"), """
     ---
     name: Standing accept fail
-    status: active
+    status: closed
+    tempered: true
     shuttle:
       enabled: true
       kind: standing
@@ -412,7 +416,7 @@ defmodule ShuttleWeb.LifecycleControllerTest do
         )
 
       assert conn.status == 400
-      assert conn.resp_body =~ "not awaiting review"
+      assert conn.resp_body =~ "not acceptable"
       refute File.exists?(args_file)
     end)
 

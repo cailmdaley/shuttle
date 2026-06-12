@@ -37,10 +37,28 @@ defmodule Shuttle.LifecycleStoreTest do
           # Composted is a verdict, not awaiting (status:closed + tempered:false):
           # the doc-awaiting precondition rejects.
           assert {:error, reason} = LifecycleStore.accept(fiber_id)
-          assert reason =~ "awaiting review"
+          assert reason =~ "not acceptable"
         end,
         status: "closed",
         tempered: false
+      )
+    end
+
+    test "accept re-arms an active+untempered standing role (temper mid-run / pre-exit-mark)" do
+      # The morning-post temper bug: Temper clicked while the run was still
+      # status:active (worker alive or just killed, exit writer not yet run).
+      # Accept must re-arm idempotently rather than refuse — the refusal is
+      # what let the transition fall through to close-tempered.
+      with_doc_awaiting_role(
+        fn fiber_id, path ->
+          assert {:ok, message} = LifecycleStore.accept(fiber_id)
+          assert message =~ "accepted run for #{fiber_id}"
+
+          fm = read_frontmatter(path)
+          assert fm["status"] == "active"
+          refute Map.has_key?(fm, "tempered")
+        end,
+        status: "active"
       )
     end
   end
