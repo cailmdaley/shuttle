@@ -926,6 +926,99 @@ defmodule Shuttle.PollerTest do
     refute Enum.any?(Poller.snapshot(poller).eligible, &(&1.fiber_id == "tests/pinned-at-rest"))
   end
 
+  test "a pinned worker exit leaves the role resting (status:active), not awaiting-review" do
+    # Bug: pinned roles were treated as cyclical (standing OR pinned) on worker
+    # exit and marked awaiting (status:closed), so a closed-out pinned role left
+    # the strip for the awaiting-review/timeline surfaces. A pinned role never
+    # auto-re-fires (force-dispatch only), so the awaiting mark is no anti-re-fire
+    # gain and only adds accept-friction. Its steady state is resting status:active
+    # on the strip — that's where its exit must leave it. (A pinned worker that
+    # wants review still self-closes; only STANDING/cron roles mark awaiting.)
+    #
+    # The exit handler's awaiting-mark writes through felt (LifecycleStore →
+    # FeltStores.resolve_fiber), so the mock fiber must be felt-resolvable for the
+    # mark to actually land: point LOOM_HOMES at the mock store the factory wrote
+    # to (/private/tmp/.felt). Without this, mark_awaiting can't resolve the fiber
+    # and silently no-ops — masking whether the gate even fired.
+    prev_loom = System.get_env("LOOM_HOMES")
+    System.put_env("LOOM_HOMES", "/private/tmp")
+    on_exit(fn -> if prev_loom, do: System.put_env("LOOM_HOMES", prev_loom), else: System.delete_env("LOOM_HOMES") end)
+
+    fiber_id = "tests/pinned-exit-rests"
+    leaf = fiber_id |> String.split("/") |> List.last()
+    MockRunner.set_fiber(fiber_id, make_fiber(fiber_id, %{"status" => "active"}))
+    MockRunner.set_shuttle(fiber_id, "kind: pinned\nagent: claude-opus\n", "active")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_pinned_exit_rests,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    # Pinned fires only on an explicit force-dispatch.
+    assert {:ok, _session} = Poller.dispatch_fiber(poller, fiber_id, force: true, ad_hoc: true)
+
+    # Worker exits while the document is still active (the interactive-intake
+    # case — the worker did NOT self-close).
+    MockRunner.remove_tmux_session(Dispatcher.session_name(fiber_id))
+    send(poller, {:worker_exited, fiber_id, :normal_exit, false})
+    # Flush the GenServer mailbox: a synchronous call only returns after the
+    # preceding :worker_exited info message has been fully handled (write incl.),
+    # so the disk read below is deterministic — no sleep race.
+    _ = Poller.snapshot(poller)
+
+    # The on-disk document is untouched: still resting active, never closed.
+    # Reverting the exit gate to `cyclical_role?` flips this file to status:closed.
+    doc = File.read!("/private/tmp/.felt/#{fiber_id}/#{leaf}.md")
+    assert doc =~ ~r/status:\s*active/
+    refute doc =~ ~r/status:\s*closed/
+    refute doc =~ "closed-at"
+  end
+
+  test "a standing worker exit DOES close the role to awaiting-review (status:closed)" do
+    # The complement of the pinned carve-out: a STANDING (cron) worker's exit
+    # still marks the role awaiting, so the cron does not re-fire it this cycle.
+    # This is what guards the gate against being broadened to skip standing too.
+    prev_loom = System.get_env("LOOM_HOMES")
+    System.put_env("LOOM_HOMES", "/private/tmp")
+    on_exit(fn -> if prev_loom, do: System.put_env("LOOM_HOMES", prev_loom), else: System.delete_env("LOOM_HOMES") end)
+
+    fiber_id = "tests/standing-exit-closes"
+    leaf = fiber_id |> String.split("/") |> List.last()
+    MockRunner.set_fiber(fiber_id, make_fiber(fiber_id, %{"status" => "active"}))
+
+    MockRunner.set_shuttle(
+      fiber_id,
+      """
+      kind: standing
+      agent: claude-sonnet
+      schedule:
+        expr: "0 9 * * *"
+        tz: Europe/Paris
+      """,
+      "active"
+    )
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_standing_exit_closes,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    assert {:ok, _session} = Poller.dispatch_fiber(poller, fiber_id, force: true, ad_hoc: true)
+
+    MockRunner.remove_tmux_session(Dispatcher.session_name(fiber_id))
+    send(poller, {:worker_exited, fiber_id, :normal_exit, false})
+    _ = Poller.snapshot(poller)
+
+    doc = File.read!("/private/tmp/.felt/#{fiber_id}/#{leaf}.md")
+    assert doc =~ ~r/status:\s*closed/
+  end
+
   test "poller does not dispatch a scheduled standing role before it is due" do
     fiber = make_fiber("tests/standing-sleeping", %{"tags" => ["constitution", "standing"]})
     MockRunner.set_fiber("tests/standing-sleeping", fiber)
