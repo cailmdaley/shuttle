@@ -172,6 +172,31 @@ defmodule Shuttle.FeltStoresTest do
       # real dir, so exactly one survives the realpath dedup.
       assert Enum.count(hosts, &same_dir?(&1, project)) == 1
     end
+
+    # Regression (the lightcone topology). A project store whose `.felt` is a REAL
+    # directory, plus a parent store whose own `.felt` is a SYMLINK into it — both
+    # configured, sharing one `.felt` realpath. The dedup keeps exactly one, and it
+    # MUST be the real-directory store: the poller's `list_shuttle_fibers/2` returns
+    # `{:ok, []}` for any store whose `.felt` is a symlink, so keeping the symlink
+    # store would make every fiber under that realpath vanish from dispatch and the
+    # kanban. The symlink store is configured FIRST, so a naive first-wins `uniq_by`
+    # would keep it (the pre-fix bug).
+    test "dedup keeps the real-.felt store over a symlink-.felt store sharing its realpath" do
+      parent = tmp_dir()
+      project = Path.join(parent, "lightcone")
+      File.mkdir_p!(Path.join(project, ".felt"))
+      File.ln_s!(Path.join(project, ".felt"), Path.join(parent, ".felt"))
+      System.put_env("LOOM_HOMES", "#{parent},#{project}")
+
+      hosts = FeltStores.configured_hosts()
+
+      survivors =
+        Enum.filter(hosts, &same_dir?(Path.join(&1, ".felt"), Path.join(project, ".felt")))
+
+      assert length(survivors) == 1
+      [survivor] = survivors
+      assert File.lstat!(Path.join(survivor, ".felt")).type == :directory
+    end
   end
 
   defp write_fiber(felt_dir, slug_segments, opts \\ []) do

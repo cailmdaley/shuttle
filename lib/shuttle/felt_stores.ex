@@ -85,7 +85,27 @@ defmodule Shuttle.FeltStores do
 
     (stores ++ discovered)
     |> Enum.map(&Path.expand/1)
+    # When two stores share a `.felt/` realpath — a project root whose `.felt/` is
+    # a real directory AND a parent (or sibling) whose own `.felt/` is a symlink
+    # into it — keep the REAL-directory store. The poller's `list_shuttle_fibers/2`
+    # returns `{:ok, []}` for any store whose `.felt/` is a symlink (it owns
+    # nothing; the physical root is meant to enumerate). So if the dedup kept the
+    # symlink store, that realpath would be enumerated by no store at all and its
+    # fibers would vanish from dispatch and the kanban. Stable-sort real-`.felt`
+    # stores ahead of symlink ones (Elixir's sort is stable, so order is otherwise
+    # preserved); `uniq_by` then keeps the real-directory store per realpath.
+    |> Enum.sort_by(&felt_symlink?/1)
     |> Enum.uniq_by(&store_felt_realpath/1)
+  end
+
+  # True when `<store>/.felt` is itself a symlink rather than a real directory.
+  # Such a store is skipped by the poller's enumerator, so it must lose a dedup
+  # tie to a real-directory store sharing the same `.felt/` realpath.
+  defp felt_symlink?(store) do
+    case File.lstat(Path.join(Path.expand(store), ".felt")) do
+      {:ok, %File.Stat{type: :symlink}} -> true
+      _ -> false
+    end
   end
 
   # Project roots of symlinked substores under `<store>/.felt/`: each `.felt/`
