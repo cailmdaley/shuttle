@@ -398,7 +398,8 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
            ] = Jason.decode!(by_slug.resp_body)["fibers"]
   end
 
-  test "GET /api/v1/fibers/:id?body=true includes the felt body", %{store: store} do
+  test "GET /api/v1/fibers/:id?body=true includes the felt body alongside full metadata",
+       %{store: store} do
     write_fiber!(store, "tests/single-body", """
     ---
     name: Single with body
@@ -412,8 +413,51 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
 
     assert conn.status == 200
 
-    assert [%{"fiber" => %{"body" => "The body content."}}] =
-             Jason.decode!(conn.resp_body)["fibers"]
+    # body=true returns the COMPLETE fiber — id + name + body — not a body-only
+    # stub. `felt show -j` already carries the body, so the fast path resolves
+    # the whole fiber and we keep the body rather than re-fetching it.
+    assert [
+             %{
+               "fiber" => %{
+                 "id" => "tests/single-body",
+                 "name" => "Single with body",
+                 "body" => "The body content."
+               }
+             }
+           ] = Jason.decode!(conn.resp_body)["fibers"]
+  end
+
+  test "GET /api/v1/fibers/:id?body=true resolves via the show fast path, not the whole-store scan",
+       %{store: store} do
+    # Regression guard for the body-read stall: the daemon must NOT pass `--body`
+    # to `felt show`. That selector returns `{body, body_start_line}` with no
+    # `id`, so the fast path can't build an entry and `get/2` falls through to
+    # `scan_lookup` — a `felt ls --body` over every store that cost the live
+    # endpoint 6-10s while felt itself answered in ~10ms. This fake felt emulates
+    # BOTH felt JSON shapes faithfully:
+    #
+    #   * `show -j` (no --body) → full fiber JSON (id + path + body)  [fast path]
+    #   * `show -j --body`      → `{body, body_start_line}`, NO id     [the trap]
+    #   * `ls …`                → `[]`                                 [scan = miss]
+    #
+    # If the `--body` flag is ever reintroduced, the fast path misses, the scan
+    # returns nothing, and the endpoint answers an empty fiber list — failing the
+    # assertion below. With the correct `felt show -j` call the fiber and its
+    # body come back from the first store.
+    install_body_read_fake_felt!(store)
+
+    conn = get(api_conn(), "/api/v1/fibers/tests/single-body?body=true")
+
+    assert conn.status == 200
+
+    assert [
+             %{
+               "fiber" => %{
+                 "id" => "tests/single-body",
+                 "body" => "The body content."
+               }
+             }
+           ] = Jason.decode!(conn.resp_body)["fibers"]
   end
 
   test "GET /api/v1/fibers/:id resolves a symlink-traversed fiber via the canonical id (scan fallback)",
@@ -629,6 +673,43 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
     only = get(api_conn(), "/api/v1/fibers?shuttle=true")
     owner_names = Jason.decode!(only.resp_body)["fibers"] |> Enum.map(& &1["fiber"]["name"]) |> Enum.sort()
     assert owner_names == ["Managed", "Owner with due"]
+  end
+
+  # A fake `felt` on PATH that mimics the felt JSON shapes the body-read path can
+  # hit. Faithful emulation is the point: `felt show -j` carries id + path + body;
+  # `felt show -j --body` is the minimal, id-less editing selector; `felt ls` is
+  # the (here empty) whole-store scan. Lets a controller test distinguish the
+  # fast path from the scan fallback by RESULT alone, no timing. `$(pwd)` (not
+  # `$PWD`, which `cd:` leaves stale) gives felt's per-call working store.
+  defp install_body_read_fake_felt!(store) do
+    bin_dir = Path.join(Path.dirname(store), "fake-bin")
+    File.mkdir_p!(bin_dir)
+    bin = Path.join(bin_dir, "felt")
+
+    File.write!(bin, """
+    #!/bin/sh
+    case " $* " in
+      *" --body "*)
+        printf '{"body":"The body content.","body_start_line":7}\\n'
+        ;;
+      *" show "*)
+        dir=$(pwd)
+        printf '{"id":"tests/single-body","name":"Single with body","status":"open","path":"%s/.felt/tests/single-body/single-body.md","body":"The body content."}\\n' "$dir"
+        ;;
+      *" ls "*)
+        printf '[]\\n'
+        ;;
+      *)
+        printf '\\n'
+        ;;
+    esac
+    """)
+
+    File.chmod!(bin, 0o755)
+
+    old_path = System.get_env("PATH")
+    System.put_env("PATH", bin_dir <> ":" <> (old_path || ""))
+    on_exit(fn -> restore_env("PATH", old_path) end)
   end
 
   defp write_fiber!(store, fiber_id, content) do

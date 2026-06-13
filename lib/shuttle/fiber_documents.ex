@@ -127,20 +127,23 @@ defmodule Shuttle.FiberDocuments do
   end
 
   defp show_store(store, id, with_body?) do
-    args = ["show", id, "-j"]
-    args = if with_body?, do: args ++ ["--body"], else: args
-
+    # `felt show -j` ALWAYS emits the full fiber JSON — id, path, AND body. Do
+    # NOT append `--body`: that selector switches felt to a minimal
+    # `{body, body_start_line}` shape with NO `id`, so `entry_for/2` (which keys
+    # on `id`) drops it, `fast_lookup/3` misses on every store, and `get/2` falls
+    # all the way through to the whole-store `scan_lookup` — a `felt ls --body`
+    # over every configured store, which under poller churn cost the body-read
+    # endpoint 6-10s while felt itself answered in ~10ms. The body is already in
+    # hand here: keep it for the content reader, drop it for the metadata path so
+    # the response still matches the list endpoint's body=… contract.
+    #
     # Same stderr discipline as list_store: never fold stderr into stdout — felt
     # prints "no felt found matching …" (and parse warnings) to stderr while
     # emitting JSON on stdout. A missing fiber exits non-zero with empty stdout,
     # which we treat as "not in this store" and fall through to the next.
-    case System.cmd("felt", args, cd: store) do
+    case System.cmd("felt", ["show", id, "-j"], cd: store) do
       {output, 0} ->
         case Jason.decode(output) do
-          # `felt show -j` always emits `body`, even without `--body` (unlike
-          # `felt ls -j`). Drop it when the caller didn't ask, so the metadata
-          # path stays minimal and the response matches the list endpoint's
-          # body=… contract.
           {:ok, %{} = fiber} ->
             fiber = if with_body?, do: fiber, else: Map.delete(fiber, "body")
             {:ok, entry_for(store, fiber)}
