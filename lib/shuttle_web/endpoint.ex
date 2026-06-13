@@ -30,7 +30,7 @@ defmodule ShuttleWeb.Endpoint do
   plug Plug.Static,
     at: "/",
     from: ShuttleWeb.Assets.dist(),
-    only: ~w(assets fonts index.html favicon.ico)
+    only: ~w(assets fonts index.html paper.html favicon.ico)
 
   plug Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],

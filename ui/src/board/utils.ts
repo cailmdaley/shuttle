@@ -139,15 +139,48 @@ export function escapeAttr(text: string): string {
  */
 export function fileUrl(rawPath: string, opts?: RenderMarkdownOptions): string | null {
   if (/^https?:\/\//.test(rawPath) || /^data:/.test(rawPath)) return rawPath
-  let abs: string
-  if (rawPath.startsWith('/')) abs = rawPath
-  else if (opts?.basePath) abs = `${opts.basePath}/${rawPath}`
-  else return null
-  // encodeURIComponent leaves `~` raw (it's an unreserved mark), but the body
-  // is fed through `marked`, whose tilde-preprocess hook rewrites a lone `~` to
-  // `&#126;` outside code regions — which would corrupt a path under `~user` or
-  // a `foo.png~` backup. Percent-encode it so the URL survives the hook intact.
-  let url = `${FILE_ROUTE}?path=${encodeURIComponent(abs).replace(/~/g, '%7E')}`
+  const abs = resolveAbs(rawPath, opts)
+  if (abs === null) return null
+  let url = `${FILE_ROUTE}?path=${encodePathParam(abs)}`
+  if (opts?.originId && opts.originId !== 'local') {
+    url += `&origin=${encodeURIComponent(opts.originId)}`
+  }
+  return url
+}
+
+/**
+ * Resolve a relative or absolute artifact path to the absolute path the daemon
+ * routes require. Absolute (`/…`) passes through; relative needs `opts.basePath`
+ * (the fiber's dir); otherwise `null`.
+ */
+function resolveAbs(rawPath: string, opts?: RenderMarkdownOptions): string | null {
+  if (rawPath.startsWith('/')) return rawPath
+  if (opts?.basePath) return `${opts.basePath}/${rawPath}`
+  return null
+}
+
+/**
+ * Percent-encode a path for a query param. `encodeURIComponent` leaves `~` raw
+ * (an unreserved mark), but the body is fed through `marked`, whose tilde-
+ * preprocess hook rewrites a lone `~` to `&#126;` outside code regions — which
+ * would corrupt a path under `~user`. Percent-encode it so the URL survives.
+ */
+function encodePathParam(abs: string): string {
+  return encodeURIComponent(abs).replace(/~/g, '%7E')
+}
+
+/**
+ * Build the URL for the ASTRA paper render of an `astra.yaml`. The paper entry
+ * (`paper.html`) bakes a project *dir* — the dir holding the astra.yaml — so we
+ * resolve the file path, take its dirname, and pass it (owner-routed by origin)
+ * to the entry, which fetches `/api/v1/astra` and renders via @lightcone/
+ * renderer. Returns `null` when the path can't be resolved to an absolute dir.
+ */
+export function paperUrl(astraPath: string, opts?: RenderMarkdownOptions): string | null {
+  const abs = resolveAbs(astraPath, opts)
+  if (abs === null) return null
+  const dir = dirname(abs)
+  let url = `paper.html?path=${encodePathParam(dir)}`
   if (opts?.originId && opts.originId !== 'local') {
     url += `&origin=${encodeURIComponent(opts.originId)}`
   }
@@ -157,6 +190,9 @@ export function fileUrl(rawPath: string, opts?: RenderMarkdownOptions): string |
 const EMBED_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'avif'])
 const EMBED_AUDIO_EXTS = new Set(['wav', 'mp3', 'm4a', 'ogg', 'flac', 'aac'])
 const EMBED_DEFAULT_IFRAME_HEIGHT = 600
+// An ASTRA paper render is the full lightcone chrome (masthead + scope rail) —
+// it earns more vertical room than a generic file preview; it scrolls inside.
+const EMBED_ASTRA_IFRAME_HEIGHT = 820
 
 /**
  * Replace MyST `:::{embed} <path>` blocks with real artifact embeds resolved
@@ -211,6 +247,16 @@ function embedHtml(
   const caption = embedOpts.title ? `<figcaption>${escapeHtml(embedOpts.title)}</figcaption>` : ''
   const heightCss = cssLength(embedOpts.height)
 
+  // An embedded `astra.yaml` opens the full Lightcone paper render in the paper
+  // entry (isolated React + Tailwind), not the generic /file iframe. The paper
+  // entry bakes the project dir and renders via @lightcone/renderer.
+  if (basename(path) === 'astra.yaml') {
+    const purl = paperUrl(path, opts)
+    if (!purl) return embedPlaceholderHtml(path, embedOpts.title)
+    const height = heightCss ?? `${EMBED_ASTRA_IFRAME_HEIGHT}px`
+    return `<div class="kbn-detail-embed-frame kbn-detail-embed-astra" style="height:${height}"><iframe src="${escapeAttr(purl)}" title="${safeTitle}" loading="lazy"></iframe></div>`
+  }
+
   if (EMBED_IMAGE_EXTS.has(ext)) {
     const style = heightCss ? ` style="height:${heightCss}"` : ''
     return `<figure class="kbn-detail-embed-figure"><img class="kbn-detail-embed-img" src="${safeSrc}" alt="${safeTitle}" loading="lazy"${style} />${caption}</figure>`
@@ -226,6 +272,11 @@ function embedHtml(
 
 function basename(path: string): string {
   return path.split('/').filter(Boolean).pop() ?? path
+}
+
+function dirname(path: string): string {
+  const i = path.replace(/\/+$/, '').lastIndexOf('/')
+  return i <= 0 ? '/' : path.slice(0, i)
 }
 
 function fileExt(path: string): string {

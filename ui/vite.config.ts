@@ -1,34 +1,102 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
+import { resolve } from 'node:path'
+import { existsSync } from 'node:fs'
 
 /**
  * The Shuttle UI build.
  *
- * The board fetches the daemon with a *relative* base (`/api/v1/...`), so:
+ * Two entries, two worlds:
+ *
+ *   index.html  → src/main.ts    the kanban board + Stash/Capture (vanilla TS
+ *                                 DOM + React form islands). NO Tailwind, the
+ *                                 vellum/parchment look is hand-rolled CSS.
+ *   paper.html  → src/paper/      the ASTRA paper render: @lightcone/renderer
+ *                                 over a baked astra.yaml. React + Tailwind v4.
+ *                                 Loaded by the fiber panel in an <iframe>, so
+ *                                 its Tailwind preflight + tokens.css html/body
+ *                                 reset are fully isolated from the board.
+ *
+ * The board fetches the daemon with a *relative* base (`/api/v1/...`):
  *
  * Prod (`npm run build`): the daemon serves the bundle at :4000 (Plug.Static,
- * backend slice), so relative fetches are same-origin — zero CORS, zero
- * config. `base: ''` keeps asset URLs relative too, so the bundle works from
- * the daemon root or a subpath.
+ * backend slice), so relative fetches are same-origin — zero CORS, zero config.
+ * `base: ''` keeps asset URLs relative so the bundle works from any path.
  *
  * Dev (`npm run dev`): this proxy forwards `/api` → the local daemon, so the
  * board's relative fetches reach :4000 without CORS regardless of dev port.
  * Point at a remote/non-default daemon with `VITE_SHUTTLE_API` (proxy target)
  * or `VITE_SHUTTLE_BASE` (absolute base, bypasses the proxy).
+ *
+ * `@lightcone/renderer` is consumed as TS *source* (it ships no dist; the
+ * constitution's "file:-link now, publish later" decision): resolve.alias the
+ * three packages to a lightcone-ui checkout. LIGHTCONE_UI_DIR overrides the
+ * default sibling layout (~/Documents/projects/LightconeResearch/lightcone-ui).
+ * Building the paper bundle requires that checkout present — the board bundle
+ * does not, so a host without lightcone-ui still builds + serves the board.
  */
 const apiTarget = process.env.VITE_SHUTTLE_API ?? 'http://localhost:4000'
 
+const lightconeUiDir =
+  process.env.LIGHTCONE_UI_DIR ??
+  resolve(__dirname, '../../LightconeResearch/lightcone-ui')
+const rendererSrc = resolve(lightconeUiDir, 'packages/renderer/src')
+
+/**
+ * Tailwind v4 auto-detects content by scanning the project tree, but the
+ * renderer's source lives in *another repo* (aliased, not under our root), so
+ * its utility classes (`hover:text-gold`, …) would never be generated. Inject
+ * an `@source` pointing at the renderer src into the paper entry CSS — one
+ * env-driven path shared with the alias above, so the two can't drift. Runs
+ * before @tailwindcss/vite so the directive is present when Tailwind scans.
+ */
+function lightconeTailwindSource() {
+  const marker = '/* @inject-lightcone-source */'
+  return {
+    name: 'lightcone-tailwind-source',
+    enforce: 'pre' as const,
+    transform(code: string, id: string) {
+      if (id.includes('/src/paper/') && id.endsWith('.css') && code.includes(marker)) {
+        return { code: code.replace(marker, `@source "${rendererSrc}";`), map: null }
+      }
+      return null
+    },
+  }
+}
+
 export default defineConfig({
   base: '',
-  plugins: [react()],
+  plugins: [lightconeTailwindSource(), tailwindcss(), react()],
+  resolve: {
+    alias: [
+      { find: '@lightcone/renderer', replacement: resolve(lightconeUiDir, 'packages/renderer/src') },
+      { find: '@lightcone/providers', replacement: resolve(lightconeUiDir, 'packages/providers/src') },
+      { find: '@lightcone/styles', replacement: resolve(lightconeUiDir, 'packages/styles/src') },
+    ],
+  },
   server: {
     port: 5174,
     proxy: {
       '/api': { target: apiTarget, changeOrigin: true },
     },
+    // The renderer source is outside the Vite root — let the dev server read it.
+    fs: { allow: [resolve(__dirname), lightconeUiDir] },
   },
   build: {
     outDir: 'dist',
     emptyOutDir: true,
+    rollupOptions: {
+      // The paper entry needs the lightcone-ui checkout (aliased TS source). A
+      // host without it still builds + serves the board — the paper entry is
+      // dropped rather than failing the whole build. An astra.yaml embed on
+      // such a host degrades to a missing iframe; the board is unaffected.
+      input: existsSync(rendererSrc)
+        ? {
+            index: resolve(__dirname, 'index.html'),
+            paper: resolve(__dirname, 'paper.html'),
+          }
+        : { index: resolve(__dirname, 'index.html') },
+    },
   },
 })
