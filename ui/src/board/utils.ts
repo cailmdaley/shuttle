@@ -2,10 +2,17 @@ import { marked } from 'marked'
 import markedKatex from 'marked-katex-extension'
 import 'katex/dist/katex.min.css'
 
-// Configure marked for safe rendering with KaTeX math support
+// Configure marked for safe rendering with KaTeX math support.
+// `breaks` stays OFF (CommonMark): a fiber's outcome/body is real markdown —
+// often a hard-wrapped paragraph stored as a `|-` block scalar — so a soft
+// newline must fold to a space, not a `<br>`. With `breaks:true` a wrapped
+// outcome (e.g. science/cmbx's) rendered as a ragged wall of forced line
+// breaks; CommonMark folding matches the vellum/PretextProse render the
+// Portolan web-app shows, which is the parity target. Intentional breaks
+// still work via GFM (two trailing spaces / backslash); blank lines still
+// separate paragraphs.
 marked.setOptions({
   gfm: true,        // GitHub Flavored Markdown
-  breaks: true,     // Convert \n to <br>
 })
 
 // $..$ for inline math, $$...$$ for display math
@@ -264,6 +271,20 @@ function embedHtml(
 
   if (EMBED_AUDIO_EXTS.has(ext)) {
     return `<figure class="kbn-detail-embed-figure"><audio class="kbn-detail-embed-audio" controls src="${safeSrc}"></audio>${caption}</figure>`
+  }
+
+  // An embedded HTML artifact (report.html and friends) reads as part of the
+  // page, not a porthole into another doc — so unless the author pins a
+  // `:height:`, render it FULL-LENGTH: the iframe grows to its own content
+  // height (measured post-load by FiberDetailModal.autosizeEmbeds — same-origin
+  // through /file) and the panel page scrolls as one column, no nested
+  // scrollbar. An explicit `:height:` opts back into the fixed, internally
+  // scrolling frame.
+  if (ext === 'html' || ext === 'htm') {
+    if (heightCss) {
+      return `<div class="kbn-detail-embed-frame" style="height:${heightCss}"><iframe src="${safeSrc}" title="${safeTitle}" loading="lazy"></iframe></div>`
+    }
+    return `<div class="kbn-detail-embed-frame kbn-detail-embed-autosize"><iframe src="${safeSrc}" title="${safeTitle}" loading="lazy" data-autosize="1"></iframe></div>`
   }
 
   const height = heightCss ?? `${EMBED_DEFAULT_IFRAME_HEIGHT}px`

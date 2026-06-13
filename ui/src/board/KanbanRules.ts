@@ -103,11 +103,19 @@ export function classifyFiber(
     return 'inFlight';
   }
 
-  // A resting pinned umbrella role: schedule-less, never auto-dispatched, its
-  // steady state is `status:active`. It gets its own strip rather than reading
-  // as an armed oneshot in the Now/in-flight lane. This is checked AFTER the
-  // running-worker override (a live pinned worker shows in Now).
-  if (f.hasShuttleBlock === true && f.shuttleKind === 'pinned' && f.status === 'active') {
+  // A resting pinned umbrella role: schedule-less, never auto-dispatched. It
+  // gets its own strip rather than reading as an armed oneshot in the
+  // Now/in-flight lane. Resting covers BOTH parked (`status:open`) and the
+  // older armed-at-rest (`status:active`) generations — a pinned role belongs
+  // on the strip whenever it is neither closed (handled above) nor actively
+  // running (the running-worker override above sends a live pinned worker to
+  // Now). Matching both statuses keeps parked roles like science/cmbx
+  // (`status:open`) visible on the strip without ejecting legacy active ones.
+  if (
+    f.hasShuttleBlock === true &&
+    f.shuttleKind === 'pinned' &&
+    (f.status === 'active' || f.status === 'open')
+  ) {
     return 'pinned';
   }
 

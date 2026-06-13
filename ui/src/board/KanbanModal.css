@@ -527,6 +527,21 @@
 .kbn-pinned-row .kbn-card {
   flex: 0 0 280px;
 }
+/* Empty strip: a slim, dashed "drop a role here" target. The strip ALWAYS
+   renders (it's the park/drop target), so when nothing is parked it shrinks to
+   this hint rather than vanishing. */
+.kbn-section-pinned-empty {
+  background: rgba(154, 123, 53, 0.04);
+  border-style: dashed;
+}
+.kbn-pinned-empty-hint {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  color: rgba(122, 94, 30, 0.6);
+  padding: 4px 2px;
+  font-style: italic;
+}
 
 /* Timeline */
 .kbn-section-timeline {

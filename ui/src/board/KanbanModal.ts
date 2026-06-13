@@ -1089,8 +1089,9 @@ export class KanbanModal {
     this.body.classList.remove('kbn-body-zoomed')
 
     this.body.append(this.surfaces.renderNowSection(now, staleness))
-    const pinnedSection = this.surfaces.renderPinnedSection(pinned, staleness)
-    if (pinnedSection) this.body.append(pinnedSection)
+    // The Pinned strip always renders (a permanent park/drop target) — see
+    // renderPinnedSection; no null guard needed.
+    this.body.append(this.surfaces.renderPinnedSection(pinned, staleness))
     this.body.append(this.surfaces.renderTimelineSection(timeline, now, timelineWindow, staleness))
     this.body.append(this.surfaces.renderStashSection(stash, staleness))
 

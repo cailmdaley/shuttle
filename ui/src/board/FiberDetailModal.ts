@@ -78,6 +78,10 @@ export class FiberDetailModal {
   private escapeHandler: ((e: KeyboardEvent) => void) | null = null
   private outsideHandler: ((e: PointerEvent) => void) | null = null
   private searchDebounce: number | null = null
+  /** ResizeObservers watching full-length HTML embeds so they re-fit their
+   *  height when the panel reflows their content (see autosizeEmbeds).
+   *  Disconnected on close so a re-opened panel never leaks observers. */
+  private embedObservers: ResizeObserver[] = []
   /** Shuttle daemon base (`:4000`). Every verb routes here — transition,
    *  dispatch, felt-edit, felt-history, lifecycle, felt-nest — owner-routed
    *  by the card's `originId` carried as `origin` in the body. Reads (agent
@@ -307,6 +311,8 @@ export class FiberDetailModal {
       this.searchDebounce = null
     }
     this.fiberIndex = null
+    for (const ro of this.embedObservers) ro.disconnect()
+    this.embedObservers = []
     this.overlay?.remove()
     this.overlay = null
     // The split is an arrangement between this panel and its viewer —
@@ -372,6 +378,7 @@ export class FiberDetailModal {
       // placeholders + un-rewritten images, but the prose still reads.
       const bodyOpts = { basePath: card.fiberDir, originId: card.originId }
       prose.innerHTML = lede + renderMarkdown(renderEmbeds(body, bodyOpts), bodyOpts)
+      this.autosizeEmbeds(prose)
       return
     }
     if (!outcome && reached) {
@@ -391,6 +398,54 @@ export class FiberDetailModal {
         void this.renderFiberBody(prose, card, overlay)
       })
     }
+  }
+
+  /**
+   * Grow full-length HTML embeds (`iframe[data-autosize]`, emitted by
+   * utils.embedHtml for a `:::{embed} report.html` with no pinned `:height:`)
+   * to their own content height, so the artifact reads as part of the page —
+   * one scroll column, no nested scrollbar. The iframe is served from the same
+   * origin (the daemon's `/file` route on :4000), so its document is readable:
+   * on load we size to the content's scrollHeight, and a ResizeObserver on its
+   * body re-fits whenever a panel resize reflows the content. A cross-origin or
+   * unreadable doc silently keeps the CSS min-height.
+   */
+  private autosizeEmbeds(prose: HTMLElement): void {
+    const frames = prose.querySelectorAll<HTMLIFrameElement>('iframe[data-autosize]')
+    frames.forEach((iframe) => {
+      const fit = () => {
+        try {
+          const doc = iframe.contentDocument
+          if (!doc) return
+          const h = Math.max(
+            doc.documentElement?.scrollHeight ?? 0,
+            doc.body?.scrollHeight ?? 0,
+          )
+          if (h > 0) iframe.style.height = `${h}px`
+        } catch {
+          /* cross-origin / unreadable — leave the CSS min-height in place */
+        }
+      }
+      iframe.addEventListener('load', () => {
+        fit()
+        try {
+          const doc = iframe.contentDocument
+          if (doc?.body && typeof ResizeObserver !== 'undefined') {
+            const ro = new ResizeObserver(() => fit())
+            ro.observe(doc.body)
+            this.embedObservers.push(ro)
+          }
+        } catch {
+          /* ignore — observation is best-effort */
+        }
+      })
+      // A cached doc may have finished loading before the listener attached.
+      try {
+        if (iframe.contentDocument?.readyState === 'complete') fit()
+      } catch {
+        /* ignore */
+      }
+    })
   }
 
   // ── Panel geometry: default + remembered, drag, resize ────────────────────

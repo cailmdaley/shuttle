@@ -575,9 +575,13 @@
    Single reading column, EB Garamond, the panel's parchment/ink palette. */
 .kbn-detail-prose {
   display: block;
-  max-width: 640px;
-  margin: 0 auto;
-  padding: 1.7rem 2.2rem 3.5rem;
+  /* Fill the panel: no narrow reading column, only a slim gutter — the page
+     IS the panel, so the prose tracks the panel width and grows as it's
+     resized (per Cail's parity note: text should be ~full width, tiny
+     margins, and follow the pop-up's size). */
+  max-width: none;
+  margin: 0;
+  padding: 1.5rem 1.6rem 3rem;
   font-family: var(--font-main, 'EB Garamond', Georgia, serif);
   font-size: 17px;
   line-height: 1.62;
@@ -585,7 +589,7 @@
 }
 @container kbn-detail (max-width: 600px) {
   .kbn-detail-prose {
-    padding: 1.2rem 1.2rem 2.5rem;
+    padding: 1.2rem 1.1rem 2.5rem;
     font-size: 16px;
   }
 }
@@ -767,6 +771,20 @@
   width: 100%;
   height: 100%;
   border: 0;
+}
+
+/* A full-length HTML embed (report.html with no pinned `:height:`): the frame
+   carries no fixed height — autosizeEmbeds (FiberDetailModal.ts) measures the
+   same-origin doc on load and sets an explicit px height so it reads as part of
+   the page with no nested scrollbar. `min-height` is the pre-load / cross-origin
+   fallback; `overflow: visible` keeps the grown iframe from being clipped. */
+.kbn-detail-embed-autosize {
+  overflow: visible;
+  min-height: 240px;
+}
+.kbn-detail-embed-autosize iframe {
+  height: auto;
+  min-height: 240px;
 }
 
 /* Placeholder for an embed whose path couldn't be resolved (relative path on a

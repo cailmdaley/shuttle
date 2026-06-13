@@ -158,30 +158,39 @@ export class KanbanSurfaceRenderer {
    *  dispatch one by dragging it onto the Now In-flight column (the cards are
    *  the standard draggable `kbn-card`, and `classifyFiber` returns 'pinned'
    *  so `findCardColumn` routes the drag through `transition(card,'inFlight')`).
-   *  Ordered most-recently-used first by the read model. Rendered only when
-   *  there is at least one — an empty strip would be visual noise.
+   *  Ordered most-recently-used first by the read model. ALWAYS rendered —
+   *  even with zero parked roles — because the strip IS the drop target for
+   *  parking a role, so hiding it when empty made parking impossible exactly
+   *  when nothing was parked. The empty state shrinks to a slim "drag a role
+   *  here" hint (parity with the Portolan board).
    */
   renderPinnedSection(
     pinned: KanbanCard[],
     staleness: Record<string, KanbanOriginStaleness>,
-  ): HTMLElement | null {
-    if (pinned.length === 0) return null
-
+  ): HTMLElement {
     const section = document.createElement('section')
     section.className = 'kbn-section kbn-section-pinned'
+    if (pinned.length === 0) section.classList.add('kbn-section-pinned-empty')
     section.setAttribute('role', 'region')
-    section.setAttribute('aria-label', `Pinned (${pinned.length}) — dispatchable on demand`)
+    section.setAttribute('aria-label', `Pinned (${pinned.length}) — drag a role here to park it; drag one to In flight to start it`)
 
     const head = document.createElement('h2')
     head.className = 'kbn-pinned-title'
-    head.textContent = `Pinned · ${pinned.length}`
+    head.textContent = pinned.length ? `Pinned · ${pinned.length}` : 'Pinned'
     section.append(head)
 
     const row = document.createElement('div')
     row.className = 'kbn-pinned-row'
     row.setAttribute('role', 'list')
-    for (const card of pinned) {
-      row.append(this.renderCard(card, 'pinned', staleness[card.originId]))
+    if (pinned.length === 0) {
+      const hint = document.createElement('div')
+      hint.className = 'kbn-pinned-empty-hint'
+      hint.textContent = 'Drag a role here to park it on the strip'
+      row.append(hint)
+    } else {
+      for (const card of pinned) {
+        row.append(this.renderCard(card, 'pinned', staleness[card.originId]))
+      }
     }
     section.append(row)
     this.installPinnedDropHandlers(section)
