@@ -132,6 +132,50 @@ defmodule Shuttle.FeltStoresTest do
       assert Enum.any?(hosts, &same_dir?(&1, project))
     end
 
+    # Candide's REAL topology nests substores under the tree mirror:
+    # loom/.felt/science/unions/shapepipe -> project/.felt. Discovery must recurse
+    # into real subdirectories, not just read the top level of loom/.felt — else
+    # the project store is never found and its fibers vanish from the kanban (the
+    # exact bug that drove the shapepipe constitution to be copied into loom).
+    test "auto-discovers a NESTED symlinked substore (science/unions/shapepipe)" do
+      loom = tmp_dir()
+      project = tmp_dir()
+      nested = Path.join([loom, ".felt", "science", "unions"])
+      File.mkdir_p!(nested)
+      File.mkdir_p!(Path.join(project, ".felt"))
+      File.ln_s!(Path.join(project, ".felt"), Path.join(nested, "shapepipe"))
+      System.put_env("LOOM_HOMES", loom)
+
+      hosts = FeltStores.configured_hosts()
+
+      assert Enum.any?(hosts, &same_dir?(&1, loom))
+      assert Enum.any?(hosts, &same_dir?(&1, project))
+    end
+
+    # The walk recurses into real dirs only; it must NOT follow a symlink during
+    # traversal (that could loop or wander into another store's tree). A substore
+    # hidden behind an intermediate symlinked directory is therefore intentionally
+    # NOT discovered — only direct substore links (entry -> .../.felt) are.
+    test "does not traverse THROUGH an intermediate symlinked directory" do
+      loom = tmp_dir()
+      elsewhere = tmp_dir()
+      project = tmp_dir()
+      File.mkdir_p!(Path.join(loom, ".felt"))
+
+      inner = Path.join(elsewhere, "inner")
+      File.mkdir_p!(inner)
+      File.mkdir_p!(Path.join(project, ".felt"))
+      # A genuine substore link, but parked behind a symlinked gateway directory.
+      File.ln_s!(Path.join(project, ".felt"), Path.join(inner, "shapepipe"))
+      File.ln_s!(elsewhere, Path.join([loom, ".felt", "gateway"]))
+      System.put_env("LOOM_HOMES", loom)
+
+      hosts = FeltStores.configured_hosts()
+
+      refute Enum.any?(hosts, &same_dir?(&1, project))
+      assert hosts == [Path.expand(loom)]
+    end
+
     test "skips a dangling substore symlink" do
       loom = tmp_dir()
       File.mkdir_p!(Path.join(loom, ".felt"))

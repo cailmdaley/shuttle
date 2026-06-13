@@ -62,16 +62,20 @@ defmodule Shuttle.FeltStores do
   reachable from each store's `.felt/`.
 
   A project-canonical substore — candide's
-  `~/loom/.felt/shapepipe -> /automnt/.../shapepipe/.felt` — is physically rooted
-  *outside* the store it is linked into. The poller enumerates a fiber only from
-  the store where its felt `path` physically roots (`run_shuttle_listing/2`'s
-  `store_felt_realpath` prefix check), so the loom store correctly drops those
-  fibers — and they vanish from the kanban unless the project root is *also* a
-  configured store. Following the symlink here makes configuring just `~/loom`
-  sufficient: the project root is auto-discovered, no per-substore config.
+  `~/loom/.felt/science/unions/shapepipe -> .../code/shapepipe/.felt` — is
+  physically rooted *outside* the store it is linked into. The poller enumerates
+  a fiber only from the store where its felt `path` physically roots
+  (`run_shuttle_listing/2`'s `store_felt_realpath` prefix check), so the loom
+  store correctly drops those fibers — and they vanish from the kanban unless the
+  project root is *also* a configured store. Following the symlink here makes
+  configuring just `~/loom` sufficient: the project root is auto-discovered, no
+  per-substore config.
 
-  For each store, scan `<store>/.felt/` for symlinks resolving to an external real
-  `.felt/` directory and add its parent (the project root). Dedup is by
+  For each store, scan `<store>/.felt/` **recursively** for symlinks resolving to
+  an external real `.felt/` directory and add its parent (the project root). The
+  scan must recurse, not just read the top level: candide mounts substores deep in
+  the tree mirror (`science/unions/shapepipe`), so a shallow scan finds nothing and
+  the substore silently vanishes from dispatch. Dedup is by
   `store_felt_realpath/1` — the same canonicalization the ownership check uses —
   so a store reached two ways (configured explicitly *and* discovered, or via two
   path spellings of the same real dir) is listed once. That dedup is load-bearing:
@@ -108,29 +112,49 @@ defmodule Shuttle.FeltStores do
     end
   end
 
-  # Project roots of symlinked substores under `<store>/.felt/`: each `.felt/`
+  # Project roots of symlinked substores reachable under `<store>/.felt/`: every
   # entry that is a symlink resolving to a real directory named `.felt` yields
-  # that `.felt`'s parent. A root that lands back inside the linking store is
-  # dropped (the store already enumerates it).
+  # that `.felt`'s parent. The walk recurses into REAL subdirectories at any depth
+  # (candide nests substores as `science/unions/shapepipe`) but never follows a
+  # symlink during traversal — a substore link is *detected*, not *descended*, so
+  # the walk cannot loop or wander into another store's tree. A root that lands
+  # back inside the linking store is dropped (the store already enumerates it).
   defp symlinked_substore_roots(store) do
-    felt_dir = Path.join(store, ".felt")
+    walk_substore_roots(Path.join(store, ".felt"), store_felt_realpath(store), 0)
+  end
 
-    case File.ls(felt_dir) do
+  # Real directory trees are finite (no symlink-following), so the recursion
+  # terminates on its own; the depth cap is a guard against a pathologically deep
+  # tree slowing the 30s-cached expansion, not a correctness boundary.
+  @max_substore_scan_depth 16
+
+  defp walk_substore_roots(_dir, _store_real, depth) when depth > @max_substore_scan_depth, do: []
+
+  defp walk_substore_roots(dir, store_real, depth) do
+    case File.ls(dir) do
       {:ok, entries} ->
-        store_real = store_felt_realpath(store)
+        Enum.flat_map(entries, fn entry ->
+          path = Path.join(dir, entry)
 
-        entries
-        |> Enum.flat_map(fn entry ->
-          link = Path.join(felt_dir, entry)
+          case File.lstat(path) do
+            # A symlink: a substore link iff it resolves to an external real
+            # `.felt` directory. Detected here, never descended.
+            {:ok, %File.Stat{type: :symlink}} ->
+              with {:ok, real} <- resolve_realpath(path),
+                   ".felt" <- Path.basename(real),
+                   true <- File.dir?(real),
+                   false <- inside?(real, store_real) do
+                [Path.dirname(real)]
+              else
+                _ -> []
+              end
 
-          with {:ok, %File.Stat{type: :symlink}} <- File.lstat(link),
-               {:ok, real} <- resolve_realpath(link),
-               ".felt" <- Path.basename(real),
-               true <- File.dir?(real),
-               false <- inside?(real, store_real) do
-            [Path.dirname(real)]
-          else
-            _ -> []
+            # A real subdirectory: recurse to reach nested mount points.
+            {:ok, %File.Stat{type: :directory}} ->
+              walk_substore_roots(path, store_real, depth + 1)
+
+            _ ->
+              []
           end
         end)
 
