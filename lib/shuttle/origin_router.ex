@@ -100,6 +100,34 @@ defmodule Shuttle.OriginRouter do
     end
   end
 
+  @doc """
+  Forward a GET to the owning remote daemon's identical `path` with `query`
+  appended as a query string (the `origin` key stripped, so the owner serves the
+  fiber as local). Used by the file-bytes route (`/api/v1/file`): only the owning
+  daemon can read its own host's filesystem, so a remote-owned embed/asset must
+  be fetched from that daemon, not this one's git mirror.
+
+  Returns `{:forwarded, status, content_type, body}` — the remote's raw bytes and
+  content type for the caller to relay verbatim — or `{:error, {:forward_failed,
+  name, reason}}` on a tunnel failure. The body is binary-safe (images, PDFs),
+  unlike the text-only feed `get/2`.
+
+  Opts: `:client` (transport stub), `:forward_timeout_ms`.
+  """
+  @spec forward_get(Remote.t(), String.t(), map(), keyword()) ::
+          {:forwarded, non_neg_integer(), String.t(), binary()} | {:error, term()}
+  def forward_get(%Remote{} = remote, path, query, opts \\ []) when is_map(query) do
+    client = Keyword.get(opts, :client) || forward_client()
+    timeout = Keyword.get(opts, :forward_timeout_ms, @default_forward_timeout_ms)
+    stripped = query |> Map.delete("origin") |> Map.delete(:origin)
+    url = remote_url(remote, path) <> "?" <> URI.encode_query(stripped)
+
+    case client.get_file(url, timeout) do
+      {:ok, status, content_type, body} -> {:forwarded, status, content_type, body}
+      {:error, reason} -> {:error, {:forward_failed, remote.name, reason}}
+    end
+  end
+
   defp remote_url(%Remote{url: url}, path) do
     String.trim_trailing(url, "/") <> path
   end

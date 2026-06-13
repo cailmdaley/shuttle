@@ -54,4 +54,24 @@ defmodule ShuttleWeb.Router do
     post("/felt-stores", FeltStoresController, :create)
     post("/cache/bust", CacheBustController, :create)
   end
+
+  # File/asset bytes by absolute path (owner-routed). Unlocks `:::{embed}` +
+  # relative images in the fiber panel and lets a remote-owned fiber's assets
+  # render — only the owning daemon can read its own host's filesystem.
+  #
+  # Deliberately OUTSIDE the `:api` pipeline: this route returns arbitrary
+  # content types (image/PDF/…), so the json `:accepts` plug would 406 a strict
+  # `Accept: application/pdf` (a fetch() for an embedded artifact) before the
+  # controller runs. The controller sets the response content-type itself and
+  # renders its error bodies as JSON directly, so it needs no format negotiation.
+  scope "/api/v1", ShuttleWeb do
+    get("/file", FileController, :show)
+  end
+
+  # The served frontend's bare-root document. Static assets are served by
+  # `Plug.Static` in the endpoint (it skips `/`); this serves `index.html` so the
+  # daemon hosts the board itself — one `shuttle` process, API + UI.
+  scope "/", ShuttleWeb do
+    get("/", SpaController, :index)
+  end
 end

@@ -835,9 +835,14 @@ defmodule Shuttle.RemoteRegistry.Client do
             ) ::
               {:ok, status :: non_neg_integer(), body :: String.t()} | {:error, term()}
 
-  # Only the write transport (Transition forwarding) needs post/4; the
+  @callback get_file(url :: String.t(), timeout_ms :: non_neg_integer()) ::
+              {:ok, status :: non_neg_integer(), content_type :: String.t(), body :: binary()}
+              | {:error, term()}
+
+  # Only the write transport (Transition forwarding) needs post/4, and only the
+  # file-bytes forward (`OriginRouter.forward_get/4`) needs get_file/2; the
   # read-only registry stubs implement get/2 alone.
-  @optional_callbacks post: 4
+  @optional_callbacks post: 4, get_file: 2
 end
 
 defmodule Shuttle.RemoteRegistry.Client.Default do
@@ -888,5 +893,37 @@ defmodule Shuttle.RemoteRegistry.Client.Default do
     end
   rescue
     e -> {:error, {:exception, Exception.message(e)}}
+  end
+
+  # Binary-safe file fetch used by `OriginRouter.forward_get/4`: `body_format:
+  # :binary` keeps image/PDF bytes intact (unlike `get/2`, which is text-only),
+  # and the response carries the remote's status + content-type so the local
+  # daemon can relay them verbatim. Any non-200 (404, etc.) is relayed too —
+  # the kanban shows the remote's own "file not found", not a tunnel error.
+  @impl true
+  def get_file(url, timeout_ms) when is_binary(url) and is_integer(timeout_ms) do
+    {:ok, _} = Application.ensure_all_started(:inets)
+    {:ok, _} = Application.ensure_all_started(:ssl)
+
+    request = {String.to_charlist(url), []}
+    http_opts = [{:timeout, timeout_ms}, {:connect_timeout, timeout_ms}]
+
+    case :httpc.request(:get, request, http_opts, body_format: :binary) do
+      {:ok, {{_, status, _}, headers, body}} ->
+        {:ok, status, content_type_header(headers), body}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  rescue
+    e -> {:error, {:exception, Exception.message(e)}}
+  end
+
+  # httpc returns headers as charlist tuples; pull content-type (case-insensitive)
+  # and fall back to octet-stream so the relayed response always has a type.
+  defp content_type_header(headers) do
+    Enum.find_value(headers, "application/octet-stream", fn {key, value} ->
+      if String.downcase(to_string(key)) == "content-type", do: to_string(value)
+    end)
   end
 end
