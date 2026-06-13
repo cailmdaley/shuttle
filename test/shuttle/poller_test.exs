@@ -718,14 +718,19 @@ defmodule Shuttle.PollerTest do
     assert {:ok, %{fibers: [%{runtime: %{tmux_session: session}}]}} =
              Poller.cached_fiber_documents(poller)
 
-    Application.put_env(:shuttle, :waiting_sessions_source, fn -> MapSet.new([session]) end)
-    on_exit(fn -> Application.delete_env(:shuttle, :waiting_sessions_source) end)
+    Application.put_env(:shuttle, :waiting_phases_source, fn -> %{session => "waiting"} end)
+    on_exit(fn -> Application.delete_env(:shuttle, :waiting_phases_source) end)
 
     assert {:ok, %{fibers: [%{runtime: runtime}]}} = Poller.cached_fiber_documents(poller)
     assert runtime.phase == "waiting"
 
-    # Clearing the waiting set drops the phase — self-healing on the serve path.
-    Application.put_env(:shuttle, :waiting_sessions_source, fn -> MapSet.new() end)
+    # The escalation phase stamps straight through the same path.
+    Application.put_env(:shuttle, :waiting_phases_source, fn -> %{session => "attention"} end)
+    assert {:ok, %{fibers: [%{runtime: escalated}]}} = Poller.cached_fiber_documents(poller)
+    assert escalated.phase == "attention"
+
+    # Clearing the phase map drops the phase — self-healing on the serve path.
+    Application.put_env(:shuttle, :waiting_phases_source, fn -> %{} end)
     assert {:ok, %{fibers: [%{runtime: cleared}]}} = Poller.cached_fiber_documents(poller)
     refute Map.has_key?(cleared, :phase)
   end

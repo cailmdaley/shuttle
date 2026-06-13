@@ -1,40 +1,62 @@
 defmodule Shuttle.WaitingTracker do
   @moduledoc """
-  Tracks which worker sessions are *waiting for human input* by tailing this
-  host's Claude Code hook-event stream (`~/.portolan/data/events.jsonl`).
+  Tracks which worker sessions are *waiting for a human* by tailing this host's
+  Claude Code hook-event stream (`~/.portolan/data/events.jsonl`) and deriving
+  two polled phases — `waiting` and `attention` — from it.
 
   ## Why tail the local stream
 
-  Claude Code's `Notification` hook fires exactly when an agent blocks on a
-  human — a permission prompt or an idle "waiting for your input" notice — and
-  `~/loom/hooks/portolan-hook.sh` already appends every hook event to a
-  host-local `events.jsonl` on every machine a worker runs on. The owning
+  `~/loom/hooks/portolan-hook.sh` already appends every Claude Code hook event
+  to a host-local `events.jsonl` on every machine a worker runs on. The owning
   daemon stamps runtime liveness for *its own* fibers (local daemon for local
   workers, the remote daemon for remote workers — the resolve/invoke split in
   the composite feed). So the simplest transport that respects that split is:
   **each daemon tails its own host's `events.jsonl`** and contributes a
-  `phase: "waiting"` to the runtime block it already serves. No new cross-host
-  channel — the waiting signal rides the same per-host runtime stamping that
+  `phase` to the runtime block it already serves. No new cross-host channel —
+  the waiting signal rides the same per-host runtime stamping that
   `tmux_session` liveness already does.
 
-  ## State machine (per tmux session)
+  ## State machine (per `*-shuttle` tmux session)
 
-    * a `notification` event → the session is marked waiting
-    * *any other* event from that session (tool use, `user_prompt_submit`,
-      `stop`, `session_end`, …) → the session is cleared
+  Each tracked session holds at most one entry — a `%{kind: ..., since: ms}`
+  where `kind` is `:stopped` or `:attention`. The transition on each event:
 
-  Self-healing falls out of two things: clear-on-activity above, and the fact
-  that `Shuttle.Poller.stamp_runtime/2` only stamps `phase: "waiting"` for
-  sessions that are *still in `state.running`*. A dead worker is gone from
-  `running`, so no stale "waiting" badge can survive its session. A periodic
-  age prune (`@max_age_ms`) is pure hygiene for the rare session that goes
-  waiting and then dies without emitting a clearing event.
+    * `notification` → mark `:attention` with `since: now` (always overwrites,
+      even an existing `:stopped`). This is the *escalation* signal — the
+      built-in Claude Code Notification hook fires when an agent blocks on a
+      human (idle prompt, permission, MCP elicitation). It is the **only**
+      escalation source.
+    * `stop` → STICKY mark `:stopped`. If the entry is already `:attention`,
+      leave it untouched (a turn finishing must not downgrade an escalation).
+      If it is already `:stopped`, keep its original `since` (do not reset the
+      gate clock). If absent, put `:stopped` with `since: now`.
+    * *any other* event — `subagent_stop`, `user_prompt_submit`,
+      `pre_tool_use`, `post_tool_use`, `session_start`, `session_end`, … →
+      clear the entry. `subagent_stop` clears (not marks): a subagent finishing
+      means the main agent is mid-orchestration, i.e. busy.
+
+  ## Two phases, gated at READ time
+
+  `waiting_phases/1` resolves the stored kinds to a `session => phase` string
+  map *with the current clock*, so the value can flip purely by elapsed time
+  without a new event:
+
+    * `:attention` → always `"attention"` (no gate — escalation is immediate).
+    * `:stopped` → `"waiting"` only once it has persisted `@stopped_gate_ms`
+      (60s); before the gate matures the session is omitted entirely, so an
+      autonomous worker pausing between turns doesn't flash a chip.
+
+  Self-healing falls out of clear-on-activity above plus the fact that
+  `Shuttle.Poller.stamp_runtime/2` only stamps a phase for sessions still in
+  `state.running` — a dead worker is gone from `running`, so no stale badge can
+  survive its session. A periodic age prune (`@max_age_ms`) is hygiene for the
+  rare session that marks and then dies without emitting a clearing event.
 
   ## Reading the past
 
-  On boot the tail offset is set to the file's current end — historical
-  notifications are not replayed, so a daemon restart can't resurrect a stale
-  waiting state from an old line.
+  On boot the tail offset is set to the file's current end — historical events
+  are not replayed, so a daemon restart can't resurrect a stale state from an
+  old line.
 
   Only `*-shuttle` sessions are tracked; events from interactive (non-shuttle)
   sessions are ignored, mirroring the dispatch gate.
@@ -45,11 +67,14 @@ defmodule Shuttle.WaitingTracker do
 
   @poll_interval_ms 1_000
   @max_age_ms 6 * 60 * 60 * 1_000
+  @stopped_gate_ms 60_000
   @shuttle_session_suffix "-shuttle"
 
   defmodule State do
     @moduledoc false
-    defstruct [:events_file, :poll_interval_ms, offset: 0, waiting: %{}]
+    # `waiting` is `session => %{kind: :stopped | :attention, since: ms}`.
+    # `clock` is a 0-arity fn returning the current epoch ms (injectable for tests).
+    defstruct [:events_file, :poll_interval_ms, :clock, offset: 0, waiting: %{}]
   end
 
   # ── Client ──
@@ -59,17 +84,20 @@ defmodule Shuttle.WaitingTracker do
   end
 
   @doc """
-  The set of tmux session names currently waiting for human input.
+  A `session => phase` map for the tmux sessions currently signalling a human,
+  resolved at call time against the tracker's clock.
 
-  Returns a `MapSet` so `stamp_runtime` can membership-test each running
-  worker's session in O(1). Defaults to the singleton tracker; pass a pid/name
-  for tests.
+  `phase` is `"attention"` (escalation, immediate) or `"waiting"` (baseline,
+  only after the 60s gate matures). Sessions with no mature signal are omitted,
+  so `stamp_runtime` can look up each running worker's session in O(1) and treat
+  absence as "busy". Defaults to the singleton tracker; pass a pid/name for tests.
   """
-  @spec waiting_sessions(GenServer.server()) :: MapSet.t()
-  def waiting_sessions(server \\ __MODULE__) do
-    GenServer.call(server, :waiting_sessions)
+  @spec waiting_phases(GenServer.server(), pos_integer() | nil) ::
+          %{optional(String.t()) => String.t()}
+  def waiting_phases(server \\ __MODULE__, now \\ nil) do
+    GenServer.call(server, {:waiting_phases, now})
   catch
-    :exit, _ -> MapSet.new()
+    :exit, _ -> %{}
   end
 
   @doc "Default host-local events stream path, honoring the same env the hook reads."
@@ -87,8 +115,9 @@ defmodule Shuttle.WaitingTracker do
   def init(opts) do
     events_file = Keyword.get(opts, :events_file, default_events_file())
     poll_interval_ms = Keyword.get(opts, :poll_interval_ms, @poll_interval_ms)
+    clock = Keyword.get(opts, :clock, &default_clock/0)
 
-    # Start at end-of-file so a restart doesn't replay historical notifications.
+    # Start at end-of-file so a restart doesn't replay historical events.
     offset =
       case File.stat(events_file) do
         {:ok, %{size: size}} -> size
@@ -96,12 +125,30 @@ defmodule Shuttle.WaitingTracker do
       end
 
     schedule_poll(poll_interval_ms)
-    {:ok, %State{events_file: events_file, poll_interval_ms: poll_interval_ms, offset: offset}}
+
+    {:ok,
+     %State{
+       events_file: events_file,
+       poll_interval_ms: poll_interval_ms,
+       clock: clock,
+       offset: offset
+     }}
   end
 
   @impl true
-  def handle_call(:waiting_sessions, _from, state) do
-    {:reply, MapSet.new(Map.keys(state.waiting)), state}
+  def handle_call({:waiting_phases, now_override}, _from, state) do
+    now = now_override || now_ms(state)
+
+    phases =
+      Enum.reduce(state.waiting, %{}, fn {session, %{kind: kind, since: since}}, acc ->
+        case kind do
+          :attention -> Map.put(acc, session, "attention")
+          :stopped when now - since >= @stopped_gate_ms -> Map.put(acc, session, "waiting")
+          :stopped -> acc
+        end
+      end)
+
+    {:reply, phases, state}
   end
 
   @impl true
@@ -131,7 +178,15 @@ defmodule Shuttle.WaitingTracker do
                 {last_nl, _} = List.last(matches)
                 consumed = last_nl + 1
                 complete = binary_part(chunk, 0, consumed)
-                waiting = Enum.reduce(String.split(complete, "\n", trim: true), state.waiting, &apply_event/2)
+                now = now_ms(state)
+
+                waiting =
+                  Enum.reduce(
+                    String.split(complete, "\n", trim: true),
+                    state.waiting,
+                    &apply_event(&1, &2, now)
+                  )
+
                 %{state | offset: offset + consumed, waiting: waiting}
             end
 
@@ -161,16 +216,12 @@ defmodule Shuttle.WaitingTracker do
     end
   end
 
-  defp apply_event(line, waiting) do
+  defp apply_event(line, waiting, now) do
     case Jason.decode(line) do
       {:ok, %{"type" => type, "tmuxSession" => session}}
       when is_binary(session) and session != "" ->
         if shuttle_session?(session) do
-          if type == "notification" do
-            Map.put(waiting, session, now_ms())
-          else
-            Map.delete(waiting, session)
-          end
+          transition(waiting, session, type, now)
         else
           waiting
         end
@@ -180,14 +231,35 @@ defmodule Shuttle.WaitingTracker do
     end
   end
 
+  # `notification` always escalates to `:attention` (overwrites any prior kind).
+  # `stop` is STICKY: it never downgrades an `:attention`, and it preserves an
+  # existing `:stopped`'s `since` so the 60s gate clock isn't reset by repeated
+  # stops; only an absent entry gets a fresh `:stopped`. Every other event type
+  # (including `subagent_stop`) is activity and clears the entry.
+  defp transition(waiting, session, "notification", now),
+    do: Map.put(waiting, session, %{kind: :attention, since: now})
+
+  defp transition(waiting, session, "stop", now) do
+    case Map.get(waiting, session) do
+      %{kind: :attention} = entry -> Map.put(waiting, session, entry)
+      %{kind: :stopped} = entry -> Map.put(waiting, session, entry)
+      _ -> Map.put(waiting, session, %{kind: :stopped, since: now})
+    end
+  end
+
+  defp transition(waiting, session, _other, _now), do: Map.delete(waiting, session)
+
   defp prune_stale(%State{waiting: waiting} = state) do
-    cutoff = now_ms() - @max_age_ms
-    %{state | waiting: Map.reject(waiting, fn {_s, at} -> at < cutoff end)}
+    cutoff = now_ms(state) - @max_age_ms
+    %{state | waiting: Map.reject(waiting, fn {_s, entry} -> entry.since < cutoff end)}
   end
 
   defp shuttle_session?(session), do: String.ends_with?(session, @shuttle_session_suffix)
 
-  defp now_ms, do: System.system_time(:millisecond)
+  defp now_ms(%State{clock: clock}) when is_function(clock, 0), do: clock.()
+  defp now_ms(%State{}), do: default_clock()
+
+  defp default_clock, do: System.system_time(:millisecond)
 
   defp home, do: System.user_home!() || "/root"
 end
