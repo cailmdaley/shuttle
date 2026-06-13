@@ -1350,28 +1350,29 @@ defmodule Shuttle.Poller do
   defp stamp_runtime(entries, running) when map_size(running) == 0, do: entries
 
   defp stamp_runtime(entries, running) do
-    # `phases` is the `session => phase` map of tmux sessions signalling a human
-    # ("waiting" / "attention"), derived from this host's events.jsonl. Only
-    # running workers get stamped, so a session that signals and then dies never
-    # leaves a stale phase — it's already gone from `running`.
-    phases = waiting_phases()
-    index = runtime_index(running, phases)
+    # `activity` is the `session => %{last_event_at, phase}` map derived from
+    # this host's events.jsonl — the real last-activity timestamp and phase
+    # category ("attention" / "waiting" / "working") of each tracked session.
+    # Only running workers get stamped, so a session that signals and then dies
+    # never leaves a stale runtime — it's already gone from `running`.
+    activity = session_activity()
+    index = runtime_index(running, activity)
     Enum.map(entries, &put_runtime(&1, index))
   end
 
-  # The waiting-phase source. Defaults to the host-local WaitingTracker;
-  # overridable via app env so tests inject a deterministic map without writing
-  # to the real events.jsonl.
-  defp waiting_phases do
+  # The activity source. Defaults to the host-local WaitingTracker; overridable
+  # via app env so tests inject a deterministic `session => %{last_event_at,
+  # phase}` map without writing to the real events.jsonl.
+  defp session_activity do
     case Application.get_env(:shuttle, :waiting_phases_source) do
       fun when is_function(fun, 0) -> fun.()
-      _ -> Shuttle.WaitingTracker.waiting_phases()
+      _ -> Shuttle.WaitingTracker.session_activity()
     end
   end
 
-  defp runtime_index(running, phases) do
+  defp runtime_index(running, activity) do
     Enum.reduce(running, %{}, fn {runtime_key, meta}, acc ->
-      payload = runtime_payload(meta, phases)
+      payload = runtime_payload(meta, activity)
 
       [runtime_key, metadata_uid(meta), fiber_address(meta)]
       |> Enum.filter(&(is_binary(&1) and &1 != ""))
@@ -1391,25 +1392,32 @@ defmodule Shuttle.Poller do
   # The eligible-row subset of a worker's meta, as a wire payload. Mirrors the
   # `eligible` snapshot row so the feed's `runtime` and the snapshot agree on
   # shape; the viewer reads `tmux_session` for liveness and may surface the rest.
-  # `phase` ("waiting" / "attention") is added when this worker's session is
-  # signalling a human; it's omitted otherwise so the viewer treats absence as
-  # "busy".
-  defp runtime_payload(meta, phases) do
-    %{
+  #
+  # `last_activity_at` + `phase` come from the activity tracker keyed by this
+  # worker's tmux session: the REAL timestamp of its most recent hook event and
+  # the event's phase category ("attention" / "waiting" / "working"). This is
+  # what lets the in-flight column rank by idle duration. The old served
+  # `last_activity_at` was `meta.last_activity_at`, which equals `started_at`
+  # (only the tmux liveness heartbeat ever bumps it) — useless for ranking.
+  #
+  # Fallback: a just-dispatched worker with no hook event yet has no tracker
+  # record, so we fall back to `meta.last_activity_at` (≈ `started_at`) and omit
+  # `phase` — correct, since a brand-new worker shouldn't outrank an idle review.
+  defp runtime_payload(meta, activity) do
+    base = %{
       tmux_session: meta.session,
       agent: Map.get(meta, :agent_id),
       state: Map.get(meta, :state, "running"),
       run_id: Map.get(meta, :run_id),
-      started_at: DateTime.to_unix(meta.started_at, :millisecond),
-      last_activity_at: DateTime.to_unix(meta.last_activity_at, :millisecond)
+      started_at: DateTime.to_unix(meta.started_at, :millisecond)
     }
-    |> maybe_put_phase(meta.session, phases)
-  end
 
-  defp maybe_put_phase(payload, session, phases) do
-    case is_binary(session) and Map.get(phases, session) do
-      phase when is_binary(phase) -> Map.put(payload, :phase, phase)
-      _ -> payload
+    case is_binary(meta.session) and Map.get(activity, meta.session) do
+      %{last_event_at: at, phase: phase} ->
+        base |> Map.put(:last_activity_at, at) |> Map.put(:phase, phase)
+
+      _ ->
+        Map.put(base, :last_activity_at, DateTime.to_unix(meta.last_activity_at, :millisecond))
     end
   end
 

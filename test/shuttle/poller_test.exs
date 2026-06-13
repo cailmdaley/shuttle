@@ -680,8 +680,58 @@ defmodule Shuttle.PollerTest do
     assert %{tmux_session: session, state: _state, started_at: started} = runtime
     assert is_binary(session)
     assert is_integer(started)
-    # No waiting source by default → no phase.
+    # No activity source by default → no phase, but last_activity_at still
+    # present (falls back to meta/started_at) so the field is never missing.
     refute Map.has_key?(runtime, :phase)
+    assert is_integer(runtime.last_activity_at)
+  end
+
+  test "owner feed stamps the REAL last_activity_at, distinct from started_at" do
+    uid = "01JZ00000000000000000000RA"
+
+    fiber =
+      make_fiber("tests/realactivity", %{
+        "uid" => uid,
+        "modified_at" => "2026-06-08T01:00:00Z"
+      })
+
+    MockRunner.set_fiber("tests/realactivity", fiber)
+    MockRunner.set_shuttle("tests/realactivity", "enabled: true\nkind: oneshot\nhost: candide\n")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_runtime_real_activity,
+        runner: MockRunner,
+        own_host_id: "candide",
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             snap = Poller.snapshot(poller)
+             length(snap.eligible) == 1 and get_in(snap, [:document_cache, "entries"]) >= 1
+           end)
+
+    # Discover the running worker's session and its started_at, then inject an
+    # activity record whose last_event_at is deliberately 90s BEFORE started_at.
+    assert {:ok, %{fibers: [%{runtime: %{tmux_session: session, started_at: started}}]}} =
+             Poller.cached_fiber_documents(poller)
+
+    last_event_at = started - 90_000
+
+    Application.put_env(:shuttle, :waiting_phases_source, fn ->
+      %{session => %{last_event_at: last_event_at, phase: "waiting"}}
+    end)
+
+    on_exit(fn -> Application.delete_env(:shuttle, :waiting_phases_source) end)
+
+    assert {:ok, %{fibers: [%{runtime: runtime}]}} = Poller.cached_fiber_documents(poller)
+    # The served last_activity_at is the tracker's real timestamp — NOT started_at.
+    assert runtime.last_activity_at == last_event_at
+    assert runtime.last_activity_at != runtime.started_at
+    assert runtime.phase == "waiting"
   end
 
   test "owner feed stamps phase: waiting when the live worker's session is waiting for input" do
@@ -718,21 +768,30 @@ defmodule Shuttle.PollerTest do
     assert {:ok, %{fibers: [%{runtime: %{tmux_session: session}}]}} =
              Poller.cached_fiber_documents(poller)
 
-    Application.put_env(:shuttle, :waiting_phases_source, fn -> %{session => "waiting"} end)
+    Application.put_env(:shuttle, :waiting_phases_source, fn ->
+      %{session => %{last_event_at: 1_700_000_000_000, phase: "waiting"}}
+    end)
+
     on_exit(fn -> Application.delete_env(:shuttle, :waiting_phases_source) end)
 
     assert {:ok, %{fibers: [%{runtime: runtime}]}} = Poller.cached_fiber_documents(poller)
     assert runtime.phase == "waiting"
+    assert runtime.last_activity_at == 1_700_000_000_000
 
     # The escalation phase stamps straight through the same path.
-    Application.put_env(:shuttle, :waiting_phases_source, fn -> %{session => "attention"} end)
+    Application.put_env(:shuttle, :waiting_phases_source, fn ->
+      %{session => %{last_event_at: 1_700_000_000_000, phase: "attention"}}
+    end)
+
     assert {:ok, %{fibers: [%{runtime: escalated}]}} = Poller.cached_fiber_documents(poller)
     assert escalated.phase == "attention"
 
-    # Clearing the phase map drops the phase — self-healing on the serve path.
+    # Clearing the activity map drops the phase but keeps last_activity_at (the
+    # meta/started_at fallback) — self-healing on the serve path.
     Application.put_env(:shuttle, :waiting_phases_source, fn -> %{} end)
     assert {:ok, %{fibers: [%{runtime: cleared}]}} = Poller.cached_fiber_documents(poller)
     refute Map.has_key?(cleared, :phase)
+    assert is_integer(cleared.last_activity_at)
   end
 
   test "owner feed omits runtime for an owned fiber with no live worker" do

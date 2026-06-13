@@ -3,12 +3,12 @@ defmodule Shuttle.WaitingTrackerTest do
 
   alias Shuttle.WaitingTracker
 
-  @gate_ms 60_000
-  # Events are ingested against this fixed clock, so a `:stopped` entry's `since`
-  # is always exactly @base. Reads pass an explicit `now` to `waiting_phases/2`,
-  # decoupling the read clock from ingestion — the gate becomes a pure function
-  # of stored state and the supplied `now`, with no race against the async poll.
-  @base 1_000_000
+  @hour_ms 60 * 60 * 1_000
+  # Ingestion clock. Events carry their OWN timestamp now (last-event-wins
+  # records the event's real `timestamp`, not the poll wall-clock), so the
+  # injected clock only matters for boot-seed pruning and the missing-timestamp
+  # fallback. `@base` is the "now" the tracker sees on boot and per poll.
+  @base 1_000_000_000_000
 
   setup do
     base = Path.join(System.tmp_dir!(), "waiting_tracker_#{System.unique_integer([:positive])}")
@@ -34,18 +34,22 @@ defmodule Shuttle.WaitingTrackerTest do
     name
   end
 
-  defp append(events, type, session) do
-    line = Jason.encode!(%{type: type, tmuxSession: session})
+  # Append an event carrying its own real timestamp (defaults to @base).
+  defp append(events, type, session, ts \\ @base) do
+    line = Jason.encode!(%{type: type, tmuxSession: session, timestamp: ts})
     File.write!(events, line <> "\n", [:append])
   end
 
-  # Phase at an explicit read-time clock (defaults to ingestion-time @base).
-  defp phase(name, session, now \\ @base),
-    do: Map.get(WaitingTracker.waiting_phases(name, now), session)
+  # Write a line directly to disk BEFORE boot, to seed from a pre-existing file.
+  defp prewrite(events, type, session, ts) do
+    line = Jason.encode!(%{type: type, tmuxSession: session, timestamp: ts})
+    File.write!(events, line <> "\n", [:append])
+  end
 
-  # Whether a session has any tracked entry at all, regardless of the read-time
-  # gate — reads far past the gate so a `:stopped` entry surfaces as "waiting".
-  defp ingested?(name, session), do: not is_nil(phase(name, session, @base + 10 * @gate_ms))
+  defp activity(name, session), do: Map.get(WaitingTracker.session_activity(name), session)
+  defp phase(name, session), do: (activity(name, session) || %{})[:phase]
+  defp last_event_at(name, session), do: (activity(name, session) || %{})[:last_event_at]
+  defp ingested?(name, session), do: not is_nil(activity(name, session))
 
   defp wait_until(fun, tries \\ 50) do
     cond do
@@ -55,130 +59,150 @@ defmodule Shuttle.WaitingTrackerTest do
     end
   end
 
-  test "a stop event yields \"waiting\" only after the 60s gate matures",
-       %{events: events} do
+  # ── Category derivation per last event type ──
+
+  test "a stop event yields phase \"waiting\"", %{events: events} do
     name = start(events)
     append(events, "stop", "foo-01J-shuttle")
-
-    # Before the gate matures the session is omitted entirely (treated as busy).
-    assert wait_until(fn -> ingested?(name, "foo-01J-shuttle") end)
-    refute phase(name, "foo-01J-shuttle")
-
-    # Read past the gate — flips to "waiting" with no new event, purely by elapsed time.
-    assert phase(name, "foo-01J-shuttle", @base + @gate_ms) == "waiting"
+    assert wait_until(fn -> phase(name, "foo-01J-shuttle") == "waiting" end)
   end
 
-  test "a stop event before the gate is not reported", %{events: events} do
+  test "a notification event yields phase \"attention\"", %{events: events} do
     name = start(events)
-    append(events, "stop", "foo-01J-shuttle")
-
-    assert wait_until(fn -> ingested?(name, "foo-01J-shuttle") end)
-    # Just shy of the gate — still omitted.
-    refute phase(name, "foo-01J-shuttle", @base + @gate_ms - 1)
-  end
-
-  test "a notification event yields \"attention\" immediately, no gate",
-       %{events: events} do
-    name = start(events)
-    append(events, "notification", "foo-01J-shuttle")
-
-    assert wait_until(fn -> phase(name, "foo-01J-shuttle") == "attention" end)
-  end
-
-  test "attention is sticky over a later stop — never downgrades to waiting",
-       %{events: events} do
-    name = start(events)
-    append(events, "notification", "foo-01J-shuttle")
-    assert wait_until(fn -> phase(name, "foo-01J-shuttle") == "attention" end)
-
-    append(events, "stop", "foo-01J-shuttle")
-    # Give the stop a chance to be ingested; even reading well past the gate must
-    # not turn attention into waiting.
-    Process.sleep(40)
-    assert phase(name, "foo-01J-shuttle", @base + 10 * @gate_ms) == "attention"
-  end
-
-  test "a notification upgrades a prior stopped to attention", %{events: events} do
-    name = start(events)
-    append(events, "stop", "foo-01J-shuttle")
-    assert wait_until(fn -> ingested?(name, "foo-01J-shuttle") end)
-
     append(events, "notification", "foo-01J-shuttle")
     assert wait_until(fn -> phase(name, "foo-01J-shuttle") == "attention" end)
   end
 
-  for activity <- ["post_tool_use", "user_prompt_submit", "session_end"] do
-    test "an activity event (#{activity}) clears the state", %{events: events} do
+  test "subagent_stop yields phase \"waiting\" (folded into waiting, not cleared)",
+       %{events: events} do
+    name = start(events)
+    append(events, "subagent_stop", "foo-01J-shuttle")
+    assert wait_until(fn -> phase(name, "foo-01J-shuttle") == "waiting" end)
+  end
+
+  for working_type <- ["pre_tool_use", "post_tool_use", "user_prompt_submit", "session_start"] do
+    test "a #{working_type} event yields phase \"working\" (long-tool guard)",
+         %{events: events} do
       name = start(events)
-      append(events, "notification", "foo-01J-shuttle")
-      assert wait_until(fn -> phase(name, "foo-01J-shuttle") == "attention" end)
-
-      append(events, unquote(activity), "foo-01J-shuttle")
-      assert wait_until(fn -> not ingested?(name, "foo-01J-shuttle") end)
+      append(events, unquote(working_type), "foo-01J-shuttle")
+      assert wait_until(fn -> phase(name, "foo-01J-shuttle") == "working" end)
     end
   end
 
-  test "subagent_stop CLEARS — it does not mark waiting", %{events: events} do
-    name = start(events)
-    # First mark stopped so there is something to clear...
-    append(events, "stop", "foo-01J-shuttle")
-    assert wait_until(fn -> ingested?(name, "foo-01J-shuttle") end)
+  # ── Last-event-wins (no sticky state machine) ──
 
-    # ...a subagent finishing means the main agent is mid-orchestration (busy):
-    # it clears, and never appears even when read well past the gate.
-    append(events, "subagent_stop", "foo-01J-shuttle")
-    assert wait_until(fn -> not ingested?(name, "foo-01J-shuttle") end)
-    refute phase(name, "foo-01J-shuttle", @base + 2 * @gate_ms)
+  test "last event wins: stop then pre_tool_use reads as \"working\"", %{events: events} do
+    name = start(events)
+    append(events, "stop", "foo-01J-shuttle")
+    assert wait_until(fn -> phase(name, "foo-01J-shuttle") == "waiting" end)
+
+    # A following tool call wins — the worker resumed, no stickiness keeps it idle.
+    append(events, "pre_tool_use", "foo-01J-shuttle")
+    assert wait_until(fn -> phase(name, "foo-01J-shuttle") == "working" end)
   end
+
+  test "natural escalation: stop then notification reads as \"attention\"",
+       %{events: events} do
+    name = start(events)
+    append(events, "stop", "foo-01J-shuttle")
+    assert wait_until(fn -> phase(name, "foo-01J-shuttle") == "waiting" end)
+
+    # CC fires the idle notification AFTER the stop — last-event-wins escalates
+    # to attention with no hand-rolled stickiness.
+    append(events, "notification", "foo-01J-shuttle")
+    assert wait_until(fn -> phase(name, "foo-01J-shuttle") == "attention" end)
+  end
+
+  # ── Real last_event_at, not poll wall-clock (pins the fake-timestamp fix) ──
+
+  test "last_event_at is the event's own timestamp, not the ingest clock",
+       %{events: events} do
+    name = start(events)
+    one_hour_ago = @base - @hour_ms
+    append(events, "stop", "foo-01J-shuttle", one_hour_ago)
+
+    assert wait_until(fn -> ingested?(name, "foo-01J-shuttle") end)
+    assert last_event_at(name, "foo-01J-shuttle") == one_hour_ago
+  end
+
+  test "a line missing a timestamp falls back to the ingest clock", %{events: events} do
+    name = start(events)
+    line = Jason.encode!(%{type: "stop", tmuxSession: "foo-01J-shuttle"})
+    File.write!(events, line <> "\n", [:append])
+
+    assert wait_until(fn -> ingested?(name, "foo-01J-shuttle") end)
+    assert last_event_at(name, "foo-01J-shuttle") == @base
+  end
+
+  # ── Boot seeding from a pre-written file (pins the stopped-before-boot fix) ──
+
+  test "a session stopped before boot is known immediately, with its real time",
+       %{events: events} do
+    stopped_24h_ago = @base - 24 * @hour_ms
+    prewrite(events, "stop", "stale-01J-shuttle", stopped_24h_ago)
+
+    name = start(events)
+
+    # No new append — it must already be there from the boot seed.
+    act = activity(name, "stale-01J-shuttle")
+    assert act != nil
+    assert act.phase == "waiting"
+    assert act.last_event_at == stopped_24h_ago
+  end
+
+  test "boot seed prunes a session older than 48h, keeps one just inside",
+       %{events: events} do
+    prewrite(events, "stop", "ancient-01J-shuttle", @base - 49 * @hour_ms)
+    prewrite(events, "stop", "recent-01J-shuttle", @base - 47 * @hour_ms)
+
+    name = start(events)
+
+    refute ingested?(name, "ancient-01J-shuttle")
+    assert ingested?(name, "recent-01J-shuttle")
+  end
+
+  test "boot seed honors last-event-wins across the whole file", %{events: events} do
+    # stop, then notification, then pre_tool_use — the last one wins on seed.
+    prewrite(events, "stop", "seed-01J-shuttle", @base - 3_000)
+    prewrite(events, "notification", "seed-01J-shuttle", @base - 2_000)
+    prewrite(events, "pre_tool_use", "seed-01J-shuttle", @base - 1_000)
+
+    name = start(events)
+
+    assert phase(name, "seed-01J-shuttle") == "working"
+    assert last_event_at(name, "seed-01J-shuttle") == @base - 1_000
+  end
+
+  # ── Filtering / robustness (carried forward) ──
 
   test "non-shuttle sessions are ignored", %{events: events} do
     name = start(events)
     append(events, "notification", "my-interactive-session")
-    # Give the tailer a couple of cycles to ingest.
     Process.sleep(40)
-    refute phase(name, "my-interactive-session")
-  end
-
-  test "historical events before boot are not replayed", %{events: events} do
-    # A notification already on disk when the tracker boots must not resurrect a
-    # stale state — the tail starts at end-of-file.
-    append(events, "notification", "stale-01J-shuttle")
-    name = start(events)
-
-    Process.sleep(40)
-    refute phase(name, "stale-01J-shuttle")
+    refute ingested?(name, "my-interactive-session")
   end
 
   test "a partial line (no trailing newline yet) is not consumed until complete",
        %{events: events} do
     name = start(events)
 
-    # Write a notification record WITHOUT its trailing newline — a record still
-    # mid-write. It must not be parsed-and-dropped; the session stays unseen.
-    line = Jason.encode!(%{type: "notification", tmuxSession: "foo-01J-shuttle"})
+    line = Jason.encode!(%{type: "notification", tmuxSession: "foo-01J-shuttle", timestamp: @base})
     File.write!(events, line, [:append])
     Process.sleep(40)
-    refute phase(name, "foo-01J-shuttle")
+    refute ingested?(name, "foo-01J-shuttle")
 
-    # Complete the line — now it registers as attention.
     File.write!(events, "\n", [:append])
     assert wait_until(fn -> phase(name, "foo-01J-shuttle") == "attention" end)
   end
 
-  test "file truncation resets the tail offset without crashing",
-       %{events: events} do
+  test "file truncation resets the tail offset without crashing", %{events: events} do
     name = start(events)
     append(events, "notification", "foo-01J-shuttle")
     assert wait_until(fn -> phase(name, "foo-01J-shuttle") == "attention" end)
 
-    # Rotate: truncate to empty (the real copytruncate shape — events.jsonl is
-    # append-only-grow, so the poller observes size drop below its offset and
-    # resets its read position). Let a poll cycle see the empty file before the
-    # regrowth, then a fresh notification for a new session must still register.
     File.write!(events, "")
     Process.sleep(40)
     append(events, "notification", "bar-01J-shuttle")
     assert wait_until(fn -> phase(name, "bar-01J-shuttle") == "attention" end)
   end
-
 end
