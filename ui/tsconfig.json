@@ -6,6 +6,10 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": ["vite/client"],
 
+    /* React islands (the Stash/Capture forms) render through the automatic
+       JSX runtime; the kanban board stays vanilla TS/DOM. */
+    "jsx": "react-jsx",
+
     "skipLibCheck": true,
 
     /* Bundler mode — mirrors Portolan, the source of the ported board.

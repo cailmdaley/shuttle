@@ -1,4 +1,5 @@
 import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
 
 /**
  * The Shuttle UI build.
@@ -19,6 +20,7 @@ const apiTarget = process.env.VITE_SHUTTLE_API ?? 'http://localhost:4000'
 
 export default defineConfig({
   base: '',
+  plugins: [react()],
   server: {
     port: 5174,
     proxy: {

@@ -1,6 +1,7 @@
 import './app.css'
 import { KanbanModal } from './board/KanbanModal.js'
 import { showToast } from './board/utils.js'
+import { openStash, openCapture } from './forms/mountForms.js'
 
 /**
  * Entry point — mounts the kanban board against the Shuttle daemon.
@@ -25,8 +26,16 @@ const board = new KanbanModal({
   onOpenFiber: (card) => {
     showToast(`Viewer coming soon — ${card.id}`, 'success')
   },
-  // Stash (`+`) / Capture (`✶`) header buttons stay hidden until their React
-  // islands are wired (slice 2) — omitting the callbacks hides the buttons.
+  // Stash (`+`) / Capture (`✶`) header buttons — providing these callbacks is
+  // what surfaces the buttons. Each opens its React island (slice 2); the
+  // result lands as a board toast. The board polls, so a new card appears on
+  // its own once the daemon writes the fiber / the capture session claims it.
+  onStashClick: () => {
+    void openStash({ shuttleBase, onResult: (msg, ok) => showToast(msg, ok ? 'success' : 'error') })
+  },
+  onNewIdeaClick: () => {
+    void openCapture({ shuttleBase, onResult: (msg, ok) => showToast(msg, ok ? 'success' : 'error') })
+  },
 })
 
 // Loom-wide view (cityScope: null) — the standalone UI is not city-scoped.
