@@ -32,6 +32,10 @@ defmodule ShuttleWeb.Router do
     # Hard-kill a fiber's live worker (owner-routed). The kanban fires this when
     # a running card is dragged off the in-flight column; the column write follows.
     post("/kill", KillController, :create)
+    # Open a worker's tmux session in kitty (the ▸ aloft / ☞ needs-you-now pill).
+    # Deliberately NOT owner-routed: the terminal opens on the host serving the
+    # UI (where the human is), ssh-ing out for a remote worker. See Shuttle.Kitty.
+    post("/attach", AttachController, :create)
     post("/wait", WaitController, :create)
     post("/reserve", ReserveController, :create)
     get("/state", StateController, :show)

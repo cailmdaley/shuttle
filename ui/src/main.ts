@@ -36,6 +36,25 @@ const board = new KanbanModal({
   onNewIdeaClick: () => {
     void openCapture({ shuttleBase, onResult: (msg, ok) => showToast(msg, ok ? 'success' : 'error') })
   },
+  // ▸ aloft / ☞ needs-you-now → open the worker's tmux session in kitty. The
+  // web app can't open a terminal itself (Portolan does it natively); the
+  // daemon does, via POST /api/v1/attach (not owner-routed — the tab opens on
+  // the host serving this UI, ssh-ing out for a remote worker). Success raises
+  // kitty; only failures surface a toast.
+  onOpenWorker: (tmuxSession, shuttleHost) => {
+    void fetch(`${shuttleBase}/api/v1/attach`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tmux_session: tmuxSession, shuttle_host: shuttleHost ?? null }),
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const detail = await res.text().catch(() => '')
+          showToast(detail ? `Couldn’t open terminal: ${detail}` : 'Couldn’t open terminal', 'error')
+        }
+      })
+      .catch(() => showToast('Couldn’t reach the daemon to open the terminal', 'error'))
+  },
 })
 
 // Loom-wide view (cityScope: null) — the standalone UI is not city-scoped.
