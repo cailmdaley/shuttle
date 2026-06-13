@@ -69,6 +69,36 @@ export default defineConfig({
   base: '',
   plugins: [lightconeTailwindSource(), tailwindcss(), react()],
   resolve: {
+    /**
+     * Collapse the myst stack to a SINGLE physical copy. The renderer is
+     * aliased to lightcone-ui's `packages/renderer/src`, whose bare imports
+     * (`myst-to-react`, `@myst-theme/providers`, …) Node-resolve from
+     * lightcone-ui's *own* node_modules — a different path than shuttle-ui's
+     * copies of the same packages. Without dedupe the bundle ends up with TWO
+     * instances of `@myst-theme/providers`, hence two distinct module-scope
+     * `ThemeContext` objects (the renderer set rides in a field of
+     * `ThemeContext`, read via `useNodeRenderers`): PaperApp's `ThemeProvider`
+     * (shuttle-ui copy) populates one, but PaperView's internal `<MyST>`
+     * (lightcone-ui copy) reads the OTHER → it sees no renderers → every
+     * MyST-dispatched node falls to myst-to-react's class-less
+     * `DefaultComponent`. The chrome
+     * (masthead/sections, PaperView's own React) survives, masking the break;
+     * the symptom is bare-`<div>` body prose and missing finding/decision/xref
+     * treatments — and ONLY in `vite build` (dev's optimizeDeps happens to
+     * unify the duplicate). Versions match exactly across both checkouts
+     * (@myst-theme/* 1.2.2, myst-common/-spec-ext 1.9.5, react 18.3.1), so
+     * forcing one copy is lossless. react/react-dom listed defensively —
+     * two Reacts would break hooks outright.
+     */
+    dedupe: [
+      'react',
+      'react-dom',
+      'myst-to-react',
+      'myst-common',
+      'myst-spec-ext',
+      '@myst-theme/providers',
+      '@myst-theme/common',
+    ],
     alias: [
       { find: '@lightcone/renderer', replacement: resolve(lightconeUiDir, 'packages/renderer/src') },
       { find: '@lightcone/providers', replacement: resolve(lightconeUiDir, 'packages/providers/src') },
