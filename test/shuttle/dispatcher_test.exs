@@ -833,6 +833,22 @@ defmodule Shuttle.DispatcherTest do
     refute script =~ "send-keys"
   end
 
+  test "build_run_script for a headless worker skips the client-wait gate and dismiss send-keys" do
+    # Headless `-p` workers run unattended — no human client ever attaches, so
+    # the 10s wait-for-client gate would only burn its timeout, and the
+    # resume-warning dismiss send-keys has no TTY warning page to dismiss.
+    script =
+      Dispatcher.build_run_script("tests/haiku", "claude -p --resume 'abc'", "claude-haiku",
+        dismiss_resume_warning: false,
+        headless: true,
+        session: "haiku-shuttle"
+      )
+
+    refute script =~ "WAIT_DEADLINE"
+    refute script =~ "list-clients"
+    refute script =~ "send-keys"
+  end
+
   test "build_run_script with no opts (fresh dispatch path) emits no send-keys" do
     # Default opts = [] → dismiss_resume_warning defaults to false. This is
     # the path fresh dispatch takes, so fresh workers never get the dismiss.

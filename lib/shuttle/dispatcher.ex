@@ -1100,11 +1100,16 @@ defmodule Shuttle.Dispatcher do
         # TTY can dismiss. The heredoc-piped prompt arrives *after* the
         # warning, so we can't fold it in. Schedule a tmux send-keys to
         # fire a couple seconds in. Other harnesses (codex/pi) don't
-        # show this warning.
+        # show this warning — and a headless `-p` resume has no TTY warning
+        # page and no human to attach, so both the dismiss send-keys and the
+        # wait-for-client gate are skipped for it.
+        headless = agent[:headless] == true
+
         run_script =
           build_run_script(fiber_id, command, agent.id,
-            dismiss_resume_warning: agent.cli == "claude",
+            dismiss_resume_warning: agent.cli == "claude" and not headless,
             session: session,
+            headless: headless,
             display_fiber_id: worker_fiber_id
           )
 
@@ -1427,6 +1432,9 @@ defmodule Shuttle.Dispatcher do
   def build_run_script(fiber_id, command, agent_id, opts \\ []) do
     dismiss_resume_warning = Keyword.get(opts, :dismiss_resume_warning, false)
     session = Keyword.get(opts, :session, "")
+    # Headless `-p` workers run unattended: no human client attaches, so the
+    # wait-for-client gate below would only burn its full timeout for nothing.
+    headless = Keyword.get(opts, :headless, false)
     display_fiber_id = Keyword.get(opts, :display_fiber_id, fiber_id)
 
     # When resuming claude, schedule a backgrounded tmux send-keys to
@@ -1468,7 +1476,7 @@ defmodule Shuttle.Dispatcher do
     # human in the loop). After the timeout the harness proceeds at the
     # default-size, same as the world before this gate existed.
     wait_for_client_block =
-      if session != "" do
+      if session != "" and not headless do
         ~s"""
         WAIT_DEADLINE=$(( $(date +%s) + 10 ))
         while [ "$(date +%s)" -lt "$WAIT_DEADLINE" ]; do
