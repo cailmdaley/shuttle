@@ -1,0 +1,23 @@
+{
+  "name": "shuttle-ui",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "The Shuttle UI — a lean web client for the Shuttle daemon (:4000): kanban board, Stash/Capture, and a fiber/file viewer. Served by the daemon as a static bundle.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "cron-parser": "^5.5.0",
+    "katex": "^0.16.27",
+    "marked": "^17.0.1",
+    "marked-katex-extension": "^5.1.6"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vite": "^7.3.2"
+  }
+}
