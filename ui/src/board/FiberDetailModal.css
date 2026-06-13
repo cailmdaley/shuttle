@@ -734,9 +734,43 @@
   margin: 0.4em 0;
 }
 
-/* `:::{embed} <path>` placeholder — the inline render lands with the file
-   route (slice 4). Names the artifact so report.html-style fibers read
-   cleanly meanwhile. */
+/* `:::{embed} <path>` rendered through the `/file` route: images and audio as
+   a captioned figure, everything else (PDF, HTML, text) in a fixed-height
+   scrolling iframe. An unresolvable path degrades to `.kbn-detail-embed-missing`
+   — the labelled placeholder, so report.html-style fibers still read cleanly. */
+.kbn-detail-embed-figure {
+  margin: 1.2em 0;
+}
+.kbn-detail-embed-img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 5px;
+  border: 1px solid rgba(27, 22, 17, 0.12);
+}
+.kbn-detail-embed-audio { display: block; width: 100%; }
+.kbn-detail-embed-figure figcaption {
+  margin-top: 0.45em;
+  font-size: 0.82em;
+  font-style: italic;
+  color: #9A8F80;
+}
+.kbn-detail-embed-frame {
+  margin: 1.2em 0;
+  border: 1px solid rgba(27, 22, 17, 0.16);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--porch-rag, #FBF6E9);
+}
+.kbn-detail-embed-frame iframe {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+/* Placeholder for an embed whose path couldn't be resolved (relative path on a
+   fiber whose dir didn't reach the client, or a bad path). */
 .kbn-detail-embed {
   display: flex;
   align-items: baseline;

@@ -1,4 +1,4 @@
-import { renderMarkdown, escapeHtml } from './utils.js'
+import { renderMarkdown, renderEmbeds } from './utils.js'
 import type { ColumnKind, KanbanCard } from './KanbanTypes.js'
 import { dispatchIneligibleReason, errorMessageFromResponse, isAgentCard } from './KanbanModalShared.js'
 import { fetchFiberIndex, filterParentCandidates, type FiberSearchResult } from './fiberSearch.js'
@@ -21,23 +21,6 @@ let lastGeometry: { left: number; top: number; width: number; height: number } |
 
 const MIN_WIDTH = 380
 const MIN_HEIGHT = 320
-
-/**
- * MyST `:::{embed} <path>` directives aren't markdown the `marked` renderer
- * understands, and the artifact bytes need the daemon's file route (slice 4)
- * anyway. Until then, swap each embed block for an inline placeholder that
- * names the artifact, so report.html-style fibers read cleanly instead of
- * leaking raw directive syntax. (`marked` passes block-level HTML through.)
- */
-function embedPlaceholders(md: string): string {
-  // `:::{embed} <path>` then optional `:key: val` option lines, closed by `:::`.
-  const EMBED_RE =
-    /^:::\{embed\}[ \t]+(\S+)[^\n]*\n(?:[ \t]*:[a-zA-Z-]+:[^\n]*\n)*[ \t]*:::[ \t]*$/gim
-  return md.replace(EMBED_RE, (_match, path: string) => {
-    const safe = escapeHtml(path)
-    return `\n<div class="kbn-detail-embed"><span class="kbn-detail-embed-glyph">⧉</span><code>${safe}</code><span class="kbn-detail-embed-note">embedded artifact · inline render lands with the file route</span></div>\n`
-  })
-}
 
 /**
  * One entry of the daemon's `GET /api/v1/agents` registry. The axis metadata
@@ -70,8 +53,8 @@ interface AgentRecord {
  * comes from the daemon's `GET /api/v1/fibers/<id>?body=true`; a fiber whose
  * body the local daemon can't read (remote origin — owner-routed body is a
  * later slice) degrades to its outcome, which the composite feed always
- * carries. `:::{embed}` artifacts render as a placeholder until the file
- * route lands (slice 4).
+ * carries. `:::{embed}` artifacts and relative images render through the
+ * daemon's owner-routed `/file` route, anchored on the fiber's own dir.
  *
  * Every card action lives in one dropdown directly under the title,
  * collapsed by default: directive box + "wait for me", New session /
@@ -340,8 +323,9 @@ export class FiberDetailModal {
    * page pane, styled to read like a vellum page. The body endpoint
    * (`GET /api/v1/fibers/<id>?body=true`) is local-only — a remote fiber's
    * body can't be read from here, so it degrades to the outcome, which the
-   * composite feed always carries. `:::{embed}` artifacts become placeholders
-   * until the daemon's file route lands (slice 4).
+   * composite feed always carries. `:::{embed}` artifacts and relative images
+   * resolve through the daemon's `/file` route, anchored on the fiber's dir
+   * (`card.fiberDir`); an unresolvable path falls back to a placeholder.
    */
   private async renderFiberBody(
     prose: HTMLElement,
@@ -382,7 +366,12 @@ export class FiberDetailModal {
     if (this.overlay !== overlay) return
 
     if (body) {
-      prose.innerHTML = lede + renderMarkdown(embedPlaceholders(body))
+      // Resolve a relative `:::{embed}` / image against the fiber's own dir
+      // (carried on the card from the composite feed) and route the bytes
+      // through `/file`. A fiber whose dir didn't resolve degrades to embed
+      // placeholders + un-rewritten images, but the prose still reads.
+      const bodyOpts = { basePath: card.fiberDir, originId: card.originId }
+      prose.innerHTML = lede + renderMarkdown(renderEmbeds(body, bodyOpts), bodyOpts)
       return
     }
     if (!outcome && reached) {

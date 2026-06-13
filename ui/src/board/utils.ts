@@ -103,17 +103,11 @@ export function renderMarkdown(text: string, opts?: RenderMarkdownOptions): stri
       localRenderer.codespan = renderer.codespan
       localRenderer.link = renderer.link
       localRenderer.image = ({ href, text: alt }: { href: string; text?: string }) => {
-        let src = href
-        // Resolve relative paths through the file-content API
-        if (!/^https?:\/\//.test(href) && !/^data:/.test(href)) {
-          const fullPath = href.startsWith('/') ? href : `${opts.basePath}/${href}`
-          src = `${FILE_ROUTE}?path=${encodeURIComponent(fullPath)}`
-          if (opts.originId && opts.originId !== 'local') {
-            src += `&origin=${encodeURIComponent(opts.originId)}`
-          }
-        }
+        // Relative/absolute local paths resolve through /file; http(s)/data
+        // URLs (and an unresolvable relative path) pass through unchanged.
+        const src = fileUrl(href, opts) ?? href
         const cleanAlt = (alt || '').replace(/<[^>]*>/g, '')
-        return `<img src="${escapeHtml(src)}" alt="${escapeHtml(cleanAlt)}" loading="lazy" />`
+        return `<img src="${escapeAttr(src)}" alt="${escapeAttr(cleanAlt)}" loading="lazy" />`
       }
       return marked.parse(text, { renderer: localRenderer }) as string
     }
@@ -122,6 +116,135 @@ export function renderMarkdown(text: string, opts?: RenderMarkdownOptions): stri
     console.error('Markdown render error:', e)
     return escapeHtml(text)
   }
+}
+
+/**
+ * Attribute-safe escape: `escapeHtml` (textContent→innerHTML) escapes `<`, `>`,
+ * and `&` but NOT quotes, so a value with a `"` could break out of a double-
+ * quoted attribute. Escaping the quote too makes the result safe inside
+ * `attr="…"`.
+ */
+export function escapeAttr(text: string): string {
+  return escapeHtml(text).replace(/"/g, '&quot;')
+}
+
+/**
+ * Build the URL a relative or absolute artifact path resolves to through the
+ * Shuttle daemon's owner-routed file route (`GET /api/v1/file?path=&origin=`).
+ * `http(s)`/`data` URLs pass through unchanged. A relative path needs
+ * `opts.basePath` (the fiber's absolute dir) to become the absolute path the
+ * route requires; without one it returns `null` so the caller can fall back to
+ * a placeholder. `origin` is appended only for a remote-owned fiber, mirroring
+ * the route's local-when-absent contract.
+ */
+export function fileUrl(rawPath: string, opts?: RenderMarkdownOptions): string | null {
+  if (/^https?:\/\//.test(rawPath) || /^data:/.test(rawPath)) return rawPath
+  let abs: string
+  if (rawPath.startsWith('/')) abs = rawPath
+  else if (opts?.basePath) abs = `${opts.basePath}/${rawPath}`
+  else return null
+  // encodeURIComponent leaves `~` raw (it's an unreserved mark), but the body
+  // is fed through `marked`, whose tilde-preprocess hook rewrites a lone `~` to
+  // `&#126;` outside code regions — which would corrupt a path under `~user` or
+  // a `foo.png~` backup. Percent-encode it so the URL survives the hook intact.
+  let url = `${FILE_ROUTE}?path=${encodeURIComponent(abs).replace(/~/g, '%7E')}`
+  if (opts?.originId && opts.originId !== 'local') {
+    url += `&origin=${encodeURIComponent(opts.originId)}`
+  }
+  return url
+}
+
+const EMBED_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'avif'])
+const EMBED_AUDIO_EXTS = new Set(['wav', 'mp3', 'm4a', 'ogg', 'flac', 'aac'])
+const EMBED_DEFAULT_IFRAME_HEIGHT = 600
+
+/**
+ * Replace MyST `:::{embed} <path>` blocks with real artifact embeds resolved
+ * through the `/file` route, by extension — images → `<img>`, audio →
+ * `<audio>`, everything else (PDF, HTML, text) → a fixed-height scrolling
+ * `<iframe>`, mirroring the sent-file viewer's dispatch. The `:height:` (px or
+ * a unit-carrying length) and `:title:` options are honored. A relative path
+ * needs the fiber's dir (`opts.basePath`) to resolve; without it — or for an
+ * unresolvable path — the block degrades to a labelled placeholder, so a
+ * report.html-style fiber on a host that can't resolve the dir still reads
+ * cleanly. Runs BEFORE `marked`, injecting block-level HTML the renderer passes
+ * through untouched.
+ */
+export function renderEmbeds(md: string, opts?: RenderMarkdownOptions): string {
+  // `:::{embed} <path>` then optional `:key: val` option lines, closed by `:::`.
+  const EMBED_RE =
+    /^:::\{embed\}[ \t]+(\S+)[^\n]*\n((?:[ \t]*:[a-zA-Z-]+:[^\n]*\n)*)[ \t]*:::[ \t]*$/gim
+  return md.replace(EMBED_RE, (_match, path: string, optionBlock: string) => {
+    return '\n\n' + embedHtml(path, parseEmbedOptions(optionBlock), opts) + '\n\n'
+  })
+}
+
+function parseEmbedOptions(block: string): { height?: string; title?: string } {
+  const out: { height?: string; title?: string } = {}
+  for (const line of block.split('\n')) {
+    const m = line.match(/^[ \t]*:([a-zA-Z-]+):[ \t]*(.*)$/)
+    if (!m) continue
+    const key = m[1].toLowerCase()
+    const val = m[2].trim()
+    if (key === 'height') out.height = val
+    else if (key === 'title') out.title = val
+  }
+  return out
+}
+
+function embedPlaceholderHtml(path: string, title?: string): string {
+  const label = title ? escapeHtml(title) : 'embedded artifact'
+  return `<div class="kbn-detail-embed kbn-detail-embed-missing"><span class="kbn-detail-embed-glyph">⧉</span><code>${escapeHtml(path)}</code><span class="kbn-detail-embed-note">${label} · couldn’t resolve a path to render</span></div>`
+}
+
+function embedHtml(
+  path: string,
+  embedOpts: { height?: string; title?: string },
+  opts?: RenderMarkdownOptions,
+): string {
+  const src = fileUrl(path, opts)
+  if (!src) return embedPlaceholderHtml(path, embedOpts.title)
+
+  const ext = fileExt(path)
+  const safeSrc = escapeAttr(src)
+  const safeTitle = escapeAttr(embedOpts.title ?? basename(path))
+  const caption = embedOpts.title ? `<figcaption>${escapeHtml(embedOpts.title)}</figcaption>` : ''
+  const heightCss = cssLength(embedOpts.height)
+
+  if (EMBED_IMAGE_EXTS.has(ext)) {
+    const style = heightCss ? ` style="height:${heightCss}"` : ''
+    return `<figure class="kbn-detail-embed-figure"><img class="kbn-detail-embed-img" src="${safeSrc}" alt="${safeTitle}" loading="lazy"${style} />${caption}</figure>`
+  }
+
+  if (EMBED_AUDIO_EXTS.has(ext)) {
+    return `<figure class="kbn-detail-embed-figure"><audio class="kbn-detail-embed-audio" controls src="${safeSrc}"></audio>${caption}</figure>`
+  }
+
+  const height = heightCss ?? `${EMBED_DEFAULT_IFRAME_HEIGHT}px`
+  return `<div class="kbn-detail-embed-frame" style="height:${height}"><iframe src="${safeSrc}" title="${safeTitle}" loading="lazy"></iframe></div>`
+}
+
+function basename(path: string): string {
+  return path.split('/').filter(Boolean).pop() ?? path
+}
+
+function fileExt(path: string): string {
+  const base = basename(path).split(/[?#]/)[0]
+  const dot = base.lastIndexOf('.')
+  return dot > 0 ? base.slice(dot + 1).toLowerCase() : ''
+}
+
+/**
+ * Normalize a `:height:` option for an inline `style`. A bare number → `px`; a
+ * value already carrying a CSS unit passes through; anything else → undefined.
+ * The whitelist guards against style-attribute injection from the option text.
+ */
+function cssLength(value?: string): string | undefined {
+  if (!value) return undefined
+  const v = value.trim()
+  if (/^\d+(\.\d+)?$/.test(v)) return `${v}px`
+  if (/^\d+(\.\d+)?(px|em|rem|vh|vw|%)$/.test(v)) return v
+  return undefined
 }
 
 /**

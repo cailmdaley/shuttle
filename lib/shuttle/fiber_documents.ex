@@ -14,6 +14,7 @@ defmodule Shuttle.FiberDocuments do
           required(:felt_store) => String.t(),
           required(:path) => String.t(),
           required(:fiber) => map(),
+          optional(:dir) => String.t(),
           optional(:report_path) => String.t()
         }
 
@@ -302,13 +303,18 @@ defmodule Shuttle.FiberDocuments do
       fiber: fiber
     }
 
-    # report.html is a filesystem sibling of the fiber's `.md` — universally,
-    # with no flat-vs-dir branch and no `entry_point` dependency. Read it from
-    # the directory felt carries (`dirname(felt.path)`), the one path concept.
-    # felt's `path` is symlink-canonicalized and already absolute, exactly the
-    # form Portolan serves over /project-file/<originId><absPath>.
-    case report_sibling(fiber) do
-      {:ok, report_path} ->
+    # The fiber's own directory (`dirname(felt.path)`) is the anchor two clients
+    # need: the detail panel resolves a relative `:::{embed}` / image against it
+    # before calling `/file?path=…`, and report.html is just its `report.html`
+    # sibling. Emitted unconditionally (not gated on report.html existing) so
+    # relative artifacts render for every local fiber, not only reported ones.
+    # felt's `path` is symlink-canonicalized and already absolute — the exact
+    # form `/file` reads by and Portolan serves over /project-file/<origin><abs>.
+    case fiber_dir(fiber) do
+      {:ok, dir} ->
+        entry = Map.put(entry, :dir, dir)
+        report_path = Path.join(dir, "report.html")
+
         if File.exists?(report_path),
           do: [Map.put(entry, :report_path, report_path)],
           else: [entry]
@@ -351,15 +357,15 @@ defmodule Shuttle.FiberDocuments do
 
   defp leaf_shape(_fiber, leaf), do: Path.join(leaf, "#{leaf}.md")
 
-  # report.html beside the fiber file: `dirname(felt.path)/report.html`. felt's
-  # `path` is absolute and symlink-canonicalized, so this is the real fiber dir
-  # in every topology (dir-contained, symlinked-flat substore, entry point) with
-  # no served-store-prefix coupling. `:error` when felt carries no `path`.
-  defp report_sibling(%{"path" => path}) when is_binary(path) and path != "" do
-    {:ok, Path.join(Path.dirname(Path.expand(path)), "report.html")}
+  # The fiber's directory: `dirname(felt.path)`. felt's `path` is absolute and
+  # symlink-canonicalized, so this is the real fiber dir in every topology
+  # (dir-contained, symlinked-flat substore, entry point) with no served-store-
+  # prefix coupling. `:error` when felt carries no `path`.
+  defp fiber_dir(%{"path" => path}) when is_binary(path) and path != "" do
+    {:ok, Path.dirname(Path.expand(path))}
   end
 
-  defp report_sibling(_fiber), do: :error
+  defp fiber_dir(_fiber), do: :error
 
   # Canonical (realpath store-relative) id from felt's carried absolute `path`:
   # the tail after the physically-enclosing `.felt/`, minus the `<leaf>.md`

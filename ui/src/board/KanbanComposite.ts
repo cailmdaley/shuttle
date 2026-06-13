@@ -22,6 +22,7 @@
 //         path: string,             // fiber path relative to .felt/
 //         fiber: {...felt JSON...}, // → mapFeltJsonToFiber
 //         runtime?: { tmux_session: string } | null,  // owner-served liveness
+//         dir?: string,             // fiber's own dir (embed/image base), owner-resolved
 //         report_path?: string,     // sibling report.html, owner-resolved
 //         origin: string,           // owning host/remote name
 //       }, ...
@@ -74,8 +75,13 @@ export interface CompositeEntry {
   /** Owner-served liveness — present iff the owning daemon runs a live worker
    * for this fiber. The single reconciled liveness observation per fiber. */
   runtime?: CompositeRuntime;
+  /** Absolute path to the fiber's own directory on the owning host
+   * (`dirname(felt.path)`), owner-resolved. The base a relative `:::{embed}` /
+   * image in the body resolves against before the `/file` route reads it.
+   * Present for every fiber a current-build daemon serves. */
+  dir?: string;
   /** Absolute path to a sibling `report.html`, when the owning daemon resolved
-   * one. */
+   * one. (Always `<dir>/report.html`; presence is the report-exists signal.) */
   reportPath?: string;
 }
 
@@ -118,9 +124,10 @@ export function parseCompositeFeed(body: unknown): CompositeFeed {
 
     const origin = typeof item.origin === 'string' && item.origin ? item.origin : host;
     const runtime = parseRuntime(item.runtime);
+    const dir = typeof item.dir === 'string' ? item.dir : undefined;
     const reportPath = typeof item.report_path === 'string' ? item.report_path : undefined;
 
-    entries.push({ origin, feltStore, path, fiber, runtime, reportPath });
+    entries.push({ origin, feltStore, path, fiber, runtime, dir, reportPath });
   }
 
   const origins: Record<string, CompositeOrigin> = {};

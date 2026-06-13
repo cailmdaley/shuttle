@@ -294,6 +294,11 @@ function toCard(
     path: entry.path,
     originId: entry.origin,
     feltStore: entry.feltStore,
+    // Prefer the fiber's own dir; fall back to the report.html sibling's dir
+    // for rows from an older daemon that emits `report_path` but not `dir`.
+    fiberDir:
+      entry.dir ??
+      (entry.reportPath ? entry.reportPath.replace(/\/[^/]*$/, '') : undefined),
     status: f.status,
     outcome: f.outcome,
     due: f.due,

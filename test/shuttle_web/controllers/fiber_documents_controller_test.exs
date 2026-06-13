@@ -66,7 +66,10 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
     # report_path is `dirname(felt.path)/report.html` — felt's carried path is
     # symlink-canonicalized (on macOS the tmp store's /var → /private/var), and
     # Portolan serves it as an absolute path, so assert against that realpath.
+    # `dir` is that same canonicalized directory: the base the panel resolves a
+    # relative `:::{embed}` / image against, emitted for every fiber.
     report = real_report_path(store, "tests/document")
+    dir = real_fiber_dir(store, "tests/document")
 
     conn = get(api_conn(), "/api/v1/fibers")
 
@@ -79,6 +82,7 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
              %{
                "felt_store" => ^store,
                "path" => "tests/document/document.md",
+               "dir" => ^dir,
                "report_path" => ^report,
                "fiber" => %{
                  "id" => "tests/document",
@@ -639,10 +643,17 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
   # felt's `path` is symlink-canonicalized. Mirror that by realpath'ing the
   # report file's directory so the assertion is robust to macOS's /var symlink.
   defp real_report_path(store, fiber_id) do
+    Path.join(real_fiber_dir(store, fiber_id), "report.html")
+  end
+
+  # The `dir` the endpoint emits: `dirname(felt.path)`, symlink-canonicalized.
+  # Mirror it by realpath'ing the fiber's directory so the assertion survives
+  # macOS's /var → /private/var symlink.
+  defp real_fiber_dir(store, fiber_id) do
     segments = String.split(fiber_id, "/")
     dir = Path.join([store, ".felt" | segments])
     {realdir, 0} = System.cmd("realpath", [dir])
-    Path.join(String.trim(realdir), "report.html")
+    String.trim(realdir)
   end
 
   defp api_conn do

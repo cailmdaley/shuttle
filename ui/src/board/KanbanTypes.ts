@@ -22,6 +22,14 @@ export interface KanbanCard {
    * git-synced local one.
    */
   feltStore?: string
+  /**
+   * Absolute path to the fiber's own directory on the owning host
+   * (`dirname(felt.path)`). The base the detail panel resolves a relative
+   * `:::{embed}` / markdown image against before handing it to the `/file`
+   * route. Absent for remote-origin fibers served by an older daemon and for
+   * fibers felt carries no path for; the panel then falls back to a placeholder.
+   */
+  fiberDir?: string
   status: string
   outcome?: string
   due?: string
