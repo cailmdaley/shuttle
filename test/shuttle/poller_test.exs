@@ -962,17 +962,46 @@ defmodule Shuttle.PollerTest do
            end)
   end
 
-  test "poller never auto-dispatches an active pinned role" do
-    # A pinned role's steady state is status:active "at rest" — but unlike an
-    # active oneshot (which dispatches on the next poll) the poller must skip it
-    # entirely. It fires only on an explicit force-dispatch.
-    fiber = make_fiber("tests/pinned-at-rest", %{"status" => "active"})
-    MockRunner.set_fiber("tests/pinned-at-rest", fiber)
-    MockRunner.set_shuttle("tests/pinned-at-rest", "kind: pinned\n", "active")
+  test "poller auto-dispatches a LOOPING (status:active) pinned role, like a oneshot" do
+    # Option D: a pinned role at status:active is LOOPING — eligible and
+    # dispatched on the poll, exactly like an active oneshot. (Old model: the
+    # poller hard-skipped every pinned role; the never-auto-dispatch branch is
+    # gone.) The parked rest state is status:open, covered by the sibling test.
+    fiber = make_fiber("tests/pinned-looping", %{"status" => "active"})
+    MockRunner.set_fiber("tests/pinned-looping", fiber)
+    MockRunner.set_shuttle("tests/pinned-looping", "kind: pinned\n", "active")
 
     {:ok, poller} =
       Poller.start_link(
-        name: :test_poller_pinned_at_rest,
+        name: :test_poller_pinned_looping,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    send(poller, :run_poll_cycle)
+
+    assert wait_until(fn ->
+             Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+               cmd == "tmux" and hd(args) == "new-session"
+             end)
+           end)
+
+    assert Enum.any?(Poller.snapshot(poller).eligible, &(&1.fiber_id == "tests/pinned-looping"))
+  end
+
+  test "poller does NOT auto-dispatch a PARKED (status:open) pinned role" do
+    # Option D: status:open is the parked rest state on the strip. The existing
+    # `status != "active"` gate skips it — no bespoke pinned branch. This is the
+    # park half of the loop: dragging In-flight → strip writes active → open, and
+    # the role stops looping.
+    fiber = make_fiber("tests/pinned-parked", %{"status" => "open"})
+    MockRunner.set_fiber("tests/pinned-parked", fiber)
+    MockRunner.set_shuttle("tests/pinned-parked", "kind: pinned\n", "open")
+
+    {:ok, poller} =
+      Poller.start_link(
+        name: :test_poller_pinned_parked,
         runner: MockRunner,
         poll_interval_ms: 60_000,
         felt_stores: ["/tmp"]
@@ -985,60 +1014,65 @@ defmodule Shuttle.PollerTest do
              cmd == "tmux" and hd(args) == "new-session"
            end)
 
-    # And it is not counted eligible (the never-auto-dispatch gate, not a
-    # transient not-yet-due).
-    refute Enum.any?(Poller.snapshot(poller).eligible, &(&1.fiber_id == "tests/pinned-at-rest"))
+    refute Enum.any?(Poller.snapshot(poller).eligible, &(&1.fiber_id == "tests/pinned-parked"))
   end
 
-  test "a pinned worker exit leaves the role resting (status:active), not awaiting-review" do
-    # Bug: pinned roles were treated as cyclical (standing OR pinned) on worker
-    # exit and marked awaiting (status:closed), so a closed-out pinned role left
-    # the strip for the awaiting-review/timeline surfaces. A pinned role never
-    # auto-re-fires (force-dispatch only), so the awaiting mark is no anti-re-fire
-    # gain and only adds accept-friction. Its steady state is resting status:active
-    # on the strip — that's where its exit must leave it. (A pinned worker that
-    # wants review still self-closes; only STANDING/cron roles mark awaiting.)
+  test "a LOOPING pinned worker exit leaves the role active and re-dispatches next poll" do
+    # Option D: a pinned role at status:active is looping. On worker-exit-while-
+    # active it must stay status:active (NOT marked awaiting like a standing role)
+    # so the next poll re-dispatches it — that's the loop. Only STANDING/cron
+    # roles mark awaiting; a pinned worker that's genuinely done self-closes.
     #
-    # The exit handler's awaiting-mark writes through felt (LifecycleStore →
-    # FeltStores.resolve_fiber), so the mock fiber must be felt-resolvable for the
-    # mark to actually land: point LOOM_HOMES at the mock store the factory wrote
-    # to (/private/tmp/.felt). Without this, mark_awaiting can't resolve the fiber
-    # and silently no-ops — masking whether the gate even fired.
+    # The exit handler routes through felt (LifecycleStore → FeltStores.resolve_
+    # fiber), so the mock fiber must be felt-resolvable: point LOOM_HOMES at the
+    # mock store the factory wrote to (/private/tmp/.felt). Without this a
+    # mark_awaiting regression would silently no-op — masking whether the gate
+    # even fired.
     prev_loom = System.get_env("LOOM_HOMES")
     System.put_env("LOOM_HOMES", "/private/tmp")
     on_exit(fn -> if prev_loom, do: System.put_env("LOOM_HOMES", prev_loom), else: System.delete_env("LOOM_HOMES") end)
 
-    fiber_id = "tests/pinned-exit-rests"
+    fiber_id = "tests/pinned-exit-loops"
     leaf = fiber_id |> String.split("/") |> List.last()
+    session = Dispatcher.session_name(fiber_id)
     MockRunner.set_fiber(fiber_id, make_fiber(fiber_id, %{"status" => "active"}))
     MockRunner.set_shuttle(fiber_id, "kind: pinned\nagent: claude-opus\n", "active")
 
     {:ok, poller} =
       Poller.start_link(
-        name: :test_poller_pinned_exit_rests,
+        name: :test_poller_pinned_exit_loops,
         runner: MockRunner,
         poll_interval_ms: 60_000,
         felt_stores: ["/tmp"]
       )
 
-    # Pinned fires only on an explicit force-dispatch.
-    assert {:ok, _session} = Poller.dispatch_fiber(poller, fiber_id, force: true, ad_hoc: true)
+    new_sessions = fn ->
+      Enum.count(MockRunner.commands(), fn {cmd, args} ->
+        cmd == "tmux" and hd(args) == "new-session" and session in args
+      end)
+    end
 
-    # Worker exits while the document is still active (the interactive-intake
-    # case — the worker did NOT self-close).
-    MockRunner.remove_tmux_session(Dispatcher.session_name(fiber_id))
+    # First dispatch (a force-dispatch is how the strip's "start" gesture fires).
+    assert {:ok, _session} = Poller.dispatch_fiber(poller, fiber_id, force: true, ad_hoc: true)
+    assert new_sessions.() == 1
+
+    # Worker exits while the document is still active (it did NOT self-close).
+    MockRunner.remove_tmux_session(session)
     send(poller, {:worker_exited, fiber_id, :normal_exit, false})
-    # Flush the GenServer mailbox: a synchronous call only returns after the
-    # preceding :worker_exited info message has been fully handled (write incl.),
-    # so the disk read below is deterministic — no sleep race.
+    # Flush the GenServer mailbox so the exit write lands before the disk read.
     _ = Poller.snapshot(poller)
 
-    # The on-disk document is untouched: still resting active, never closed.
-    # Reverting the exit gate to `cyclical_role?` flips this file to status:closed.
+    # The on-disk document is untouched: still active, never closed/awaiting.
+    # Reverting the exit gate to treat pinned as cyclical flips this to closed.
     doc = File.read!("/private/tmp/.felt/#{fiber_id}/#{leaf}.md")
     assert doc =~ ~r/status:\s*active/
     refute doc =~ ~r/status:\s*closed/
     refute doc =~ "closed-at"
+
+    # The loop: the next poll re-dispatches the still-active, no-longer-running
+    # role (a SECOND new-session for the same session name).
+    send(poller, :run_poll_cycle)
+    assert wait_until(fn -> new_sessions.() == 2 end)
   end
 
   test "a standing worker exit DOES close the role to awaiting-review (status:closed)" do
@@ -2245,7 +2279,7 @@ defmodule Shuttle.PollerTest do
     assert Enum.any?(snap.eligible, &(&1.fiber_id == fiber_id and &1.state == "running"))
   end
 
-  test "poller adopts a live orphan session for a resting pinned role (no dispatch-rescue)" do
+  test "poller adopts a live orphan session for a looping pinned role (no duplicate dispatch)" do
     # Regression for the daemon-restart-drops-all-adoptions bug. After a restart,
     # `candidate_session_lookup` must record the fiber_id for a session name seen
     # exactly once — every uid-keyed name is unique to one fiber. A `Map.update/4`
@@ -2253,12 +2287,11 @@ defmodule Shuttle.PollerTest do
     # applied to the default), so a single-occurrence session kept empty sets,
     # resolved to nil, and the live worker was never adopted.
     #
-    # Oneshots MASKED this: the poll's dispatch attempt hits :already_running and
-    # `do_dispatch` adopts the session directly, bypassing the lookup. A pinned
-    # role never auto-dispatches, so `candidate_session_lookup` is its ONLY
-    # adoption path — exactly the case that broke in the field (operator/
-    # morning-post showed at-rest on the board while dispatch refused them as
-    # already_running).
+    # A looping pinned role (Option D: status:active dispatches) with a live
+    # worker must be adopted as running — NOT duplicate-dispatched by the loop —
+    # whether via `candidate_session_lookup` or the dispatch→:already_running
+    # adopt. The field symptom this guards: operator/morning-post showing at-rest
+    # on the board while a live worker existed.
     fiber_id = "tests/pinned-orphan"
     uid = "01KTHDNZS287ZSSG8X8V59XKWD"
     MockRunner.set_fiber(fiber_id, make_fiber(fiber_id, %{"uid" => uid, "status" => "active"}))

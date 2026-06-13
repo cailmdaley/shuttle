@@ -17,21 +17,21 @@ func newPinCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "pin <fiber>",
-		Short: "Install a fiber as a pinned, schedule-less dispatchable role",
-		Long: `Install the fiber as a pinned role: a schedule-less umbrella concern the
-daemon NEVER auto-dispatches. The only way it fires is an explicit
-force-dispatch — the kanban's "Dispatch ▸" affordance, or the /dispatch verb.
+		Short: "Install a fiber as a pinned, schedule-less perennial role",
+		Long: `Install the fiber as a pinned role: a schedule-less umbrella concern that
+rests PARKED on the board's pinned strip (status:open) until you start it.
 
-  shuttle pin <fiber> --project-dir "$PWD"                      # at rest, default agent
+  shuttle pin <fiber> --project-dir "$PWD"                      # parked, default agent
   shuttle pin <fiber> --project-dir "$PWD" --model claude-opus  # explicit agent
 
 The shuttle: block is validated before any file is touched.
 
-A pinned role's steady state is status:active "at rest": the poller skips it
-(kind=pinned is never eligible for auto-dispatch), so it sits on the board's
-pinned strip waiting for a human (or another agent) to dispatch it on demand. A
-run closes the fiber to awaiting-review; accepting it re-arms back to rest. This
-is the standing-role lifecycle minus the cron.
+A pinned role is a oneshot whose resting state is status:open on the strip
+(Option D). Parked (status:open) the poller skips it; started (status:active,
+the board's strip → In-flight gesture) it LOOPS — dispatched, and re-dispatched
+on every worker exit — until a human parks it again (In-flight → strip, which
+writes active → open) or a worker closes it. Perennial: you park it, you don't
+delete it.
 
 Use 'shuttle install' for one-shot roles and 'shuttle repeat' for recurring
 (cron) standing roles.`,
@@ -77,16 +77,14 @@ Use 'shuttle install' for one-shot roles and 'shuttle repeat' for recurring
 				return fmt.Errorf("invalid input")
 			}
 
-			// Pinned steady state is status:active "at rest" — never dispatched by
-			// the poller, only by an explicit force-dispatch. Closed fibers must be
-			// reopened first.
+			// Pinned rest is status:open "parked on the strip" (Option D). Pin lands
+			// the role parked, not looping: starting the loop is the explicit strip
+			// → In-flight gesture (open → active). Any prior status — including
+			// closed (revive as a parked role) — settles to open.
 			statusBefore := f.Status()
-			if statusBefore == "closed" {
-				return fmt.Errorf("fiber %s has status: closed; reopen it before pinning", args[0])
-			}
 			statusChanged := false
-			if statusBefore != "active" {
-				f.SetStatus("active")
+			if statusBefore != "open" {
+				f.SetStatus("open")
 				statusChanged = true
 			}
 
@@ -94,7 +92,7 @@ Use 'shuttle install' for one-shot roles and 'shuttle repeat' for recurring
 				return fmt.Errorf("writing fiber: %w", err)
 			}
 
-			fmt.Fprintf(cmd.OutOrStdout(), "pinned %s (schedule-less; dispatch on demand)\n", args[0])
+			fmt.Fprintf(cmd.OutOrStdout(), "pinned %s (parked on the strip; start it to loop)\n", args[0])
 			fmt.Fprintf(cmd.OutOrStdout(), "  host: %s\n", block.Host)
 			if block.Agent != "" {
 				fmt.Fprintf(cmd.OutOrStdout(), "  agent: %s\n", block.Agent)
@@ -102,9 +100,9 @@ Use 'shuttle install' for one-shot roles and 'shuttle repeat' for recurring
 			fmt.Fprintf(cmd.OutOrStdout(), "  project_dir: %s\n", block.ProjectDir)
 			if statusChanged {
 				if statusBefore == "" {
-					fmt.Fprintln(cmd.OutOrStdout(), "  status: active (set; was missing)")
+					fmt.Fprintln(cmd.OutOrStdout(), "  status: open (set; was missing)")
 				} else {
-					fmt.Fprintf(cmd.OutOrStdout(), "  status: %s → active\n", statusBefore)
+					fmt.Fprintf(cmd.OutOrStdout(), "  status: %s → open\n", statusBefore)
 				}
 			}
 			return nil

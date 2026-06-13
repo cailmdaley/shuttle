@@ -76,15 +76,16 @@ defmodule Shuttle.Actions do
     status = Map.get(fiber, "status")
 
     cond do
-      # Temper on a cyclical role (standing/pinned) with no verdict is ACCEPT
-      # in every non-draft state — running (an interactive run just wrapped,
-      # worker alive or freshly killed), armed (`status: active`, exit not yet
-      # marked awaiting), or awaiting (`status: closed`). close_tempered is a
-      # ONESHOT terminus; resolving it here checked a standing role off for
-      # good (the morning-post temper bug, 2026-06-12). This clause MUST
-      # precede the generic `running?` clauses — a live or just-killed worker
-      # is exactly the state where status hasn't flipped to closed yet.
-      cyclical?(shuttle) and untempered?(fiber) and status != "open" and
+      # Temper on a STANDING role with no verdict is ACCEPT in every non-draft
+      # state — running (an interactive run just wrapped, worker alive or freshly
+      # killed), armed (`status: active`, exit not yet marked awaiting), or
+      # awaiting (`status: closed`). close_tempered is a ONESHOT terminus;
+      # resolving it here checked a standing role off for good (the morning-post
+      # temper bug, 2026-06-12). This clause MUST precede the generic `running?`
+      # clauses — a live or just-killed worker is exactly the state where status
+      # hasn't flipped to closed yet. Pinned is NOT standing (Option D): a
+      # looping pinned role tempered = retire (close_tempered), the oneshot path.
+      standing?(shuttle) and untempered?(fiber) and status != "open" and
           target == "tempered" ->
         :accept_run
 
@@ -108,25 +109,26 @@ defmodule Shuttle.Actions do
       # A CLOSED standing role with no verdict (`tempered` unset) is the
       # new-model AWAITING signal: status:closed + untempered = "ran this cycle,
       # pending a human verdict" — felt-native, no `review.state`. Only a
-      # STANDING role re-arms (a oneshot closes for good). The verdict gestures:
-      # inFlight/tempered = keep it (accept-run → advance the schedule),
-      # composted = reject (close-composted), drafts = park the role as a
-      # paused draft (reopen-draft — stopping a role for now is not the same
-      # verdict as composting it), awaitingReview = no-op (a same-column drop
-      # stays in review). This clause MUST precede the generic
+      # STANDING role re-arms (a oneshot — and, under Option D, a pinned role —
+      # closes for good). The verdict gestures: inFlight/tempered = keep it
+      # (accept-run → advance the schedule), composted = reject (close-composted),
+      # drafts = park the role as a paused draft (reopen-draft — stopping a role
+      # for now is not the same verdict as composting it), awaitingReview = no-op
+      # (a same-column drop stays in review). This clause MUST precede the generic
       # `status == "closed"` clauses below — those resolve a closed fiber to
       # reopen/close, which would TERMINATE the role instead of re-arming it
       # (the slice-1 entanglement). Tempered-true and composted (tempered:false)
-      # closed roles are termini and fall through to the generic clauses.
-      status == "closed" and cyclical?(shuttle) and untempered?(fiber) and
+      # closed roles, and all closed pinned/oneshot roles, are termini and fall
+      # through to the generic clauses.
+      status == "closed" and standing?(shuttle) and untempered?(fiber) and
           target in ["inFlight", "tempered"] ->
         :accept_run
 
-      status == "closed" and cyclical?(shuttle) and untempered?(fiber) and
+      status == "closed" and standing?(shuttle) and untempered?(fiber) and
           target == "composted" ->
         :close_composted
 
-      status == "closed" and cyclical?(shuttle) and untempered?(fiber) and
+      status == "closed" and standing?(shuttle) and untempered?(fiber) and
           target == "awaitingReview" ->
         :close_awaiting_review
 
@@ -220,12 +222,13 @@ defmodule Shuttle.Actions do
     end
   end
 
-  # Cyclical = standing OR pinned: both close to awaiting-review after a run and
-  # re-arm on accept, so both honor the same verdict gestures (accept-run vs.
-  # compost). Pinned roles never auto-dispatch, but once a run has closed them to
-  # awaiting-review the board's keep/reject gestures resolve identically.
-  defp cyclical?(shuttle),
-    do: Map.get(shuttle, "kind", Map.get(shuttle, "mode")) in ["standing", "pinned"]
+  # Only STANDING roles have the active→closed→active cron lifecycle that the
+  # accept/re-arm verdict gestures advance. Pinned roles are not cyclical under
+  # Option D — they loop while `active` and park at `open`, so a pinned role that
+  # a worker self-closed is a plain terminus (temper = retire), resolved by the
+  # generic closed-card clauses just like a oneshot.
+  defp standing?(shuttle),
+    do: Map.get(shuttle, "kind", Map.get(shuttle, "mode")) == "standing"
 
   # `tempered` absent (nil) is the no-verdict state — the awaiting signal for a
   # closed fiber. `tempered: true` (accepted oneshot terminus) and

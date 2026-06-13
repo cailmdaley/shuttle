@@ -71,7 +71,7 @@ defmodule ShuttleWeb.AstraController do
   defp run_bake(conn, path, universe) do
     args = [@bake_script, path] ++ if universe in [nil, ""], do: [], else: [universe]
 
-    case System.cmd("node", args, stderr_to_stdout: false) do
+    case bake_cmd(args) do
       {out, 0} ->
         conn |> put_resp_content_type("application/json") |> send_resp(200, out)
 
@@ -81,9 +81,21 @@ defmodule ShuttleWeb.AstraController do
     end
   rescue
     e in ErlangError ->
-      # `node` not on PATH, or otherwise unspawnable.
+      # `bash` unspawnable — both invocation paths failed.
       Logger.warning("astra bake could not run for #{path}: #{Exception.message(e)}")
       conn |> put_status(500) |> json(%{error: "bake could not run", detail: Exception.message(e)})
+  end
+
+  # Run the bake. Try `node` on the daemon's PATH first (fast); if it isn't there
+  # — a respawn-loop launcher may source asdf (erlang/elixir) but not nvm — retry
+  # through a login shell so the user's node (nvm/homebrew/…) is found. The bake
+  # is on-demand, so the extra shell on the fallback is cheap. `$@` carries the
+  # args so a path with spaces survives.
+  defp bake_cmd(args) do
+    System.cmd("node", args, stderr_to_stdout: false)
+  rescue
+    ErlangError ->
+      System.cmd("bash", ["-lc", ~s(exec node "$@"), "bake" | args], stderr_to_stdout: false)
   end
 
   # Relay the owning remote's JSON + status verbatim, so a remote 404/502 reads

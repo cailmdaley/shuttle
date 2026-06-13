@@ -99,38 +99,40 @@ defmodule Shuttle.LifecycleStoreTest do
     end
   end
 
-  describe "pinned roles share the cyclical lifecycle (no schedule)" do
-    test "mark_awaiting → accept re-arms a pinned role back to its resting active state" do
+  describe "pinned roles are not cyclical (Option D: loop while active, park at open)" do
+    test "accept and mark_awaiting reject a pinned role (standing-only)" do
+      # Pinned is no longer cyclical (Option D): a pinned run does not close to
+      # awaiting-review and there is no accept/re-arm cycle. mark_awaiting (the
+      # standing worker-exit closer) and accept (the standing recurrence-advance)
+      # both reject a pinned block by KIND — even in the awaiting-shaped
+      # status:closed + untempered state a standing role would accept from.
       with_pinned_role(
         fn fiber_id, path ->
-          # A pinned run exits → awaiting review (status:closed, untempered).
-          assert {:ok, _} = LifecycleStore.mark_awaiting(fiber_id)
+          assert {:error, msg} = LifecycleStore.mark_awaiting(fiber_id)
+          assert msg =~ "standing"
+          # Untouched: mark_awaiting did not close it.
           assert read_frontmatter(path)["status"] == "closed"
 
-          # Accept re-arms to rest. No schedule → no "next due"; the message names
-          # the pinned re-arm instead.
-          assert {:ok, message} = LifecycleStore.accept(fiber_id)
-          assert message =~ "pinned role re-armed at rest"
-          refute message =~ "next due:"
-
-          fm = read_frontmatter(path)
-          assert fm["status"] == "active"
-          refute Map.has_key?(fm, "tempered")
-          refute Map.has_key?(fm, "closed-at")
+          assert {:error, accept_msg} = LifecycleStore.accept(fiber_id)
+          assert accept_msg =~ "standing"
         end,
-        status: "active"
+        status: "closed"
       )
     end
 
-    test "rearm re-arms a closed pinned role for force-dispatch" do
+    test "rearm starts a parked pinned role (open → active) for force-dispatch" do
+      # The board's strip → In-flight "start" gesture force-dispatches a parked
+      # (status:open) pinned role; maybe_force_rearm → rearm writes open → active
+      # so the role both spawns now AND keeps looping. rearm covers pinned because
+      # a pinned role is perennial (its active state re-dispatches).
       with_pinned_role(
         fn fiber_id, path ->
-          assert {:ok, _} = LifecycleStore.mark_awaiting(fiber_id)
+          assert read_frontmatter(path)["status"] == "open"
           assert {:ok, message} = LifecycleStore.rearm(fiber_id)
           assert message =~ "re-armed"
           assert read_frontmatter(path)["status"] == "active"
         end,
-        status: "active"
+        status: "open"
       )
     end
   end
@@ -178,9 +180,10 @@ defmodule Shuttle.LifecycleStoreTest do
   end
 
   # Pinned variant of with_doc_awaiting_role: a schedule-less pinned block. The
-  # pinned role's steady state is status:active "at rest".
+  # pinned role's parked rest state is status:open on the strip (Option D);
+  # status:active is the looping state.
   defp with_pinned_role(fun, opts) do
-    status = Keyword.get(opts, :status, "active")
+    status = Keyword.get(opts, :status, "open")
     tempered = Keyword.get(opts, :tempered, nil)
 
     loom = Path.join(System.tmp_dir!(), "shuttle-lifecycle-pin-test-#{System.unique_integer([:positive])}")

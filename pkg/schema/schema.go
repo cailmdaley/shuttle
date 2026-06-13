@@ -123,11 +123,12 @@ func (b *Block) UnmarshalJSON(data []byte) error {
 //
 //   - oneshot  — one-time dispatch, picked up on the next poll when status:active.
 //   - standing — recurring; the cron `schedule` decides when the poller dispatches.
-//   - pinned   — schedule-less umbrella role the poller NEVER auto-dispatches; it
-//     fires only on an explicit force-dispatch (the kanban's "Dispatch ▸" / the
-//     `/dispatch` verb). Steady state is status:active "at rest"; a run closes to
-//     awaiting-review and an accept re-arms it back to rest (the standing-role
-//     lifecycle minus the cron).
+//   - pinned   — schedule-less umbrella role that rests PARKED on the board's
+//     pinned strip (status:open). Started (status:active, the strip → In-flight
+//     gesture) it LOOPS like a oneshot — dispatched and re-dispatched on every
+//     worker exit — until a human parks it (In-flight → strip, active → open) or
+//     a worker closes it. A oneshot whose resting state is open; perennial
+//     (Option D).
 var ValidKinds = []string{"oneshot", "standing", "pinned"}
 
 // ---- Validation ------------------------------------------------------------
@@ -180,11 +181,12 @@ func Validate(b *Block, agents *AgentRegistry) ValidationErrors {
 		}
 	}
 
-	// A pinned role has no recurrence — it never auto-dispatches, so a schedule
-	// would be meaningless (and misleading on the board). Reject the combination
-	// loudly rather than silently ignoring the schedule.
+	// A pinned role has no cron recurrence — its loop is driven by status:active
+	// (re-dispatch on every worker exit), not a schedule. A schedule would be
+	// meaningless (and misleading on the board). Reject the combination loudly
+	// rather than silently ignoring the schedule.
 	if b.Kind == "pinned" && b.Schedule != nil {
-		add("schedule", "not allowed for kind=pinned (pinned roles never auto-dispatch)")
+		add("schedule", "not allowed for kind=pinned (pinned roles loop on status, not a cron)")
 	}
 
 	if b.Kind == "standing" {

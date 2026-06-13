@@ -1,15 +1,20 @@
 defmodule Shuttle.LifecycleStore do
   @moduledoc """
-  Standing-role lifecycle transitions (accept / resume / mark-awaiting), written
-  straight to the felt document.
+  Standing-role lifecycle transitions (accept / resume / mark-awaiting), plus the
+  force-dispatch `rearm` shared by standing and pinned roles, written straight to
+  the felt document.
 
   The document is the single source of truth: `status`, `tempered`, `outcome`,
   the cron `schedule`, `agent`, `host`. Accept and resume re-arm an awaiting
-  role (`status: closed` + untempered) by writing `status: active` back to the
-  document; `mark_awaiting` is the worker-exit writer that flips it closed. There
-  is no runtime store (slice 6 deleted it) and no review axis (slice 4 removed
-  it): the document carries the entire lifecycle, and `next_due` is recomputed
-  from the cron schedule on the next poll.
+  STANDING role (`status: closed` + untempered) by writing `status: active` back
+  to the document; `mark_awaiting` is the worker-exit writer that flips it closed.
+  `rearm` is the force-dispatch open: it writes `status: active` for any perennial
+  role — standing or pinned — so the board's strip → In-flight "start" gesture
+  loops a parked pinned role (open → active). There is no runtime store (slice 6
+  deleted it) and no review axis (slice 4 removed it): the document carries the
+  entire lifecycle, and `next_due` is recomputed from the cron schedule on the
+  next poll. Pinned is not cyclical (Option D): it loops while active and parks
+  at open, so it has no accept/awaiting cycle here — only the `rearm` open.
   """
 
   alias Shuttle.{Cron, FeltStores}
@@ -24,30 +29,18 @@ defmodule Shuttle.LifecycleStore do
   def accept(fiber_id, _opts \\ []) when is_binary(fiber_id) do
     with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
-         :ok <- require_cyclical(shuttle),
+         :ok <- require_standing(shuttle),
          :ok <- require_doc_acceptable(frontmatter) do
       # Awaiting is `status: closed` + untempered in the document itself — there
       # is no `review.state` (slice 4 removed the review axis). Recognize it
-      # straight from the doc and re-arm. A standing role advances its cron
-      # recurrence (next_due from the schedule); a pinned role has no schedule,
-      # so it simply returns to its resting `status: active`. The previous run's
-      # outcome is preserved — it stays the card's headline until the next run
-      # overwrites it (accept no longer blanks it; see update_document).
-      if pinned_block?(shuttle) do
-        accept_pinned(fiber_id, path, frontmatter, body)
-      else
-        accept_from_doc(fiber_id, path, frontmatter, body, shuttle)
-      end
+      # straight from the doc and re-arm, advancing the cron recurrence (next_due
+      # from the schedule). The previous run's outcome is preserved — it stays
+      # the card's headline until the next run overwrites it (accept no longer
+      # blanks it; see update_document). Accept is standing-only: a pinned role
+      # is not cyclical (Option D — it loops while active, parks at open), so it
+      # has no awaiting/accept cycle to advance.
+      accept_from_doc(fiber_id, path, frontmatter, body, shuttle)
     end
-  end
-
-  # Pinned accept: re-arm to the resting `status: active` with no recurrence to
-  # advance. The document carries the whole lifecycle; there is no schedule and
-  # no next_due to compute (the poller never auto-dispatches a pinned role).
-  defp accept_pinned(fiber_id, path, frontmatter, body) do
-    {:ok, frontmatter} = update_document(frontmatter)
-    write_fiber!(path, evict_runtime_keys(frontmatter), body)
-    {:ok, "accepted run for #{fiber_id}\n  pinned role re-armed at rest (status: active)\n"}
   end
 
   defp accept_from_doc(fiber_id, path, frontmatter, body, shuttle) do
@@ -67,7 +60,7 @@ defmodule Shuttle.LifecycleStore do
   def resume(fiber_id) when is_binary(fiber_id) do
     with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
-         :ok <- require_cyclical(shuttle),
+         :ok <- require_standing(shuttle),
          :ok <- require_doc_awaiting(frontmatter) do
       resume_from_doc(fiber_id, path, frontmatter, body)
     end
@@ -107,7 +100,7 @@ defmodule Shuttle.LifecycleStore do
   def mark_awaiting(fiber_id) when is_binary(fiber_id) do
     with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
-         :ok <- require_cyclical(shuttle) do
+         :ok <- require_standing(shuttle) do
       frontmatter =
         frontmatter
         |> Map.put("status", "closed")
@@ -121,15 +114,19 @@ defmodule Shuttle.LifecycleStore do
   end
 
   @doc """
-  Re-arm a standing role to `status: active` regardless of its current verdict.
+  Re-arm a PERENNIAL role (standing or pinned) to `status: active` regardless of
+  its current verdict.
 
   This is the **force-dispatch** re-arm: an explicit human "go" from the board
   (force-dispatch) is the verdict, so unlike `accept`/`resume` it does not
   require the awaiting precondition — it reopens a closed role whether it was
-  awaiting, tempered, or composted. Clears `tempered`/`closed-at`, keeps the
-  outcome, and wipes daemon-owned runtime keys. A no-op `{:ok, ...}` for a role
-  already active, and an `{:error, _}` for a non-standing or unreadable fiber so
-  the dispatch path can log without crashing.
+  awaiting, tempered, or composted, and (Option D) starts a parked pinned role
+  by writing `open → active` so the board's strip → In-flight "start" gesture
+  both spawns the worker now AND leaves the role looping. Clears
+  `tempered`/`closed-at`, keeps the outcome, and wipes daemon-owned runtime keys.
+  A no-op `{:ok, ...}` for a role already active, and an `{:error, _}` for a
+  oneshot or unreadable fiber (a force-dispatched oneshot runs once and stays
+  put — no loop to revive) so the dispatch path can log without crashing.
 
   Mirror of `mark_awaiting/1` (the worker-exit closer): this is the open.
   """
@@ -137,7 +134,7 @@ defmodule Shuttle.LifecycleStore do
   def rearm(fiber_id) when is_binary(fiber_id) do
     with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
-         :ok <- require_cyclical(shuttle) do
+         :ok <- require_perennial(shuttle) do
       if Map.get(frontmatter, "status") == "active" do
         {:ok, "#{fiber_id} already active\n"}
       else
@@ -219,21 +216,30 @@ defmodule Shuttle.LifecycleStore do
     end
   end
 
-  # Cyclical = standing OR pinned: both have the active→closed→active lifecycle
-  # this module implements. Standing roles advance a cron recurrence on accept;
-  # pinned roles return to their resting active state. Oneshots and non-shuttle
-  # fibers are rejected — they have no re-arm.
-  defp require_cyclical(%{"kind" => kind}) when kind in ["standing", "pinned"], do: :ok
-  defp require_cyclical(%{"mode" => mode}) when mode in ["standing", "pinned"], do: :ok
+  # Standing = the cron-driven active→closed→active lifecycle this module's
+  # accept/resume/mark_awaiting paths implement (a run closes to awaiting-review;
+  # accept advances the recurrence). Pinned is NOT standing under Option D — it
+  # loops while active and parks at open, with no awaiting/accept cycle — so
+  # those three paths reject it along with oneshots and non-shuttle fibers.
+  defp require_standing(%{"kind" => "standing"}), do: :ok
+  defp require_standing(%{"mode" => "standing"}), do: :ok
 
-  defp require_cyclical(shuttle),
+  defp require_standing(shuttle),
     do:
       {:error,
-       "accept/resume store path only applies to standing or pinned roles (kind=#{inspect(Map.get(shuttle, "kind"))})"}
+       "accept/resume/mark-awaiting store path only applies to standing roles (kind=#{inspect(Map.get(shuttle, "kind"))})"}
 
-  defp pinned_block?(%{"kind" => "pinned"}), do: true
-  defp pinned_block?(%{"mode" => "pinned"}), do: true
-  defp pinned_block?(_), do: false
+  # Perennial = standing OR pinned: roles whose `active` state means perennial
+  # dispatch (a cron loop, or the Option-D poll loop). `rearm` (the force-dispatch
+  # re-arm) writes them to `active`; a oneshot is rejected — force-dispatching a
+  # oneshot runs it once and leaves its status put, with no loop to revive.
+  defp require_perennial(%{"kind" => kind}) when kind in ["standing", "pinned"], do: :ok
+  defp require_perennial(%{"mode" => mode}) when mode in ["standing", "pinned"], do: :ok
+
+  defp require_perennial(shuttle),
+    do:
+      {:error,
+       "rearm only applies to standing or pinned roles (kind=#{inspect(Map.get(shuttle, "kind"))})"}
 
   defp require_schedule(%{"schedule" => schedule}) when is_map(schedule), do: {:ok, schedule}
   defp require_schedule(_), do: {:error, "fiber has no schedule"}

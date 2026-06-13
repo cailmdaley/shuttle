@@ -1718,13 +1718,14 @@ defmodule Shuttle.Poller do
         MapSet.member?(state.claimed, fiber_id) ->
           false
 
-        # Pinned roles are NEVER auto-dispatched — not on status, not on a cron.
-        # An active pinned fiber is "at rest"; it fires only on an explicit
-        # force-dispatch (force_dispatch_eligible?, which bypasses this gate).
-        # This branch MUST precede the oneshot fallthrough below, or an active
-        # pinned role would dispatch as a oneshot.
-        Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot")) == "pinned" ->
-          false
+        # A pinned role dispatches exactly like a oneshot: an `active` pinned
+        # fiber is LOOPING — eligible → dispatch → worker exits active →
+        # re-dispatch next poll, until a worker sets `status: closed` or a human
+        # parks it (`active → open`, the `pause` verb). `open` is the parked rest
+        # state, already excluded by the `status != "active"` gate above. So
+        # pinned needs no bespoke branch here; it falls through to the oneshot
+        # dependency check below. (Option D: parked=open, looping=active — the
+        # never-auto-dispatch special case was deleted.)
 
         # Standing roles have additional preconditions; oneshots go to dep check.
         # Support both new-format (kind:) and old-format (mode:) shuttle blocks.
@@ -2187,11 +2188,13 @@ defmodule Shuttle.Poller do
     end)
   end
 
-  # Re-arm a standing role on the forced path. Returns the fiber map with
-  # `status` reflected as "active" so the running-state snapshot built later in
-  # this dispatch is coherent without an extra felt re-read. A failed re-arm
-  # (non-standing, unreadable) is logged and the fiber passes through unchanged —
-  # force-dispatch of a oneshot or a non-awaiting role still spawns as before.
+  # Re-arm a perennial role (standing or pinned) on the forced path. Returns the
+  # fiber map with `status` reflected as "active" so the running-state snapshot
+  # built later in this dispatch is coherent without an extra felt re-read. This
+  # is what makes the board's strip → In-flight "start" gesture both spawn now
+  # AND leave a pinned role looping (open → active). A failed re-arm (oneshot,
+  # unreadable) is logged and the fiber passes through unchanged — force-dispatch
+  # of a oneshot still spawns it for a single run.
   defp maybe_force_rearm(fiber, opts) do
     if Keyword.get(opts, :force, false) and Map.get(fiber, "status") != "active" do
       fiber_id = Map.get(fiber, "id", "")
@@ -2206,8 +2209,8 @@ defmodule Shuttle.Poller do
           |> Map.delete("closed-at")
 
         {:error, _reason} ->
-          # Oneshots and non-standing fibers aren't re-armable; that's expected —
-          # force-dispatch still spawns them.
+          # Oneshots aren't re-armable; that's expected — force-dispatch still
+          # spawns them for a single run.
           fiber
       end
     else
@@ -2633,10 +2636,10 @@ defmodule Shuttle.Poller do
   # lifecycle overlay merge. Supports both the new `kind:` and legacy `mode:`
   # shapes. Only standing roles need the dead-orphan awaiting mark: an armed
   # standing document (`status: active`) would re-fire on the next cron tick if
-  # its worker died unobserved, so it must be closed. A PINNED role never
-  # re-fires (it's at rest at `status: active`, force-dispatch only), so a
-  # pinned worker dying unobserved correctly leaves the document resting on the
-  # strip — closing it would only add accept-friction for no anti-re-fire gain.
+  # its worker died unobserved, so it must be closed. A PINNED role is
+  # oneshot-shaped (Option D): a dead pinned worker correctly leaves the document
+  # at `status: active`, and the next poll re-dispatches it (the loop) just like
+  # an orphaned oneshot — there is nothing to close.
   defp standing_block?(shuttle) when is_map(shuttle) do
     Map.get(shuttle, "kind", Map.get(shuttle, "mode")) == "standing"
   end
@@ -2753,23 +2756,27 @@ defmodule Shuttle.Poller do
                     # anchor, both doc-representable. Write BEFORE release_claim
                     # so the document reflects awaiting before the claim frees (a
                     # re-poll racing the release then reads `status: closed` and
-                    # skips re-dispatch). Pinned roles do NOT come here: they
-                    # never auto-re-fire, so they fall through to the resting
-                    # branch below and stay `status: active` on the strip.
+                    # skips re-dispatch). Pinned roles do NOT come here
+                    # (`standing_role?` is standing-only): they loop instead, so
+                    # they fall through to the resting branch below and stay
+                    # `status: active`, which re-dispatches next poll.
                     mark_standing_awaiting(fiber_id)
 
                     release_claim(state, fiber_id)
 
                   true ->
-                    # Still active — just release the claim. Two shapes land here:
-                    #  • A pinned role at rest: `eligible?` never re-dispatches it
-                    #    (force-only), so it simply stays `status: active` on the
-                    #    strip, ready for the next force-dispatch. This is the
-                    #    resting state the kanban classifies to the pinned strip.
+                    # Still active — just release the claim. Two shapes land here,
+                    # and both re-dispatch on the next poll (status:active + no
+                    # live session → eligible):
+                    #  • A LOOPING pinned role: it stays `status: active` and the
+                    #    next poll re-dispatches it (Option D: active=looping). A
+                    #    human parks it by dragging In-flight → strip, which writes
+                    #    `active → open` (the `pause` verb); `open` then fails the
+                    #    eligible? status gate and the loop stops.
                     #  • A multi-session oneshot continuation: the next poll
-                    #    re-picks it (status:active + no live session → eligible)
-                    #    and starts a fresh session (no resume_mode:previous on
-                    #    file — retries collapsed into the poll loop, slice 6).
+                    #    re-picks it and starts a fresh session (no
+                    #    resume_mode:previous on file — retries collapsed into the
+                    #    poll loop, slice 6).
                     release_claim(state, fiber_id)
                 end
 
@@ -3045,13 +3052,12 @@ defmodule Shuttle.Poller do
   # Does this role's worker exit close it to awaiting-review? Only STANDING
   # (cron-driven) roles do. Marking a role awaiting on exit is an anti-re-fire
   # gate — `status: closed` is what stops the cron from re-dispatching the role
-  # again this cycle. A PINNED role never auto-re-fires (it's "at rest" at
-  # `status: active`; `eligible?` skips it, dispatch is force-only), so the gate
-  # buys nothing for it and only adds accept-friction: its steady state is
-  # resting `status: active` on the strip, and that's where its worker exit
-  # should leave it. (A pinned worker that genuinely wants review still self-
-  # closes to `status: closed` — handled by the `status == "closed"` branch
-  # before this gate is reached.) The "it ran" record lives in felt history
+  # again this cycle. A PINNED role does NOT come here (Option D: pinned is not
+  # cyclical, just a oneshot-shaped looper): on exit-while-active it stays
+  # `status: active` and re-dispatches next poll (the loop); a human stops the
+  # loop by parking it (`active → open`). A pinned worker that's genuinely done
+  # self-closes to `status: closed` — handled by the `status == "closed"` branch
+  # before this gate is reached. The "it ran" record lives in felt history
   # either way (log_worker_exit), not in the status field.
   defp standing_role?(fiber, state) do
     case fetch_standing_role(Map.get(fiber, "id", ""), state) do
