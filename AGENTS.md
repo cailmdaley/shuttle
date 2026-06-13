@@ -35,7 +35,51 @@ payload. A new `git_short_sha` only proves `BuildInfo` was rebuilt; if the live
 payload still has old semantics, run `make clean && make build`, then let the
 respawn loop restart the daemon from the clean escript.
 
-Candide: OTP 27.3.4.12 pinned in `~/.tool-versions` (OTP 28.0.2 had a compilation crash — do not upgrade to 28.0.x). Daemon log: `~/.shuttle/shuttle.log`. Respawn loop in tmux session `shuttle-daemon`; `make stop` lets it auto-restart with the new binary.
+**The respawn loop owns the remote daemon — `make stop`/`make all` may not
+cycle it.** On candide/cineca a `while true; ./bin/shuttle start` loop in tmux
+session `shuttle-daemon` owns the live daemon. `make stop`/`make all` target the
+pidfile that `make start` writes, which is *not* the respawn-spawned daemon, so
+they can build a fresh `bin/shuttle` yet leave the old binary serving `:4000`. To
+actually cycle to the new binary, **kill the `:4000` listener directly**
+(`lsof -ti:4000 -sTCP:LISTEN | xargs kill`) — the respawn loop restarts it from
+the rebuilt escript. Confirm `git_short_sha` flipped; if not, the old process is
+still bound. **candide startup is slow (~2 min)** — it scans large shapepipe felt
+stores and adopts orphan sessions before binding `:4000`; wait it out, don't
+assume a crash.
+
+Candide: OTP 27.3.4.12 pinned in `~/.tool-versions`. Daemon log:
+`~/.shuttle/shuttle.log`. cineca runs OTP 28.0.2 and **compiles fine** (the old
+"OTP 28.0.x compilation crash" no longer reproduces on current `main`; only a
+non-fatal "regexes re-compiled at runtime" perf warning remains — OTP 28.1+ or
+27- silences it).
+
+**The UI bundle is shipped, not built on-host.** `make all` rebuilds only the
+Elixir escript — it does *not* build `ui/dist`. And the UI **can't** be built on
+the clusters from a source-only `lightcone-ui` clone: the aliased renderer source
+imports its myst peers (`myst-to-react`, `@myst-theme/*`), which Node resolves
+from `lightcone-ui`'s *own* `node_modules` — present only after a `pnpm install`
+of that workspace. But the bundle is host-independent static output, so the lean
+path is **build `ui/dist` locally (where the deps resolve) and `rsync` it**:
+
+```bash
+cd ui && npm run build              # locally; lightcone-ui present → paper entry included
+rsync -az --delete ui/dist/ candide:~/Documents/projects/shuttle/ui/dist/
+rsync -az --delete ui/dist/ cineca:~/Documents/projects/shuttle/ui/dist/
+```
+
+(The renderer is compiled *into* the bundle, so a remote serving the shipped
+`dist` self-serves the paper render — it needs no `lightcone-ui` at runtime.)
+
+**The ASTRA paper path needs node + a built MySTRA on each owning host.**
+`GET /api/v1/astra` is owner-routed and shells out to `priv/mystra/bake.mjs`,
+which imports MySTRA's built `dist`. Each host that *owns* astra.yamls you want
+to render needs: `node` (any v22+) and a MySTRA checkout built once —
+`git clone -b cail/migrate-to-astra-spec-sdk …/MySTRA && cd MySTRA && npm install
+&& npm run build` at `~/Documents/projects/LightconeResearch/MySTRA` (the sibling
+path `bake.mjs` resolves by default; its `dist/` is gitignored). The bake finds
+node via a `bash -lc` login-shell fallback, so it works even though the respawn
+loop sources asdf but not nvm. A host without node/MySTRA fails `/astra` cleanly;
+the board + fibers are unaffected.
 
 **Two artifacts, two languages, two release cadences.** The Elixir daemon
 (`bin/shuttle`) and the Go CLI (`~/go/bin/shuttle-ctl`) are independent —
