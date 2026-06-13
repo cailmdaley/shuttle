@@ -17,7 +17,7 @@ defmodule Shuttle.LifecycleStore do
   at open, so it has no accept/awaiting cycle here — only the `rearm` open.
   """
 
-  alias Shuttle.{Cron, FeltStores}
+  alias Shuttle.{Cron, FeltStores, FrontmatterEdit}
 
   # Legacy + daemon-owned shuttle keys wiped from the block on every accept /
   # resume / mark-awaiting rewrite (clean cutover, slice 5: `enabled` and
@@ -27,7 +27,7 @@ defmodule Shuttle.LifecycleStore do
 
   @spec accept(String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
   def accept(fiber_id, _opts \\ []) when is_binary(fiber_id) do
-    with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
+    with {:ok, path, raw_fm, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
          :ok <- require_standing(shuttle),
          :ok <- require_doc_acceptable(frontmatter) do
@@ -36,21 +36,20 @@ defmodule Shuttle.LifecycleStore do
       # straight from the doc and re-arm, advancing the cron recurrence (next_due
       # from the schedule). The previous run's outcome is preserved — it stays
       # the card's headline until the next run overwrites it (accept no longer
-      # blanks it; see update_document). Accept is standing-only: a pinned role
+      # blanks it; see rearm_ops). Accept is standing-only: a pinned role
       # is not cyclical (Option D — it loops while active, parks at open), so it
       # has no awaiting/accept cycle to advance.
-      accept_from_doc(fiber_id, path, frontmatter, body, shuttle)
+      accept_from_doc(fiber_id, path, raw_fm, body, shuttle)
     end
   end
 
-  defp accept_from_doc(fiber_id, path, frontmatter, body, shuttle) do
+  defp accept_from_doc(fiber_id, path, raw_fm, body, shuttle) do
     with {:ok, schedule} <- require_schedule(shuttle),
-         {:ok, next_due_at} <- Cron.next_occurrence(schedule, DateTime.utc_now()),
-         {:ok, frontmatter} <- update_document(frontmatter) do
+         {:ok, next_due_at} <- Cron.next_occurrence(schedule, DateTime.utc_now()) do
       # The document carries the entire lifecycle: writing `status: active` re-arms
       # the role, and `next_due` is recomputed from the cron schedule on the next
       # poll. There is no runtime row to upsert (slice 6).
-      write_fiber!(path, evict_runtime_keys(frontmatter), body)
+      write_fiber!(path, raw_fm, body, rearm_ops() ++ evict_runtime_ops())
 
       {:ok, "accepted run for #{fiber_id}\n  next due: #{DateTime.to_iso8601(next_due_at)}\n"}
     end
@@ -58,22 +57,21 @@ defmodule Shuttle.LifecycleStore do
 
   @spec resume(String.t()) :: {:ok, String.t()} | {:error, String.t()}
   def resume(fiber_id) when is_binary(fiber_id) do
-    with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
+    with {:ok, path, raw_fm, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
          :ok <- require_standing(shuttle),
          :ok <- require_doc_awaiting(frontmatter) do
-      resume_from_doc(fiber_id, path, frontmatter, body)
+      resume_from_doc(fiber_id, path, raw_fm, body)
     end
   end
 
-  defp resume_from_doc(fiber_id, path, frontmatter, body) do
+  defp resume_from_doc(fiber_id, path, raw_fm, body) do
     now = DateTime.utc_now()
-    {:ok, frontmatter} = update_document(frontmatter)
 
     # Re-arm by writing `status: active`; the next poll's cron window picks the
     # role up immediately (the active document IS the re-queue). No runtime row
     # (slice 6).
-    write_fiber!(path, evict_runtime_keys(frontmatter), body)
+    write_fiber!(path, raw_fm, body, rearm_ops() ++ evict_runtime_ops())
 
     {:ok,
      "resumed #{fiber_id} (standing role; re-queued for immediate dispatch)\n" <>
@@ -98,16 +96,17 @@ defmodule Shuttle.LifecycleStore do
   """
   @spec mark_awaiting(String.t()) :: {:ok, String.t()} | {:error, String.t()}
   def mark_awaiting(fiber_id) when is_binary(fiber_id) do
-    with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
+    with {:ok, path, raw_fm, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
          :ok <- require_standing(shuttle) do
-      frontmatter =
-        frontmatter
-        |> Map.put("status", "closed")
-        |> Map.put("closed-at", DateTime.to_iso8601(DateTime.utc_now()))
-        |> Map.delete("tempered")
+      ops =
+        [
+          {:put, "status", "closed"},
+          {:put, "closed-at", DateTime.to_iso8601(DateTime.utc_now())},
+          {:delete, "tempered"}
+        ] ++ evict_runtime_ops()
 
-      write_fiber!(path, evict_runtime_keys(frontmatter), body)
+      write_fiber!(path, raw_fm, body, ops)
 
       {:ok, "marked #{fiber_id} awaiting review (status: closed, untempered)\n"}
     end
@@ -132,25 +131,29 @@ defmodule Shuttle.LifecycleStore do
   """
   @spec rearm(String.t()) :: {:ok, String.t()} | {:error, String.t()}
   def rearm(fiber_id) when is_binary(fiber_id) do
-    with {:ok, path, frontmatter, body} <- read_fiber(fiber_id),
+    with {:ok, path, raw_fm, frontmatter, body} <- read_fiber(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
          :ok <- require_perennial(shuttle) do
       if Map.get(frontmatter, "status") == "active" do
         {:ok, "#{fiber_id} already active\n"}
       else
-        {:ok, frontmatter} = update_document(frontmatter)
-        write_fiber!(path, evict_runtime_keys(frontmatter), body)
+        write_fiber!(path, raw_fm, body, rearm_ops() ++ evict_runtime_ops())
         {:ok, "re-armed #{fiber_id} (status: active) for force-dispatch\n"}
       end
     end
   end
 
+  # Returns BOTH the raw frontmatter text (for surgical, byte-stable writes) and
+  # the parsed map (for the lifecycle gates: require_standing, doc_awaiting?,
+  # …). The write path edits the raw text directly and never round-trips the map
+  # through an emitter — that round-trip used to reorder keys and collapse block
+  # scalars, breaking felt indexing (see Shuttle.FrontmatterEdit).
   defp read_fiber(fiber_id) do
     with {:ok, path} <- resolve_fiber_path(fiber_id),
          {:ok, text} <- File.read(path),
          {:ok, frontmatter_yaml, body} <- split_frontmatter(text),
          {:ok, frontmatter} <- YamlElixir.read_from_string(frontmatter_yaml) do
-      {:ok, path, stringify_keys(frontmatter || %{}), body}
+      {:ok, path, frontmatter_yaml, stringify_keys(frontmatter || %{}), body}
     else
       {:error, :not_found} -> {:error, "fiber not found: #{fiber_id}"}
       {:error, reason} when is_atom(reason) -> {:error, to_string(reason)}
@@ -244,34 +247,47 @@ defmodule Shuttle.LifecycleStore do
   defp require_schedule(%{"schedule" => schedule}) when is_map(schedule), do: {:ok, schedule}
   defp require_schedule(_), do: {:error, "fiber has no schedule"}
 
-  # accept/resume both re-arm an awaiting role by writing `status: active` back
-  # to the document — the sole dispatch gate (slice 5: no enabled flag, no
-  # review block). tempered and closed-at are cleared so the card leaves the
-  # Awaiting/Tempered/Composted columns.
-  defp update_document(frontmatter) do
-    frontmatter =
-      frontmatter
-      |> Map.put("status", "active")
-      |> Map.delete("tempered")
-      |> Map.delete("closed-at")
-
-    # The outcome is never blanked on re-arm: the last run's digest stays the
-    # card headline until the next run overwrites it. (Accept used to clear it
-    # as a "fresh precondition for the next run", but that left a re-armed role
-    # with an empty headline for the whole inter-run gap — the doc carries the
-    # lifecycle, the outcome carries the latest result.)
-    {:ok, frontmatter}
+  # accept/resume/rearm all re-arm a role by writing `status: active` back to the
+  # document — the sole dispatch gate (slice 5: no enabled flag, no review
+  # block). tempered and closed-at are deleted so the card leaves the
+  # Awaiting/Tempered/Composted columns. Emitted as surgical edits against the
+  # raw frontmatter text, NOT a re-serialization of the whole map: every other
+  # key (notably the `outcome:` block scalar) stays byte-identical.
+  #
+  # The outcome is never blanked on re-arm: the last run's digest stays the card
+  # headline until the next run overwrites it.
+  defp rearm_ops do
+    [{:put, "status", "active"}, {:delete, "tempered"}, {:delete, "closed-at"}]
   end
 
-  defp evict_runtime_keys(%{"shuttle" => shuttle} = frontmatter) do
-    %{frontmatter | "shuttle" => Map.drop(shuttle, @runtime_keys)}
+  # Drop the daemon-owned / legacy runtime keys from inside the `shuttle:` block.
+  # Surgical: each is a {:delete_nested, "shuttle", key} that removes just that
+  # child line (and its value span) if present, no-op if absent.
+  defp evict_runtime_ops do
+    Enum.map(@runtime_keys, &{:delete_nested, "shuttle", &1})
   end
 
-  defp write_fiber!(path, frontmatter, body) do
+  # Atomic (tmp + rename), surgical write: apply the edit ops to the raw
+  # frontmatter text and reconstruct the file. Only the targeted frontmatter
+  # lines change; the `body` is re-emitted verbatim.
+  #
+  # Byte-stability of the fences: `split_frontmatter` splits on "\n---", so the
+  # newline that terminated the last frontmatter line is consumed by the split,
+  # and `body` begins with the "\n" that terminates the closing "---" fence
+  # line. We therefore normalize the frontmatter to exactly one trailing newline
+  # and write the closing fence as bare "---" (no newline) — `body`'s leading
+  # "\n" completes it. Writing "---\n" here instead would double the newline and
+  # grow a blank line after the fence on every write.
+  defp write_fiber!(path, raw_fm, body, ops) do
+    new_fm = raw_fm |> FrontmatterEdit.apply(ops) |> ensure_single_trailing_newline()
     tmp = path <> ".tmp"
-    File.write!(tmp, ["---\n", yaml(frontmatter), "---\n", body, ensure_trailing_newline(body)])
+    File.write!(tmp, ["---\n", new_fm, "---", body, ensure_trailing_newline(body)])
     File.rename!(tmp, path)
     :ok
+  end
+
+  defp ensure_single_trailing_newline(text) do
+    String.trim_trailing(text, "\n") <> "\n"
   end
 
   defp stringify_keys(map),
@@ -281,45 +297,6 @@ defmodule Shuttle.LifecycleStore do
   defp stringify_value(value) when is_list(value), do: Enum.map(value, &stringify_value/1)
   defp stringify_value(value), do: value
 
-  defp yaml(map) do
-    map
-    |> Enum.sort_by(fn {key, _} -> key end)
-    |> Enum.map_join("", fn {key, value} -> yaml_field(key, value, 0) end)
-  end
-
-  defp yaml_field(key, value, indent) when is_map(value) do
-    "#{spaces(indent)}#{key}:\n" <> yaml_nested(value, indent + 2)
-  end
-
-  defp yaml_field(key, value, indent) when is_list(value) do
-    "#{spaces(indent)}#{key}:\n" <>
-      Enum.map_join(value, "", fn item -> "#{spaces(indent + 2)}- #{yaml_scalar(item)}\n" end)
-  end
-
-  defp yaml_field(key, value, indent), do: "#{spaces(indent)}#{key}: #{yaml_scalar(value)}\n"
-
-  defp yaml_nested(map, indent) do
-    map
-    |> Enum.sort_by(fn {key, _} -> key end)
-    |> Enum.map_join("", fn {key, value} -> yaml_field(key, value, indent) end)
-  end
-
-  defp yaml_scalar(value) when is_boolean(value), do: to_string(value)
-  defp yaml_scalar(value) when is_integer(value), do: to_string(value)
-  defp yaml_scalar(value) when is_float(value), do: to_string(value)
-  defp yaml_scalar(nil), do: "null"
-
-  defp yaml_scalar(value) when is_binary(value) do
-    cond do
-      value == "" -> ~s("")
-      String.match?(value, ~r/^[A-Za-z0-9_\/.\-:@+]+$/) -> value
-      true -> inspect(value)
-    end
-  end
-
-  defp yaml_scalar(value), do: inspect(value)
-
-  defp spaces(n), do: String.duplicate(" ", n)
   defp ensure_trailing_newline(""), do: ""
   defp ensure_trailing_newline(body), do: if(String.ends_with?(body, "\n"), do: "", else: "\n")
 end
