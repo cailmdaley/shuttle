@@ -348,36 +348,60 @@ export class FiberDetailModal {
     card: KanbanCard,
     overlay: HTMLElement,
   ): Promise<void> {
+    // Render the outcome (the card already carries it) IMMEDIATELY, so the
+    // panel is never blank: the daemon's body read (`?body=true`) can take
+    // several seconds under poll-load, and a bare "Loading…" reads as broken.
+    // The body then fills in below the lede, or degrades to a clear note.
+    const outcome = (card.outcome ?? '').trim()
+    const lede = outcome
+      ? `<div class="kbn-detail-lede">${renderMarkdown(outcome)}</div>`
+      : ''
+    prose.innerHTML = lede + '<p class="kbn-detail-body-status">loading body…</p>'
+
     let body = ''
+    let reached = false
     try {
       const idPath = card.id.split('/').map(encodeURIComponent).join('/')
-      const res = await fetch(`${this.shuttleBase}/api/v1/fibers/${idPath}?body=true`)
+      const ctrl = new AbortController()
+      const timer = window.setTimeout(() => ctrl.abort(), 25000)
+      const res = await fetch(`${this.shuttleBase}/api/v1/fibers/${idPath}?body=true`, {
+        signal: ctrl.signal,
+      })
+      window.clearTimeout(timer)
       if (res.ok) {
         const data = (await res.json()) as {
           fibers?: Array<{ fiber?: { body?: string } }>
         }
-        body = data.fibers?.[0]?.fiber?.body ?? ''
+        body = (data.fibers?.[0]?.fiber?.body ?? '').trim()
+        reached = true
       }
     } catch {
-      // Daemon hiccup / offline — fall through to the outcome fallback.
+      // abort / timeout / network — `reached` stays false.
     }
     // The panel may have closed (or been replaced) while we awaited.
     if (this.overlay !== overlay) return
 
-    const outcome = (card.outcome ?? '').trim()
-    const md = body.trim()
-    if (!md && !outcome) {
+    if (body) {
+      prose.innerHTML = lede + renderMarkdown(embedPlaceholders(body))
+      return
+    }
+    if (!outcome && reached) {
       prose.classList.add('kbn-detail-prose-empty')
       prose.textContent = 'No body or outcome yet.'
       return
     }
-    const lede = outcome
-      ? `<div class="kbn-detail-lede">${renderMarkdown(outcome)}</div>`
-      : ''
-    const main = md
-      ? renderMarkdown(embedPlaceholders(md))
-      : '<p class="kbn-detail-prose-note">Body lives on the owning host. Cross-host body rendering is a later slice; the outcome above is the current headline.</p>'
-    prose.innerHTML = lede + main
+    // No body: either the daemon answered but had nothing local (remote-origin
+    // fiber) or the read failed/timed out. Keep the outcome; explain + (on
+    // failure) offer a retry.
+    const note = reached
+      ? 'Body lives on the owning host — cross-host body rendering is a later slice; the outcome above is the headline.'
+      : 'Couldn’t load the body — the daemon was slow to respond. <button type="button" class="kbn-detail-body-retry">retry</button>'
+    prose.innerHTML = lede + `<p class="kbn-detail-prose-note">${note}</p>`
+    if (!reached) {
+      prose.querySelector('.kbn-detail-body-retry')?.addEventListener('click', () => {
+        void this.renderFiberBody(prose, card, overlay)
+      })
+    }
   }
 
   // ── Panel geometry: default + remembered, drag, resize ────────────────────

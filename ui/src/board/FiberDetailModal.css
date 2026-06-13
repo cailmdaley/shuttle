@@ -601,6 +601,23 @@
   font-style: italic;
   color: #9A8F80;
 }
+.kbn-detail-body-status {
+  font-style: italic;
+  color: #9A8F80;
+  font-size: 14px;
+}
+.kbn-detail-body-retry {
+  border: none;
+  background: none;
+  padding: 0;
+  margin-left: 0.3em;
+  font: inherit;
+  font-style: normal;
+  color: var(--porch-verdigris, #2f7d6f);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
 
 /* The lede = the fiber's outcome, set above the body and ruled off from it. */
 .kbn-detail-lede {
