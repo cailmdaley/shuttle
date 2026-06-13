@@ -127,15 +127,16 @@ defmodule Shuttle.FiberDocuments do
   end
 
   defp show_store(store, id, with_body?) do
-    # `felt show -j` ALWAYS emits the full fiber JSON — id, path, AND body. Do
-    # NOT append `--body`: that selector switches felt to a minimal
-    # `{body, body_start_line}` shape with NO `id`, so `entry_for/2` (which keys
-    # on `id`) drops it, `fast_lookup/3` misses on every store, and `get/2` falls
-    # all the way through to the whole-store `scan_lookup` — a `felt ls --body`
-    # over every configured store, which under poller churn cost the body-read
-    # endpoint 6-10s while felt itself answered in ~10ms. The body is already in
-    # hand here: keep it for the content reader, drop it for the metadata path so
-    # the response still matches the list endpoint's body=… contract.
+    # `felt show -j` emits the full fiber JSON — always `id` and `path`, plus
+    # `body` whenever the fiber has one. Do NOT append `--body`: that selector
+    # switches felt to a minimal `{body, body_start_line}` shape with NO `id`, so
+    # `entry_for/2` (which keys on `id`) drops it, `fast_lookup/3` misses on every
+    # store, and `get/2` falls all the way through to the whole-store
+    # `scan_lookup` — a `felt ls --body` over every configured store, which under
+    # poller churn cost the body-read endpoint 6-10s while felt itself answered in
+    # ~10ms. The body is already in hand here: keep it for the content reader,
+    # drop it (a no-op when the fiber has none) for the metadata path so the
+    # response still matches the list endpoint's body=… contract.
     #
     # Same stderr discipline as list_store: never fold stderr into stdout — felt
     # prints "no felt found matching …" (and parse warnings) to stderr while

@@ -686,18 +686,29 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
     File.mkdir_p!(bin_dir)
     bin = Path.join(bin_dir, "felt")
 
+    # Branch on the SUBCOMMAND ($1) first so `ls --body` (the scan) and
+    # `show --body` (the trap) don't collide — both carry `--body`, only the
+    # subcommand tells them apart, exactly as real felt distinguishes them.
     File.write!(bin, """
     #!/bin/sh
-    case " $* " in
-      *" --body "*)
-        printf '{"body":"The body content.","body_start_line":7}\\n'
-        ;;
-      *" show "*)
-        dir=$(pwd)
-        printf '{"id":"tests/single-body","name":"Single with body","status":"open","path":"%s/.felt/tests/single-body/single-body.md","body":"The body content."}\\n' "$dir"
-        ;;
-      *" ls "*)
+    case "$1" in
+      ls)
+        # The whole-store scan. Deliberately empty: if get/2 wrongly falls
+        # through to scan_lookup, it finds nothing here and the test fails.
         printf '[]\\n'
+        ;;
+      show)
+        case " $* " in
+          *" --body "*)
+            # felt's --body selector: body + start line ONLY, no id (the trap).
+            printf '{"body":"The body content.","body_start_line":7}\\n'
+            ;;
+          *)
+            # felt show -j: the full fiber JSON, body included.
+            dir=$(pwd)
+            printf '{"id":"tests/single-body","name":"Single with body","status":"open","path":"%s/.felt/tests/single-body/single-body.md","body":"The body content."}\\n' "$dir"
+            ;;
+        esac
         ;;
       *)
         printf '\\n'
