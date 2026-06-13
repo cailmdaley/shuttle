@@ -20,12 +20,12 @@ if (!host) throw new Error('#app host element is missing')
 
 const board = new KanbanModal({
   shuttleBase,
-  // Viewer seam (slice 3): a clicked card opens the fiber in the
-  // @lightcone/renderer viewer ("opening a fiber = opening a file"). Until
-  // that island lands, the FiberDetailModal shim routes here — surface intent.
-  onOpenFiber: (card) => {
-    showToast(`Viewer coming soon — ${card.id}`, 'success')
-  },
+  // A clicked card opens the real FiberDetailModal panel directly (KanbanModal
+  // owns it; card-click → openDetail → panel). `onOpenFiber` was Portolan's
+  // "drill out to the full vellum workspace" escalation; the standalone UI has
+  // no such target — the panel is the fiber view — so this stays a no-op,
+  // wired only to satisfy the board's option shape.
+  onOpenFiber: () => {},
   // Stash (`+`) / Capture (`✶`) header buttons — providing these callbacks is
   // what surfaces the buttons. Each opens its React island (slice 2); the
   // result lands as a board toast. The board polls, so a new card appears on

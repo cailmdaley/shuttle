@@ -1,0 +1,799 @@
+/* ── Fiber detail panel — a kanban card opened as a vellum page ──────────
+   One click on a card opens the fiber itself: a floating, draggable,
+   edge-and-corner-resizable panel whose body is a single-column vellum
+   rendering (outcome lede → report.html embed → markdown body). Non-modal
+   by design — no scrim, the board behind stays interactive, so the reader
+   can drag the page aside and keep an eye on one fiber while working the
+   board.
+
+   Chrome is title + one controls dropdown, nothing else. The panel frame
+   wears the kanban's warm parchment; the page inside sits on vellum's
+   panel paper, so the fiber reads as a page held in a frame.
+
+   Loaded from FiberDetailModal.ts. The legacy two-column dialog styles in
+   KanbanModal.css were retired with the vellum-page rework. */
+
+.kbn-detail-overlay {
+  position: fixed;
+  /* ≥ 10000 — .vellum-modal-scrim is 9999 and the panel must float above
+     the vellum workspace modal hosting the kanban tab. */
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  min-width: 380px;
+  min-height: 320px;
+  background: #EDE2CE;
+  border: 1px solid rgba(27, 22, 17, 0.16);
+  border-radius: 2px;
+  box-shadow:
+    0 1px 0 rgba(255, 251, 237, 0.6) inset,
+    0 14px 38px rgba(27, 22, 17, 0.22),
+    0 3px 10px rgba(27, 22, 17, 0.10);
+  /* container-type: size so the controls dropdown can cap its height in
+     cqh units — the panel mounts at user-chosen sizes, which is exactly
+     the case viewport media queries get wrong. Explicit width/height are
+     always set inline by the drag/resize machinery, so `size` containment
+     never collapses the layout. */
+  container-name: kbn-detail;
+  container-type: size;
+  font-family: var(--font-main, 'EB Garamond', serif);
+  color: #1B1611;
+  overflow: hidden;
+  /* Soft tonal mottling — aged-paper warmth without a moiré. */
+  background-image:
+    radial-gradient(ellipse 800px 500px at 18% 12%, rgba(255, 251, 237, 0.55), transparent 65%),
+    radial-gradient(ellipse 700px 500px at 88% 88%, rgba(27, 22, 17, 0.035), transparent 60%);
+}
+.kbn-detail-overlay.kbn-detail-dragging,
+.kbn-detail-overlay.kbn-detail-resizing {
+  user-select: none;
+  -webkit-user-select: none;
+}
+.kbn-detail-overlay.kbn-detail-dragging iframe,
+.kbn-detail-overlay.kbn-detail-resizing iframe {
+  /* Pointer events over an iframe would swallow the drag mid-gesture. */
+  pointer-events: none;
+}
+
+/* ── Header: the drag handle ─────────────────────────────────────────── */
+.kbn-detail-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 20px 5px;
+  flex-shrink: 0;
+  cursor: grab;
+  touch-action: none;
+}
+.kbn-detail-overlay.kbn-detail-dragging .kbn-detail-header {
+  cursor: grabbing;
+}
+.kbn-detail-title-stack {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+/* The title is plain identification text and part of the header drag surface
+   (the standalone UI has no "open elsewhere" target — the panel is the view),
+   so no pointer cursor or hover affordance. */
+.kbn-detail-title {
+  font-family: var(--font-main, 'EB Garamond', serif);
+  font-size: 19px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.005em;
+  color: #1B1611;
+  max-width: 100%;
+}
+/* ID slug under the title — plain identification text. */
+.kbn-detail-id {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  color: #7A7368;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Status as an ink-stamped mark. */
+.kbn-detail-header .kbn-pill {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 3px 8px 2px;
+  border-radius: 1px;
+  flex-shrink: 0;
+  margin-top: 6px;
+  transform: rotate(-1.5deg);
+  box-shadow: 0 0 0 0.5px rgba(196, 147, 51, 0.18) inset;
+}
+/* The header borrows the grid card's ▸ aloft pill (.kbn-card-worker in
+   KanbanModal.css — teal, pulsing, click → kitty). Locally it joins the
+   status stamp's ink-stamp idiom: same size, same slight hand-applied
+   rotation, so the two read as a pair of stamps on the page head. */
+.kbn-detail-aloft {
+  margin-left: 0;
+  margin-top: 6px;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  padding: 3px 8px 2px;
+  border-radius: 1px;
+  transform: rotate(-1.5deg);
+}
+.kbn-detail-close {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  margin-top: 2px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: #7A7368;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 2px;
+}
+.kbn-detail-close:hover {
+  color: #1B1611;
+  background: rgba(27, 22, 17, 0.06);
+}
+
+/* ── Controls dropdown ───────────────────────────────────────────────── */
+.kbn-detail-controls {
+  flex-shrink: 0;
+  border-bottom: 1px solid rgba(27, 22, 17, 0.12);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.kbn-detail-controls-toggle {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 20px 6px;
+  border: none;
+  background: transparent;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #7A7368;
+  cursor: pointer;
+  text-align: left;
+}
+.kbn-detail-controls-toggle:hover {
+  color: #1B1611;
+  background: rgba(27, 22, 17, 0.04);
+}
+.kbn-detail-controls-chevron {
+  font-size: 9px;
+  width: 10px;
+  flex-shrink: 0;
+}
+.kbn-detail-controls-label {
+  font-weight: 600;
+}
+.kbn-detail-controls-summary {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-transform: none;
+  letter-spacing: 0.03em;
+  color: #9A8F80;
+}
+.kbn-detail-controls-body {
+  /* Cap the expanded cluster so the page below keeps breathing room even
+     on a short panel; scrolls internally past the cap. cqh works because
+     the panel root is a size container. */
+  max-height: 62cqh;
+  overflow-y: auto;
+  padding: 2px 20px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background:
+    linear-gradient(rgba(27, 22, 17, 0.025), transparent 14px);
+}
+/* The author display above would silently defeat the `hidden` attribute
+   (UA display:none loses to any author display) — this is what made the
+   dropdown "stuck open" on first ship. Keep this rule adjacent so the
+   pairing survives refactors. */
+.kbn-detail-controls-body[hidden] {
+  display: none;
+}
+.kbn-detail-controls-open .kbn-detail-controls-toggle {
+  color: #1B1611;
+}
+
+/* Sections inside the dropdown */
+.kbn-detail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+/* Worker config / tags / parent sit as a two-column cluster when the
+   panel is wide enough — the dropdown stays shallow instead of a long
+   single stack. Collapses to one column on narrow panels. */
+.kbn-detail-controls-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+  column-gap: 26px;
+  row-gap: 10px;
+  align-items: start;
+}
+@container kbn-detail (max-width: 640px) {
+  .kbn-detail-controls-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.kbn-detail-section-heading {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #9A8F80;
+}
+.kbn-detail-rule {
+  height: 1px;
+  background: rgba(27, 22, 17, 0.10);
+  margin: 2px 0;
+}
+
+/* Directive + actions */
+.kbn-detail-directive {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 44px;
+  padding: 6px 9px;
+  border: 1px solid rgba(27, 22, 17, 0.18);
+  border-radius: 2px;
+  background: rgba(255, 251, 237, 0.7);
+  font-family: var(--font-main, 'EB Garamond', serif);
+  font-size: 14px;
+  line-height: 1.45;
+  color: #1B1611;
+}
+.kbn-detail-directive:focus {
+  outline: none;
+  border-color: rgba(154, 123, 53, 0.55);
+  box-shadow: 0 0 0 2px rgba(154, 123, 53, 0.12);
+}
+.kbn-detail-wait-btn {
+  border: 1px solid rgba(27, 22, 17, 0.16);
+  background: rgba(255, 251, 237, 0.5);
+  border-radius: 2px;
+  padding: 4px 9px 3px;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 10.5px;
+  color: #4A443C;
+  cursor: pointer;
+}
+.kbn-detail-wait-btn:hover {
+  border-color: rgba(154, 123, 53, 0.45);
+  color: #1B1611;
+}
+.kbn-detail-actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+/* Review verdicts (Temper · Compost) are a different family from the
+   dispatch verbs — push them to the right edge so the one row reads as
+   two clusters. Wrapping (narrow panels) keeps them adjacent instead. */
+.kbn-detail-actions-row .kbn-detail-action-tempered {
+  margin-left: auto;
+}
+.kbn-detail-action-btn {
+  border: 1px solid rgba(27, 22, 17, 0.18);
+  background: rgba(255, 251, 237, 0.6);
+  border-radius: 2px;
+  padding: 3px 10px;
+  font-family: var(--font-main, 'EB Garamond', serif);
+  font-size: 13px;
+  font-weight: 600;
+  color: #2E2A26;
+  cursor: pointer;
+}
+.kbn-detail-action-btn:hover:not(:disabled) {
+  background: rgba(255, 251, 237, 0.95);
+}
+.kbn-detail-action-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.kbn-detail-action-primary {
+  border-color: rgba(154, 123, 53, 0.55);
+  color: #6B5526;
+  background: rgba(196, 147, 51, 0.10);
+}
+.kbn-detail-action-primary:hover:not(:disabled) {
+  background: rgba(196, 147, 51, 0.18);
+}
+.kbn-detail-action-tempered {
+  border-color: rgba(90, 123, 123, 0.5);
+  color: #3E5757;
+}
+.kbn-detail-action-composted {
+  color: #7A7368;
+}
+
+/* Field rows (agent / kind / schedule) */
+.kbn-detail-field-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.kbn-detail-label {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #7A7368;
+  width: 44px;
+  flex-shrink: 0;
+}
+.kbn-detail-select,
+.kbn-detail-input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid rgba(27, 22, 17, 0.18);
+  border-radius: 2px;
+  background: rgba(255, 251, 237, 0.7);
+  font-family: var(--font-main, 'EB Garamond', serif);
+  font-size: 13.5px;
+  color: #1B1611;
+}
+.kbn-detail-select-effort {
+  flex: 0 1 150px;
+  font-size: 12.5px;
+}
+.kbn-detail-chrome-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: #5A544B;
+  cursor: pointer;
+  user-select: none;
+}
+.kbn-detail-chrome-toggle input:disabled {
+  cursor: not-allowed;
+}
+.kbn-detail-chrome-toggle:has(input:disabled) {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.kbn-detail-input-mono {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 12px;
+}
+.kbn-detail-input-tz {
+  flex: 0 1 130px;
+  font-size: 12.5px;
+}
+.kbn-detail-segmented {
+  display: inline-flex;
+  border: 1px solid rgba(27, 22, 17, 0.18);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.kbn-detail-segment {
+  border: none;
+  background: transparent;
+  padding: 4px 12px;
+  font-family: var(--font-main, 'EB Garamond', serif);
+  font-size: 13px;
+  color: #7A7368;
+  cursor: pointer;
+}
+.kbn-detail-segment + .kbn-detail-segment {
+  border-left: 1px solid rgba(27, 22, 17, 0.14);
+}
+.kbn-detail-segment-active {
+  background: rgba(196, 147, 51, 0.16);
+  color: #1B1611;
+}
+
+/* Tags */
+.kbn-detail-tags-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.kbn-detail-tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px 2px 8px;
+  border: 1px solid rgba(27, 22, 17, 0.14);
+  border-radius: 10px;
+  background: rgba(255, 251, 237, 0.6);
+  font-size: 12.5px;
+  color: #4A443C;
+}
+.kbn-detail-tag-remove {
+  border: none;
+  background: transparent;
+  color: #9A8F80;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 3px;
+}
+.kbn-detail-tag-remove:hover {
+  color: #1B1611;
+}
+.kbn-detail-tag-input {
+  border: none;
+  background: transparent;
+  font-family: var(--font-main, 'EB Garamond', serif);
+  font-size: 13px;
+  color: #1B1611;
+  min-width: 80px;
+  padding: 3px 2px;
+}
+.kbn-detail-tag-input:focus {
+  outline: none;
+}
+
+/* Parent fiber autocomplete */
+.kbn-detail-current-parent {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 11px;
+  color: #7A7368;
+}
+.kbn-detail-parent-wrap {
+  position: relative;
+}
+.kbn-detail-parent-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 5px 9px;
+  border: 1px solid rgba(27, 22, 17, 0.18);
+  border-radius: 2px;
+  background: rgba(255, 251, 237, 0.7);
+  font-family: var(--font-main, 'EB Garamond', serif);
+  font-size: 13.5px;
+  color: #1B1611;
+}
+.kbn-detail-parent-dropdown {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  right: 0;
+  max-height: 200px;
+  overflow-y: auto;
+  background: #F4EBD9;
+  border: 1px solid rgba(27, 22, 17, 0.2);
+  border-radius: 2px;
+  box-shadow: 0 8px 22px rgba(27, 22, 17, 0.18);
+  z-index: 20;
+}
+.kbn-detail-parent-option {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.kbn-detail-parent-option:hover,
+.kbn-detail-parent-option:focus {
+  background: rgba(196, 147, 51, 0.12);
+  outline: none;
+}
+.kbn-detail-parent-option-name {
+  font-size: 13px;
+  color: #1B1611;
+}
+.kbn-detail-parent-option-id {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 10px;
+  color: #9A8F80;
+}
+.kbn-detail-parent-empty {
+  cursor: default;
+  color: #9A8F80;
+  font-size: 12.5px;
+}
+
+/* Footer: live-save status */
+.kbn-detail-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.kbn-detail-save-status {
+  margin-left: auto;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: #9A8F80;
+}
+.kbn-detail-save-status-saving {
+  color: #9A7B35;
+  font-style: italic;
+}
+.kbn-detail-save-status-saved {
+  color: #5A7B7B;
+}
+.kbn-detail-error {
+  font-size: 12.5px;
+  color: #8C3B2E;
+}
+
+/* ── Resize handles ──────────────────────────────────────────────────── */
+.kbn-detail-rh {
+  position: absolute;
+  z-index: 30;
+  touch-action: none;
+}
+.kbn-detail-rh-n  { top: -3px; left: 12px; right: 12px; height: 7px; cursor: ns-resize; }
+.kbn-detail-rh-s  { bottom: -3px; left: 12px; right: 12px; height: 7px; cursor: ns-resize; }
+.kbn-detail-rh-e  { right: -3px; top: 12px; bottom: 12px; width: 7px; cursor: ew-resize; }
+.kbn-detail-rh-w  { left: -3px; top: 12px; bottom: 12px; width: 7px; cursor: ew-resize; }
+.kbn-detail-rh-ne { top: -3px; right: -3px; width: 15px; height: 15px; cursor: nesw-resize; }
+.kbn-detail-rh-nw { top: -3px; left: -3px; width: 15px; height: 15px; cursor: nwse-resize; }
+.kbn-detail-rh-se { bottom: -3px; right: -3px; width: 15px; height: 15px; cursor: nwse-resize; }
+.kbn-detail-rh-sw { bottom: -3px; left: -3px; width: 15px; height: 15px; cursor: nesw-resize; }
+
+/* ── The vellum page pane ────────────────────────────────────────────── */
+.kbn-detail-page {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--porch-panel, #EDE8E0);
+  border-top: 1px solid rgba(255, 251, 237, 0.5);
+}
+
+/* ── The fiber body, vellum-styled ───────────────────────────────────────
+   The standalone UI emulates the vellum reading look in plain CSS rather than
+   mounting vellum's NarrativeView/PretextProse. `.kbn-detail-prose` wraps the
+   `marked`-rendered body (utils.renderMarkdown); the lede is the outcome.
+   Single reading column, EB Garamond, the panel's parchment/ink palette. */
+.kbn-detail-prose {
+  display: block;
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 1.7rem 2.2rem 3.5rem;
+  font-family: var(--font-main, 'EB Garamond', Georgia, serif);
+  font-size: 17px;
+  line-height: 1.62;
+  color: #2E2A26;
+}
+@container kbn-detail (max-width: 600px) {
+  .kbn-detail-prose {
+    padding: 1.2rem 1.2rem 2.5rem;
+    font-size: 16px;
+  }
+}
+
+.kbn-detail-prose-loading,
+.kbn-detail-prose-empty {
+  padding: 2rem 2.2rem;
+  font-style: italic;
+  color: #7A7368;
+}
+.kbn-detail-prose-note {
+  font-size: 14px;
+  font-style: italic;
+  color: #9A8F80;
+}
+
+/* The lede = the fiber's outcome, set above the body and ruled off from it. */
+.kbn-detail-lede {
+  margin-bottom: 1.6rem;
+  padding-bottom: 1.2rem;
+  border-bottom: 1px solid rgba(27, 22, 17, 0.12);
+  font-size: 1.04em;
+  color: #3a352e;
+}
+.kbn-detail-lede > :first-child { margin-top: 0; }
+.kbn-detail-lede > :last-child { margin-bottom: 0; }
+
+/* Block rhythm */
+.kbn-detail-prose > :first-child { margin-top: 0; }
+.kbn-detail-prose p { margin: 0 0 0.95em; }
+.kbn-detail-prose h1,
+.kbn-detail-prose h2,
+.kbn-detail-prose h3,
+.kbn-detail-prose h4 {
+  font-family: var(--font-main, 'EB Garamond', Georgia, serif);
+  font-weight: 600;
+  line-height: 1.2;
+  color: #1f1b16;
+  margin: 1.7em 0 0.5em;
+}
+.kbn-detail-prose h1 { font-size: 1.6em; font-weight: 500; font-style: italic; }
+.kbn-detail-prose h2 { font-size: 1.34em; }
+.kbn-detail-prose h3 { font-size: 1.13em; }
+.kbn-detail-prose h4 { font-size: 1em; letter-spacing: 0.01em; }
+.kbn-detail-prose h2 {
+  padding-bottom: 0.18em;
+  border-bottom: 1px solid rgba(27, 22, 17, 0.10);
+}
+
+.kbn-detail-prose ul,
+.kbn-detail-prose ol { margin: 0 0 0.95em; padding-left: 1.4em; }
+.kbn-detail-prose li { margin-bottom: 0.35em; }
+.kbn-detail-prose li > ul,
+.kbn-detail-prose li > ol { margin: 0.35em 0 0; }
+
+.kbn-detail-prose blockquote {
+  margin: 0 0 0.95em;
+  padding-left: 1em;
+  border-left: 2px solid var(--porch-ochre, #C2963B);
+  font-style: italic;
+  color: #5e564b;
+}
+
+.kbn-detail-prose hr {
+  border: none;
+  border-top: 1px solid rgba(27, 22, 17, 0.14);
+  margin: 1.8em 0;
+}
+
+.kbn-detail-prose a,
+.kbn-detail-prose a.md-link {
+  color: var(--porch-verdigris, #2f7d6f);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-thickness: 1px;
+}
+.kbn-detail-prose a:hover { color: var(--porch-cinnabar, #B5453A); }
+
+.kbn-detail-prose code.md-inline-code {
+  font-family: var(--font-mono, 'IBM Plex Mono', monospace);
+  font-size: 0.86em;
+  background: rgba(46, 42, 38, 0.07);
+  padding: 0.08em 0.34em;
+  border-radius: 3px;
+}
+.kbn-detail-prose pre.md-code-block {
+  margin: 0 0 0.95em;
+  padding: 0.9em 1.05em;
+  background: #2E2A26;
+  color: #E4DCCB;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-size: 0.82em;
+  line-height: 1.5;
+}
+.kbn-detail-prose pre.md-code-block code {
+  font-family: var(--font-mono, 'IBM Plex Mono', monospace);
+  background: none;
+  padding: 0;
+  color: inherit;
+}
+
+.kbn-detail-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 1.1em;
+  font-size: 0.9em;
+}
+.kbn-detail-prose th,
+.kbn-detail-prose td {
+  text-align: left;
+  padding: 0.4em 0.6em;
+  border-bottom: 1px solid rgba(27, 22, 17, 0.14);
+  vertical-align: top;
+}
+.kbn-detail-prose th {
+  font-family: var(--font-mono, 'IBM Plex Mono', monospace);
+  font-size: 0.82em;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #7A7368;
+  font-weight: 500;
+}
+
+.kbn-detail-prose img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 4px;
+  margin: 0.4em 0;
+}
+
+/* `:::{embed} <path>` placeholder — the inline render lands with the file
+   route (slice 4). Names the artifact so report.html-style fibers read
+   cleanly meanwhile. */
+.kbn-detail-embed {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.55em;
+  margin: 1.1em 0;
+  padding: 0.8em 1em;
+  background: rgba(46, 42, 38, 0.04);
+  border: 1px dashed rgba(27, 22, 17, 0.22);
+  border-radius: 6px;
+}
+.kbn-detail-embed-glyph { color: var(--porch-verdigris, #2f7d6f); font-size: 1.05em; }
+.kbn-detail-embed code {
+  font-family: var(--font-mono, 'IBM Plex Mono', monospace);
+  font-size: 0.86em;
+  color: #2E2A26;
+}
+.kbn-detail-embed-note {
+  font-size: 0.8em;
+  font-style: italic;
+  color: #9A8F80;
+}
+
+/* ── Sent files strip ─────────────────────────────────────────────────── */
+/* The deliverable trail between the controls cluster and the page pane.
+   Hidden until /sent-files returns entries (see buildSentFiles). */
+.kbn-detail-sent {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 14px 10px;
+  border-top: 1px solid rgba(27, 22, 17, 0.08);
+  background: rgba(154, 123, 53, 0.05);
+}
+.kbn-detail-sent-empty {
+  display: none;
+}
+.kbn-detail-sent-heading {
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #9A8F80;
+}
+.kbn-detail-sent-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+.kbn-detail-sent-file {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  max-width: 100%;
+  padding: 2px 8px;
+  border: 1px solid rgba(154, 123, 53, 0.35);
+  border-radius: 3px;
+  background: rgba(255, 251, 237, 0.6);
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 11px;
+  color: #2E2A26;
+  cursor: pointer;
+}
+.kbn-detail-sent-file:hover {
+  border-color: #9A7B35;
+  background: rgba(255, 251, 237, 0.95);
+}
+.kbn-detail-sent-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.kbn-detail-sent-when {
+  flex-shrink: 0;
+  font-size: 9.5px;
+  color: #7A7368;
+}
