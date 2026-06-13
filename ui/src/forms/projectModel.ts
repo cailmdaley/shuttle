@@ -37,6 +37,17 @@
 
 import { parseCompositeFeed } from '../board/KanbanComposite.js'
 
+/**
+ * Normalize a project's `originId` to the owner-routing key the daemon's
+ * `OriginRouter` expects on a write. The standalone feed always carries bare
+ * host names (`origin || host`), so this is defense-in-depth: it strips a stray
+ * `remote-` prefix (Portolan's old `'remote-<host>'` city-origin shape) that
+ * would otherwise match no configured remote and silently fall through to a
+ * mis-routed LOCAL write. Both owner-routed forms (Stash + Capture) send their
+ * origin through here, so the guard is enforced in exactly one place.
+ */
+export const shuttleOrigin = (originId: string): string => originId.replace(/^remote-/, '')
+
 export interface ProjectEntry {
   /** Stable key: `${originId}:${path}`. */
   id: string
@@ -46,8 +57,9 @@ export interface ProjectEntry {
   path: string
   /** Owning host/remote (bare name, e.g. `dapmcw68`, `candide`). */
   originId: string
-  /** This origin is the local daemon's own host — the only place Stash's
-   *  (local-only) create endpoint can write. */
+  /** This origin is the local daemon's own host. Owner-routed writes (Stash
+   *  create, Capture spawn) send `origin: 'local'` for these; remote projects
+   *  send their bare host name and the daemon forwards. */
   isLocal: boolean
   /** Loom-relative substore prefix; `''` when the project is a store root. */
   loomPrefix: string

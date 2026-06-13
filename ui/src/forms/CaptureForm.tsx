@@ -23,6 +23,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { AppDialog } from './AppDialog'
 import type { AgentEntry } from './StashForm'
+import { shuttleOrigin } from './projectModel'
 
 /**
  * Fallback when the registry fetch fails — keeps the dialog usable offline.
@@ -35,15 +36,6 @@ const FALLBACK_AGENTS: AgentEntry[] = [
   { id: 'claude-sonnet', default: false },
   { id: 'codex', default: false },
 ]
-
-/**
- * Defensive normalization: Portolan's city originIds were `'local' |
- * 'remote-<host>'`. The standalone UI's origins are already bare host names
- * (`candide`, `cineca`, the local host), so this is a no-op here — kept so a
- * stray `remote-` prefix can never reach OriginRouter and fall through to a
- * mis-routed local 422.
- */
-const shuttleOrigin = (originId: string): string => originId.replace(/^remote-/, '')
 
 export interface CaptureFormProps {
   /** Default destination: a project path (matched against `availableCities` by

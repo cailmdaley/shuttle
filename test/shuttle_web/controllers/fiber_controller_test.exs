@@ -5,6 +5,24 @@ defmodule ShuttleWeb.FiberControllerTest do
 
   @endpoint ShuttleWeb.Endpoint
 
+  # POST transport stub for the cross-host create forward test. Records the last
+  # (url, body) it was asked to POST and replays a scripted response, so the
+  # forward leg is exercised without a real tunnel.
+  defmodule StubPostClient do
+    use Agent
+
+    def start_link(_ \\ []),
+      do: Agent.start_link(fn -> %{response: nil, last: nil} end, name: __MODULE__)
+
+    def set_response(response), do: Agent.update(__MODULE__, &Map.put(&1, :response, response))
+    def last, do: Agent.get(__MODULE__, & &1.last)
+
+    def post(url, body, _content_type, _timeout_ms) do
+      Agent.update(__MODULE__, &Map.put(&1, :last, %{url: url, body: body}))
+      Agent.get(__MODULE__, & &1.response)
+    end
+  end
+
   setup do
     tmp =
       Path.join(
@@ -137,6 +155,91 @@ defmodule ShuttleWeb.FiberControllerTest do
              Jason.decode!(conn.resp_body)
   end
 
+  test "POST /api/v1/fiber/create forwards a remote-origin create to the owning daemon", %{
+    tmp: tmp
+  } do
+    start_supervised!(StubPostClient)
+
+    StubPostClient.set_response(
+      {:ok, 200, Jason.encode!(%{"id" => "tests/remote-stash", "path" => "/candide/.felt/…"})}
+    )
+
+    previous_remotes = Application.get_env(:shuttle, :remotes)
+    previous_client = Application.get_env(:shuttle, :write_forward_client)
+    Application.put_env(:shuttle, :remotes, [%{name: "candide", url: "http://localhost:4001"}])
+    Application.put_env(:shuttle, :write_forward_client, StubPostClient)
+
+    on_exit(fn ->
+      restore_app_env(:remotes, previous_remotes)
+      restore_app_env(:write_forward_client, previous_client)
+    end)
+
+    conn =
+      api_conn()
+      |> post(
+        "/api/v1/fiber/create",
+        Jason.encode!(%{
+          id: "tests/remote-stash",
+          name: "Remote stash",
+          body: "hi\n",
+          origin: "candide",
+          frontmatter: %{status: "open", shuttle: %{kind: "oneshot", project_dir: tmp}}
+        })
+      )
+
+    # The remote owner's verbatim response is relayed; nothing is written locally.
+    assert conn.status == 200
+    assert %{"id" => "tests/remote-stash"} = Jason.decode!(conn.resp_body)
+    refute File.exists?(Path.join([tmp, ".felt", "tests", "remote-stash", "remote-stash.md"]))
+
+    # Forwarded to the owning remote's identical create, origin stripped so the
+    # owner writes it as local and auto-stamps its own host.
+    last = StubPostClient.last()
+    assert last.url == "http://localhost:4001/api/v1/fiber/create"
+    forwarded = Jason.decode!(last.body)
+    refute Map.has_key?(forwarded, "origin")
+    assert forwarded["id"] == "tests/remote-stash"
+    assert forwarded["frontmatter"]["shuttle"]["project_dir"] == tmp
+  end
+
+  test "POST /api/v1/fiber/create with an unknown origin falls through to a local write", %{
+    tmp: tmp
+  } do
+    # An origin matching no configured remote degrades to :local, where the
+    # endpoint's own resolution arbitrates — never a silent wrong-host write.
+    # A remote IS configured here, so the test proves the fall-through
+    # discriminates: "ghost" doesn't match "candide", so it stays local and the
+    # forward plane is never touched.
+    start_supervised!(StubPostClient)
+    previous_remotes = Application.get_env(:shuttle, :remotes)
+    previous_client = Application.get_env(:shuttle, :write_forward_client)
+    Application.put_env(:shuttle, :remotes, [%{name: "candide", url: "http://localhost:4001"}])
+    Application.put_env(:shuttle, :write_forward_client, StubPostClient)
+
+    on_exit(fn ->
+      restore_app_env(:remotes, previous_remotes)
+      restore_app_env(:write_forward_client, previous_client)
+    end)
+
+    conn =
+      api_conn()
+      |> post(
+        "/api/v1/fiber/create",
+        Jason.encode!(%{
+          id: "tests/ghost-origin",
+          name: "Ghost origin",
+          origin: "ghost",
+          frontmatter: %{status: "open", shuttle: %{kind: "oneshot", project_dir: tmp}}
+        })
+      )
+
+    assert conn.status == 200
+    assert %{"id" => "tests/ghost-origin"} = Jason.decode!(conn.resp_body)
+    assert File.exists?(Path.join([tmp, ".felt", "tests", "ghost-origin", "ghost-origin.md"]))
+    # Wrote locally, never forwarded — the unknown origin did not reach the tunnel.
+    assert StubPostClient.last() == nil
+  end
+
   test "POST /api/v1/fiber/create rejects cross-host blocks", %{tmp: tmp} do
     conn =
       api_conn()
@@ -180,4 +283,7 @@ defmodule ShuttleWeb.FiberControllerTest do
 
   defp restore_env(key, nil), do: System.delete_env(key)
   defp restore_env(key, value), do: System.put_env(key, value)
+
+  defp restore_app_env(key, nil), do: Application.delete_env(:shuttle, key)
+  defp restore_app_env(key, value), do: Application.put_env(:shuttle, key, value)
 end

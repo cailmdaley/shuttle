@@ -9,9 +9,10 @@
  * single shared root suffices; closing renders `null`.
  *
  * Both forms need the "project" set — the map-less replacement for Portolan's
- * pinned cities, derived from the composite feed (see projectModel). Stash is
- * local-only (its create endpoint has no owner-routing yet), so it gets just
- * the local projects; Capture is owner-routed, so it gets all of them.
+ * pinned cities, derived from the composite feed (see projectModel). Both
+ * create endpoints are owner-routed now, so both forms get every project: a
+ * local origin writes/spawns here, a remote origin forwards to its owning
+ * daemon.
  */
 
 import { createRoot, type Root } from 'react-dom/client'
@@ -69,17 +70,20 @@ export async function openStash(opts: OpenFormOptions): Promise<void> {
     opts.onResult?.('Couldn’t reach the Shuttle daemon (:4000).', false)
     return
   }
-  // Create is local-only — offer only the local daemon's own projects.
-  const projects: StashProject[] = feed.model.projects
-    .filter((p) => p.isLocal)
-    .map((p) => ({ id: p.id, name: p.name, path: p.path, originId: 'local', loomPrefix: p.loomPrefix }))
-  const activityById: Record<string, number> = {}
-  for (const p of projects) activityById[p.id] = feed.model.activityById[p.id] ?? 0
+  // Create is owner-routed — offer every project; local origin writes here,
+  // remote origins forward to their owning daemon.
+  const projects: StashProject[] = feed.model.projects.map((p) => ({
+    id: p.id,
+    name: p.name,
+    path: p.path,
+    originId: p.isLocal ? 'local' : p.originId,
+    loomPrefix: p.loomPrefix,
+  }))
 
   ensureRoot().render(
     <StashForm
       availableCities={projects}
-      cityActivityById={activityById}
+      cityActivityById={feed.model.activityById}
       tagSuggestions={feed.tags}
       shuttleBase={opts.shuttleBase}
       onCancel={close}

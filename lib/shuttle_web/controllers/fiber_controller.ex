@@ -1,13 +1,20 @@
 defmodule ShuttleWeb.FiberController do
   @moduledoc """
-  Agent-API endpoint for daemon-local fiber creation.
+  Agent-API endpoint for fiber creation, owner-routed.
 
-  Cross-host callers choose the target daemon before calling this endpoint; the
-  controller itself writes only to this daemon's local felt store.
+  A create targets the daemon owning the destination project. The caller stamps
+  the destination's `origin` (the same key the composite feed carries); this
+  controller either writes locally (origin is itself / absent) or forwards the
+  POST to the owning remote's identical `/api/v1/fiber/create` over the tunnel
+  (`Shuttle.OriginRouter`, the one forwarder behind every write endpoint) — the
+  file must be written where the project lives, since `felt add` and the
+  `project_dir` existence check resolve against that host's filesystem. The
+  owner runs the forwarded request as local (origin stripped) and auto-stamps
+  its own `shuttle.host`, so a remote stash is born owned by the right daemon.
 
-  Placement and identity belong to felt, not to this controller. Creation shells
-  out to `felt add ... --top-level`, which mints the intrinsic ULID, owns the
-  on-disk layout, and rejects duplicates. The controller then reads felt's
+  Placement and identity belong to felt, not to this controller. The local write
+  shells out to `felt add ... --top-level`, which mints the intrinsic ULID, owns
+  the on-disk layout, and rejects duplicates. The controller then reads felt's
   carried `path` back via `felt show -j` and splices the non-native frontmatter
   (the `shuttle:` block and any other custom keys) into the file felt wrote —
   exactly the read-then-edit-the-markdown flow felt prescribes for non-native
@@ -16,7 +23,7 @@ defmodule ShuttleWeb.FiberController do
 
   use Phoenix.Controller, formats: [:json]
 
-  alias Shuttle.FeltStores
+  alias Shuttle.{FeltStores, OriginRouter}
 
   # Frontmatter keys felt owns natively and writes itself on `felt add`. Anything
   # the caller supplies outside this set is non-native and gets spliced into the
@@ -25,6 +32,16 @@ defmodule ShuttleWeb.FiberController do
   @felt_native_keys ~w(id name status tags outcome due created-at)
 
   def create(conn, params) do
+    case OriginRouter.route(Map.get(params, "origin")) do
+      {:remote, remote} ->
+        relay_json(conn, OriginRouter.forward(remote, "/api/v1/fiber/create", conn.body_params))
+
+      :local ->
+        create_local(conn, params)
+    end
+  end
+
+  defp create_local(conn, params) do
     with {:ok, fiber_id} <- required_string(params, "id"),
          {:ok, name} <- required_string(params, "name"),
          {:ok, body} <- optional_string(params, "body", ""),
@@ -41,6 +58,19 @@ defmodule ShuttleWeb.FiberController do
         |> put_status(400)
         |> json(%{error: reason})
     end
+  end
+
+  # Relay the owning remote's verbatim response (the create returns JSON either
+  # way), or surface a tunnel failure as a 502 — the same shape CaptureController
+  # uses for its forwarded spawn.
+  defp relay_json(conn, {:forwarded, status, body}) do
+    conn |> put_resp_content_type("application/json") |> send_resp(status, body)
+  end
+
+  defp relay_json(conn, {:error, {:forward_failed, name, reason}}) do
+    conn
+    |> put_status(502)
+    |> json(%{error: "forward_failed", origin: name, detail: inspect(reason)})
   end
 
   defp normalize_frontmatter(params, name) do

@@ -19,14 +19,17 @@
  * <project_dir> add <id> --top-level` expects `id` *relative to that substore*.
  * So this form speaks project-relative ids natively: the parent picker is
  * scoped to the selected project and strips its `loomPrefix`, and `submit`
- * builds `{id, name, body, frontmatter}` itself. Create is local-only on the
- * daemon (no owner-routing yet), so the island only offers local projects.
+ * builds `{id, name, body, frontmatter, origin}` itself. Create is owner-routed
+ * on the daemon, so the island offers every project — the selected project's
+ * `origin` rides the POST: a local origin writes here, a remote origin forwards
+ * to its owning daemon (which auto-stamps its own `shuttle.host`).
  *
  * Esc closes; Cmd/Ctrl+Enter submits.
  */
 
 import { useEffect, useRef, useState } from 'react'
 import { fetchFiberIndex, filterParentCandidates, type FiberSearchResult } from '../board/fiberSearch'
+import { shuttleOrigin } from './projectModel'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -53,7 +56,8 @@ export interface StashProject {
   name?: string
   /** `shuttle.project_dir` — the worker cwd AND the create endpoint's felt root. */
   path: string
-  /** Bare host name (own host for local create). */
+  /** Owner-routing key sent as `origin`: `'local'` for the local daemon's own
+   *  projects, else the owning remote's bare name (e.g. `candide`). */
   originId: string
   /** Loom-relative substore prefix; `''` when the project is a store root.
    *  Used to scope/strip parent candidates to project-relative slugs. */
@@ -513,6 +517,9 @@ export function StashForm({
           name: trimmedTitle,
           body: body.length > 0 ? body : '',
           frontmatter,
+          // Owner-routing key — the daemon writes locally when this is its own
+          // origin (or 'local') and forwards to the owning remote otherwise.
+          origin: shuttleOrigin(selectedCity.originId),
         }),
       })
       const data = (await res.json().catch(() => ({}))) as CreateFiberResponse
