@@ -130,7 +130,8 @@ defmodule Shuttle.Agents do
   defp normalize_axes(axes) when is_map(axes) do
     %{
       effort: axes |> Map.get(:effort) |> normalize_optional_string(),
-      chrome: Map.get(axes, :chrome, false)
+      chrome: Map.get(axes, :chrome, false),
+      headless: Map.get(axes, :headless, false)
     }
   end
 
@@ -206,14 +207,17 @@ defmodule Shuttle.Agents do
 
   @doc """
   Resolves an agent name plus the block-declared axes (effort, chrome) into the
-  base agent record augmented with the effective, validated `:effort` and
-  `:chrome` keys.
+  base agent record augmented with the effective, validated `:effort`,
+  `:chrome`, and `:headless` keys.
 
   An alias record (`alias_of` set) expands to its base agent with the alias's
   `axes` overlaid *beneath* the block axes (block wins). Effort falls back
-  through: block → alias overlay → base `default_effort`. Validation rejects an
-  effort token outside the base agent's `effort_levels` (or any effort on an
-  agent with none) and chrome on a non-chrome-capable harness.
+  through: block → alias overlay → base `default_effort`. Chrome is block OR
+  overlay; headless rides the overlay only (a fiber opts into print mode by
+  naming a `*-headless` agent — there is no block field for it). Validation
+  rejects an effort token outside the base agent's `effort_levels` (or any
+  effort on an agent with none), chrome on a non-chrome-capable harness, and
+  headless on any non-claude harness.
 
   `block_effort` may be `nil`/`""`; `block_chrome` is a boolean.
   """
@@ -250,9 +254,12 @@ defmodule Shuttle.Agents do
           first_present([block_effort, overlay[:effort], base[:default_effort]])
 
         chrome = !!block_chrome or !!overlay[:chrome]
+        # Headless rides the alias overlay only — there is no block field for it
+        # (a fiber selects the print-mode shape by naming a `*-headless` agent).
+        headless = !!overlay[:headless]
 
-        with :ok <- validate_axes(base, effort, chrome) do
-          {:ok, Map.merge(base, %{effort: effort, chrome: chrome})}
+        with :ok <- validate_axes(base, effort, chrome, headless) do
+          {:ok, Map.merge(base, %{effort: effort, chrome: chrome, headless: headless})}
         end
     end
   end
@@ -261,7 +268,7 @@ defmodule Shuttle.Agents do
     Enum.find(values, fn v -> is_binary(v) and v != "" end)
   end
 
-  defp validate_axes(base, effort, chrome) do
+  defp validate_axes(base, effort, chrome, headless) do
     levels = base[:effort_levels] || []
 
     cond do
@@ -274,6 +281,9 @@ defmodule Shuttle.Agents do
 
       chrome and not base[:chrome_capable] ->
         {:error, "chrome not supported by agent #{base.id} (claude harness only)"}
+
+      headless and base[:cli] != "claude" ->
+        {:error, "headless (-p print mode) not supported by agent #{base.id} (claude harness only)"}
 
       true ->
         :ok
@@ -370,27 +380,42 @@ defmodule Shuttle.Agents do
   end
 
   # Renders the harness invocation flags, folding the resolved axes (effort,
-  # chrome) into each CLI's native form:
-  #   claude → `--effort <level>` flag + `--chrome`
+  # chrome, headless) into each CLI's native form:
+  #   claude → `--effort <level>` flag + `--chrome`; headless adds `-p` and
+  #            swaps the interactive permission mode for `bypassPermissions`
   #   pi     → `:level` suffix on the model string (preserves today's behaviour)
   #   codex  → `-c model_reasoning_effort="<level>"`
-  # Effort/chrome come from the agent map's `:effort`/`:chrome` keys set by
-  # apply_axes/3; absent (raw record) means no axis rendering.
+  # Effort/chrome/headless come from the agent map's `:effort`/`:chrome`/
+  # `:headless` keys set by apply_axes/3; absent (raw record) means no axis
+  # rendering.
   defp render_flags(agent) do
     effort = agent[:effort]
     chrome = agent[:chrome] == true
+    headless = agent[:headless] == true and agent.cli == "claude"
     model = effective_model(agent, effort)
 
     [
+      if(headless, do: "-p", else: nil),
       flag("--provider", agent.provider),
       flag("--model", model),
       effort_flag(agent.cli, effort),
       if(chrome, do: "--chrome", else: nil),
-      agent.extra_flags
+      headless_extra_flags(agent, headless)
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" ")
   end
+
+  # A headless `-p` worker runs unattended: no human can approve a tool call, so
+  # the interactive `--permission-mode auto` is swapped for `bypassPermissions`
+  # (claude's "never stall" mode, the parallel to codex's
+  # `--dangerously-bypass-approvals-and-sandbox`). Non-headless invocations keep
+  # their declared `extra_flags` verbatim.
+  defp headless_extra_flags(%{extra_flags: ef}, true) when is_binary(ef) do
+    String.replace(ef, "--permission-mode auto", "--permission-mode bypassPermissions")
+  end
+
+  defp headless_extra_flags(agent, _headless), do: agent.extra_flags
 
   # pi renders effort as a `:level` suffix on the model string; other harnesses
   # keep the bare model.

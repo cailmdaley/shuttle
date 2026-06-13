@@ -55,6 +55,34 @@
     "default": false
   },
   {
+    "id": "claude-sonnet-headless",
+    "alias_of": "claude-sonnet",
+    "axes": { "headless": true },
+    "aliases": [],
+    "default": false
+  },
+  {
+    "id": "claude-opus-headless",
+    "alias_of": "claude-opus",
+    "axes": { "headless": true },
+    "aliases": [],
+    "default": false
+  },
+  {
+    "id": "claude-fable-headless",
+    "alias_of": "claude-fable",
+    "axes": { "headless": true },
+    "aliases": [],
+    "default": false
+  },
+  {
+    "id": "claude-haiku-headless",
+    "alias_of": "claude-haiku",
+    "axes": { "headless": true },
+    "aliases": [],
+    "default": false
+  },
+  {
     "id": "codex",
     "cli": "codex",
     "wrapper": "codex",

@@ -22,7 +22,7 @@
     },
     "agent": {
       "type": "string",
-      "description": "Base agent ID from the agent registry (harness + model). Defaults to the registry's default agent when absent. Orthogonal axes (effort, chrome) layer on top via the sibling fields. Legacy combination ids like 'claude-opus-chrome' still resolve — they are registry aliases expanding to a base agent + axes."
+      "description": "Base agent ID from the agent registry (harness + model). Defaults to the registry's default agent when absent. Orthogonal axes (effort, chrome) layer on top via the sibling fields. Combination ids like 'claude-opus-chrome' and the print-mode 'claude-<model>-headless' variants resolve as registry aliases expanding to a base agent + axes; headless has no sibling field, so naming the alias is how a fiber opts into 'claude -p' fire-and-forget dispatch."
     },
     "effort": {
       "type": "string",

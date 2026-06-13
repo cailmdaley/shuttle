@@ -44,11 +44,15 @@ type AgentRecord struct {
 }
 
 // Axes carries the orthogonal per-fiber dispatch axes beyond base agent: effort
-// (a token from the base agent's EffortLevels) and chrome (claude harness only).
-// Used both as an alias record's overlay and as the resolved effective axes.
+// (a token from the base agent's EffortLevels), chrome (claude harness only),
+// and headless (claude `-p` print mode, claude harness only). Used both as an
+// alias record's overlay and as the resolved effective axes. Headless has no
+// shuttle:-block field — a fiber opts into print mode by naming a `*-headless`
+// alias agent, so it only ever arrives via the overlay.
 type Axes struct {
-	Effort string `json:"effort,omitempty"`
-	Chrome bool   `json:"chrome,omitempty"`
+	Effort   string `json:"effort,omitempty"`
+	Chrome   bool   `json:"chrome,omitempty"`
+	Headless bool   `json:"headless,omitempty"`
 }
 
 // IsAlias reports whether this record is an alias (resolves to another agent).
@@ -141,8 +145,10 @@ func (r *AgentRegistry) Resolve(name, blockEffort string, blockChrome bool) (Age
 		effort = rec.DefaultEffort
 	}
 	chrome := blockChrome || overlay.Chrome
+	// Headless rides the overlay only — there is no block field for it.
+	headless := overlay.Headless
 
-	eff := Axes{Effort: effort, Chrome: chrome}
+	eff := Axes{Effort: effort, Chrome: chrome, Headless: headless}
 	if err := r.validateAxes(rec, eff); err != nil {
 		return AgentRecord{}, Axes{}, err
 	}
@@ -168,6 +174,9 @@ func (r *AgentRegistry) validateAxes(base AgentRecord, eff Axes) error {
 	}
 	if eff.Chrome && !base.ChromeCapable {
 		return fmt.Errorf("chrome not supported by agent %q (claude harness only)", base.ID)
+	}
+	if eff.Headless && base.CLI != "claude" {
+		return fmt.Errorf("headless (-p print mode) not supported by agent %q (claude harness only)", base.ID)
 	}
 	return nil
 }

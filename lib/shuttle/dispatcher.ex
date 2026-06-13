@@ -647,12 +647,29 @@ defmodule Shuttle.Dispatcher do
     [
       header,
       render_exit_contract(),
+      render_headless_notice(Keyword.get(opts, :headless, false)),
       render_user_message_block(fiber_id, felt_opts)
     ]
     |> Enum.reject(&(&1 == ""))
     |> Enum.join("\n\n")
     |> String.trim()
   end
+
+  # Print-mode (`claude -p`) workers run unattended: stdout is not a TTY, no
+  # human can attach, and the exit contract's human-gate exception therefore
+  # cannot apply. Surfacing that in the prompt — right after the exit contract,
+  # where causal attention meets the termination semantics — stops a headless
+  # worker from parking itself at a "wait for the human" checkpoint that will
+  # never be answered.
+  defp render_headless_notice(true) do
+    render_block(
+      "Headless",
+      nil,
+      "Headless print-mode run: no human can attach to this session — work to completion and exit. The human-gate exception never applies here; if you hit something you would normally pause to ask about, record it in the outcome/history and keep driving to a clean checkpoint, then exit."
+    )
+  end
+
+  defp render_headless_notice(_), do: ""
 
   defp render_exit_contract do
     render_block(
@@ -682,7 +699,8 @@ defmodule Shuttle.Dispatcher do
     * `:runner` — `Shuttle.Runner` impl (default `Shuttle.Runner.Default`)
     * `:work_dir` — project directory to spawn in (required)
     * `:felt_store` — felt store the worker should file into
-    * `:agent` — agent registry name (default `"claude-fable"`)
+    * `:agent` — agent registry name (default `"claude-sonnet"`, the bare
+      fallback; fable is disabled and is never a default)
     * `:effort` — reasoning-effort token, validated against the agent's
       `effort_levels` (same contract as `shuttle.effort` on a fiber)
     * `:chrome` — boolean; claude harness only (same as `shuttle.chrome`)
@@ -696,7 +714,7 @@ defmodule Shuttle.Dispatcher do
     runner = Keyword.get(opts, :runner, Shuttle.Runner.Default)
     work_dir = Keyword.fetch!(opts, :work_dir)
     felt_store = Keyword.get(opts, :felt_store, default_felt_store())
-    agent_name = Keyword.get(opts, :agent) || "claude-fable"
+    agent_name = Keyword.get(opts, :agent) || "claude-sonnet"
     effort = Keyword.get(opts, :effort)
     chrome = Keyword.get(opts, :chrome) == true
     port = Keyword.get(opts, :port, 4000)
@@ -1061,6 +1079,7 @@ defmodule Shuttle.Dispatcher do
       opts
       |> Keyword.put(:work_dir, work_dir)
       |> Keyword.put(:prompt_fiber_id, worker_fiber_id)
+      |> Keyword.put(:headless, agent[:headless] == true)
 
     case resume_intent do
       {:previous, session_id} ->

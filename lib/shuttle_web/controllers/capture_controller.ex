@@ -14,7 +14,7 @@ defmodule ShuttleWeb.CaptureController do
 
   Body: `prompt` (required, the yap verbatim), `project_dir` (required,
   absolute path on the owning host), `agent` (optional registry name,
-  default claude-fable), `effort` (optional reasoning-effort token, validated
+  default claude-sonnet), `effort` (optional reasoning-effort token, validated
   against the agent's `effort_levels`), `chrome` (optional boolean, claude
   harness only), `origin` (optional owner-routing key).
   """

@@ -93,6 +93,34 @@ func TestResolve_ChromeAliasExpands(t *testing.T) {
 	}
 }
 
+func TestResolve_HeadlessAliasExpands(t *testing.T) {
+	reg := loadReg(t)
+	base, eff, err := reg.Resolve("claude-haiku-headless", "", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if base.ID != "claude-haiku" {
+		t.Fatalf("alias base = %q, want claude-haiku", base.ID)
+	}
+	if !eff.Headless {
+		t.Fatalf("expected headless:true from alias overlay, got %+v", eff)
+	}
+	// Headless composes with effort declared on the block.
+	_, eff2, err := reg.Resolve("claude-opus-headless", "max", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !eff2.Headless || eff2.Effort != "max" {
+		t.Fatalf("expected headless:true effort:max, got %+v", eff2)
+	}
+}
+
+// Note: headless rejection on a non-claude harness is unreachable through the
+// public API — headless has no shuttle:-block field, so it only ever arrives
+// via a claude-base alias overlay. The validateAxes guard is symmetric
+// defense-in-depth (mirroring the Elixir side's white-box test) for any future
+// non-claude `*-headless` alias slipped into the registry.
+
 func TestResolve_UnknownAgent(t *testing.T) {
 	reg := loadReg(t)
 	_, _, err := reg.Resolve("nope", "", false)

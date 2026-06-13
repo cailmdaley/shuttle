@@ -183,6 +183,20 @@ defmodule Shuttle.DispatcherTest do
     refute prompt =~ "Exit before context is half-full"
   end
 
+  test "render_prompt carries the headless notice only when headless: true" do
+    # Headless (-p) workers run unattended — the prompt must tell them the
+    # human-gate exception can't apply, or they may park at a checkpoint that
+    # never gets answered.
+    headless = Dispatcher.render_prompt("tests/haiku", headless: true)
+    assert headless =~ "Headless"
+    assert headless =~ "no human can attach"
+    assert headless =~ "human-gate exception never applies"
+
+    # Default (interactive) dispatch carries no such notice.
+    interactive = Dispatcher.render_prompt("tests/haiku")
+    refute interactive =~ "no human can attach"
+  end
+
   test "render_prompt names the felt store so the safe-fail global id stays resolvable" do
     # When prompt_fiber_id's local translation misses, the worker holds a
     # global id that doesn't resolve from cwd. The store line makes the
@@ -580,6 +594,50 @@ defmodule Shuttle.DispatcherTest do
     assert cmd =~ "--chrome"
   end
 
+  test "claude-*-headless alias expands to base + -p print mode with bypass permissions" do
+    {:ok, agent} = Agents.resolve_with_axes("claude-haiku-headless", nil, false)
+    assert agent.id == "claude-haiku"
+    assert agent[:headless] == true
+    cmd = Agents.build_command(agent, "hi", session_id: "11111111-2222-4333-8444-555555555555")
+    assert cmd =~ "-p"
+    assert cmd =~ "--model 'haiku'"
+    assert cmd =~ "--permission-mode bypassPermissions"
+    refute cmd =~ "--permission-mode auto"
+    # --session-id survives print mode (the durable resume handle)
+    assert cmd =~ "--session-id '11111111-2222-4333-8444-555555555555'"
+  end
+
+  test "headless composes with effort (claude-opus-headless + max)" do
+    {:ok, agent} = Agents.resolve_with_axes("claude-opus-headless", "max", false)
+    cmd = Agents.build_command(agent, "hi")
+    assert cmd =~ "-p"
+    assert cmd =~ "--effort 'max'"
+    assert cmd =~ "--permission-mode bypassPermissions"
+  end
+
+  test "non-headless claude keeps interactive permission mode and no -p" do
+    {:ok, agent} = Agents.resolve_with_axes("claude-sonnet", nil, false)
+    cmd = Agents.build_command(agent, "hi")
+    assert cmd =~ "--permission-mode auto"
+    refute cmd =~ "bypassPermissions"
+    refute cmd =~ ~r/(^|\s)-p(\s|$)/
+  end
+
+  test "headless is rejected on a non-claude harness" do
+    rec = %{
+      id: "codex-headless-bogus",
+      cli: "codex",
+      effort_levels: ["low"],
+      chrome_capable: false,
+      alias_of: "codex",
+      axes: %{headless: true, chrome: false, effort: nil}
+    }
+
+    assert {:error, msg} = Agents.apply_axes(rec, nil, false)
+    assert msg =~ "headless"
+    assert msg =~ "claude harness only"
+  end
+
   test "effort out of range is rejected (Copilot Sonnet capped at high)" do
     assert {:error, msg} = Agents.resolve_with_axes("pi-sonnet", "xhigh", false)
     assert msg =~ "not allowed"
@@ -866,7 +924,7 @@ defmodule Shuttle.DispatcherTest do
   end
 
   test "capture spawns a non-shuttle-suffixed session with the prompt in the run script" do
-    {:ok, %{session: session, session_uuid: uuid, agent_id: "claude-fable"}} =
+    {:ok, %{session: session, session_uuid: uuid, agent_id: "claude-sonnet"}} =
       Dispatcher.capture("an idea", runner: MockRunner, work_dir: "/tmp", felt_store: "/tmp")
 
     assert session =~ ~r/^capture-[0-9a-f]{8}$/
