@@ -215,6 +215,12 @@ function SurfaceView({
           activeSurface={surface}
           outputs={outputs}
           includeSupportingDocuments={false}
+          /* On a surface, the narrative-section links would otherwise be bare
+             `#section-…` anchors that don't resolve (the sections aren't on
+             this page) — so "Narrative" couldn't bring you back. A "/" base
+             makes them `/#section-…`, which onClickInterceptNav routes back to
+             the narrative surface. */
+          sectionHrefBase="/"
         />
       </AstraDataProvider>
     </ArticleProvider>
