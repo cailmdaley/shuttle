@@ -23,6 +23,7 @@ import {
   readPanelGeometry,
   type PanelGeometry,
 } from './FloatingPanelChrome.js'
+import { paperUrl } from './utils.js'
 
 const MIN_WIDTH = 320
 const MIN_HEIGHT = 240
@@ -148,7 +149,7 @@ export class FileViewerPanel {
     document.body.appendChild(overlay)
     this.overlay = overlay
 
-    this.applyGeometry(overlay, opts?.geometry)
+    this.applyGeometry(overlay, opts?.geometry, isAstraYaml(fullPath))
     attachPanelDrag(overlay, header, {
       draggingClass: 'kbn-fileview-dragging',
       onSettle: () => this.rememberGeometry(),
@@ -202,7 +203,15 @@ export class FileViewerPanel {
 
   private buildViewer(fullPath: string, originId: string): HTMLElement {
     const ext = extOf(fullPath)
-    const src = this.projectFileUrl(fullPath, originId)
+    // An astra.yaml deliverable renders as the full Lightcone paper, not raw
+    // YAML — the paper entry (served by the Shuttle daemon, owner-routed by
+    // origin) bakes the astra.yaml's project dir, the same treatment a
+    // `:::{embed} astra.yaml` gets in a fiber body. Falls back to the raw
+    // bytes if the path can't resolve to a dir.
+    const isAstra = isAstraYaml(fullPath)
+    const src = isAstra
+      ? (paperUrl(fullPath, { originId }) ?? this.projectFileUrl(fullPath, originId))
+      : this.projectFileUrl(fullPath, originId)
 
     if (IMAGE_EXTS.has(ext)) {
       const img = document.createElement('img')
@@ -262,14 +271,17 @@ export class FileViewerPanel {
     return `${this.portolanBase}/project-file/${encodeURIComponent(origin)}${encodedPath}?standalone=1`
   }
 
-  private applyGeometry(overlay: HTMLElement, pinned?: PanelGeometry): void {
+  private applyGeometry(overlay: HTMLElement, pinned?: PanelGeometry, wide = false): void {
     const vw = window.innerWidth
     const vh = window.innerHeight
     let g = pinned ?? lastGeometry
     if (g && (g.left > vw - 80 || g.top > vh - 80)) g = null
     // Default: a reading-width column hugging the right edge, so it lands
-    // beside (not on top of) a centered detail panel.
-    const width = g?.width ?? Math.min(720, Math.round(vw * 0.45))
+    // beside (not on top of) a centered detail panel. A paper render (astra)
+    // gets a wider default — the full Lightcone chrome (two sidebars) needs
+    // room — though a remembered/pinned geometry still wins.
+    const width =
+      g?.width ?? (wide ? Math.min(1180, Math.round(vw * 0.74)) : Math.min(720, Math.round(vw * 0.45)))
     const height = g?.height ?? vh - 48
     const left = g?.left ?? Math.max(0, vw - width - 16)
     const top = g?.top ?? Math.round((vh - height) / 2)
@@ -292,4 +304,8 @@ function extOf(path: string): string {
   const base = basenameOf(path)
   const dot = base.lastIndexOf('.')
   return dot > 0 ? base.slice(dot + 1).toLowerCase() : ''
+}
+
+function isAstraYaml(path: string): boolean {
+  return basenameOf(path) === 'astra.yaml'
 }
