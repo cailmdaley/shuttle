@@ -623,11 +623,17 @@
   cursor: pointer;
 }
 
-/* The lede = the fiber's outcome, set above the body and ruled off from it. */
+/* The lede = the fiber's outcome, set above the body as a quoted callout —
+   a left ochre rule + warm tint, matching how vellum presents a fiber's
+   lede/blockquote. Upright (not italic): outcomes are often long and
+   information-dense, so the rule + offset carry the "quote" read without the
+   readability cost of a full italic paragraph. */
 .kbn-detail-lede {
-  margin-bottom: 1.6rem;
-  padding-bottom: 1.2rem;
-  border-bottom: 1px solid rgba(27, 22, 17, 0.12);
+  margin: 0 0 1.7rem;
+  padding: 0.5rem 0.9rem 0.55rem 1.1rem;
+  border-left: 3px solid var(--porch-ochre, #C2963B);
+  border-radius: 0 3px 3px 0;
+  background: rgba(194, 150, 59, 0.07);
   font-size: 1.04em;
   color: #3a352e;
 }
