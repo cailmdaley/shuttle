@@ -12,7 +12,7 @@
  */
 
 declare module '@lightcone/renderer' {
-  import type { ComponentType } from 'react'
+  import type { ComponentType, ReactNode } from 'react'
   import type { GenericParent, References } from 'myst-common'
   import type { NodeRenderers } from '@myst-theme/providers'
 
@@ -33,13 +33,71 @@ declare module '@lightcone/renderer' {
     kind?: unknown
   }
 
+  /** A structured ASTRA output (from MySTRA's buildASTRADataMap). */
+  export interface OutputEntry {
+    id: string
+    label?: string
+    type?: string
+    description?: string
+    /** Relative artifact URL, e.g. /static/hubble_diagram.png. */
+    resolved_path?: string
+    metric?: {
+      value?: number | string
+      uncertainty?: number | string
+      error?: number | string
+      unit?: string
+      units?: string
+    }
+  }
+
+  /** A structured ASTRA input (from MySTRA's buildASTRADataMap). */
+  export interface InputEntry {
+    id: string
+    label?: string
+    type?: string
+    description?: string
+    source?: string
+    from?: string
+  }
+
   export const PaperView: ComponentType<{
     article: PaperArticle
     crumbs?: unknown[]
     scopeNav?: unknown
     mastheadFrontmatter?: MastheadFrontmatter
-    astra?: { inputs: unknown[]; outputs?: unknown[] } | null
+    astra?: { inputs: InputEntry[]; outputs?: OutputEntry[] } | null
     projectLabel?: string
+  }>
+
+  // The non-narrative surfaces + the shell pieces lightcone-ui's SurfacePage
+  // composes. Findings/Decisions walk the page mdast; Outputs/Inputs read the
+  // structured data. Typed at the surface we use — the real source is bundled
+  // by Vite through the alias; these declarations only keep `tsc` at the border.
+  export const FindingsView: ComponentType<{ nodes: unknown[] }>
+  export const DecisionsView: ComponentType<{
+    nodes: unknown[]
+    astraOutputs?: OutputEntry[]
+    scopeLabel?: string
+  }>
+  export const OutputsGallery: ComponentType<{ outputs: OutputEntry[]; baseSlug?: string }>
+  export const InputsList: ComponentType<{ inputs: InputEntry[] }>
+
+  export const Masthead: ComponentType<{
+    frontmatter?: MastheadFrontmatter
+    fallbackTitle?: string
+  }>
+  export const PaperSidebar: ComponentType<{
+    mdast: GenericParent
+    activeSurface?: string
+    scopeNav?: unknown
+    sectionHrefBase?: string
+    outputs?: OutputEntry[]
+    includeSupportingDocuments?: boolean
+  }>
+  export const ThemeToggle: ComponentType<Record<string, never>>
+  export const AstraDataProvider: ComponentType<{
+    value: { inputs: InputEntry[]; outputs: OutputEntry[] }
+    children?: ReactNode
   }>
 
   export const LIGHTCONE_OVERRIDES: NodeRenderers

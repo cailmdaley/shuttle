@@ -45,7 +45,29 @@ if (!projectDir) {
   process.exit(2)
 }
 
-const { loadASTRASource, buildAllPages } = await import(pathToFileURL(resolveMystraDist()).href)
+const distIndex = resolveMystraDist()
+const { loadASTRASource, buildAllPages } = await import(pathToFileURL(distIndex).href)
+
+// buildASTRADataMap lives in the server route module (not re-exported from
+// dist/index.js), but it's a pure transform with no server deps — it's what
+// MySTRA's /astra/{slug}.json endpoint serves. We call it alongside
+// buildAllPages so the daemon hands the paper entry BOTH the mdast pages and
+// the structured {outputs, inputs} the decisions/outputs/inputs SURFACES need
+// (the narrative page renders from mdast alone; the surfaces don't).
+const astraRoute = join(dirname(distIndex), 'server', 'routes', 'astra.js')
+const { buildASTRADataMap } = await import(pathToFileURL(astraRoute).href)
+
 const src = loadASTRASource(resolve(projectDir), universe)
 const pages = buildAllPages(src.analysis, src.universe, src.results, src.projectDir)
-process.stdout.write(JSON.stringify({ pages }))
+
+// Map<slug, {outputs, inputs}> → a plain object keyed by slug ('index' = root).
+// Defensive: a data-shape problem in the surface extraction must not sink the
+// whole bake — the narrative still renders, the surfaces just show empty.
+let astra = {}
+try {
+  astra = Object.fromEntries(buildASTRADataMap(src.analysis, src.results))
+} catch (e) {
+  process.stderr.write(`buildASTRADataMap failed (surfaces will be empty): ${e?.stack ?? e}\n`)
+}
+
+process.stdout.write(JSON.stringify({ pages, astra }))

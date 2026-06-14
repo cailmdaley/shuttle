@@ -1,5 +1,5 @@
 import type { GenericParent } from 'myst-common'
-import type { MastheadFrontmatter } from '@lightcone/renderer'
+import type { MastheadFrontmatter, InputEntry, OutputEntry } from '@lightcone/renderer'
 
 /**
  * One baked page, as MySTRA's `buildAllPages` emits it (see priv/mystra/bake.mjs).
@@ -17,8 +17,21 @@ export interface BakedPage {
   dois?: unknown
 }
 
+/**
+ * The structured ASTRA data for one page — what the decisions/outputs/inputs
+ * SURFACES render from (the narrative page renders from mdast alone). Produced
+ * by MySTRA's `buildASTRADataMap`, keyed by page slug ('index' = root) in
+ * `BakedPaper.astra` (see priv/mystra/bake.mjs).
+ */
+export interface AstraPageData {
+  outputs: OutputEntry[]
+  inputs: InputEntry[]
+}
+
 export interface BakedPaper {
   pages: BakedPage[]
+  /** Per-page `{outputs, inputs}` for the non-narrative surfaces, by slug. */
+  astra?: Record<string, AstraPageData>
 }
 
 export interface LoadPaperArgs {
