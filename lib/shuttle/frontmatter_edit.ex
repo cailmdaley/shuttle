@@ -97,6 +97,66 @@ defmodule Shuttle.FrontmatterEdit do
     ~s(") <> escaped <> ~s(")
   end
 
+  # ── fresh emission (map → YAML block) ────────────────────────────────────────
+
+  @doc """
+  Render a map of frontmatter keys to a fresh YAML block — the emit counterpart
+  to `apply/2`'s surgical edit. Used by the fiber-CREATION path to splice
+  non-native keys (the `shuttle:` block, an authored `outcome`, …) into a newly
+  minted fiber. Nested maps recurse; lists become `- item` sequences; multi-line
+  strings become `|-` block scalars (never `inspect/1`-escaped one-liners — the
+  corruption that vanished cmbx); single-line values use `scalar/1`. Keys are
+  emitted in sorted order: a fresh map carries no authored order to preserve, and
+  determinism keeps creation byte-stable.
+  """
+  @spec render(map()) :: String.t()
+  def render(map) when is_map(map), do: render_map(map, 0)
+
+  defp render_map(map, indent) do
+    map
+    |> Enum.sort_by(fn {key, _} -> to_string(key) end)
+    |> Enum.map_join("", fn {key, value} -> render_field(to_string(key), value, indent) end)
+  end
+
+  defp render_field(key, value, indent) when is_map(value) do
+    "#{indent(indent)}#{key}:\n" <> render_map(value, indent + 2)
+  end
+
+  defp render_field(key, value, indent) when is_list(value) do
+    "#{indent(indent)}#{key}:\n" <>
+      Enum.map_join(value, "", fn item -> "#{indent(indent + 2)}- #{scalar(item)}\n" end)
+  end
+
+  defp render_field(key, value, indent) when is_binary(value) do
+    if String.contains?(value, "\n") do
+      render_block_scalar(key, value, indent)
+    else
+      "#{indent(indent)}#{key}: #{scalar(value)}\n"
+    end
+  end
+
+  defp render_field(key, value, indent), do: "#{indent(indent)}#{key}: #{scalar(value)}\n"
+
+  # A multi-line string as a `|-` block scalar (strip-chomped: no trailing blank
+  # line), each content line indented two past the key. Blank lines stay blank so
+  # they don't carry trailing whitespace.
+  defp render_block_scalar(key, value, indent) do
+    child = indent + 2
+
+    body =
+      value
+      |> String.trim_trailing("\n")
+      |> String.split("\n")
+      |> Enum.map_join("\n", fn
+        "" -> ""
+        line -> indent(child) <> line
+      end)
+
+    "#{indent(indent)}#{key}: |-\n#{body}\n"
+  end
+
+  defp indent(n), do: String.duplicate(" ", n)
+
   # ── parsing ──────────────────────────────────────────────────────────────────
 
   # Split the text into lines, remembering whether it ended with a newline so we

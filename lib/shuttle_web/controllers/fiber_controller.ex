@@ -23,7 +23,7 @@ defmodule ShuttleWeb.FiberController do
 
   use Phoenix.Controller, formats: [:json]
 
-  alias Shuttle.{FeltStores, OriginRouter}
+  alias Shuttle.{FeltStores, FrontmatterEdit, OriginRouter}
 
   # Frontmatter keys felt owns natively and writes itself on `felt add`. Anything
   # the caller supplies outside this set is non-native and gets spliced into the
@@ -244,7 +244,7 @@ defmodule ShuttleWeb.FiberController do
   defp splice(path, content, extra) do
     case String.split(content, "---\n", parts: 3) do
       ["", frontmatter, rest] ->
-        rendered = yaml(extra)
+        rendered = FrontmatterEdit.render(extra)
         payload = ["---\n", frontmatter, rendered, "---\n", rest]
         atomic_write(path, payload)
 
@@ -295,44 +295,4 @@ defmodule ShuttleWeb.FiberController do
   defp stringify_value(value) when is_map(value), do: stringify_keys(value)
   defp stringify_value(value) when is_list(value), do: Enum.map(value, &stringify_value/1)
   defp stringify_value(value), do: value
-
-  defp yaml(map) do
-    map
-    |> Enum.sort_by(fn {key, _} -> key end)
-    |> Enum.map_join("", fn {key, value} -> yaml_field(key, value, 0) end)
-  end
-
-  defp yaml_field(key, value, indent) when is_map(value) do
-    "#{spaces(indent)}#{key}:\n" <> yaml_nested(value, indent + 2)
-  end
-
-  defp yaml_field(key, value, indent) when is_list(value) do
-    "#{spaces(indent)}#{key}:\n" <>
-      Enum.map_join(value, "", fn item -> "#{spaces(indent + 2)}- #{yaml_scalar(item)}\n" end)
-  end
-
-  defp yaml_field(key, value, indent), do: "#{spaces(indent)}#{key}: #{yaml_scalar(value)}\n"
-
-  defp yaml_nested(map, indent) do
-    map
-    |> Enum.sort_by(fn {key, _} -> key end)
-    |> Enum.map_join("", fn {key, value} -> yaml_field(key, value, indent) end)
-  end
-
-  defp yaml_scalar(value) when is_boolean(value), do: to_string(value)
-  defp yaml_scalar(value) when is_integer(value), do: to_string(value)
-  defp yaml_scalar(value) when is_float(value), do: to_string(value)
-  defp yaml_scalar(nil), do: "null"
-
-  defp yaml_scalar(value) when is_binary(value) do
-    cond do
-      value == "" -> ~s("")
-      String.match?(value, ~r/^[A-Za-z0-9_\/.\-:@]+$/) -> value
-      true -> inspect(value)
-    end
-  end
-
-  defp yaml_scalar(value), do: inspect(value)
-
-  defp spaces(n), do: String.duplicate(" ", n)
 end

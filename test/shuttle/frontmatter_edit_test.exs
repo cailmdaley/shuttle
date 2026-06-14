@@ -92,4 +92,44 @@ defmodule Shuttle.FrontmatterEditTest do
       assert keys == ["name", "status", "outcome", "shuttle"]
     end
   end
+
+  describe "render/1 — fresh map → YAML block (creation-path emit)" do
+    test "nested map + scalars render as valid YAML that round-trips" do
+      extra = %{
+        "shuttle" => %{"kind" => "pinned", "host" => "cineca", "project_dir" => "/leonardo/cmbx"},
+        "horizon" => "now"
+      }
+
+      {:ok, parsed} = YamlElixir.read_from_string(FrontmatterEdit.render(extra))
+      assert parsed == extra
+    end
+
+    test "multi-line string renders as a |- block scalar, never an escaped one-liner" do
+      outcome = "First line, Cail: \"much better\"\n---\nSecond chunk, unicode δκ → σ ≥ done"
+      out = FrontmatterEdit.render(%{"outcome" => outcome})
+
+      assert out =~ "outcome: |-"
+      refute out =~ ~s(outcome: ")
+      {:ok, parsed} = YamlElixir.read_from_string(out)
+      assert parsed["outcome"] == outcome
+    end
+
+    test "embedded quotes + unicode in a single-line value round-trip as YAML (not inspect/1)" do
+      {:ok, parsed} =
+        FrontmatterEdit.render(%{"name" => "Cail said \"hi\" — δ"})
+        |> YamlElixir.read_from_string()
+
+      assert parsed["name"] == "Cail said \"hi\" — δ"
+    end
+
+    test "spliced after felt-native frontmatter, the whole document parses" do
+      native = "id: 01ABC\nname: Test\nstatus: active\n"
+      extra = %{"shuttle" => %{"kind" => "oneshot", "host" => "dapmcw68"}, "outcome" => "line one\nline two"}
+
+      {:ok, parsed} = YamlElixir.read_from_string(native <> FrontmatterEdit.render(extra))
+      assert parsed["shuttle"]["kind"] == "oneshot"
+      assert parsed["outcome"] == "line one\nline two"
+      assert parsed["status"] == "active"
+    end
+  end
 end
