@@ -48,6 +48,41 @@ declare module '@lightcone/renderer' {
       unit?: string
       units?: string
     }
+    /** Shell recipe that materializes this output (the output-detail page). */
+    recipe?: { command?: string; container?: string }
+    /** Input ids this output consumes (declared in the recipe). */
+    inputs?: string[]
+    /** Decision ids parameterizing this output's recipe chain. */
+    decisions?: string[]
+    /** Parsed inline table for a materialized table output. */
+    table_data?: TableData
+  }
+
+  /** Parsed CSV/JSON table for a table output (renderer's TableFromData). */
+  export interface TableData {
+    headers: string[]
+    rows: string[][]
+    truncated?: boolean
+  }
+
+  /** One node in the sub-analysis scope tree (PaperSidebar / PaperView). */
+  export interface ScopeNavItem {
+    slug: string
+    title: string
+  }
+
+  /** The scope tree: root + its sub-analysis pages, with the active slug. */
+  export interface ScopeNav {
+    rootTitle: string
+    pages: ScopeNavItem[]
+    /** '' (or 'index') = root; else the active sub-analysis slug. */
+    activeSlug?: string
+  }
+
+  /** A breadcrumb hop back up the sub-analysis hierarchy. */
+  export interface HeaderCrumb {
+    label: string
+    href: string
   }
 
   /** A structured ASTRA input (from MySTRA's buildASTRADataMap). */
@@ -62,8 +97,8 @@ declare module '@lightcone/renderer' {
 
   export const PaperView: ComponentType<{
     article: PaperArticle
-    crumbs?: unknown[]
-    scopeNav?: unknown
+    crumbs?: HeaderCrumb[]
+    scopeNav?: ScopeNav
     mastheadFrontmatter?: MastheadFrontmatter
     astra?: { inputs: InputEntry[]; outputs?: OutputEntry[] } | null
     projectLabel?: string
@@ -86,12 +121,16 @@ declare module '@lightcone/renderer' {
     frontmatter?: MastheadFrontmatter
     fallbackTitle?: string
   }>
+  export const Breadcrumb: ComponentType<{ crumbs: HeaderCrumb[] }>
+  export const TableFromData: ComponentType<{ data: TableData; label?: string }>
   export const PaperSidebar: ComponentType<{
     mdast: GenericParent
     activeSurface?: string
-    scopeNav?: unknown
+    scopeNav?: ScopeNav
     sectionHrefBase?: string
     outputs?: OutputEntry[]
+    /** Active output id → leaf highlight on /outputs/<id> detail pages. */
+    activeOutputId?: string
     includeSupportingDocuments?: boolean
   }>
   export const ThemeToggle: ComponentType<Record<string, never>>
