@@ -230,19 +230,22 @@ Dispatch sanity ladder:
    the resolved agent's `cli` and that the wrapper is on `PATH`.
 
 **Kanban stuck on "Loading…" / `/api/v1/state` returns
-`{"error":"poller_unavailable", ..., "{:timeout, {GenServer, :call, [Shuttle.Poller, …, 1500]}}"}`.**
-The poller is perpetually mid-walk and can't answer the snapshot call within its
-1500ms budget — almost always an over-broad store in the persisted
-`~/.shuttle/felt_stores.json`. A `$HOME` or iCloud entry makes each tick walk a
-huge tree (seen: a single `felt show` taking 100s+ in `shuttle.log` as
-`Sent 200 in NNNNNms`); the snapshot call starves behind it. This is a classic
-fresh-machine artifact — the persisted list is git-synced/stale and lists paths
-that are enormous on the new host. Fix: collapse the file to the canonical
-`~/loom` (the global store recurses into every symlinked substore, so it's the
-superset), then `make restart`. Confirm with `curl -s :4000/api/v1/state` — the
-`local` block should resolve without `poller_unavailable`. The remotes timing
-out independently (`ssh_check_failed`, `:4001 econnrefused`) is separate noise,
-not this.
+`{"error":"poller_unavailable", ..., "{:timeout, {GenServer, :call, [Shuttle.Poller, …, 1500]}}"}`
+right after a fresh daemon start.** The poller serves its *last* snapshot, but on
+a cold boot there is none yet, so the snapshot call starves behind the first full
+walk until it completes — and the **first tick on a fresh machine is cold**: empty
+OS file cache, dataless iCloud sidecars (`com~apple~CloudDocs` stores ship `.felt`
+index files as `dataless` placeholders that block on a network download the first
+time `felt` reads them), and every configured store walked back-to-back. Observed
+once at **~106s** (`Sent 200 in 106275ms` in `shuttle.log`). It is a one-time tax:
+once warm, all stores poll in well under a second and the board loads. So **wait
+out the first walk** rather than trimming `~/.shuttle/felt_stores.json` — the
+persisted list is fine, and most project stores are slices of `~/loom` (the
+aggregate store; its ids are already prefixed `ai-futures/…`, `portolan/…`) so
+trimming gains little. Two real follow-ups: (1) a store path with **no `.felt/`
+dir** ("not in a felt repository") errors every tick — drop it from the list;
+(2) the remotes timing out independently (`ssh_check_failed`, `:4001
+econnrefused`) is separate noise, not this.
 
 ## Codebase layout
 
