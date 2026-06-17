@@ -42,24 +42,35 @@ defmodule Shuttle.Kitty do
 
   def open(session, host) when is_binary(session) and session != "" do
     with {:ok, kitty} <- kitty_bin() do
-      socket = kitty_socket()
       remote? = remote_host?(host)
       title = if remote?, do: "#{session}@#{host}", else: session
 
       result =
-        case focus_tab(kitty, socket, title) do
-          :ok -> :ok
-          :miss -> launch_tab(kitty, socket, title, session, host, remote?)
+        case kitty_socket() do
+          # No live kitty to remote-control (only stale/dead socket files, or
+          # nothing). Spawn a fresh standalone kitty window running the attach
+          # directly — reliable without any control socket, and the new window
+          # registers its own listen socket so the NEXT click can focus-dedupe.
+          nil ->
+            spawn_window(kitty, title, session, host, remote?)
+
+          # A live socket — a Quick-Access panel (preferred: it's the user's
+          # quick terminal surface) or a normal window. Put the worker tab on
+          # it, then reveal: a panel is hide-on-focus-loss so it must be toggled
+          # visible; a normal window just gets raised.
+          {socket, kind} ->
+            placed =
+              case focus_tab(kitty, socket, title) do
+                :ok -> :ok
+                :miss -> launch_tab(kitty, socket, title, session, host, remote?)
+              end
+
+            with :ok <- placed do
+              reveal(kitty, socket, kind)
+            end
         end
 
-      case result do
-        :ok ->
-          activate(kitty)
-          :ok
-
-        {:error, _} = err ->
-          err
-      end
+      result
     end
   end
 
@@ -108,6 +119,26 @@ defmodule Shuttle.Kitty do
     end
   end
 
+  # Spawn a fresh standalone kitty OS window running the attach command, with no
+  # remote control involved. The fallback when no live normal control socket
+  # exists — invoking the `kitty` binary directly always opens a real window
+  # (the GUI process daemonizes its own window), and that window registers its
+  # own `listen_on` socket, so subsequent clicks find a normal socket and
+  # focus-dedupe via `launch_tab`. SSH_AUTH_SOCK is inherited from the daemon's
+  # env (so a remote `ssh -tt` attach authenticates) — no `--env` needed, unlike
+  # the `kitty @ launch` path which runs in a *different* kitty's env.
+  #
+  # Run detached in a throwaway process: invoking the kitty binary blocks until
+  # the window closes, so `open/2` must not wait on it. A spawn failure is
+  # swallowed (best-effort) — `kitty_bin/0` already validated the binary, so the
+  # realistic failure modes are gone by here.
+  defp spawn_window(kitty, title, session, host, remote?) do
+    attach = attach_command(session, host, remote?)
+    args = ["--title", title] ++ attach
+    spawn(fn -> run(kitty, args) end)
+    :ok
+  end
+
   @doc """
   The inner attach command kitty runs in the new tab. Local → `tmux attach -t
   =<session>` (the leading `=` forces an exact session match); remote → the same
@@ -127,40 +158,100 @@ defmodule Shuttle.Kitty do
     end
   end
 
+  # Bring the worker terminal into view after its tab is placed.
+  #   :panel  → reveal the Quick-Access dropdown (hide-on-focus-loss, so a
+  #             focused tab isn't enough — the OS window must be toggled visible)
+  #   :normal → raise the kitty app to the front
+  defp reveal(kitty, socket, :panel) do
+    show_panel(socket)
+    activate(kitty)
+    :ok
+  end
+
+  defp reveal(kitty, _socket, :normal) do
+    activate(kitty)
+    :ok
+  end
+
+  # Reveal the Quick-Access panel iff it is currently hidden. Its
+  # `quick-access-terminal` kitten TOGGLES visibility, so blindly invoking it
+  # on an already-visible panel would hide it — guard on the panel window's
+  # `is_focused` (a visible, focused panel needs no toggle).
+  defp show_panel(socket) do
+    unless panel_focused?(socket) do
+      case kitten_bin() do
+        {:ok, kitten} -> run(kitten, ["quick-access-terminal"])
+        _ -> :noop
+      end
+    end
+
+    :ok
+  end
+
+  # Whether the panel's OS window is currently focused (visible + frontmost),
+  # read from `kitty @ ls`. Any failure → false, so show_panel errs toward
+  # revealing rather than leaving it hidden.
+  defp panel_focused?(socket) do
+    case run_kitty_ls(socket) do
+      {:ok, windows} -> Enum.any?(windows, &(&1["is_focused"] == true))
+      _ -> false
+    end
+  end
+
+  defp run_kitty_ls(socket) do
+    with {:ok, kitty} <- kitty_bin(),
+         {out, 0} <- run(kitty, ["@"] ++ to_opt(socket) ++ ["ls"]),
+         {:ok, windows} <- Jason.decode(out) do
+      {:ok, windows}
+    else
+      _ -> :error
+    end
+  end
+
   # Raise kitty to the front (best-effort, macOS).
   defp activate(_kitty) do
     run("osascript", ["-e", ~s(tell application "kitty" to activate)])
     :ok
   end
 
+  @kitten_candidates [
+    "/opt/homebrew/bin/kitten",
+    "/usr/local/bin/kitten",
+    "/Applications/kitty.app/Contents/MacOS/kitten"
+  ]
+
+  defp kitten_bin do
+    case System.find_executable("kitten") || Enum.find(@kitten_candidates, &File.exists?/1) do
+      nil -> {:error, "kitten not found on this host"}
+      path -> {:ok, path}
+    end
+  end
+
   defp to_opt(nil), do: []
   defp to_opt(socket), do: ["--to", socket]
 
-  # The `--to` target: `$KITTY_LISTEN_ON` when the daemon itself runs inside a
-  # kitty, else the best `/tmp/kitty-*` socket. nil → let kitty try its own
-  # default (works when a single socket is unambiguous).
+  # The `--to` target as `{socket, kind}`: `$KITTY_LISTEN_ON` when the daemon
+  # itself runs inside a kitty (treated as a normal window), else the best
+  # `/tmp/kitty-*` socket. nil → no live kitty to control (`open/2` spawns a
+  # fresh window).
   defp kitty_socket do
     case System.get_env("KITTY_LISTEN_ON") do
-      s when is_binary(s) and s != "" -> s
+      s when is_binary(s) and s != "" -> {s, :normal}
       _ -> best_tmp_socket()
     end
   end
 
-  # Pick the best `/tmp/kitty-<pid>` control socket. A NORMAL kitty window wins
-  # over a Quick-Access / `kitten panel` overlay: the panel is a
-  # hide-on-focus-loss dropdown, so a worker terminal launched there vanishes
-  # the moment you click away — and its socket is often the most recently
-  # touched, so the naive newest-wins heuristic always lost to it. Within each
-  # class the most-recently-touched wins; a panel is the last resort so the
-  # button still does *something* when no normal window is listening — though
-  # the real fix then is to (re)open a normal kitty window so it exposes a
-  # `/tmp/kitty-<pid>` socket of its own.
+  # Choose a live `/tmp/kitty-<pid>` control socket, preferring the Quick-Access
+  # panel (the user's quick-terminal surface) over a normal window. Stale/dead
+  # socket files (owning pid gone — `kitty @ --to` then fails with `connect: no
+  # such file`) are excluded; nil when nothing live remains, which routes
+  # `open/2` to spawn a fresh window.
   defp best_tmp_socket do
     "/tmp/kitty-*"
     |> Path.wildcard()
     |> Enum.flat_map(fn p ->
       case File.stat(p, time: :posix) do
-        {:ok, %File.Stat{mtime: m}} -> [{p, m, panel_socket?(p)}]
+        {:ok, %File.Stat{mtime: m}} -> [{p, m, socket_kind(p)}]
         _ -> []
       end
     end)
@@ -168,35 +259,44 @@ defmodule Shuttle.Kitty do
   end
 
   @doc """
-  Choose the control socket from candidates shaped `{path, mtime, panel?}`:
-  the most-recently-touched NORMAL window, else the most-recently-touched panel
-  as a last resort, else nil. Pure, so the preference order is unit-testable
-  without a live kitty.
+  Choose the control socket from candidates shaped `{path, mtime, kind}` where
+  `kind` is `:normal | :panel | :dead`. Returns `{"unix:" <> path, kind}` or
+  nil. Preference: the most-recently-touched `:panel` (the Quick-Access
+  dropdown is the preferred worker-terminal surface), else the
+  most-recently-touched `:normal` window, else nil (all candidates dead). Pure,
+  so the policy is unit-testable without a live kitty.
   """
-  @spec pick_socket([{String.t(), integer(), boolean()}]) :: String.t() | nil
+  @spec pick_socket([{String.t(), integer(), :normal | :panel | :dead}]) ::
+          {String.t(), :panel | :normal} | nil
   def pick_socket(candidates) do
-    sorted = Enum.sort_by(candidates, fn {_p, m, _panel?} -> m end, :desc)
-    main = Enum.find(sorted, fn {_p, _m, panel?} -> not panel? end)
+    by_recency = Enum.sort_by(candidates, fn {_p, m, _kind} -> m end, :desc)
 
-    case main || List.first(sorted) do
-      {path, _m, _panel?} -> "unix:" <> path
+    panel = Enum.find(by_recency, fn {_p, _m, kind} -> kind == :panel end)
+    normal = Enum.find(by_recency, fn {_p, _m, kind} -> kind == :normal end)
+
+    case panel || normal do
+      {path, _m, kind} -> {"unix:" <> path, kind}
       nil -> nil
     end
   end
 
-  # True iff the socket's owning kitty process (`/tmp/kitty-<pid>`) was launched
-  # as a Quick-Access / panel overlay rather than a normal window. Keyed on the
-  # `kitten panel` / `quick-access` signature in its argv; any lookup failure
-  # falls back to "not a panel" so a normal socket is never wrongly excluded.
-  defp panel_socket?(path) do
+  # Classify a `/tmp/kitty-<pid>` socket by its owning process:
+  #   :dead   — pid gone (stale socket file left behind; connecting would fail)
+  #   :panel  — a Quick-Access / `kitten panel` overlay instance
+  #   :normal — a normal kitty window we can safely remote-control
+  # `ps` exiting non-zero means the pid is gone → :dead, which is how the stale
+  # `/tmp/kitty-<pid>` files that caused `connect: no such file` get excluded.
+  defp socket_kind(path) do
     with "kitty-" <> pid when pid != "" <- Path.basename(path),
          {out, 0} <- System.cmd("ps", ["-o", "args=", "-p", pid], stderr_to_stdout: true) do
-      String.contains?(out, "quick-access") or String.contains?(out, "kitten panel")
+      if String.contains?(out, "quick-access") or String.contains?(out, "kitten panel"),
+        do: :panel,
+        else: :normal
     else
-      _ -> false
+      _ -> :dead
     end
   rescue
-    _ -> false
+    _ -> :dead
   end
 
   defp kitty_bin do

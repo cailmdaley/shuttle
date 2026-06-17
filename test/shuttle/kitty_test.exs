@@ -36,30 +36,48 @@ defmodule Shuttle.KittyTest do
   end
 
   describe "pick_socket/1" do
-    test "prefers a normal window over a more-recent quick-access panel" do
-      # The panel is newer (higher mtime) but must NOT win — a worker terminal
-      # in a hide-on-focus-loss dropdown vanishes on click-away.
+    test "prefers the quick-access panel — the user's worker-terminal surface" do
       candidates = [
-        {"/tmp/kitty-100", 100, false},
-        {"/tmp/kitty-200", 200, true}
+        {"/tmp/kitty-100", 100, :normal},
+        {"/tmp/kitty-200", 200, :panel}
       ]
 
-      assert Kitty.pick_socket(candidates) == "unix:/tmp/kitty-100"
+      assert Kitty.pick_socket(candidates) == {"unix:/tmp/kitty-200", :panel}
     end
 
-    test "among normal windows the most-recently-touched wins" do
+    test "among panels the most-recently-touched wins" do
       candidates = [
-        {"/tmp/kitty-100", 100, false},
-        {"/tmp/kitty-300", 300, false},
-        {"/tmp/kitty-200", 200, false}
+        {"/tmp/kitty-100", 100, :panel},
+        {"/tmp/kitty-300", 300, :panel},
+        {"/tmp/kitty-200", 200, :panel}
       ]
 
-      assert Kitty.pick_socket(candidates) == "unix:/tmp/kitty-300"
+      assert Kitty.pick_socket(candidates) == {"unix:/tmp/kitty-300", :panel}
     end
 
-    test "falls back to a panel when no normal window is listening" do
-      candidates = [{"/tmp/kitty-200", 200, true}]
-      assert Kitty.pick_socket(candidates) == "unix:/tmp/kitty-200"
+    test "falls back to a normal window when no panel is listening" do
+      candidates = [
+        {"/tmp/kitty-100", 100, :normal},
+        {"/tmp/kitty-300", 300, :normal}
+      ]
+
+      assert Kitty.pick_socket(candidates) == {"unix:/tmp/kitty-300", :normal}
+    end
+
+    test "dead sockets are never chosen" do
+      # A stale `/tmp/kitty-<pid>` left by a gone process — the cause of the
+      # `connect: no such file` launch failure.
+      candidates = [{"/tmp/kitty-999", 999, :dead}]
+      assert Kitty.pick_socket(candidates) == nil
+    end
+
+    test "a live panel beats a more-recent dead socket" do
+      candidates = [
+        {"/tmp/kitty-100", 100, :panel},
+        {"/tmp/kitty-999", 999, :dead}
+      ]
+
+      assert Kitty.pick_socket(candidates) == {"unix:/tmp/kitty-100", :panel}
     end
 
     test "nil when there are no sockets at all" do
