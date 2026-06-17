@@ -98,6 +98,14 @@ export default defineConfig({
       'myst-spec-ext',
       '@myst-theme/providers',
       '@myst-theme/common',
+      // The renderer's SupportingDocuments → PaperModal lazily
+      // `import("pdfjs-dist")` for its PDF preview. The importer is the aliased
+      // lightcone-ui source, whose tree declares pdfjs-dist but never installed
+      // it (its node_modules predate that addition), so a bare resolve from
+      // there fails the build. We declare + install pdfjs-dist ourselves; dedupe
+      // forces the resolve to our project-root copy regardless of importer
+      // location — same mechanism as the myst stack above.
+      'pdfjs-dist',
     ],
     alias: [
       { find: '@lightcone/renderer', replacement: resolve(lightconeUiDir, 'packages/renderer/src') },

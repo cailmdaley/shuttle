@@ -32,6 +32,14 @@ export interface BakedPaper {
   pages: BakedPage[]
   /** Per-page `{outputs, inputs}` for the non-narrative surfaces, by slug. */
   astra?: Record<string, AstraPageData>
+  /**
+   * Materialized result artifacts, basename → absolute path on the *owning*
+   * host (the one that baked). MySTRA renders figure URLs and output
+   * `resolved_path`s as `/static/<basename>`; the daemon serves many projects
+   * from one origin, so a bare `/static/…` can't resolve there. `resolveStatic`
+   * rewrites each to the owner-routed `/file` byte route using this map.
+   */
+  files?: Record<string, string>
 }
 
 export interface LoadPaperArgs {
@@ -71,5 +79,77 @@ export async function loadPaper(args: LoadPaperArgs): Promise<BakedPaper> {
     const detail = await res.text().catch(() => '')
     throw new Error(detail || `astra bake failed (${res.status})`)
   }
-  return (await res.json()) as BakedPaper
+  return resolveStaticUrls((await res.json()) as BakedPaper, args.origin)
+}
+
+const STATIC_PREFIX = '/static/'
+
+/**
+ * Build the owner-routed `/file` URL for an absolute path on the bake host.
+ * Mirrors the board's `fileUrl` encoding (`board/utils.ts`): percent-encode the
+ * path (`~`→`%7E` for parity), and carry `origin` only for a remote bake — a
+ * local/empty origin lets the daemon serve the bytes itself.
+ */
+function fileUrl(absPath: string, origin?: string | null): string {
+  let url = `/api/v1/file?path=${encodeURIComponent(absPath).replace(/~/g, '%7E')}`
+  if (origin && origin !== 'local') url += `&origin=${encodeURIComponent(origin)}`
+  return url
+}
+
+/**
+ * Rewrite a single `/static/<basename>` reference to the owner-routed `/file`
+ * route via the bake's `files` map. An unmaterialized output isn't in the map,
+ * so its URL is left untouched — for an inline figure MySTRA already emitted a
+ * "Pending Output" admonition in its place, and an output card simply shows no
+ * image. A missing `files` map (an older/remote bake) degrades the same way.
+ */
+function resolveStatic(
+  url: string,
+  files: Record<string, string>,
+  origin?: string | null,
+): string {
+  if (!url.startsWith(STATIC_PREFIX)) return url
+  // Match raw: MySTRA emits bare, never-encoded `/static/<basename>` URLs and
+  // `files` is keyed by the raw `basename(absPath)`, so raw-to-raw is exact.
+  // (No decodeURIComponent — there's no encoded input to undo, and a literal
+  // `%` in a name would throw URIError synchronously inside loadPaper, sinking
+  // the WHOLE paper render via PaperApp's catch rather than just one image.)
+  const base = url.slice(STATIC_PREFIX.length).split(/[?#]/)[0]
+  const abs = files[base]
+  return abs ? fileUrl(abs, origin) : url
+}
+
+/** Recursively rewrite `/static/…` in any mdast node's `url`/`src` field. */
+function rewriteNode(
+  node: unknown,
+  files: Record<string, string>,
+  origin?: string | null,
+): void {
+  if (!node || typeof node !== 'object') return
+  const n = node as { url?: unknown; src?: unknown; children?: unknown }
+  if (typeof n.url === 'string') n.url = resolveStatic(n.url, files, origin)
+  if (typeof n.src === 'string') n.src = resolveStatic(n.src, files, origin)
+  if (Array.isArray(n.children)) for (const c of n.children) rewriteNode(c, files, origin)
+}
+
+/**
+ * Resolve every `/static/<basename>` figure reference — inline mdast image nodes
+ * (the narrative) and `outputs[].resolved_path` (the Outputs surface + cards) —
+ * to the owner-routed `/file` byte route, in place. The `files` map is keyed by
+ * basename exactly as MySTRA's own `/static` handler resolves; this is that same
+ * resolution, precomputed at bake time so one daemon can serve many projects.
+ */
+function resolveStaticUrls(paper: BakedPaper, origin?: string | null): BakedPaper {
+  const files = paper.files
+  if (!files) return paper
+  for (const page of paper.pages) rewriteNode(page.ast, files, origin)
+  for (const data of Object.values(paper.astra ?? {})) {
+    for (const out of data.outputs ?? []) {
+      const o = out as { resolved_path?: unknown }
+      if (typeof o.resolved_path === 'string') {
+        o.resolved_path = resolveStatic(o.resolved_path, files, origin)
+      }
+    }
+  }
+  return paper
 }
