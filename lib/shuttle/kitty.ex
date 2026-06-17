@@ -162,9 +162,12 @@ defmodule Shuttle.Kitty do
   #   :panel  → reveal the Quick-Access dropdown (hide-on-focus-loss, so a
   #             focused tab isn't enough — the OS window must be toggled visible)
   #   :normal → raise the kitty app to the front
-  defp reveal(kitty, socket, :panel) do
+  defp reveal(_kitty, socket, :panel) do
+    # The quick-access-terminal kitten brings the panel to the front with focus
+    # on its own. Do NOT also `activate` the main kitty app — the panel is a
+    # SEPARATE app (kitty-quick-access), so raising the main app would steal
+    # focus and the hide-on-focus-loss panel would immediately hide again.
     show_panel(socket)
-    activate(kitty)
     :ok
   end
 
