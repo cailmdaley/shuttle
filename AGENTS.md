@@ -53,6 +53,13 @@ Candide: OTP 27.3.4.12 pinned in `~/.tool-versions`. Daemon log:
 non-fatal "regexes re-compiled at runtime" perf warning remains — OTP 28.1+ or
 27- silences it).
 
+**The daemon serves its own web UI at `http://127.0.0.1:4000/`** — the kanban
+board, Stash/Capture, and the fiber/file viewer, served as the static `ui/dist`
+bundle by the same process as the `:4000` API (`Plug.Static` + `SpaController`).
+To pull it up locally: `make start` (or Portolan's `dev.sh`), then open the root
+URL in a browser. A fresh checkout that hasn't built the bundle gets a 404 with
+the hint `cd ui && npm run build`; the API stays usable regardless.
+
 **The UI bundle is shipped, not built on-host.** `make all` rebuilds only the
 Elixir escript — it does *not* build `ui/dist`. And the UI **can't** be built on
 the clusters from a source-only `lightcone-ui` clone: the aliased renderer source
@@ -221,6 +228,21 @@ Dispatch sanity ladder:
    `make restart`.
 4. Daemon sees it but agent never appears → check `share/agents.json` for
    the resolved agent's `cli` and that the wrapper is on `PATH`.
+
+**Kanban stuck on "Loading…" / `/api/v1/state` returns
+`{"error":"poller_unavailable", ..., "{:timeout, {GenServer, :call, [Shuttle.Poller, …, 1500]}}"}`.**
+The poller is perpetually mid-walk and can't answer the snapshot call within its
+1500ms budget — almost always an over-broad store in the persisted
+`~/.shuttle/felt_stores.json`. A `$HOME` or iCloud entry makes each tick walk a
+huge tree (seen: a single `felt show` taking 100s+ in `shuttle.log` as
+`Sent 200 in NNNNNms`); the snapshot call starves behind it. This is a classic
+fresh-machine artifact — the persisted list is git-synced/stale and lists paths
+that are enormous on the new host. Fix: collapse the file to the canonical
+`~/loom` (the global store recurses into every symlinked substore, so it's the
+superset), then `make restart`. Confirm with `curl -s :4000/api/v1/state` — the
+`local` block should resolve without `poller_unavailable`. The remotes timing
+out independently (`ssh_check_failed`, `:4001 econnrefused`) is separate noise,
+not this.
 
 ## Codebase layout
 
