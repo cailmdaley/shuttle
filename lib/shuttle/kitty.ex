@@ -137,29 +137,66 @@ defmodule Shuttle.Kitty do
   defp to_opt(socket), do: ["--to", socket]
 
   # The `--to` target: `$KITTY_LISTEN_ON` when the daemon itself runs inside a
-  # kitty, else the most-recently-touched `/tmp/kitty-*` socket. nil → let
-  # kitty try its own default (works when a single socket is unambiguous).
+  # kitty, else the best `/tmp/kitty-*` socket. nil → let kitty try its own
+  # default (works when a single socket is unambiguous).
   defp kitty_socket do
     case System.get_env("KITTY_LISTEN_ON") do
       s when is_binary(s) and s != "" -> s
-      _ -> latest_tmp_socket()
+      _ -> best_tmp_socket()
     end
   end
 
-  defp latest_tmp_socket do
+  # Pick the best `/tmp/kitty-<pid>` control socket. A NORMAL kitty window wins
+  # over a Quick-Access / `kitten panel` overlay: the panel is a
+  # hide-on-focus-loss dropdown, so a worker terminal launched there vanishes
+  # the moment you click away — and its socket is often the most recently
+  # touched, so the naive newest-wins heuristic always lost to it. Within each
+  # class the most-recently-touched wins; a panel is the last resort so the
+  # button still does *something* when no normal window is listening — though
+  # the real fix then is to (re)open a normal kitty window so it exposes a
+  # `/tmp/kitty-<pid>` socket of its own.
+  defp best_tmp_socket do
     "/tmp/kitty-*"
     |> Path.wildcard()
     |> Enum.flat_map(fn p ->
       case File.stat(p, time: :posix) do
-        {:ok, %File.Stat{mtime: m}} -> [{p, m}]
+        {:ok, %File.Stat{mtime: m}} -> [{p, m, panel_socket?(p)}]
         _ -> []
       end
     end)
-    |> Enum.sort_by(fn {_p, m} -> m end, :desc)
-    |> case do
-      [{path, _} | _] -> "unix:" <> path
-      [] -> nil
+    |> pick_socket()
+  end
+
+  @doc """
+  Choose the control socket from candidates shaped `{path, mtime, panel?}`:
+  the most-recently-touched NORMAL window, else the most-recently-touched panel
+  as a last resort, else nil. Pure, so the preference order is unit-testable
+  without a live kitty.
+  """
+  @spec pick_socket([{String.t(), integer(), boolean()}]) :: String.t() | nil
+  def pick_socket(candidates) do
+    sorted = Enum.sort_by(candidates, fn {_p, m, _panel?} -> m end, :desc)
+    main = Enum.find(sorted, fn {_p, _m, panel?} -> not panel? end)
+
+    case main || List.first(sorted) do
+      {path, _m, _panel?} -> "unix:" <> path
+      nil -> nil
     end
+  end
+
+  # True iff the socket's owning kitty process (`/tmp/kitty-<pid>`) was launched
+  # as a Quick-Access / panel overlay rather than a normal window. Keyed on the
+  # `kitten panel` / `quick-access` signature in its argv; any lookup failure
+  # falls back to "not a panel" so a normal socket is never wrongly excluded.
+  defp panel_socket?(path) do
+    with "kitty-" <> pid when pid != "" <- Path.basename(path),
+         {out, 0} <- System.cmd("ps", ["-o", "args=", "-p", pid], stderr_to_stdout: true) do
+      String.contains?(out, "quick-access") or String.contains?(out, "kitten panel")
+    else
+      _ -> false
+    end
+  rescue
+    _ -> false
   end
 
   defp kitty_bin do
