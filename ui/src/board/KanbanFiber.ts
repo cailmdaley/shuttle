@@ -51,7 +51,7 @@ export interface Fiber {
   /** `shuttle.agent` — the agent identifier to dispatch with (e.g. `claude-opus`). */
   shuttleAgent?: string;
   /** `shuttle.effort` — reasoning-effort axis (harness-native token, e.g.
-   * `high`, `xhigh`, `max`). Absent means the harness default. */
+   * `high`, `xhigh`, `max`). Absent resolves to the agent registry default. */
   shuttleEffort?: string;
   /** `shuttle.chrome` — declares the worker should run with `--chrome`. Only
    * surfaced when explicitly true. */

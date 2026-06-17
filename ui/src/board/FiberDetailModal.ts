@@ -802,14 +802,15 @@ export class FiberDetailModal {
     agentLabel.setAttribute('for', 'kbn-detail-agent')
     agentSelect.id = 'kbn-detail-agent'
 
-    // Effort select — its <option>s are repopulated whenever the agent
-    // changes, from that agent's `effort_levels`. The "(default)" option maps
-    // to an empty effort (clears the axis to the harness default).
+    // Effort select — its <option>s are the selected agent's concrete
+    // `effort_levels`. There is deliberately no synthetic "default" option:
+    // an omitted fiber value resolves to the registry's `default_effort`, so
+    // the control always names the level dispatch will actually use.
     const effortSelect = document.createElement('select')
     effortSelect.className = 'kbn-detail-select kbn-detail-select-effort'
     effortSelect.id = 'kbn-detail-effort'
     effortSelect.setAttribute('aria-label', 'Reasoning effort')
-    effortSelect.title = 'Reasoning effort (harness-native; (default) clears the axis)'
+    effortSelect.title = 'Reasoning effort used for this fiber'
 
     // Chrome toggle — enabled only for chrome-capable (claude) agents.
     const chromeWrap = document.createElement('label')
@@ -1699,19 +1700,13 @@ export class FiberDetailModal {
     }
 
     // Repopulate effort options + chrome availability from a given agent's
-    // metadata. `preserveEffort` keeps the current effort on the initial sync
-    // (it's still valid for the starting agent); an agent *change* drops to
-    // that agent's default since the old token may be out of its set.
+    // metadata. The selected value is always concrete: an omitted/invalid
+    // fiber value resolves to the agent's registry default. An agent change
+    // therefore writes that new agent's explicit effective effort.
     const syncDependents = (agentId: string, effort: string): void => {
       const rec = records.find((a) => a.id === agentId)
       const levels = rec?.effort_levels ?? []
       effortSelect.innerHTML = ''
-      const defaultOpt = document.createElement('option')
-      defaultOpt.value = ''
-      defaultOpt.textContent = rec?.default_effort
-        ? `(default · ${rec.default_effort})`
-        : '(default)'
-      effortSelect.append(defaultOpt)
       for (const lvl of levels) {
         const opt = document.createElement('option')
         opt.value = lvl
@@ -1719,7 +1714,12 @@ export class FiberDetailModal {
         effortSelect.append(opt)
       }
       effortSelect.disabled = levels.length === 0
-      effortSelect.value = levels.includes(effort) ? effort : ''
+      const effectiveEffort = levels.includes(effort)
+        ? effort
+        : rec?.default_effort && levels.includes(rec.default_effort)
+          ? rec.default_effort
+          : ''
+      effortSelect.value = effectiveEffort
 
       const chromeOk = rec?.chrome_capable ?? false
       chromeToggle.disabled = !chromeOk
@@ -1738,8 +1738,8 @@ export class FiberDetailModal {
       })
 
     agentSelect.addEventListener('change', () => {
-      // New agent: reset effort to its default and re-gate chrome, then write
-      // the fresh composition.
+      // New agent: select and persist its concrete default effort, then
+      // re-gate chrome and write the fresh composition.
       syncDependents(selectedAgent(), '')
       chromeToggle.checked = chromeToggle.checked && !chromeToggle.disabled
       commit()
@@ -1751,8 +1751,9 @@ export class FiberDetailModal {
   /**
    * Write the composed agent axes through the daemon's `set-agent` lifecycle
    * action — one validated write that sees base agent × effort × chrome
-   * together. Effort `''` clears the axis to the harness default; chrome is
-   * always sent explicitly so a toggle-off is unambiguous.
+   * together. Effort is always a concrete registry token when the agent
+   * supports that axis; chrome is always sent explicitly so a toggle-off is
+   * unambiguous.
    */
   private async commitAxes(
     card: KanbanCard,

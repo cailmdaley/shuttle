@@ -131,6 +131,7 @@ interface KanbanScrollSnapshot {
 export class KanbanModal {
   private readonly onOpenFiber: (card: KanbanCard, options?: { openInNewWindow?: boolean }) => void
   private readonly onOpenWorker?: (tmuxSessionName: string, shuttleHost?: string) => void
+  private readonly openWorkerAfterGesture?: (tmuxSessionName: string, shuttleHost?: string) => void
   private readonly onOpenFile?: (fullPath: string, originId: string) => void
   private readonly onAttachFreshTmux?: (tmuxSessionName: string) => void
   private readonly onStashClick?: () => void
@@ -185,6 +186,16 @@ export class KanbanModal {
   constructor(options: KanbanModalOptions) {
     this.onOpenFiber = options.onOpenFiber
     this.onOpenWorker = options.onOpenWorker
+    // Kitty's quick-access panel hides on focus loss. If we activate it inside
+    // the originating button's click handler, macOS can return focus to the
+    // browser as that same gesture finishes, immediately hiding the terminal
+    // again. Let the browser finish the gesture first; session selection and
+    // Kitty activation then happen in the next task.
+    this.openWorkerAfterGesture = this.onOpenWorker
+      ? (tmuxSessionName, shuttleHost) => {
+          window.setTimeout(() => this.onOpenWorker?.(tmuxSessionName, shuttleHost), 0)
+        }
+      : undefined
     this.onOpenFile = options.onOpenFile
     this.onAttachFreshTmux = options.onAttachFreshTmux
     this.onStashClick = options.onStashClick
@@ -201,7 +212,7 @@ export class KanbanModal {
       // background commit, reconcile.
       (card, target) => this.transition(card, target),
       // Status-pill double-click → focus the running worker's kitty tab.
-      (tmuxSessionName, shuttleHost) => this.onOpenWorker?.(tmuxSessionName, shuttleHost),
+      this.openWorkerAfterGesture,
       // City → project_dir for shuttle installs (promote + reshape echo).
       (cityId) =>
         this.getCityFeltRoots?.().find((r) => r.cityId === cityId)?.projectPath || undefined,
@@ -217,7 +228,7 @@ export class KanbanModal {
       setSurface: (card, horizon, opts) => this.setSurface(card, horizon, opts),
       pin: (card) => this.pinRole(card),
       openDetail: (card, column) => this.detailModal?.open(card, this.cityScope?.cityId, column),
-      openWorker: this.onOpenWorker,
+      openWorker: this.openWorkerAfterGesture,
       setTimelineAdaptiveCleanup: (cleanup) => { this.timelineAdaptiveCleanup = cleanup },
     })
   }

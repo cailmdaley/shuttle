@@ -17,7 +17,7 @@ func loadReg(t *testing.T) *AgentRegistry {
 	return reg
 }
 
-func TestResolve_BareClaudeNoAxes(t *testing.T) {
+func TestResolve_BareClaudeUsesRegistryDefaultEffort(t *testing.T) {
 	reg := loadReg(t)
 	base, eff, err := reg.Resolve("claude-opus", "", false)
 	if err != nil {
@@ -26,8 +26,8 @@ func TestResolve_BareClaudeNoAxes(t *testing.T) {
 	if base.ID != "claude-opus" {
 		t.Fatalf("base = %q, want claude-opus", base.ID)
 	}
-	if eff.Effort != "" || eff.Chrome {
-		t.Fatalf("expected no axes, got %+v", eff)
+	if eff.Effort != "low" || eff.Chrome {
+		t.Fatalf("expected effort=low and chrome=false, got %+v", eff)
 	}
 }
 

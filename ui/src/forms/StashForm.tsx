@@ -42,7 +42,7 @@ export interface AgentEntry {
   default: boolean
   /** Harness-native effort tokens this agent accepts; empty/absent = no effort axis. */
   effort_levels?: string[]
-  /** Token applied when no effort is chosen; display-only here. */
+  /** Concrete token applied when the fiber omits an explicit effort. */
   default_effort?: string | null
   /** Whether the harness supports `--chrome` (claude only). */
   chrome_capable?: boolean
@@ -499,7 +499,7 @@ export function StashForm({
       ...(tags.length > 0 ? { tags: [...tags] } : {}),
       shuttle: buildShuttleBlock({
         agent: agentId,
-        effort,
+        effort: effectiveEffort,
         kind,
         schedule,
         tz: scheduleTz,
@@ -552,19 +552,25 @@ export function StashForm({
   // The agent whose constraint metadata gates the dependent axes.
   const constraintAgent = agents.find((a) => a.id === agentId) ?? defaultAgentEntry
   const effortLevels = constraintAgent?.effort_levels ?? []
+  const effectiveEffort = effortLevels.includes(effort)
+    ? effort
+    : constraintAgent?.default_effort && effortLevels.includes(constraintAgent.default_effort)
+      ? constraintAgent.default_effort
+      : ''
   const chromeCapable = agents.length === 0 ? true : constraintAgent?.chrome_capable ?? false
 
   // Clamp axes whenever the constraint agent shifts under them.
   useEffect(() => {
-    if (effort && !effortLevels.includes(effort)) setEffort('')
+    if (effort !== effectiveEffort) setEffort(effectiveEffort)
     if (chrome && !chromeCapable) setChrome(false)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [constraintAgent?.id, agents])
 
   const handleAgentChange = (id: string): void => {
     setAgentId(id)
-    setEffort('')
     const rec = agents.find((a) => a.id === id) ?? agents.find((a) => a.default)
+    const levels = rec?.effort_levels ?? []
+    setEffort(rec?.default_effort && levels.includes(rec.default_effort) ? rec.default_effort : '')
     if (!(rec?.chrome_capable ?? false)) setChrome(false)
   }
 
@@ -801,19 +807,14 @@ export function StashForm({
               {/* Effort — registry-gated reasoning-effort axis. */}
               <div className="stash-field">
                 <span className="stash-label">
-                  Effort <span className="stash-optional">opt</span>
+                  Effort
                 </span>
                 <select
                   className="stash-select"
-                  value={effort}
+                  value={effectiveEffort}
                   onChange={(e) => setEffort(e.target.value)}
                   disabled={effortLevels.length === 0}
                 >
-                  <option value="">
-                    {constraintAgent?.default_effort
-                      ? `default · ${constraintAgent.default_effort}`
-                      : 'default'}
-                  </option>
                   {effortLevels.map((lvl) => (
                     <option key={lvl} value={lvl}>
                       {lvl}

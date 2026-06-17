@@ -560,10 +560,10 @@ defmodule Shuttle.DispatcherTest do
     assert cmd =~ "--chrome"
   end
 
-  test "claude with no axes renders neither --effort nor --chrome" do
+  test "claude with no declared effort renders the registry default" do
     {:ok, agent} = Agents.resolve_with_axes("claude-opus", nil, false)
     cmd = Agents.build_command(agent, "hi")
-    refute cmd =~ "--effort"
+    assert cmd =~ "--effort 'low'"
     refute cmd =~ "--chrome"
   end
 
@@ -584,6 +584,12 @@ defmodule Shuttle.DispatcherTest do
     {:ok, agent} = Agents.resolve_with_axes("codex", "high", false)
     cmd = Agents.build_command(agent, "hi")
     assert cmd =~ ~s(-c model_reasoning_effort='high')
+  end
+
+  test "codex with no declared effort renders the registry default" do
+    {:ok, agent} = Agents.resolve_with_axes("codex", nil, false)
+    cmd = Agents.build_command(agent, "hi")
+    assert cmd =~ ~s(-c model_reasoning_effort='xhigh')
   end
 
   test "claude-opus-chrome alias expands to claude-opus + --chrome" do

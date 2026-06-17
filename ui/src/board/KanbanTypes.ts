@@ -107,8 +107,8 @@ export interface KanbanCard {
   shuttleAgent?: string
   /**
    * `shuttle.effort` — reasoning-effort axis (a harness-native token, e.g.
-   * `high`, `xhigh`, `max`). Absent means the harness default. Drives the
-   * effort select in the fiber-detail agent picker.
+   * `high`, `xhigh`, `max`). Absent resolves to the agent registry's concrete
+   * default. Drives the effort select in the fiber-detail agent picker.
    */
   shuttleEffort?: string
   /**

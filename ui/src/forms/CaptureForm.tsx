@@ -81,8 +81,9 @@ export function CaptureForm({
   // territory regardless of what ordinary dispatch defaults to.
   const [agent, setAgent] = useState<string>('claude-fable')
   const [agents, setAgents] = useState<AgentEntry[]>(FALLBACK_AGENTS)
-  // Axes ('' / false = harness default). Options + gating come from the
-  // selected agent's registry constraint metadata — no hardcoded lists.
+  // Axes come from the selected agent's registry constraint metadata — no
+  // hardcoded lists. The effective effort is always a concrete token when
+  // the selected agent supports reasoning levels.
   const [effort, setEffort] = useState<string>('')
   const [chrome, setChrome] = useState<boolean>(false)
   const [submitting, setSubmitting] = useState(false)
@@ -126,12 +127,18 @@ export function CaptureForm({
 
   const agentRec = agents.find((a) => a.id === agent)
   const effortLevels = agentRec?.effort_levels ?? []
+  const effectiveEffort = effortLevels.includes(effort)
+    ? effort
+    : agentRec?.default_effort && effortLevels.includes(agentRec.default_effort)
+      ? agentRec.default_effort
+      : ''
   const chromeCapable = agentRec?.chrome_capable ?? false
 
   const handleAgentChange = (id: string): void => {
     setAgent(id)
-    setEffort('')
     const rec = agents.find((a) => a.id === id)
+    const levels = rec?.effort_levels ?? []
+    setEffort(rec?.default_effort && levels.includes(rec.default_effort) ? rec.default_effort : '')
     if (!(rec?.chrome_capable ?? false)) setChrome(false)
   }
 
@@ -160,8 +167,7 @@ export function CaptureForm({
           project_dir: selectedCity.path,
           origin: shuttleOrigin(selectedCity.originId),
           agent,
-          // Lean payload: axes ride only when explicitly chosen.
-          ...(effort ? { effort } : {}),
+          ...(effectiveEffort ? { effort: effectiveEffort } : {}),
           ...(chrome ? { chrome: true } : {}),
         }),
       })
@@ -257,14 +263,11 @@ export function CaptureForm({
             <span className="capture-label" style={labelStyle}>Effort</span>
             <select
               className="capture-effort"
-              value={effort}
+              value={effectiveEffort}
               onChange={(e) => setEffort(e.target.value)}
               disabled={effortLevels.length === 0}
               style={{ ...selectStyle, opacity: effortLevels.length === 0 ? 0.5 : 1 }}
             >
-              <option value="">
-                {agentRec?.default_effort ? `default · ${agentRec.default_effort}` : 'default'}
-              </option>
               {effortLevels.map((lvl) => (
                 <option key={lvl} value={lvl}>
                   {lvl}
