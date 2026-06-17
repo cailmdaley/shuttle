@@ -230,26 +230,29 @@ defmodule Shuttle.Kitty do
   defp to_opt(nil), do: []
   defp to_opt(socket), do: ["--to", socket]
 
-  # The `--to` target as `{socket, kind}`: `$KITTY_LISTEN_ON` when the daemon
-  # itself runs inside a kitty (treated as a normal window), else the best
-  # `/tmp/kitty-*` socket. nil → no live kitty to control (`open/2` spawns a
-  # fresh window).
+  # The `--to` target as `{socket, kind}`, or nil when no live kitty exists
+  # (`open/2` then spawns a fresh window).
+  #
+  # Candidates are the `/tmp/kitty-*` sockets PLUS `$KITTY_LISTEN_ON` (the kitty
+  # the daemon was launched inside, if any). `$KITTY_LISTEN_ON` is a *candidate*,
+  # not an override: the daemon typically runs inside the dev-stack's tmux, which
+  # inherits a `KITTY_LISTEN_ON` pointing at whatever kitty opened it — often a
+  # window that has since died, leaving a stale `unix:/tmp/kitty-<pid>` that
+  # fails with `connect: no such file`. Folding it into the candidate set means
+  # the same liveness + panel-preference filter applies, so a dead inherited
+  # value is dropped and the live Quick-Access panel still wins.
   defp kitty_socket do
-    case System.get_env("KITTY_LISTEN_ON") do
-      s when is_binary(s) and s != "" -> {s, :normal}
-      _ -> best_tmp_socket()
-    end
-  end
+    env_candidate =
+      case System.get_env("KITTY_LISTEN_ON") do
+        s when is_binary(s) and s != "" -> [String.replace_prefix(s, "unix:", "")]
+        _ -> []
+      end
 
-  # Choose a live `/tmp/kitty-<pid>` control socket, preferring the Quick-Access
-  # panel (the user's quick-terminal surface) over a normal window. Stale/dead
-  # socket files (owning pid gone — `kitty @ --to` then fails with `connect: no
-  # such file`) are excluded; nil when nothing live remains, which routes
-  # `open/2` to spawn a fresh window.
-  defp best_tmp_socket do
-    "/tmp/kitty-*"
-    |> Path.wildcard()
+    (Path.wildcard("/tmp/kitty-*") ++ env_candidate)
+    |> Enum.uniq()
     |> Enum.flat_map(fn p ->
+      # File.stat failing drops a stale `$KITTY_LISTEN_ON` whose socket file is
+      # already gone — the exact stale-inherited-env case.
       case File.stat(p, time: :posix) do
         {:ok, %File.Stat{mtime: m}} -> [{p, m, socket_kind(p)}]
         _ -> []
