@@ -558,107 +558,79 @@
 .kbn-detail-rh-se { bottom: -3px; right: -3px; width: 15px; height: 15px; cursor: nwse-resize; }
 .kbn-detail-rh-sw { bottom: -3px; left: -3px; width: 15px; height: 15px; cursor: nesw-resize; }
 
-/* ── Two-column shell: card on the left, file accordion on the right ──────
-   The overlay is a flex column (header on top, then .kbn-detail-columns).
-   .kbn-detail-columns is the flex ROW holding the left card column, an
-   optional divider, and the right accordion column. Single-column = just
-   the left column at full width; the right column reveals on first file
-   open (FiberDetailModal.revealRightColumn) and the panel grows. */
-.kbn-detail-columns {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: row;
-  align-items: stretch;
-}
-.kbn-detail-leftcol {
-  flex: 1 1 100%;
-  min-width: 0;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-/* In two-column the left pane is sized by JS flex-basis (the split fraction);
-   the right pane takes the remainder. A subtle inner edge marks the seam when
-   the divider isn't hovered. */
-.kbn-detail-overlay.kbn-detail-twocol .kbn-detail-leftcol {
-  flex-grow: 0;
-  flex-shrink: 0;
-}
-
-/* The draggable divider — a slim ruled gutter with a centered grip. Widens
-   its hit area beyond its visual line via padding-collapse (the ::before grip
-   is the visible mark; the element itself is the 10px target). */
-.kbn-detail-divider {
-  flex: 0 0 11px;
-  position: relative;
-  cursor: col-resize;
-  background: linear-gradient(
-    90deg,
-    rgba(255, 251, 237, 0.45),
-    rgba(27, 22, 17, 0.05) 45%,
-    rgba(27, 22, 17, 0.07) 55%,
-    rgba(255, 251, 237, 0.3)
-  );
-  border-left: 1px solid rgba(27, 22, 17, 0.09);
-  border-right: 1px solid rgba(255, 251, 237, 0.45);
-  touch-action: none;
-  z-index: 4;
-  transition: background 0.16s ease;
-}
-.kbn-detail-divider:hover,
-.kbn-detail-overlay.kbn-detail-resizing .kbn-detail-divider {
-  background: linear-gradient(
-    90deg,
-    rgba(194, 150, 59, 0.08),
-    rgba(194, 150, 59, 0.16) 50%,
-    rgba(194, 150, 59, 0.08)
-  );
-}
-/* The grip: a slim ruled pair of beads centered in the gutter — a manuscript
-   binding stitch. Gilds on hover/drag. */
-.kbn-detail-divider::before {
-  content: "";
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: 2px;
-  height: 38px;
-  border-radius: 2px;
-  background: rgba(27, 22, 17, 0.2);
-  box-shadow:
-    -3px 0 0 -1px rgba(27, 22, 17, 0.12),
-    3px 0 0 -1px rgba(27, 22, 17, 0.12);
-  transition: background 0.16s ease, height 0.16s ease, box-shadow 0.16s ease;
-}
-.kbn-detail-divider:hover::before,
-.kbn-detail-overlay.kbn-detail-resizing .kbn-detail-divider::before {
-  background: var(--porch-ochre, #C2963B);
-  height: 52px;
-  box-shadow:
-    -3px 0 0 -1px rgba(194, 150, 59, 0.55),
-    3px 0 0 -1px rgba(194, 150, 59, 0.55);
-}
-
-/* The right column: a vellum file zone, the accordion scrolls inside it.
-   A touch darker and warmer than the left card so the seam reads as a true
-   fold in the page — the deliverables sit on their own shelf of vellum, lit
-   from the top corner. */
-.kbn-detail-rightcol {
-  flex: 1 1 0;
-  min-width: 0;
-  min-height: 0;
+/* ── The file-viewer window: a sibling window to the card ─────────────────
+   The file viewer is no longer a right column inside the card panel — it's a
+   SEPARATE floating window (its own document.body overlay), independently
+   draggable + resizable, free to overlap the card and be raised above it.
+   It reuses the card's vellum frame (.kbn-detail-overlay gives it the fixed
+   position, container-type, parchment, border, shadow, radius) and adds this
+   modifier to lay itself out as a flex column: a slim manuscript drag bar,
+   the tab strip, then the full-bleed views. The window's vellum is a touch
+   warmer/darker than the card's so the two read as a matched pair of leaves
+   from the same manuscript rather than one surface. */
+.kbn-detail-overlay.kbn-fileview-window {
   display: flex;
   flex-direction: column;
   background: var(--porch-panel, #E8E0D2);
   background-image:
-    radial-gradient(ellipse 620px 420px at 82% 4%, rgba(255, 251, 237, 0.55), transparent 62%),
+    radial-gradient(ellipse 620px 420px at 82% 6%, rgba(255, 251, 237, 0.6), transparent 62%),
     radial-gradient(ellipse 540px 460px at 8% 96%, rgba(27, 22, 17, 0.04), transparent 64%);
-  box-shadow: inset 7px 0 14px -10px rgba(27, 22, 17, 0.22);
 }
+
+/* The window header: a slim manuscript drag bar — the file title to the left,
+   a ✕ to the right — echoing the card's .kbn-detail-header at a smaller scale,
+   with a gilt hairline beneath it that seams into the tab strip below (the two
+   together read as a hand-bound window head). */
+.kbn-fileview-win-header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px 8px 15px;
+  cursor: grab;
+  touch-action: none;
+  background:
+    linear-gradient(rgba(255, 251, 237, 0.5), rgba(255, 251, 237, 0));
+  border-bottom: 1px solid rgba(154, 123, 53, 0.32);
+  box-shadow: inset 0 1px 0 rgba(255, 251, 237, 0.6);
+}
+.kbn-detail-overlay.kbn-detail-dragging .kbn-fileview-win-header {
+  cursor: grabbing;
+}
+.kbn-fileview-win-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #9A7B35;
+}
+.kbn-fileview-win-close {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: #7A7368;
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 2px;
+}
+.kbn-fileview-win-close:hover {
+  color: #1B1611;
+  background: rgba(27, 22, 17, 0.06);
+}
+
 /* ── Tab strip ────────────────────────────────────────────────────────────
-   A row of manuscript index-tabs across the top of the right column — one per
+   A row of manuscript index-tabs across the top of the viewer window — one per
    open file, stable order. The active tab is lit + raised and seams into the
    full view below it; inactive tabs sit back. Overflows horizontally (thin
    rule scrollbar) when a card has many deliverables. */

@@ -3,7 +3,6 @@ import type { ColumnKind, KanbanCard } from './KanbanTypes.js'
 import { dispatchIneligibleReason, errorMessageFromResponse, isAgentCard } from './KanbanModalShared.js'
 import { fetchFiberIndex, filterParentCandidates, type FiberSearchResult } from './fiberSearch.js'
 import {
-  animatePanelGeometry,
   attachPanelDrag,
   attachPanelResize,
   readPanelGeometry,
@@ -22,16 +21,22 @@ let lastGeometry: { left: number; top: number; width: number; height: number } |
 const MIN_WIDTH = 380
 const MIN_HEIGHT = 320
 
-/** Single-column reading width. The panel opens here; the right column grows
- *  it. Mirrors the old default (≤950 / 92vw). */
+/** Single-column reading width. The card panel opens here and keeps it — the
+ *  file viewer is now its own floating window, so the card never grows.
+ *  Mirrors the old default (≤950 / 92vw). */
 const SINGLE_COL_WIDTH = 950
-/** How much wider the panel grows when the right column reveals — enough for a
- *  comfortable file zone beside the reading column, capped to the viewport. */
-const TWO_COL_EXTRA = 620
-/** Left/right split as a fraction of the two-column inner width — the default
- *  divider position before the user drags it. */
-const DEFAULT_SPLIT = 0.5
-const MIN_PANE_FRAC = 0.28
+
+/**
+ * Shared z-order stack for the two coexisting floating windows (the card panel
+ * and the file viewer). Clicking either raises it above the other: a
+ * `pointerdown` on a window bumps the counter and stamps the window's
+ * `z-index`, so the last-touched window wins. Seeded above the vellum scrim
+ * (9999) the way the panel's base CSS `z-index` was.
+ */
+let panelZ = 10000
+function bringToFront(el: HTMLElement): void {
+  el.style.zIndex = String(++panelZ)
+}
 
 /**
  * One sent deliverable on a card's trail. `fullPath` is the absolute path the
@@ -46,15 +51,11 @@ interface SentFile {
 }
 
 /**
- * Per-card right-column UI state, persisted to localStorage under
- * `shuttle:detail:<uid>`. The `open` array is recency-ordered — index 0 is the
- * most-recently-activated file (top of the accordion). Each entry carries its
- * own expanded/collapsed state and (for iframe-rendered files) the scroll
- * offset to restore on rehydrate.
+ * Per-card file-viewer UI state, persisted to localStorage under
+ * `shuttle:detail:<uid>`. The `open` array is the stable tab order. Each entry
+ * carries its per-file scroll offset + zoom to restore on rehydrate.
  */
 interface DetailPersist {
-  /** Fraction of the two-column inner width given to the LEFT (card) pane. */
-  split?: number
   /** Full path of the active (front-most) tab — restored on reopen. */
   active?: string
   /**
@@ -104,7 +105,7 @@ function loadPersist(uid: string): DetailPersist {
     const raw = window.localStorage.getItem(PERSIST_PREFIX + uid)
     if (!raw) return { open: [] }
     const parsed = JSON.parse(raw) as DetailPersist
-    return { split: parsed.split, active: parsed.active, open: Array.isArray(parsed.open) ? parsed.open : [] }
+    return { active: parsed.active, open: Array.isArray(parsed.open) ? parsed.open : [] }
   } catch {
     return { open: [] }
   }
@@ -113,7 +114,7 @@ function loadPersist(uid: string): DetailPersist {
 function savePersist(uid: string, state: DetailPersist): void {
   if (!uid) return
   try {
-    if (state.open.length === 0 && state.split === undefined) {
+    if (state.open.length === 0) {
       window.localStorage.removeItem(PERSIST_PREFIX + uid)
     } else {
       window.localStorage.setItem(PERSIST_PREFIX + uid, JSON.stringify(state))
@@ -228,22 +229,20 @@ export class FiberDetailModal {
   /** Full path of the active (shown) file, or null. The active tab's cell is
    *  visible; every other open cell stays built-but-hidden. */
   private activePath: string | null = null
-  /** The right column's views host (holds every open file's cell; only the
-   *  active one is shown). Null in single-column. */
+  /** The viewer window's views host (holds every open file's cell; only the
+   *  active one is shown). Null while no file is open. */
   private rightCol: HTMLElement | null = null
-  /** The right column's tab strip (one tab per open file). Null single-column. */
+  /** The viewer window's tab strip (one tab per open file). Null while closed. */
   private tabStrip: HTMLElement | null = null
-  /** The left column wrapper (card chrome + body). Always present once open. */
-  private leftCol: HTMLElement | null = null
-  /** The divider between the two columns (drag to resize the split). */
-  private divider: HTMLElement | null = null
-  /** Left-pane width fraction of the two-column inner width (drag-set). */
-  private splitFrac = DEFAULT_SPLIT
+  /** The separate floating file-viewer window (its own document.body overlay,
+   *  draggable + resizable independently of the card). Null until the first
+   *  file opens; nulled when the last tab closes or its ✕ is clicked. */
+  private viewerWindow: HTMLElement | null = null
+  /** The viewer window header's title span — tracks the active file's
+   *  basename (or "Sent files" when nothing is active). */
+  private viewerTitle: HTMLElement | null = null
   /** Debounce handle for scroll-position persistence writes. */
   private scrollWriteTimer: number | null = null
-  /** The panel width remembered before the right column grew it, so closing
-   *  the last file glides back to the single-column measure. */
-  private singleColWidth = 0
 
   constructor(
     shuttleBase: string,
@@ -308,14 +307,13 @@ export class FiberDetailModal {
     title.className = 'kbn-detail-title'
     title.textContent = card.name
 
-    // Bind the card + load its persisted right-column state. The launcher and
-    // accordion read these; the persistence writer keys off `card.uid`.
+    // Bind the card + load its persisted viewer state. The launcher and tabbed
+    // viewer read these; the persistence writer keys off `card.uid`.
     this.card = card
     this.openFiles = []
     this.activePath = null
     this.sentFiles = []
     const persist = loadPersist(typeof card.uid === 'string' ? card.uid : '')
-    this.splitFrac = clampSplit(persist.split ?? DEFAULT_SPLIT)
 
     const pill = document.createElement('span')
     pill.className = `kbn-pill kbn-pill-${card.status === 'closed' ? 'closed' : card.status === 'active' ? 'active' : 'open'}`
@@ -383,30 +381,24 @@ export class FiberDetailModal {
     // The deliverable trail: files the card's worker sessions pushed via
     // SendUserFile, newest first. Mounts empty and self-populates from the
     // daemon's /sent-files (events.jsonl fallback for older daemons). Clicking
-    // an entry opens it in the right-column accordion (revealing the column on
-    // first open). Empty trail → the launcher never reveals itself.
+    // an entry opens it in the separate file-viewer window (creating that
+    // window on first open). Empty trail → the launcher never reveals itself.
     const launcher = this.buildSentFilesLauncher(card)
 
-    // ── Left column = the card (controls + launcher + body) ──────────────────
-    // The two columns share one panel. The header above spans both as the
-    // drag bar; below it, a flex row holds the left card column, a divider,
-    // and (once a file opens) the right accordion column.
-    const leftCol = document.createElement('div')
-    leftCol.className = 'kbn-detail-leftcol'
-    leftCol.append(controls, launcher, page)
-    this.leftCol = leftCol
-
-    const columns = document.createElement('div')
-    columns.className = 'kbn-detail-columns'
-    columns.append(leftCol)
-
-    // ── Assemble ────────────────────────────────────────────────────────────
-    overlay.append(header, columns)
+    // ── Assemble: a single reading column ────────────────────────────────────
+    // The card panel is one flex column again — header, controls, launcher,
+    // body. The file viewer is a SEPARATE floating window (openViewerWindow),
+    // so the card keeps its own size and never grows.
+    overlay.append(header, controls, launcher, page)
     this.attachResizeHandles(overlay)
+    // Clicking anywhere on the card raises it above the viewer window. Capture
+    // phase so a click on an inner control still bumps z-order first.
+    overlay.addEventListener('pointerdown', () => bringToFront(overlay), true)
+    bringToFront(overlay)
     document.body.append(overlay)
     this.overlay = overlay
 
-    // Rehydrate the right column from persisted state, once the launcher's
+    // Rehydrate the viewer window from persisted state, once the launcher's
     // trail is known. The launcher fetch resolves it async; rehydration that
     // needs a basename falls back to deriving it from the path.
     this.rehydrateOpenFiles(card, persist)
@@ -429,6 +421,11 @@ export class FiberDetailModal {
     this.outsideHandler = (e: PointerEvent) => {
       const target = e.target as Node | null
       if (target && overlay.contains(target)) return
+      // The file-viewer window is a sibling floating window, not "outside" the
+      // card in the user's mental model — clicking it focuses it (raises it),
+      // it must NOT close the card. Both windows coexist; only a click truly
+      // away from both closes the card (which then closes its viewer too).
+      if (target instanceof Element && target.closest('.kbn-fileview-window')) return
       this.close()
     }
     document.addEventListener('pointerdown', this.outsideHandler, true)
@@ -457,18 +454,21 @@ export class FiberDetailModal {
     this.fiberIndex = null
     for (const ro of this.embedObservers) ro.disconnect()
     this.embedObservers = []
+    // Closing the card closes its file-viewer window too — the two windows are
+    // a pair bound to one card. (closeViewerWindow nulls the viewer refs.)
+    this.viewerWindow?.remove()
+    this.viewerWindow = null
+    this.viewerTitle = null
     this.overlay?.remove()
     this.overlay = null
-    // Right-column state is durable (localStorage) — clear only the live DOM
-    // refs so a re-open rebuilds cleanly.
+    // Viewer state is durable (localStorage) — clear only the live DOM refs so
+    // a re-open rebuilds cleanly.
     this.card = null
     this.sentFiles = []
     this.openFiles = []
     this.activePath = null
     this.rightCol = null
     this.tabStrip = null
-    this.leftCol = null
-    this.divider = null
   }
 
   /**
@@ -598,9 +598,9 @@ export class FiberDetailModal {
   // ── Panel geometry: default + remembered, drag, resize ────────────────────
 
   /** Default size: a reading column at nearly full viewport height — the
-   *  page wants vertical room; width stays a comfortable measure. The panel
-   *  opens SINGLE-COLUMN at this width (the right column grows it later);
-   *  remembered geometry wins when it still fits the viewport. */
+   *  page wants vertical room; width stays a comfortable measure. The card
+   *  panel opens at this width and keeps it (the file viewer is its own
+   *  window); remembered geometry wins when it still fits the viewport. */
   private applyGeometry(overlay: HTMLElement): void {
     const vw = window.innerWidth
     const vh = window.innerHeight
@@ -614,35 +614,55 @@ export class FiberDetailModal {
     overlay.style.top = `${Math.max(0, top)}px`
     overlay.style.width = `${width}px`
     overlay.style.height = `${height}px`
-    // Remember the single-column measure so closing the last file glides back.
-    this.singleColWidth = width
   }
 
   private rememberGeometry(overlay: HTMLElement): void {
     lastGeometry = readPanelGeometry(overlay)
-    // Track the user's chosen width while single-column so the glide-back
-    // target stays current; in two-column we keep the pre-grow value.
-    if (this.openFiles.length === 0) this.singleColWidth = overlay.offsetWidth
   }
 
-  // ── Two-column reveal / hide ────────────────────────────────────────────
+  // ── The file-viewer window: open / close ─────────────────────────────────
 
-  /** Grow the panel and reveal the right-column accordion. Idempotent — a
-   *  second file opening into an already-revealed column just adds a panel.
-   *  The width grows by TWO_COL_EXTRA (capped to the viewport, keeping the
-   *  panel on-screen), and the divider lands at the persisted/default split. */
-  private revealRightColumn(): void {
-    if (this.rightCol || !this.overlay || !this.leftCol) return
-    const overlay = this.overlay
-    const columns = this.leftCol.parentElement
-    if (!columns) return
+  /**
+   * Create the separate floating file-viewer window the first time a file is
+   * opened. Idempotent — a second file opening into the already-open window
+   * just adds a tab. The window is a sibling to the card (its own document.body
+   * overlay), independently draggable + resizable, and can overlap the card.
+   * It reuses the card's vellum frame (`.kbn-detail-overlay`) with a modifier
+   * (`.kbn-fileview-window`) that lays it out as a flex column: a slim
+   * manuscript drag bar, the tab strip, then the full-bleed views.
+   */
+  private openViewerWindow(): void {
+    if (this.viewerWindow || !this.overlay) return
+    const card = this.overlay
 
-    const right = document.createElement('div')
-    right.className = 'kbn-detail-rightcol'
+    const win = document.createElement('div')
+    win.className = 'kbn-detail-overlay kbn-fileview-window'
+    win.setAttribute('role', 'dialog')
+    win.setAttribute('aria-label', 'Sent files')
 
-    // Tab strip on top (one tab per open file); full-bleed views below it
-    // (every open file's cell, only the active one shown). "A full view, but a
-    // quick back-and-forth clicker" — tabs cost the full view no width.
+    // ── Window header: a slim manuscript drag bar (title left, ✕ right) ──
+    const winHeader = document.createElement('div')
+    winHeader.className = 'kbn-fileview-win-header'
+
+    const winTitle = document.createElement('span')
+    winTitle.className = 'kbn-fileview-win-title'
+    winTitle.textContent = 'Sent files'
+    this.viewerTitle = winTitle
+
+    const winClose = document.createElement('button')
+    winClose.type = 'button'
+    winClose.className = 'kbn-fileview-win-close'
+    winClose.setAttribute('aria-label', 'Close file viewer')
+    winClose.textContent = '×'
+    winClose.addEventListener('click', (e) => {
+      e.stopPropagation()
+      // The ✕ closes the whole viewer — every open file — but leaves the card.
+      this.closeViewerWindow()
+      this.writePersist()
+    })
+    winHeader.append(winTitle, winClose)
+
+    // ── Tab strip + full-bleed views ──
     const tabs = document.createElement('div')
     tabs.className = 'kbn-detail-tabstrip'
     tabs.setAttribute('role', 'tablist')
@@ -655,96 +675,63 @@ export class FiberDetailModal {
     // Cmd/Ctrl + wheel zooms the active file (images, HTML, PDF — everything).
     views.addEventListener('wheel', (e) => this.handleZoomWheel(e), { passive: false })
 
-    right.append(tabs, views)
+    win.append(winHeader, tabs, views)
 
-    const divider = document.createElement('div')
-    divider.className = 'kbn-detail-divider'
-    divider.setAttribute('role', 'separator')
-    divider.setAttribute('aria-orientation', 'vertical')
-    divider.setAttribute('aria-label', 'Resize columns')
-    this.attachDividerDrag(divider)
-    this.divider = divider
-
-    columns.append(divider, right)
-    overlay.classList.add('kbn-detail-twocol')
-    this.applySplit()
-
-    // Grow the panel rightward, keeping it on-screen. Animate the geometry.
+    // ── Geometry: beside the card, same height; clamp on-screen ──
     const vw = window.innerWidth
-    const grown = Math.min(this.singleColWidth + TWO_COL_EXTRA, vw - 24)
-    const left = Math.max(0, Math.min(overlay.offsetLeft, vw - grown - 12))
-    animatePanelGeometry(overlay, {
-      left,
-      top: overlay.offsetTop,
-      width: grown,
-      height: overlay.offsetHeight,
+    const vh = window.innerHeight
+    const W = Math.min(720, Math.round(vw * 0.46))
+    const H = card.offsetHeight
+    let left = card.offsetLeft + card.offsetWidth + 12
+    if (left + W > vw - 12) left = vw - W - 12
+    left = Math.max(12, left)
+    let top = card.offsetTop
+    if (top + H > vh) top = Math.max(0, vh - H)
+    win.style.left = `${left}px`
+    win.style.top = `${top}px`
+    win.style.width = `${W}px`
+    win.style.height = `${H}px`
+
+    // Drag (header bar) + resize (eight edge/corner zones) — independent of
+    // the card, reusing the same chrome helpers + handle CSS.
+    attachPanelDrag(win, winHeader, { draggingClass: 'kbn-detail-dragging', onSettle: () => {} })
+    attachPanelResize(win, {
+      handleClassPrefix: 'kbn-detail-rh',
+      resizingClass: 'kbn-detail-resizing',
+      minWidth: MIN_WIDTH,
+      minHeight: MIN_HEIGHT,
+      onSettle: () => {},
     })
-    lastGeometry = { left, top: overlay.offsetTop, width: grown, height: overlay.offsetHeight }
+    // Clicking anywhere on the viewer raises it above the card.
+    win.addEventListener('pointerdown', () => bringToFront(win), true)
+
+    this.viewerWindow = win
+    document.body.append(win)
+    bringToFront(win)
   }
 
-  /** The last file closed: dissolve the right column and glide back to the
-   *  single-column measure. */
-  private hideRightColumn(): void {
-    if (!this.rightCol || !this.overlay) return
-    const overlay = this.overlay
-    this.rightCol.parentElement?.remove() // the .kbn-detail-rightcol wrapper
-    this.divider?.remove()
+  /** Tear down the file-viewer window: all tabs/cells die with it, the card
+   *  stays open. Fires when the last tab closes OR the window's ✕ is clicked
+   *  (the ✕ closes every open file at once). */
+  private closeViewerWindow(): void {
+    this.viewerWindow?.remove()
+    this.viewerWindow = null
+    this.viewerTitle = null
     this.rightCol = null
     this.tabStrip = null
-    this.divider = null
-    overlay.classList.remove('kbn-detail-twocol')
-    // Clear the inline flex-basis applySplit() wrote so the left column falls
-    // back to the CSS default `.kbn-detail-leftcol { flex: 1 1 100% }` and
-    // fills the single-column width — otherwise it stays stuck at the split %.
-    this.leftCol?.style.removeProperty('flex')
-
-    const vw = window.innerWidth
-    const width = Math.min(this.singleColWidth || SINGLE_COL_WIDTH, vw - 24)
-    const left = Math.max(0, Math.min(overlay.offsetLeft, vw - width - 12))
-    animatePanelGeometry(overlay, {
-      left,
-      top: overlay.offsetTop,
-      width,
-      height: overlay.offsetHeight,
-    })
-    lastGeometry = { left, top: overlay.offsetTop, width, height: overlay.offsetHeight }
+    // The tabs + cells lived inside the window; the live open-file set dies
+    // with it. (Persisted state is durable — written by callers.)
+    this.openFiles = []
+    this.activePath = null
+    this.syncLauncherActiveState()
   }
 
-  /** Apply the current split fraction to the two columns via flex-basis. */
-  private applySplit(): void {
-    if (!this.leftCol) return
-    const leftPct = clampSplit(this.splitFrac) * 100
-    this.leftCol.style.flex = `0 0 ${leftPct}%`
-  }
-
-  /** Drag the divider to repartition the two columns. Writes the new split
-   *  fraction to persistence on settle. Iframes are veiled mid-drag (the
-   *  panel-level dragging class does that) so the pointer math stays clean. */
-  private attachDividerDrag(divider: HTMLElement): void {
-    divider.addEventListener('pointerdown', (e: PointerEvent) => {
-      e.preventDefault()
-      e.stopPropagation()
-      const overlay = this.overlay
-      const columns = this.leftCol?.parentElement
-      if (!overlay || !columns) return
-      overlay.classList.add('kbn-detail-dragging')
-      const rect = columns.getBoundingClientRect()
-      const onMove = (ev: PointerEvent) => {
-        const frac = (ev.clientX - rect.left) / rect.width
-        this.splitFrac = clampSplit(frac)
-        this.applySplit()
-      }
-      const onUp = () => {
-        window.removeEventListener('pointermove', onMove)
-        window.removeEventListener('pointerup', onUp)
-        window.removeEventListener('pointercancel', onUp)
-        overlay.classList.remove('kbn-detail-dragging')
-        this.writePersist()
-      }
-      window.addEventListener('pointermove', onMove)
-      window.addEventListener('pointerup', onUp)
-      window.addEventListener('pointercancel', onUp)
-    })
+  /** Sync the viewer window's header title to the active file's basename (or
+   *  "Sent files" when nothing is active). */
+  private syncViewerTitle(): void {
+    if (!this.viewerTitle) return
+    const active = this.openFiles.find((e) => e.file.fullPath === this.activePath)
+    this.viewerTitle.textContent = active ? active.file.basename : 'Sent files'
   }
 
   /** Header-strip drag. Plain pointer drag — the header is dedicated chrome,
@@ -1579,7 +1566,7 @@ export class FiberDetailModal {
   /** Mark launcher entries whose file is currently open in the accordion. */
   private syncLauncherActiveState(): void {
     const openPaths = new Set(this.openFiles.map((e) => e.file.fullPath))
-    this.leftCol
+    this.overlay
       ?.querySelectorAll<HTMLElement>('.kbn-detail-sent-file')
       .forEach((row) => {
         const open = !!row.dataset.fullPath && openPaths.has(row.dataset.fullPath)
@@ -1634,7 +1621,7 @@ export class FiberDetailModal {
    * background tabs cost nothing until clicked.
    */
   private addOpenFile(file: SentFile, card: KanbanCard, scroll: number, zoom: number): OpenFileEntry {
-    this.revealRightColumn()
+    this.openViewerWindow()
 
     const tab = document.createElement('button')
     tab.type = 'button'
@@ -1699,6 +1686,7 @@ export class FiberDetailModal {
       e.tab.classList.toggle('kbn-detail-tab-active', on)
       e.tab.setAttribute('aria-selected', String(on))
     }
+    this.syncViewerTitle()
     if (!entry.viewerBuilt) this.buildEntryViewer(entry, card)
   }
 
@@ -1818,7 +1806,8 @@ export class FiberDetailModal {
       if (next && this.card) this.setActive(next, this.card)
     }
     this.syncLauncherActiveState()
-    if (this.openFiles.length === 0) this.hideRightColumn()
+    this.syncViewerTitle()
+    if (this.openFiles.length === 0) this.closeViewerWindow()
     this.writePersist()
   }
 
@@ -1838,7 +1827,6 @@ export class FiberDetailModal {
     const uid = typeof this.card?.uid === 'string' ? this.card.uid : ''
     if (!uid) return
     savePersist(uid, {
-      split: this.openFiles.length > 0 ? this.splitFrac : undefined,
       active: this.activePath ?? undefined,
       open: this.openFiles.map((e) => ({
         path: e.file.fullPath,
@@ -2660,11 +2648,6 @@ function relativeTime(timestamp: number): string {
   const hours = Math.floor(minutes / 60)
   if (hours < 24) return `${hours}h ago`
   return `${Math.floor(hours / 24)}d ago`
-}
-
-/** Clamp a left-pane split fraction so neither column collapses. */
-function clampSplit(frac: number): number {
-  return Math.max(MIN_PANE_FRAC, Math.min(1 - MIN_PANE_FRAC, frac))
 }
 
 /**
