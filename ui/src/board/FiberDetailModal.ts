@@ -6,6 +6,8 @@ import {
   attachPanelDrag,
   attachPanelResize,
   readPanelGeometry,
+  animatePanelGeometry,
+  type PanelGeometry,
 } from './FloatingPanelChrome.js'
 import { buildFileViewer, basenameOf, isScrollableFile } from './FileViewerPanel.js'
 import { fileBytesUrl } from './utils.js'
@@ -38,6 +40,40 @@ function bringToFront(el: HTMLElement): void {
   el.style.zIndex = String(++panelZ)
 }
 
+function applyGeometryTo(el: HTMLElement, g: PanelGeometry): void {
+  el.style.left = `${Math.max(0, g.left)}px`
+  el.style.top = `${Math.max(0, g.top)}px`
+  el.style.width = `${g.width}px`
+  el.style.height = `${g.height}px`
+}
+
+/** A remembered geometry is usable only if it still lands on-screen (the
+ *  viewport may have shrunk, or moved to a smaller display, since it was
+ *  saved). Falls back to the default placement otherwise. */
+function onScreen(g: PanelGeometry): boolean {
+  return (
+    g.left < window.innerWidth - 80 &&
+    g.top < window.innerHeight - 80 &&
+    g.left > 80 - g.width &&
+    g.top > -20
+  )
+}
+
+/** The half-and-half default arrangement: the card fills the left half of the
+ *  viewport, the file viewer the right half, with a shared gutter. */
+function halfAndHalf(): { card: PanelGeometry; viewer: PanelGeometry } {
+  const vw = window.innerWidth
+  const vh = window.innerHeight
+  const gutter = 12
+  const half = Math.floor((vw - 3 * gutter) / 2)
+  const top = gutter
+  const height = vh - 2 * gutter
+  return {
+    card: { left: gutter, top, width: half, height },
+    viewer: { left: 2 * gutter + half, top, width: half, height },
+  }
+}
+
 /**
  * One sent deliverable on a card's trail. `fullPath` is the absolute path the
  * `/api/v1/file` route reads; `sessionId` is the worker session that pushed it
@@ -58,6 +94,10 @@ interface SentFile {
 interface DetailPersist {
   /** Full path of the active (front-most) tab — restored on reopen. */
   active?: string
+  /** Remembered geometry of the two windows, so reopening a card restores the
+   *  exact arrangement the reader left (not the half-and-half default). */
+  cardGeom?: PanelGeometry
+  viewerGeom?: PanelGeometry
   /**
    * `basename` is the file's display label as the trail provided it — which can
    * differ from the path tail in the disambiguation case (two distinct files
@@ -105,7 +145,12 @@ function loadPersist(uid: string): DetailPersist {
     const raw = window.localStorage.getItem(PERSIST_PREFIX + uid)
     if (!raw) return { open: [] }
     const parsed = JSON.parse(raw) as DetailPersist
-    return { active: parsed.active, open: Array.isArray(parsed.open) ? parsed.open : [] }
+    return {
+      active: parsed.active,
+      cardGeom: parsed.cardGeom,
+      viewerGeom: parsed.viewerGeom,
+      open: Array.isArray(parsed.open) ? parsed.open : [],
+    }
   } catch {
     return { open: [] }
   }
@@ -114,7 +159,10 @@ function loadPersist(uid: string): DetailPersist {
 function savePersist(uid: string, state: DetailPersist): void {
   if (!uid) return
   try {
-    if (state.open.length === 0) {
+    // Keep the record while there are open tabs OR remembered window geometry
+    // (so a card with no files still reopens its windows where the user left
+    // them); drop it only when there's nothing to remember.
+    if (state.open.length === 0 && !state.cardGeom && !state.viewerGeom) {
       window.localStorage.removeItem(PERSIST_PREFIX + uid)
     } else {
       window.localStorage.setItem(PERSIST_PREFIX + uid, JSON.stringify(state))
@@ -238,6 +286,15 @@ export class FiberDetailModal {
    *  draggable + resizable independently of the card). Null until the first
    *  file opens; nulled when the last tab closes or its ✕ is clicked. */
   private viewerWindow: HTMLElement | null = null
+  /** Remembered viewer-window geometry for THIS card: loaded from persistence
+   *  on open, updated on the window's drag/resize settle, captured before the
+   *  window closes. Drives "reopen where you left it" vs the half-and-half
+   *  default. Null = no remembered placement yet (use the default). */
+  private viewerGeom: PanelGeometry | null = null
+  /** Remembered CARD-window geometry for this card (mirror of viewerGeom):
+   *  the INTENDED geometry (default / restored / half-and-half / dragged), never
+   *  a mid-animation read, so the persisted arrangement is exact. */
+  private cardGeom: PanelGeometry | null = null
   /** The viewer window header's title span — tracks the active file's
    *  basename (or "Sent files" when nothing is active). */
   private viewerTitle: HTMLElement | null = null
@@ -314,6 +371,15 @@ export class FiberDetailModal {
     this.activePath = null
     this.sentFiles = []
     const persist = loadPersist(typeof card.uid === 'string' ? card.uid : '')
+    // Restore this card's remembered window arrangement: the card to its saved
+    // spot (overriding the session default applyGeometry just set), and stash
+    // the viewer geometry for openViewerWindow to restore instead of the
+    // half-and-half default.
+    this.viewerGeom = persist.viewerGeom ?? null
+    if (persist.cardGeom && onScreen(persist.cardGeom)) {
+      applyGeometryTo(overlay, persist.cardGeom)
+      this.cardGeom = persist.cardGeom
+    }
 
     const pill = document.createElement('span')
     pill.className = `kbn-pill kbn-pill-${card.status === 'closed' ? 'closed' : card.status === 'active' ? 'active' : 'open'}`
@@ -610,14 +676,19 @@ export class FiberDetailModal {
     const height = g?.height ?? vh - 24
     const left = g?.left ?? Math.round((vw - width) / 2)
     const top = g?.top ?? Math.round((vh - height) / 2)
-    overlay.style.left = `${Math.max(0, left)}px`
-    overlay.style.top = `${Math.max(0, top)}px`
-    overlay.style.width = `${width}px`
-    overlay.style.height = `${height}px`
+    const geom = { left: Math.max(0, left), top: Math.max(0, top), width, height }
+    applyGeometryTo(overlay, geom)
+    // Track the intended geometry (not a mid-animation offset read) so the
+    // persisted card placement is exact.
+    this.cardGeom = geom
   }
 
   private rememberGeometry(overlay: HTMLElement): void {
     lastGeometry = readPanelGeometry(overlay)
+    this.cardGeom = lastGeometry
+    // Persist the card window's placement for this card so reopening restores
+    // it (alongside the viewer geometry written on the viewer's settle).
+    this.writePersist()
   }
 
   // ── The file-viewer window: open / close ─────────────────────────────────
@@ -677,30 +748,38 @@ export class FiberDetailModal {
 
     win.append(winHeader, tabs, views)
 
-    // ── Geometry: beside the card, same height; clamp on-screen ──
-    const vw = window.innerWidth
-    const vh = window.innerHeight
-    const W = Math.min(720, Math.round(vw * 0.46))
-    const H = card.offsetHeight
-    let left = card.offsetLeft + card.offsetWidth + 12
-    if (left + W > vw - 12) left = vw - W - 12
-    left = Math.max(12, left)
-    let top = card.offsetTop
-    if (top + H > vh) top = Math.max(0, vh - H)
-    win.style.left = `${left}px`
-    win.style.top = `${top}px`
-    win.style.width = `${W}px`
-    win.style.height = `${H}px`
+    // ── Geometry ──
+    // Remembered placement for this card wins; otherwise the default is
+    // half-and-half — the card glides to the left half, the viewer takes the
+    // right half. Once placed, the viewer geometry is remembered (settle +
+    // close) so the next open restores it instead of re-splitting.
+    if (this.viewerGeom && onScreen(this.viewerGeom)) {
+      applyGeometryTo(win, this.viewerGeom)
+    } else {
+      const { card: cardG, viewer: viewerG } = halfAndHalf()
+      animatePanelGeometry(card, cardG)
+      lastGeometry = cardG
+      this.cardGeom = cardG
+      applyGeometryTo(win, viewerG)
+      this.viewerGeom = viewerG
+    }
+    // Persist the new arrangement (half-and-half or restored) immediately.
+    this.writePersist()
 
+    const rememberViewer = () => {
+      this.viewerGeom = readPanelGeometry(win)
+      this.writePersist()
+    }
     // Drag (header bar) + resize (eight edge/corner zones) — independent of
-    // the card, reusing the same chrome helpers + handle CSS.
-    attachPanelDrag(win, winHeader, { draggingClass: 'kbn-detail-dragging', onSettle: () => {} })
+    // the card, reusing the same chrome helpers + handle CSS. Both remember the
+    // window's new geometry for this card.
+    attachPanelDrag(win, winHeader, { draggingClass: 'kbn-detail-dragging', onSettle: rememberViewer })
     attachPanelResize(win, {
       handleClassPrefix: 'kbn-detail-rh',
       resizingClass: 'kbn-detail-resizing',
       minWidth: MIN_WIDTH,
       minHeight: MIN_HEIGHT,
-      onSettle: () => {},
+      onSettle: rememberViewer,
     })
     // Clicking anywhere on the viewer raises it above the card.
     win.addEventListener('pointerdown', () => bringToFront(win), true)
@@ -714,6 +793,9 @@ export class FiberDetailModal {
    *  stays open. Fires when the last tab closes OR the window's ✕ is clicked
    *  (the ✕ closes every open file at once). */
   private closeViewerWindow(): void {
+    // Remember where the window sat so reopening this card restores it (not the
+    // half-and-half default).
+    if (this.viewerWindow) this.viewerGeom = readPanelGeometry(this.viewerWindow)
     this.viewerWindow?.remove()
     this.viewerWindow = null
     this.viewerTitle = null
@@ -1828,6 +1910,8 @@ export class FiberDetailModal {
     if (!uid) return
     savePersist(uid, {
       active: this.activePath ?? undefined,
+      cardGeom: this.cardGeom ?? undefined,
+      viewerGeom: this.viewerGeom ?? undefined,
       open: this.openFiles.map((e) => ({
         path: e.file.fullPath,
         basename: e.file.basename,
