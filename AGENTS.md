@@ -164,6 +164,17 @@ down" when it isn't:
   `~/.ssh/ssh_wrapper.sh` entirely — it's VS Code's remote helper, unrelated to
   Shuttle.
 
+**Deploying is ALWAYS safe — local or remote — and is never a blocker.**
+Rebuilding and restarting the daemon (`make all`, cycling `:4000`, reloading the
+LaunchAgent, the respawn loop) does **not** kill running jobs: **tmux owns the
+worker process, Shuttle only owns the watcher** (the load-bearing invariant
+below). A restart cycles the watcher and rebinds the API; the `shuttle-<id>`
+tmux sessions keep running untouched and the daemon re-adopts them on boot. So
+deploy freely whenever there's a fix to ship — never hold back, gate it behind
+"there are workers running," or frame a deploy as risky. The only cost is the
+brief API/board blip during the ~1s (local) to ~2min (candide cold-walk)
+restart; in-flight work is unaffected.
+
 **Deploying to remote hosts (candide, cineca):** push to GitHub first, then build on the host — don't copy the macOS escript, as BEAM bytecode format varies across OTP versions and the binary will crash on startup on a different host.
 
 ```bash
