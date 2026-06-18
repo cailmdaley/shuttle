@@ -212,6 +212,19 @@ defmodule ShuttleWeb.SnapshotChannelTest do
     :ok
   end
 
+  # Start the Poller under ExUnit's per-test supervisor so it is torn down at
+  # test end instead of leaking as a zombie ticker (start_link links to the test
+  # process, but a :normal test exit doesn't kill linked processes). Returns
+  # {:ok, pid} so existing `{:ok, poller} = ...` call sites are unchanged.
+  defp start_poller!(opts) do
+    pid =
+      start_supervised!(
+        %{id: make_ref(), start: {Poller, :start_link, [opts]}, restart: :temporary}
+      )
+
+    {:ok, pid}
+  end
+
   defp make_fiber(id, attrs \\ %{}) do
     Map.merge(
       %{
@@ -234,7 +247,7 @@ defmodule ShuttleWeb.SnapshotChannelTest do
     MockRunner.set_shuttle("tests/haiku", @oneshot_shuttle)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         runner: MockRunner,
         poll_interval_ms: 60_000,
         felt_stores: ["/tmp"]
@@ -259,7 +272,7 @@ defmodule ShuttleWeb.SnapshotChannelTest do
     MockRunner.set_shuttle("tests/haiku", @oneshot_shuttle)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         runner: MockRunner,
         poll_interval_ms: 60_000,
         felt_stores: ["/tmp"]
@@ -272,7 +285,7 @@ defmodule ShuttleWeb.SnapshotChannelTest do
     # Trigger dispatch — should broadcast
     send(poller, :run_poll_cycle)
 
-    assert_push("snapshot", payload, 500)
+    assert_push("snapshot", payload, 2000)
     assert length(payload.eligible) == 1
     assert hd(payload.eligible).fiber_id == "tests/haiku"
   end

@@ -111,6 +111,24 @@ defmodule Shuttle.WorkerWatcherTest do
     :ok
   end
 
+  # Poll a condition until it holds (or the attempts run out). Used instead of a
+  # fixed Process.sleep so timing assertions wait for the OBSERVABLE event (the
+  # watcher actually dying / a log line landing) rather than guessing how long
+  # heartbeat detection takes — which, under any scheduler jitter, overran the
+  # old fixed margins. ~2s ceiling; returns as soon as the condition is true, so
+  # passing tests pay nothing.
+  defp wait_until(fun, attempts \\ 80)
+  defp wait_until(fun, 0), do: fun.()
+
+  defp wait_until(fun, attempts) do
+    if fun.() do
+      true
+    else
+      Process.sleep(25)
+      wait_until(fun, attempts - 1)
+    end
+  end
+
   # ── Tests ──
 
   test "watcher children are temporary" do
@@ -141,10 +159,10 @@ defmodule Shuttle.WorkerWatcherTest do
     Process.sleep(120)
 
     # Should receive exit notification
-    assert_receive {:worker_exited, "tests/haiku", :normal_exit, false}, 200
+    assert_receive {:worker_exited, "tests/haiku", :normal_exit, false}, 1000
 
     # Watcher should have stopped
-    refute Process.alive?(watcher)
+    assert wait_until(fn -> not Process.alive?(watcher) end)
   end
 
   test "watcher exits immediately if session does not exist on init" do
@@ -157,7 +175,7 @@ defmodule Shuttle.WorkerWatcherTest do
                heartbeat_interval_ms: 50
              )
 
-    assert_receive {:worker_exited, "tests/missing", :session_not_found, _}, 200
+    assert_receive {:worker_exited, "tests/missing", :session_not_found, _}, 1000
   end
 
   test "watcher can be stopped gracefully" do
@@ -176,7 +194,7 @@ defmodule Shuttle.WorkerWatcherTest do
     assert Process.alive?(watcher)
     WorkerWatcher.stop(watcher)
     Process.sleep(50)
-    refute Process.alive?(watcher)
+    assert wait_until(fn -> not Process.alive?(watcher) end)
   end
 
   # ── Flake robustness tests ─────────────────────────────────────────────────
@@ -219,8 +237,8 @@ defmodule Shuttle.WorkerWatcherTest do
     Process.sleep(300)
 
     # Now the watcher should declare the worker dead.
-    assert_receive {:worker_exited, "tests/flaky", :normal_exit, false}, 200
-    refute Process.alive?(watcher)
+    assert_receive {:worker_exited, "tests/flaky", :normal_exit, false}, 1000
+    assert wait_until(fn -> not Process.alive?(watcher) end)
   end
 
   test "watcher resets failure counter after recovery" do
@@ -257,8 +275,8 @@ defmodule Shuttle.WorkerWatcherTest do
     FlakeyRunner.remove_session(session)
     Process.sleep(300)
 
-    assert_receive {:worker_exited, "tests/recover", :normal_exit, false}, 200
-    refute Process.alive?(watcher)
+    assert_receive {:worker_exited, "tests/recover", :normal_exit, false}, 1000
+    assert wait_until(fn -> not Process.alive?(watcher) end)
   end
 
   # Regression: WorkerWatcher used to capture self() (a pid) at start time
@@ -293,8 +311,8 @@ defmodule Shuttle.WorkerWatcherTest do
     MockRunner.remove_session(session)
     Process.sleep(200)
 
-    assert_receive {:worker_exited, "tests/named-poller", :normal_exit, false}, 200
-    refute Process.alive?(watcher)
+    assert_receive {:worker_exited, "tests/named-poller", :normal_exit, false}, 1000
+    assert wait_until(fn -> not Process.alive?(watcher) end)
   end
 
   test "watcher logs and continues when registered :poller name has no live process" do
@@ -317,12 +335,15 @@ defmodule Shuttle.WorkerWatcherTest do
     log =
       ExUnit.CaptureLog.capture_log(fn ->
         MockRunner.remove_session(session)
-        Process.sleep(200)
+        # Wait for the watcher to actually finish (it logs the failed delivery
+        # right before stopping), not a fixed sleep that can end before the
+        # heartbeat-detection + log under load.
+        wait_until(fn -> not Process.alive?(watcher) end)
       end)
 
     assert log =~ "could not deliver :worker_exited"
     assert log =~ "tests/dead-poller"
     # Watcher still stops normally; the failure is bounded to the send.
-    refute Process.alive?(watcher)
+    assert wait_until(fn -> not Process.alive?(watcher) end)
   end
 end

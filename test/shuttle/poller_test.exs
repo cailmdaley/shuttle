@@ -272,6 +272,29 @@ defmodule Shuttle.PollerTest do
     :ok
   end
 
+  # Start a Poller OWNED BY ExUnit's per-test supervisor, so it is terminated
+  # deterministically at the end of the test (before the next test runs).
+  #
+  # The bug this fixes: `Poller.start_link/1` links the poller to the *test
+  # process*, but a test process exits `:normal`, and normal exits do NOT
+  # propagate across links — so every poller SURVIVED its test as a zombie
+  # ticker. Dozens accumulated over a run, all polling the single shared
+  # MockRunner Agent + the /tmp/.felt store, dispatching and writing commands
+  # after later tests' `reset()`. That polluted later tests (sessions/commands
+  # they never created) and starved the scheduler (blowing the heartbeat-timing
+  # margins) — the rotating, order-dependent flakiness. `start_supervised!`
+  # hands the lifecycle to ExUnit; `restart: :temporary` so a poller that stops
+  # itself mid-test (crash-recovery cases) is not auto-restarted. Returns
+  # `{:ok, pid}` so existing `{:ok, poller} = ...` call sites are unchanged.
+  defp start_poller!(opts) do
+    pid =
+      start_supervised!(
+        %{id: make_ref(), start: {Shuttle.Poller, :start_link, [opts]}, restart: :temporary}
+      )
+
+    {:ok, pid}
+  end
+
   # ── Helpers ──
 
   # Minimal shuttle: block YAML for a oneshot fiber ready for dispatch.
@@ -290,7 +313,13 @@ defmodule Shuttle.PollerTest do
     )
   end
 
-  defp wait_until(fun, attempts \\ 20)
+  # Ceiling ~3s (was ~500ms). wait_until returns the instant the condition holds,
+  # so a generous ceiling costs passing assertions nothing — but the poll cycle is
+  # a multi-hop async chain (tick → 20ms timer → run_poll_cycle → read Task →
+  # :poll_world → apply → dispatch → spawn_tmux), and under CPU load (the full
+  # suite, or a tight repeat loop) a tick that used to land in <500ms can slip
+  # well past it. The tight ceiling was the dominant intrinsic-timing flake here.
+  defp wait_until(fun, attempts \\ 120)
   defp wait_until(fun, 0), do: fun.()
 
   defp wait_until(fun, attempts) do
@@ -374,7 +403,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/haiku-dispatch", @oneshot_shuttle)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_1,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -406,7 +435,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/host-mismatch", "enabled: true\nkind: oneshot\nhost: candide\n")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_host_mismatch,
         runner: MockRunner,
         own_host_id: "local",
@@ -432,7 +461,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/host-match", "enabled: true\nkind: oneshot\nhost: candide\n")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_host_match,
         runner: MockRunner,
         own_host_id: "candide",
@@ -466,7 +495,7 @@ defmodule Shuttle.PollerTest do
 
     try do
       {:ok, poller} =
-        Poller.start_link(
+        start_poller!(
           name: :test_poller_env_host,
           runner: MockRunner,
           poll_interval_ms: 60_000,
@@ -491,7 +520,7 @@ defmodule Shuttle.PollerTest do
 
     try do
       {:ok, poller} =
-        Poller.start_link(
+        start_poller!(
           name: :test_poller_host_file,
           runner: MockRunner,
           poll_interval_ms: 60_000,
@@ -527,7 +556,7 @@ defmodule Shuttle.PollerTest do
 
     try do
       {:ok, poller} =
-        Poller.start_link(
+        start_poller!(
           name: :test_poller_gethostname,
           runner: MockRunner,
           poll_interval_ms: 60_000,
@@ -550,7 +579,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/projected-discovery", @oneshot_shuttle)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_projected_listing,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -590,7 +619,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/cached-document", @oneshot_shuttle)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_document_cache,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -654,7 +683,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/aloft", "enabled: true\nkind: oneshot\nhost: candide\n")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_runtime_stamp,
         runner: MockRunner,
         own_host_id: "candide",
@@ -699,7 +728,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/realactivity", "enabled: true\nkind: oneshot\nhost: candide\n")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_runtime_real_activity,
         runner: MockRunner,
         own_host_id: "candide",
@@ -747,7 +776,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/waiting", "enabled: true\nkind: oneshot\nhost: candide\n")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_runtime_waiting,
         runner: MockRunner,
         own_host_id: "candide",
@@ -807,7 +836,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/idle", "enabled: true\nkind: oneshot\nhost: candide\n")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_runtime_idle,
         runner: MockRunner,
         own_host_id: "candide",
@@ -841,7 +870,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/killme", "enabled: true\nkind: oneshot\nhost: candide\n")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_kill_session,
         runner: MockRunner,
         own_host_id: "candide",
@@ -892,7 +921,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_felt_ls_delay(1_000)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_slow_felt_snapshot,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -920,7 +949,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/closed", @oneshot_shuttle, "closed")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_2,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -945,7 +974,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/draft", "enabled: false\nkind: oneshot\n", "open")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_3,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -972,7 +1001,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/pinned-looping", "kind: pinned\n", "active")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_pinned_looping,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1000,7 +1029,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/pinned-parked", "kind: pinned\n", "open")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_pinned_parked,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1039,7 +1068,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(fiber_id, "kind: pinned\nagent: claude-opus\n", "active")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_pinned_exit_loops,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1100,7 +1129,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_standing_exit_closes,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1142,7 +1171,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_standing_sleeping,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1179,7 +1208,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_standing_lifecycle_persist,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1218,7 +1247,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_standing_wedge,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1254,7 +1283,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_actions_overlay,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1302,7 +1331,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_accept_sticks,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1353,7 +1382,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_accept_during_poll,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1405,7 +1434,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_standing_force_now,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1472,7 +1501,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_standing_awaiting_refuses_adhoc,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1510,7 +1539,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_reconcile_dead_session,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1564,7 +1593,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_standing_force_scheduled,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1597,7 +1626,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_standing_force_resume_before_window,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1637,7 +1666,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_force_closed,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1662,7 +1691,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(fiber_id, "kind: oneshot\nagent: claude-sonnet\n", "open")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_force_disabled,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1686,7 +1715,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_force_wrong_host,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1710,7 +1739,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(fiber_id, "enabled: true\nkind: oneshot\nagent: human\n")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_force_human,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1746,7 +1775,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_standing_due,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1826,7 +1855,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_standing_stale,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1890,7 +1919,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_standing_snapshot_states,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1917,7 +1946,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/dependent", @oneshot_shuttle)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_4,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1941,7 +1970,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/untracked", @oneshot_shuttle, "untracked")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_untracked,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1967,7 +1996,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/dependent", @oneshot_shuttle)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_5,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -1991,7 +2020,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.add_tmux_session(Dispatcher.session_name("tests/haiku-dedup"))
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_6,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2020,7 +2049,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/haiku-retry", @oneshot_shuttle)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_7,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2066,7 +2095,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_running_uid_keyed,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2117,7 +2146,7 @@ defmodule Shuttle.PollerTest do
     append_review_comment(fiber_id, resume_mode: "previous")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_force_resume_unified,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2160,7 +2189,7 @@ defmodule Shuttle.PollerTest do
     append_dispatch_session(fiber_id, "old-session-id")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_continuation_fresh,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2191,7 +2220,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle("tests/haiku-close", @oneshot_shuttle)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_8,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2218,7 +2247,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.add_tmux_session(Dispatcher.session_name("tests/orphan"))
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_9,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2240,7 +2269,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.add_tmux_session(Dispatcher.session_name(fiber_id, uid))
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_orphan_uid,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2266,7 +2295,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.add_tmux_session(Dispatcher.session_name(fiber_id))
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_orphan_legacy,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2299,7 +2328,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.add_tmux_session(Dispatcher.session_name(fiber_id, uid))
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_pinned_orphan,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2331,7 +2360,7 @@ defmodule Shuttle.PollerTest do
     append_dispatch_session(fiber_id, "577af64b-644a-4733-9e6a-f60d86b6941f")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_resurrect_orphan,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2364,7 +2393,7 @@ defmodule Shuttle.PollerTest do
     # own_host_id is the default "test-host", which does not equal
     # "some-other-machine".
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_resurrect_foreign_host,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2394,7 +2423,7 @@ defmodule Shuttle.PollerTest do
     """)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_resurrect_missing_project_dir,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2450,7 +2479,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_host_absent,
         runner: MockRunner,
         own_host_id: "test-host",
@@ -2501,7 +2530,7 @@ defmodule Shuttle.PollerTest do
     doc_path = "/tmp/.felt/#{fiber_id}/standing-dead-orphan.md"
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_standing_dead_orphan,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2533,7 +2562,7 @@ defmodule Shuttle.PollerTest do
     append_dispatch_session(fiber_id, "closed-uuid")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_closed_not_resurrected,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2553,7 +2582,7 @@ defmodule Shuttle.PollerTest do
     fiber_id = "tests/missing-running-session"
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_missing_running_session,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2613,7 +2642,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_runtime_rehydrate_live_1,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2628,7 +2657,7 @@ defmodule Shuttle.PollerTest do
     # The tmux session is still alive (the MockRunner tracks it across the
     # GenServer restart) — the restarted poller re-adopts it from the tmux scan.
     {:ok, restarted} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_runtime_rehydrate_live_2,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2652,7 +2681,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_runtime_rehydrate_missing_1,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2665,7 +2694,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.remove_tmux_session(session)
 
     {:ok, restarted} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_runtime_rehydrate_missing_2,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2683,7 +2712,7 @@ defmodule Shuttle.PollerTest do
     fiber_id = "tests/prefix-parent"
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_prefix_parent,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2722,7 +2751,7 @@ defmodule Shuttle.PollerTest do
     """)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_project_dir,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2761,7 +2790,7 @@ defmodule Shuttle.PollerTest do
     """)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_missing_project_dir,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2796,7 +2825,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.add_tmux_session(Dispatcher.session_name(fiber_id))
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_10,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2820,7 +2849,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(fiber_id, @oneshot_shuttle)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_untagged_shuttle,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2849,7 +2878,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_new_session_delay(5_250)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_slow_dispatch,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2906,7 +2935,7 @@ defmodule Shuttle.PollerTest do
     write_fiber_file(host_a, "tests/fiber-in-a")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_multi_host_resolve_a,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2934,7 +2963,7 @@ defmodule Shuttle.PollerTest do
     write_fiber_file(host_b, "tests/fiber-in-b")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_multi_host_resolve_b,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2956,7 +2985,7 @@ defmodule Shuttle.PollerTest do
     File.mkdir_p!(host_a)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_multi_host_not_found,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -2986,7 +3015,7 @@ defmodule Shuttle.PollerTest do
     write_fiber_file(host_b, "tests/collision-fiber")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_multi_host_collision,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -3015,7 +3044,7 @@ defmodule Shuttle.PollerTest do
     path_a = write_fiber_file(host_a, "tests/movable-fiber")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_multi_host_bust,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -3078,7 +3107,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_subdir_symlink_skip,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -3131,7 +3160,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_symlinked_felt_skipped,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -3177,7 +3206,7 @@ defmodule Shuttle.PollerTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_symlinked_felt_cache_bust,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -3196,7 +3225,7 @@ defmodule Shuttle.PollerTest do
 
   test "snapshot includes felt_stores list" do
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_multi_host_snap,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -3241,7 +3270,7 @@ defmodule Shuttle.PollerTest do
     end)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_registered_felt_stores,
         runner: MockRunner,
         poll_interval_ms: 60_000
@@ -3280,7 +3309,7 @@ defmodule Shuttle.PollerTest do
     end)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_refresh_registered_felt_stores,
         runner: MockRunner,
         poll_interval_ms: 60_000
@@ -3304,7 +3333,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.add_tmux_session("capture-abc123")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_claim,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -3361,7 +3390,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(id, @oneshot_shuttle)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_claim_guards,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -3397,7 +3426,7 @@ defmodule Shuttle.PollerTest do
     MockRunner.add_tmux_session("capture-closed1")
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_claim_closed,
         runner: MockRunner,
         poll_interval_ms: 60_000,
@@ -3411,7 +3440,7 @@ defmodule Shuttle.PollerTest do
 
   test "capture spawns a tmux session from a free-text prompt" do
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_capture,
         runner: MockRunner,
         poll_interval_ms: 60_000,
