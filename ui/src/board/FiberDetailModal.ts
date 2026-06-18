@@ -802,6 +802,12 @@ export class FiberDetailModal {
     if (card.shuttleKind === 'standing' && card.shuttleSchedule) chips.push(card.shuttleSchedule)
     else if (card.shuttleKind) chips.push(card.shuttleKind)
     if (card.shuttleHost) chips.push(card.shuttleHost)
+    const projectDir = this.projectDirFor(card)
+    if (projectDir) {
+      // Home-relativize for the chip (~/dev/shuttle); full path on hover.
+      chips.push(projectDir.replace(/^\/(?:Users|home)\/[^/]+\//, '~/'))
+      summary.title = projectDir
+    }
     summary.textContent = chips.join(' · ')
 
     toggle.append(chevron, toggleLabel, summary)
