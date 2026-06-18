@@ -59,6 +59,20 @@
         -->
         <key>LOOM_HOMES</key>
         <string>__LOOM_HOMES__</string>
+        <!--
+          SSH_AUTH_SOCK points at the user's PERSISTENT login ssh-agent (default
+          ~/.ssh/agent.sock), NOT launchd's per-session Keychain agent. This is
+          load-bearing for remote work: launchd hands the daemon a bare agent
+          that only ever holds the default key, so credentials added to the real
+          agent — notably cineca's step-ca short-lived SSH cert (`step ssh
+          login …`, see AGENTS.md) — are invisible to it. Without this, every
+          fresh ssh the daemon makes to cineca fails auth: the daemon's own
+          remote feed/tunnel can't connect, and a kanban Attach tab (which
+          inherits this very SSH_AUTH_SOCK) opens and instantly dies. Filled in
+          by `make install-agent` (placeholder __SSH_AUTH_SOCK__).
+        -->
+        <key>SSH_AUTH_SOCK</key>
+        <string>__SSH_AUTH_SOCK__</string>
     </dict>
 
     <key>WorkingDirectory</key>

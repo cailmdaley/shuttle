@@ -29,6 +29,12 @@ AGENT_LOOM_HOMES ?= $(HOME)/loom
 # launchd's own env is too bare, and sourcing the profile at runtime under
 # launchd doesn't reconstruct it. This is the user's real PATH, frozen.
 AGENT_PATH ?= $(shell /bin/bash -lc 'echo $$PATH')
+# The user's PERSISTENT ssh-agent socket. launchd hands the daemon a bare
+# per-session Keychain agent that only holds the default key, so remote creds
+# added to the real agent — e.g. cineca's step-ca SSH cert — are invisible and
+# fresh ssh to cineca fails (dead remote feed; Attach tabs that open and die).
+# ~/.ssh/agent.sock is the stable login-agent path; override if yours differs.
+AGENT_SSH_AUTH_SOCK ?= $(HOME)/.ssh/agent.sock
 
 .PHONY: all build cli start stop restart logs status clean help install-agent uninstall-agent
 
@@ -125,6 +131,7 @@ install-agent: build stop
 	@mkdir -p $(HOME)/Library/LaunchAgents
 	@sed -e 's#__SHUTTLE_DIR__#$(CURDIR)#g' -e 's#__LOG__#$(LOG)#g' \
 	  -e 's#__LOOM_HOMES__#$(AGENT_LOOM_HOMES)#g' -e 's#__PATH__#$(AGENT_PATH)#g' \
+	  -e 's#__SSH_AUTH_SOCK__#$(AGENT_SSH_AUTH_SOCK)#g' \
 	  share/io.shuttle.daemon.plist.template > $(AGENT_PLIST)
 	@launchctl unload $(AGENT_PLIST) 2>/dev/null || true
 	@launchctl load $(AGENT_PLIST)
