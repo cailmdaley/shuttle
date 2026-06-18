@@ -135,6 +135,35 @@ escape hatch — granting FDA to each I/O binary in the tree (`…/erlang/<v>/�
 re-granted after every erlang upgrade, plus `~/.local/bin/felt`) — but it's
 fragile and per-binary; relocating out of Documents is the supported fix.
 
+**Connecting to candide and cineca (SSH auth — read this first).** The two
+remotes authenticate differently, and getting it wrong looks like "the host is
+down" when it isn't:
+
+- **candide** (`candid03.iap.fr`, IAP) — plain pubkey auth with `~/.ssh/id_rsa`
+  (the `Host *` identity), reached through an `nc` `ProxyCommand` hop. No cert
+  dance: `ssh candide` just works whenever you're on a network that can reach
+  IAP. Nothing expires.
+- **cineca** (`login07-ext.leonardo.cineca.it`, user `cdaley00`, Leonardo) —
+  auth is a **step-ca short-lived SSH certificate** held in the ssh-agent,
+  valid **24h**. Refresh it once per day with:
+
+  ```bash
+  step ssh login 'cail.daley@cea.fr' --provisioner cineca-hpc
+  ```
+
+  When the cert is fresh, `ssh cineca` works non-interactively. When it has
+  expired, **every** `ssh cineca` fails instantly with `Permission denied` —
+  including the kanban **Attach** button, which runs `ssh -tt cineca tmux attach
+  …` in a kitty tab, so the symptom is a terminal that **flashes open and dies**.
+  That is the expired cert, not a Shuttle bug: re-run the `step ssh login` and
+  attach works again. The `~/.ssh/cineca_key` / `cineca_key-cert.pub` paths in
+  the ssh config are step's cert store — they may be absent on disk and ssh
+  prints a harmless `no such identity` warning; the live credential is the cert
+  in the agent. **Do not** pass `-o BatchMode=yes` when sanity-checking cineca
+  (it suppresses the cert path and falsely reports a dead host), and ignore
+  `~/.ssh/ssh_wrapper.sh` entirely — it's VS Code's remote helper, unrelated to
+  Shuttle.
+
 **Deploying to remote hosts (candide, cineca):** push to GitHub first, then build on the host — don't copy the macOS escript, as BEAM bytecode format varies across OTP versions and the binary will crash on startup on a different host.
 
 ```bash
