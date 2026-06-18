@@ -95,6 +95,20 @@ defmodule Shuttle.DispatchIntegrationTest do
     {:ok, host: host}
   end
 
+  # Start a Poller under ExUnit's per-test supervisor so it is torn down at test
+  # end rather than leaking as a zombie ticker (Poller.start_link links to the
+  # test process, but a :normal test exit doesn't kill linked processes). Returns
+  # {:ok, pid} so existing `{:ok, poller} = ...` call sites are unchanged. See the
+  # same helper + rationale in poller_test.exs.
+  defp start_poller!(opts) do
+    pid =
+      start_supervised!(
+        %{id: make_ref(), start: {Poller, :start_link, [opts]}, restart: :temporary}
+      )
+
+    {:ok, pid}
+  end
+
   # ── Tests ──────────────────────────────────────────────────────────────────
 
   # Fresh oneshot dispatch — fiber on disk, run-script verified byte-level.
@@ -449,7 +463,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_history_resume,
         runner: IntegrationRunner,
         poll_interval_ms: 600_000,
@@ -866,7 +880,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_resume_no_uuid,
         runner: IntegrationRunner,
         poll_interval_ms: 600_000,
@@ -919,7 +933,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     )
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_blocked_then_closed,
         runner: IntegrationRunner,
         poll_interval_ms: 600_000,
@@ -1018,7 +1032,7 @@ defmodule Shuttle.DispatchIntegrationTest do
 
     try do
       {:ok, _poller} =
-        Poller.start_link(
+        start_poller!(
           name: :test_poller_standing_dead_orphan,
           runner: IntegrationRunner,
           poll_interval_ms: 600_000,
@@ -1094,7 +1108,7 @@ defmodule Shuttle.DispatchIntegrationTest do
 
     try do
       {:ok, _poller} =
-        Poller.start_link(
+        start_poller!(
           name: :test_poller_accepted_freeform,
           runner: IntegrationRunner,
           poll_interval_ms: 600_000,
@@ -1149,7 +1163,7 @@ defmodule Shuttle.DispatchIntegrationTest do
 
     try do
       {:ok, poller} =
-        Poller.start_link(
+        start_poller!(
           name: :test_poller_force_rearm,
           runner: IntegrationRunner,
           poll_interval_ms: 600_000,
@@ -1233,7 +1247,7 @@ defmodule Shuttle.DispatchIntegrationTest do
 
     try do
       {:ok, poller} =
-        Poller.start_link(
+        start_poller!(
           name: :test_poller_temper_rest,
           runner: IntegrationRunner,
           poll_interval_ms: 600_000,
@@ -1302,7 +1316,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     """)
 
     {:ok, poller} =
-      Poller.start_link(
+      start_poller!(
         name: :test_poller_refresh_seam,
         runner: IntegrationRunner,
         poll_interval_ms: 600_000,
