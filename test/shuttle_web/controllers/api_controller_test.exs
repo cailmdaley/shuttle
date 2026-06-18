@@ -1218,13 +1218,19 @@ defmodule ShuttleWeb.APIControllerTest do
     fiber = make_fiber("tests/wait-timeout")
     MockRunner.set_fiber("tests/wait-timeout", fiber)
 
+    # The wait timer starts when the POST registers the waiter, but we only
+    # subscribe to the channel AFTER the response — and Phoenix doesn't buffer a
+    # broadcast for a not-yet-joined subscriber. A 20ms timeout could fire before
+    # the connect+join finished (especially under load), so the "timed_out" push
+    # was missed. 300ms comfortably outlasts the subscribe; assert_push waits for
+    # the push, so the test is still fast.
     conn =
       post(
         api_conn(),
         "/api/v1/wait",
         Jason.encode!(%{
           "fiber_id" => "tests/wait-timeout",
-          "timeout_ms" => 20
+          "timeout_ms" => 300
         })
       )
 
@@ -1234,7 +1240,7 @@ defmodule ShuttleWeb.APIControllerTest do
     {:ok, socket} = Phoenix.ChannelTest.connect(UserSocket, %{}, connect_info: %{})
     {:ok, _reply, _channel_socket} = subscribe_and_join(socket, body["channel_topic"], %{})
 
-    assert_push("timed_out", payload, 500)
+    assert_push("timed_out", payload, 2000)
     assert payload.fiber_id == "tests/wait-timeout"
   end
 
