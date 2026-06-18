@@ -3415,7 +3415,11 @@ defmodule Shuttle.PollerTest do
   test "claim refuses unknown fibers, dead sessions, and double claims" do
     id = "tests/claim-guards"
     MockRunner.set_fiber(id, make_fiber(id, %{"uid" => "01GUARDUID"}))
-    MockRunner.set_shuttle(id, @oneshot_shuttle)
+    # host: other-host keeps the boot poll from AUTO-dispatching this active fiber
+    # — which would claim it first and race the manual claim_session calls below.
+    # claim_session is host-agnostic (do_claim_session/register_claimed_session
+    # never check host), so every guard under test still fires.
+    MockRunner.set_shuttle(id, "enabled: true\nkind: oneshot\nhost: other-host\n")
 
     {:ok, poller} =
       start_poller!(
