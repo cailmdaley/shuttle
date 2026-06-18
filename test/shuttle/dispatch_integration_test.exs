@@ -324,9 +324,62 @@ defmodule Shuttle.DispatchIntegrationTest do
     # Claude's resume warning dismiss block is present.
     assert script =~ "send-keys"
     assert script =~ "sleep 2"
-    # Resume prompt (not fresh dispatch prompt) is in the script.
+    # The resume prompt is present (the script also carries a `|| <fresh>`
+    # fallback whose full dispatch prompt is exercised in the deadlock test below).
     assert script =~ "Shuttle resumed your previous session"
     assert script =~ "Fiber: tests/kanban-resume"
+  end
+
+  # Regression for the launch deadlock (the CNRS own-words fiber): a resume whose
+  # target session is GONE must not flap. The run script tries `--resume <id>`
+  # and, on failure (claude exits non-zero with "No conversation found"), falls
+  # back to a FRESH launch that REUSES the same id (`--session-id <id>`), so the
+  # transcript is recreated under it and the next resume succeeds — self-healing.
+  # Without this the worker dies in <1s and the daemon re-arms the same dead id on
+  # every poll, so the fiber can never be launched. Harness-agnostic: it relies on
+  # the resume exit code, not on knowing where any CLI stores transcripts.
+  test "resume carries a fresh same-id fallback so a gone session can't deadlock", %{host: host} do
+    write_fiber(host, "tests/resume-fallback", """
+    ---
+    name: Resume fallback fiber
+    status: active
+    tags:
+      - constitution
+    shuttle:
+      kind: oneshot
+      agent: claude-sonnet
+    ---
+    A fiber whose stored resume session may no longer be resumable.
+    """)
+
+    append_worker_exit(host, "tests/resume-fallback",
+      agent: "claude-sonnet",
+      session: "gone-session-uuid-9999"
+    )
+
+    append_review_comment(host, "tests/resume-fallback",
+      summary: "Resume previous",
+      resume_mode: "previous"
+    )
+
+    assert {:ok, _} =
+             Dispatcher.dispatch("tests/resume-fallback",
+               runner: IntegrationRunner,
+               felt_store: host
+             )
+
+    script = read_run_script()
+
+    # Resume is attempted first...
+    assert script =~ "--resume 'gone-session-uuid-9999'"
+    # ...with a `|| <fresh>` fallback that reuses the SAME id, so the new session
+    # is created under it and the next resume succeeds.
+    assert script =~ "|| "
+    assert script =~ "--session-id 'gone-session-uuid-9999'"
+    # The resume command precedes the fresh fallback on the command line.
+    resume_idx = :binary.match(script, "--resume 'gone-session-uuid-9999'") |> elem(0)
+    fresh_idx = :binary.match(script, "--session-id 'gone-session-uuid-9999'") |> elem(0)
+    assert resume_idx < fresh_idx
   end
 
   test "kanban resume uses worker-exit history session when frontmatter session was cleared", %{
