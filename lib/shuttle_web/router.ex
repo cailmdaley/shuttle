@@ -61,6 +61,11 @@ defmodule ShuttleWeb.Router do
     get("/astra", AstraController, :show)
     post("/felt-stores", FeltStoresController, :create)
     post("/cache/bust", CacheBustController, :create)
+    # The sent-files trail for a fiber (owner-routed): the artifacts a worker
+    # pushed with SendUserFile on the card, read from the owning host's
+    # events.jsonl hook stream. JSON-native, so it lives in the :api pipeline
+    # (unlike /file, which serves raw bytes).
+    get("/sent-files", SentFilesController, :show)
   end
 
   # File/asset bytes by absolute path (owner-routed). Unlocks `:::{embed}` +
