@@ -6,6 +6,61 @@ for dashboards and other consumers.
 
 The Elixir daemon is the production dispatcher.
 
+## Direction — standalone, then merged with felt
+
+**Shuttle is becoming a fully independent package.** Portolan is being retired;
+treat Shuttle as a self-contained tool with its own browser UI, its own launch
+story, and no assumption that any Portolan process is running. When you touch
+code that reaches for Portolan — its `:4004` backend, its hook-event stream, its
+city/pinning model, its origins — the goal is to sever, not to preserve parity.
+Portolan is a peer that happened to come first, not a dependency. Default to not
+referencing it at all; the historical comments that explain *why* a shape exists
+("ported from Portolan's …") are fine to leave as provenance, but new code and
+new docs should stand on their own.
+
+**Long-term: Shuttle and felt merge into one compact, cohesive package.** The
+end state is a single tool — the felt tree as the data layer and Shuttle's
+dispatch + UI as the surface over it — simplified down from the current
+daemon/CLI/UI spread. When weighing a change, prefer the design that moves
+toward that convergence: fewer moving parts, fewer cross-process contracts, felt
+and Shuttle as one thing rather than two that shell to each other.
+
+### Where Shuttle still depends on / references Portolan
+
+Live runtime couplings (these silently break or no-op without Portolan, and are
+the real severing work):
+
+- **`lib/shuttle/waiting_tracker.ex`** — reads Portolan's Claude Code hook-event
+  stream (`~/.portolan/data/events.jsonl`, written by `~/loom/hooks/portolan-hook.sh`)
+  to derive per-session activity / "waiting" phase. Env `PORTOLAN_EVENTS_FILE` /
+  `PORTOLAN_DATA_DIR`. Without Portolan's hook installed, the feed is empty and
+  session-activity is blank. Severing means Shuttle owning its own hook + event
+  path.
+- **UI `:4004` backend (`ui/src/board/FiberDetailModal.ts`, `FileViewerPanel.ts`)** —
+  `portolanBase` defaults to `http://localhost:4004` and the standalone
+  `KanbanModal` never overrides it, so **Sent-files**, **Save-to-downloads**, and
+  the **project-file viewer** all hit a Portolan backend that won't exist once
+  it's retired. These features are dead in the standalone UI today. Severing
+  means serving those routes from the `:4000` daemon (or dropping them).
+- **`lib/shuttle_web/cors_plug.ex`** — allowlists Portolan.app's Tauri
+  custom-protocol origins. Harmless but dead once Portolan is gone; trim.
+- **UI fonts (`ui/src/board/KanbanModal.css`)** — references fonts "served from
+  Portolan's `public/fonts/`". Vendor them into `ui/` instead.
+
+Conceptual/data-model coupling (no runtime dependency, but the design carries
+Portolan assumptions worth unwinding as Shuttle simplifies):
+
+- **City / pinning model** (`KanbanCityResolver.ts`, `projectModel.ts`,
+  `KanbanReadModel.ts`) — "which city owns this fiber" is a Portolan-local
+  concept the daemon feed doesn't carry; the UI reconstructs it from loom paths.
+- **`kind` / `priority` / `isRoot`** (`KanbanFiber.ts`) — "Portolan conventions
+  felt does not interpret," defaulted client-side.
+- **Gate/transition semantics** (`transition.ex`, `origins_controller.ex`,
+  `actions.ex`) — mirror Portolan's kanban placement pipeline.
+
+The remaining `grep -ri portolan` hits are historical provenance comments — no
+action needed beyond letting them age out as the code they describe is rewritten.
+
 ## Build + lifecycle
 
 The escript loads its BEAMs at boot, so editing source has zero effect on a
@@ -21,7 +76,64 @@ make all        # restart + cli (everything)
 make logs       # tail -f the log
 make status     # shuttle-ctl ps + snapshot summary
 make clean      # rm _build and stray Elixir.*.beam at project root
+
+make install-agent    # durable launchd keep-alive (crash + login restart)
+make uninstall-agent  # unload + remove the launchd agent
 ```
+
+### Durable launch (macOS) — `make install-agent`
+
+`make start` is a bare `nohup` with no supervisor: it won't restart on crash or
+relaunch at login. Shuttle's own durable surface is a **launchd LaunchAgent**
+(`share/io.shuttle.daemon.plist.template` → `~/Library/LaunchAgents/io.shuttle.daemon.plist`),
+installed by `make install-agent`: `KeepAlive` restarts the daemon on crash,
+`RunAtLoad` starts it at login. Independent of any other process.
+
+**Run it from outside `~/Documents` — this is load-bearing.** macOS TCC blocks
+launchd-spawned processes from `~/Documents`, `~/Desktop`, and `~/Downloads`, and
+**Full Disk Access does not inherit** the way it does under Terminal (a terminal
+app *takes responsibility* for its children, so everything you launch from a
+shell shares the terminal's grant; launchd has no such umbrella, and FDA doesn't
+even cross an `exec` to a differently-signed binary). So a launchd daemon whose
+escript/`ui/dist`/felt stores sit under `~/Documents` either crash-loops
+(`getcwd: Operation not permitted`, `escript: Failed to open file`) or silently
+fails to walk stores — and the fix would be granting FDA to *each* binary in the
+tree (`beam.smp`, `felt`, …), which is fragile (the erlang path is
+version-pinned) and exactly the per-binary grind to avoid.
+
+The clean setup, and the current production layout:
+
+- **The repo lives outside Documents** — the canonical checkout is
+  **`~/dev/shuttle`** (not `~/Documents/projects/shuttle`). The escript and
+  `ui/dist` are then readable by launchd with no grant.
+- **`AGENT_LOOM_HOMES` scopes felt polling to `~/loom`** (the Makefile default,
+  baked into the plist as `LOOM_HOMES`). `~/loom` is outside Documents and the
+  felt aggregate — it re-discovers each project's substores by following the
+  symlinks under `~/loom/.felt/` (`FeltStores.expand_with_symlinked_substores`),
+  so configuring just `~/loom` is enough. **Caveat:** substores whose real root
+  is itself under a protected folder (e.g. an iCloud `wedding`, a Documents
+  `lightcone`) are discovered but can't be walked by the launchd daemon — those
+  fibers won't enumerate until their project roots also move out of Documents.
+- **`PATH` is captured from a login shell at install time** (`AGENT_PATH` in the
+  Makefile, baked into the plist). launchd's own env is too bare to find
+  `escript` (Homebrew) at boot or `felt` (`~/.local/bin`) at runtime — and a
+  login shell *at runtime* (`bash -lc`) does NOT fix it, because under launchd's
+  bare env the profile doesn't reconstruct PATH (exit 127, escript unfound). A
+  PATH missing `felt` specifically yields `:enoent` → **500 on
+  `/api/v1/fibers/composite`** (the kanban load), with the board fine otherwise.
+  Capturing the real login PATH once, at install, is deterministic and needs no
+  hand-maintained list.
+
+Result: `make install-agent` from `~/dev/shuttle` → daemon binds `:4000`,
+KeepAlive + RunAtLoad, **zero Full Disk Access grants**, survives erlang
+upgrades. On the clusters the durable surface is still the `while true;
+bin/shuttle start` tmux respawn loop in session `shuttle-daemon` (no launchd);
+the LaunchAgent is macOS-only.
+
+`make install-agent` warns if `$PWD` is under a protected folder. There *is* an
+escape hatch — granting FDA to each I/O binary in the tree (`…/erlang/<v>/…/beam.smp`,
+re-granted after every erlang upgrade, plus `~/.local/bin/felt`) — but it's
+fragile and per-binary; relocating out of Documents is the supported fix.
 
 **Deploying to remote hosts (candide, cineca):** push to GitHub first, then build on the host — don't copy the macOS escript, as BEAM bytecode format varies across OTP versions and the binary will crash on startup on a different host.
 
