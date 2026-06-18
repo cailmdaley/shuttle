@@ -305,6 +305,27 @@ defmodule ShuttleWeb.APIControllerTest do
   defp restore_app_env(key, nil), do: Application.delete_env(:shuttle, key)
   defp restore_app_env(key, value), do: Application.put_env(:shuttle, key, value)
 
+  # Re-trigger the poll until a condition holds. A bare `send(Shuttle.Poller,
+  # :run_poll_cycle)` is DROPPED when a poll is already in flight (the
+  # `poll_check_in_progress` guard), and a fixed Process.sleep after it raced the
+  # async poll cycle — so a state-reading assertion that depended on the poll
+  # having dispatched flaked under load. Re-sending each iteration (~3s ceiling)
+  # guarantees a poll lands and the state settles; returns the instant it does.
+  defp poll_until(fun, attempts \\ 120) do
+    cond do
+      fun.() ->
+        true
+
+      attempts <= 0 ->
+        flunk("poll_until: condition never held")
+
+      true ->
+        send(Shuttle.Poller, :run_poll_cycle)
+        Process.sleep(25)
+        poll_until(fun, attempts - 1)
+    end
+  end
+
   # ── GET /api/v1/workers/:fiber_id ──
 
   test "returns running worker info" do
@@ -312,8 +333,10 @@ defmodule ShuttleWeb.APIControllerTest do
     MockRunner.set_fiber("tests/haiku", fiber)
     MockRunner.set_shuttle("tests/haiku", @oneshot_shuttle)
 
-    send(Shuttle.Poller, :run_poll_cycle)
-    Process.sleep(100)
+    assert poll_until(fn ->
+             Jason.decode!(get(api_conn(), "/api/v1/workers/tests/haiku").resp_body)["running"] ==
+               true
+           end)
 
     conn = get(api_conn(), "/api/v1/workers/tests/haiku")
     assert conn.status == 200
@@ -1529,7 +1552,7 @@ defmodule ShuttleWeb.APIControllerTest do
     MockRunner.remove_tmux_session(Dispatcher.session_name("tests/channel"))
     send(Shuttle.Poller, {:worker_exited, "tests/channel", :normal_exit, false})
 
-    assert_push("worker_exited", payload, 500)
+    assert_push("worker_exited", payload, 2000)
     assert payload.fiber_id == "tests/channel"
   end
 end

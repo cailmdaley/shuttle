@@ -952,9 +952,15 @@ defmodule Shuttle.DispatchIntegrationTest do
         stderr_to_stdout: true
       )
 
-    send(poller, :run_poll_cycle)
-
-    assert eventually(fn -> Poller.snapshot(poller).blocked == [] end),
+    # Re-trigger the poll INSIDE the wait: a single `:run_poll_cycle` is dropped
+    # when the async boot poll is still in flight (the `poll_check_in_progress`
+    # guard), so the eviction would never run. Sending one each iteration
+    # guarantees a poll lands after the boot poll finishes, re-discovers the
+    # now-closed fiber as a non-candidate, and evicts the stale blocked entry.
+    assert eventually(fn ->
+             send(poller, :run_poll_cycle)
+             Poller.snapshot(poller).blocked == []
+           end),
            "expected blocked entry to evict after fiber closed"
   end
 
