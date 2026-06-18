@@ -95,6 +95,14 @@
   inset: 0;
   width: 100%;
   height: 100%;
+  /* The masthead dissolved, so the Now board would otherwise start flush at
+     the modal's top edge — straight under the fixed workspace ✕ / new-window
+     corner buttons (top:4px, 24px tall, hugging the top-left). This top inset
+     lifts the first column head clear of them (~32px to the head once the
+     body's own 12px padding is added). box-sizing keeps the inset:0 +
+     100%/100% sizing honest with the added padding. */
+  box-sizing: border-box;
+  padding-top: 20px;
   /* Pigment & Parchment warm-cool wash — the page is *lit*, not glowing.
      A warm ochre/cinnabar breath at the upper-left, a cool cobalt
      breath at the lower-right, and a faint parchment-tooth grain on
@@ -113,200 +121,12 @@
   color: #1B1611;
   overflow: hidden;
 }
-/* Header band aligns with vellum's thumb-index: bottom edge meets
-   --thumb-index-bottom (so the kanban grid below starts on the same
-   horizontal line as the thumb-index ends), right edge clears
-   --canvas-width (so the band's content doesn't sit under the
-   thumb-index in the top-right corner). The thumb-index visually
-   extends the band's right portion — same chrome layer, two pieces.
-   The min-height falls back to the natural header height when the
-   var isn't published yet (initial paint, before FloatingIsland's
-   ResizeObserver fires). */
-/* Header band — the manuscript's top edge. Slightly deeper parchment
-   than the page beneath, with a warm ochre rule separating it from the
-   columns. A small cinnabar fleuron sits over the rule at the centre:
-   a single printer's ornament announcing the page's vocabulary. */
-.kbn-header {
-  display: flex; align-items: stretch; gap: 16px;
-  /* Bottom padding compressed: with the masthead now at 39px the title
-     itself fills most of the header height, so the gap between status bar
-     and the bottom rule wants to be a hair, not a quarter-inch. */
-  /* The workspace ✕ / new-window buttons hug the very top-left corner
-     (fixed, top:4px left:6px, 24px tall); the masthead sits BELOW them,
-     not beside — so no 44px left clearance, and enough top padding to
-     start the title under their footprint. */
-  padding: 34px 20px 6px 20px;
-  padding-right: calc(20px + var(--canvas-width, 360px));
-  min-height: var(--thumb-index-bottom, auto);
-  border-bottom: 1px solid rgba(196, 147, 51, 0.35);
-  background:
-    linear-gradient(180deg, rgba(220, 207, 180, 0.55) 0%, rgba(237, 226, 206, 0.20) 100%),
-    #DCCFB4;
-  flex-shrink: 0;
-  box-sizing: border-box;
-  position: relative;
-}
-/* Header fleuron retired — it now lives on the canvas divider
-   (.vellum-canvas-divider::before in vellum.css), centred on the
-   thumb-index footprint, as a finder for the resize handle. Same
-   ornament, more functional location. */
-/* The header's left half stacks title + scope + stats vertically so the
-   thumb-index-enforced header height fills with substance instead of
-   floating a horizontal stats strip in the middle. */
-.kbn-title-block {
-  flex: 1;
-  display: flex; flex-direction: column;
-  justify-content: center;
-  /* Tight stack: masthead title → subtitle (scope) → status. With the
-     title at 39px the whole block has plenty of vertical presence; the
-     inter-row gap wants to read as inline-spacing, not column-spacing. */
-  gap: 1px;
-  min-width: 0;
-}
-.kbn-title-wrap {
-  display: flex; align-items: baseline; gap: 10px;
-}
-/* Kanban masthead — set in EB Garamond with a layered F1/F2 dropcap
-   wrapping the leading K (injected by KanbanModal.ts as
-   <span class="kbn-cap" data-letter="K">K</span>). The remainder of
-   the word continues in the body face beside it. */
-.kbn-title {
-  font-family: var(--font-serif, 'EB Garamond', Georgia, serif);
-  font-size: 39px;
-  font-weight: 500;
-  font-variant-caps: normal;
-  letter-spacing: 0.005em;
-  color: #1B1611;
-}
-.kbn-title .kbn-cap {
-  /* Masthead K wears a larger illuminated initial than the column-
-     title caps — 1.5× the previous size (was 0.82em on 39px body
-     ≈ 32px; now 1.23em on 39px body ≈ 48px). The body line-box
-     stays anchored to the 39px text; the cap extends inside it via
-     the .kbn-cap line-height: 0.78 from above, so the header chrome
-     height doesn't grow even though the K does. */
-  font-size: 1.23em;
-  vertical-align: -0.07em;
-  margin-right: 0.04em;
-}
-.kbn-title .kbn-cap::before {
-  /* Masthead K is the page's primary illuminated initial — the
-     canonical manuscript combination is rubric body + gold flourish:
-     cinnabar F2 with ochre F1 ornament layered on top. Reads as
-     "this is the most important letter on the page," the same way a
-     versal initial would be treated in a medieval book. The column
-     dropcaps keep iron-gall F1 (the running illumination idiom);
-     the masthead earns the gilt. */
-  color: #C49333;
-  opacity: 0.7;
-}
-.kbn-subtitle {
-  font-family: var(--font-serif, 'EB Garamond', Georgia, serif);
-  font-style: italic;
-  font-size: 14px;
-  color: #7A6F5C;
-  letter-spacing: 0.01em;
-}
-.kbn-subtitle:empty {
-  display: none;
-}
-.kbn-status {
-  font-family: var(--font-mono, 'JetBrains Mono', monospace);
-  font-size: 11px;
-  color: #7A6F5C;
-  letter-spacing: 0.02em;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-/* Stash trigger: gold + at the header's right edge. Pairs with the
-   "n" hotkey owned by KanbanHost; semantically belongs in the kanban's
-   own chrome rather than floated over from the React host (the floating
-   version was getting hidden behind FloatingIsland and offset wrong by
-   vellum's chrome assumptions). */
-.kbn-stash-btn,
-.kbn-newidea-btn {
-  flex-shrink: 0;
-  /* Drop the row so its centre lines up with the ❦ fleuron on the
-     canvas divider. The fleuron sits at half the thumb-index band
-     (--thumb-index-band-height 128px → centre 64); 28px-tall buttons
-     at header padding-top 34 centre at 48 without this. +2px past
-     geometric centre: the ❦'s optical centre sits a hair low. */
-  margin-top: 18px;
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  background: #C49333;
-  color: #FFFFFF;
-  border: 1px solid #8C6A24;
-  box-shadow: 0 2px 4px rgba(27, 22, 17, 0.18);
-  font-size: 18px;
-  line-height: 1;
-  font-family: var(--font-main, 'EB Garamond', serif);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: background 120ms ease-out, transform 120ms ease-out;
-}
-.kbn-stash-btn:hover,
-.kbn-stash-btn:focus-visible {
-  background: #D2A648;
-  transform: scale(1.06);
-  outline: none;
-}
-.kbn-stash-btn:focus-visible {
-  box-shadow: 0 0 0 3px rgba(196, 147, 51, 0.36);
-}
-/* New-idea trigger: cobalt ✶ next to the stash +. Chat-first capture — a
-   background session crystallizes the spoken idea into a card. Same
-   muted cobalt as the In Flight column accent (#3D5BA0) — the button
-   announces "this becomes an in-flight card." */
-.kbn-newidea-btn {
-  background: #3D5BA0;
-  border-color: #2C4378;
-  font-size: 15px;
-}
-.kbn-newidea-btn:hover,
-.kbn-newidea-btn:focus-visible {
-  background: #4D6CB5;
-  transform: scale(1.06);
-  outline: none;
-}
-.kbn-newidea-btn:focus-visible {
-  box-shadow: 0 0 0 3px rgba(61, 91, 160, 0.36);
-}
-/* Refresh ↻ button in the header. Faded, low-prominence. */
-.kbn-refresh-btn {
-  flex-shrink: 0;
-  margin-top: 18px; /* same fleuron alignment as the + / ✶ row */
-  /* Tuck slightly toward the + : the borderless ↻ carries extra optical
-     whitespace, so the uniform 16px flex gap reads wider here. */
-  margin-right: -5px;
-  /* Sized to sit in line with the round + / ✶ buttons. */
-  width: 28px;
-  height: 28px;
-  padding: 0;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: 3px;
-  font-family: var(--font-mono, 'JetBrains Mono', monospace);
-  font-size: 17px;
-  line-height: 1;
-  color: rgba(122, 111, 92, 0.55);
-  cursor: pointer;
-  transition: color 120ms ease, border-color 120ms ease;
-}
-.kbn-refresh-btn:hover,
-.kbn-refresh-btn:focus-visible {
-  color: #7A6F5C;
-  border-color: rgba(122, 111, 92, 0.22);
-  outline: none;
-}
-.kbn-refresh-btn:focus-visible {
-  outline: 1px dashed #7A6F5C;
-  outline-offset: 2px;
-}
+/* The masthead band (.kbn-header, .kbn-title*, .kbn-subtitle, .kbn-status)
+   and its floated round buttons (.kbn-stash-btn / .kbn-newidea-btn /
+   .kbn-refresh-btn) dissolved in board-chrome-redesign. The three actions
+   they carried now live in the column heads as one tinted round-button
+   family — see .kbn-col-action near .kbn-col-head below. ~80px of vertical
+   room reclaimed; the Now board starts at the top of the modal. */
 /* aria-live region — invisible but observable in the a11y tree. */
 .kbn-live {
   position: absolute;
@@ -971,7 +791,11 @@
   box-shadow: inset 0 0 0 2px rgba(196, 147, 51, 0.45);
 }
 .kbn-col-head {
-  display: flex; align-items: baseline; justify-content: space-between;
+  /* The label cluster (title + count, baseline-aligned within
+     .kbn-col-head-label) sits left; the per-lane round action centers at the
+     right edge. align-items:center so the 28px button centers against the
+     illuminated title rather than hanging from its baseline. */
+  display: flex; align-items: center; justify-content: space-between;
   width: 100%;
   /* Padding hugs the illuminated character — top/bottom just enough to
      keep the F1 flourish overlay from clipping the hairline rule or the
@@ -988,6 +812,12 @@
   font-family: inherit;
   cursor: pointer;
   outline: none;
+}
+/* Title + count cluster — keeps the dropcap and the count on a shared
+   baseline regardless of the head's center alignment for the round action. */
+.kbn-col-head-label {
+  display: flex; align-items: baseline; gap: 0;
+  min-width: 0;
 }
 .kbn-col-head:focus { outline: none; }
 .kbn-col-head:focus-visible {
@@ -1045,6 +875,78 @@
   font-family: var(--font-mono, 'JetBrains Mono', monospace);
   font-size: 12px;
   color: #7A6F5C;
+  margin-left: 8px;
+}
+
+/* ── Per-lane head action ─────────────────────────────────────────────────
+   One tinted round button at each column head's right edge — the masthead's
+   three actions, folded into the lanes they feed (color = lane identity):
+     Drafts → Stash `+` (ochre) · In flight → New idea `✶` (cobalt) ·
+     Awaiting review → Refresh `↻` (teal).
+   One unified geometry; the only per-lane difference is the fill + border
+   shade, set by the -drafts / -inFlight / -awaitingReview modifiers. */
+.kbn-col-action {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 50%;
+  color: #FFFFFF;
+  box-shadow: 0 2px 4px rgba(27, 22, 17, 0.18);
+  font-size: 18px;
+  line-height: 1;
+  font-family: var(--font-main, 'EB Garamond', serif);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 120ms ease-out, transform 120ms ease-out, box-shadow 120ms ease-out;
+}
+.kbn-col-action:hover {
+  transform: scale(1.06);
+  box-shadow: 0 3px 7px rgba(27, 22, 17, 0.22);
+  outline: none;
+}
+.kbn-col-action:focus { outline: none; }
+.kbn-col-action:focus-visible {
+  /* Manuscript focus ring — a soft tinted halo in the lane's own accent. */
+  transform: scale(1.06);
+  outline: none;
+}
+/* Drafts → Stash `+`, ochre. */
+.kbn-col-action-drafts {
+  background: #C49333;
+  border: 1px solid #8C6A24;
+}
+.kbn-col-action-drafts:hover { background: #D2A648; }
+.kbn-col-action-drafts:focus-visible { box-shadow: 0 0 0 3px rgba(196, 147, 51, 0.40); }
+/* In flight → New idea `✶`, cobalt. The glyph runs a hair smaller so the
+   six-point star optically matches the heavier `+` / `↻`. */
+.kbn-col-action-inFlight {
+  background: #3D5BA0;
+  border: 1px solid #2C4378;
+  font-size: 15px;
+}
+.kbn-col-action-inFlight:hover { background: #4D6CB5; }
+.kbn-col-action-inFlight:focus-visible { box-shadow: 0 0 0 3px rgba(61, 91, 160, 0.40); }
+/* Awaiting review → Refresh `↻`, teal (the green of the A dropcap), promoted
+   from the old faded transparent treatment to a full button. */
+.kbn-col-action-awaitingReview {
+  background: #3F8278;
+  border: 1px solid #2E6862;
+  font-size: 16px;
+}
+.kbn-col-action-awaitingReview:hover { background: #4C9588; }
+.kbn-col-action-awaitingReview:focus-visible { box-shadow: 0 0 0 3px rgba(63, 130, 120, 0.40); }
+/* Refresh feedback rides the button — a brief single spin of the ↻ glyph
+   carries in-flight state (no .kbn-status text). The class is added on click
+   and removed when the spin completes. */
+.kbn-col-action-spinning {
+  animation: kbn-col-action-spin 0.65s ease-in-out;
+}
+@keyframes kbn-col-action-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 .kbn-col-list {
   flex: 1;

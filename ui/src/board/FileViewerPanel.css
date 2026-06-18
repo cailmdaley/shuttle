@@ -1,97 +1,17 @@
-/* ── Sent-file viewer — a deliverable opened as a floating page ──────────
-   Sibling of the fiber-detail panel (FiberDetailModal.css): same parchment
-   frame, same non-modal posture, one notch above it in z so the file
-   floats over the card that summoned it. Loaded from FileViewerPanel.ts. */
-
-.kbn-fileview-overlay {
-  position: fixed;
-  /* One above .kbn-detail-overlay (10000): the viewer opens from the
-     detail panel and reads as held in front of it. */
-  z-index: 10001;
-  display: flex;
-  flex-direction: column;
-  min-width: 320px;
-  min-height: 240px;
-  background: #EDE2CE;
-  border: 1px solid rgba(27, 22, 17, 0.16);
-  border-radius: 2px;
-  box-shadow:
-    0 1px 0 rgba(255, 251, 237, 0.6) inset,
-    0 14px 38px rgba(27, 22, 17, 0.22),
-    0 3px 10px rgba(27, 22, 17, 0.10);
-  font-family: var(--font-main, 'EB Garamond', serif);
-  color: #1B1611;
-}
-
-.kbn-fileview-overlay.kbn-fileview-dragging,
-.kbn-fileview-overlay.kbn-fileview-resizing {
-  user-select: none;
-}
-
-/* Iframes swallow pointer events mid-gesture; veil them while dragging
-   or resizing so the pointer math stays with the window. */
-.kbn-fileview-overlay.kbn-fileview-dragging iframe,
-.kbn-fileview-overlay.kbn-fileview-resizing iframe {
-  pointer-events: none;
-}
-
-.kbn-fileview-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 10px 8px 14px;
-  border-bottom: 1px solid rgba(27, 22, 17, 0.12);
-  cursor: grab;
-  flex: 0 0 auto;
-}
-
-.kbn-fileview-overlay.kbn-fileview-dragging .kbn-fileview-header {
-  cursor: grabbing;
-}
-
-.kbn-fileview-title {
-  font-family: var(--font-mono, 'JetBrains Mono', monospace);
-  font-size: 12.5px;
-  letter-spacing: 0.01em;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.kbn-fileview-spacer {
-  flex: 1 1 auto;
-}
-
-.kbn-fileview-btn {
-  appearance: none;
-  border: none;
-  background: none;
-  font: inherit;
-  font-size: 15px;
-  line-height: 1;
-  padding: 2px 6px;
-  color: #7A7368;
-  cursor: pointer;
-  border-radius: 2px;
-}
-
-.kbn-fileview-btn:hover {
-  color: #1B1611;
-  background: rgba(27, 22, 17, 0.06);
-}
-
-.kbn-fileview-body {
-  flex: 1 1 auto;
-  min-height: 0;
-  display: flex;
-  background: #FFFDF6;
-}
+/* ── Sent-file viewer bodies — by-extension rendering cells ──────────────
+   The floating sibling panel is retired (the two-column file viewer absorbed
+   it into FiberDetailModal's right-column accordion). What remains is the
+   by-extension viewer the accordion mounts per open file: an <img>, an
+   <audio controls>, or an iframe-with-loading-veil. These classes style those
+   bodies so they fill their accordion cell. Loaded from FileViewerPanel.ts
+   (buildFileViewer). */
 
 .kbn-fileview-frame-wrap {
   position: relative;
   flex: 1 1 auto;
   display: flex;
   min-height: 0;
+  min-width: 0;
 }
 
 .kbn-fileview-frame {
@@ -135,6 +55,7 @@
   max-height: 100%;
   margin: auto;
   object-fit: contain;
+  padding: 8px;
 }
 
 .kbn-fileview-audio {
@@ -150,27 +71,10 @@
   max-width: 480px;
 }
 
-/* ── Resize zones — eight invisible strips on edges and corners ────────── */
-
-.kbn-fileview-rh {
-  position: absolute;
-  z-index: 5;
-}
-
-.kbn-fileview-rh-n  { top: -4px; left: 8px; right: 8px; height: 8px; cursor: ns-resize; }
-.kbn-fileview-rh-s  { bottom: -4px; left: 8px; right: 8px; height: 8px; cursor: ns-resize; }
-.kbn-fileview-rh-e  { right: -4px; top: 8px; bottom: 8px; width: 8px; cursor: ew-resize; }
-.kbn-fileview-rh-w  { left: -4px; top: 8px; bottom: 8px; width: 8px; cursor: ew-resize; }
-.kbn-fileview-rh-ne { top: -4px; right: -4px; width: 12px; height: 12px; cursor: nesw-resize; }
-.kbn-fileview-rh-nw { top: -4px; left: -4px; width: 12px; height: 12px; cursor: nwse-resize; }
-.kbn-fileview-rh-se { bottom: -4px; right: -4px; width: 12px; height: 12px; cursor: nwse-resize; }
-.kbn-fileview-rh-sw { bottom: -4px; left: -4px; width: 12px; height: 12px; cursor: nesw-resize; }
-
-/* ── Split-view glide — programmatic geometry moves only ─────────────────
-   Applied transiently by animatePanelGeometry (FloatingPanelChrome) to
-   whichever panel is being slid; shed after the move so live drag/resize
+/* ── Programmatic geometry glide — used by the detail panel's two-column
+   reveal/hide (animatePanelGeometry, FloatingPanelChrome). Applied
+   transiently to the panel being resized; shed after the move so live drag
    stays 1:1 with the pointer. */
-
 .panel-geom-anim {
   transition:
     left 0.3s cubic-bezier(0.22, 0.61, 0.36, 1),

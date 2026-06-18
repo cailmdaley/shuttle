@@ -38,8 +38,8 @@ import type {
   KanbanResponse,
   RemoteShuttleSnapshotDiagnostic,
 } from './KanbanTypes.js'
-import { dispatchIneligibleReason, errorMessageFromResponse, formatRelative } from './KanbanModalShared.js'
-import { COLUMN_TITLES, KanbanSurfaceRenderer, SURFACE_TITLE, appendCappedText, findCardColumn } from './KanbanSurfaces.js'
+import { dispatchIneligibleReason, errorMessageFromResponse } from './KanbanModalShared.js'
+import { COLUMN_TITLES, KanbanSurfaceRenderer, SURFACE_TITLE, findCardColumn } from './KanbanSurfaces.js'
 import { parseCompositeFeed } from './KanbanComposite.js'
 import { buildKanbanResponseFromComposite } from './KanbanReadModel.js'
 import { nextStandingLaunch, STANDING_TIMELINE_HORIZON_MS } from './KanbanRules.js'
@@ -142,8 +142,6 @@ export class KanbanModal {
 
   private container: HTMLDivElement | null = null
   private body: HTMLDivElement | null = null
-  private statusEl: HTMLDivElement | null = null
-  private subtitleEl: HTMLDivElement | null = null
   private liveEl: HTMLDivElement | null = null
   private bannerEl: HTMLDivElement | null = null
   private inflightFetchToken = 0
@@ -230,6 +228,11 @@ export class KanbanModal {
       openDetail: (card, column) => this.detailModal?.open(card, this.cityScope?.cityId, column),
       openWorker: this.openWorkerAfterGesture,
       setTimelineAdaptiveCleanup: (cleanup) => { this.timelineAdaptiveCleanup = cleanup },
+      // The masthead dissolved; its three actions now live in the column heads
+      // (Drafts → Stash, In flight → New idea, Awaiting review → Refresh).
+      onStashClick: this.onStashClick,
+      onNewIdeaClick: this.onNewIdeaClick,
+      onRefresh: () => void this.refreshFromSource(),
     })
   }
 
@@ -251,10 +254,10 @@ export class KanbanModal {
     opts: { cityScope?: KanbanCityScope | null } = {},
   ): void {
     if (this.container !== null) {
-      // Already mounted: scope swap is the only meaningful re-call. Update
-      // and refetch in place rather than rebuilding DOM from scratch.
+      // Already mounted: scope swap is the only meaningful re-call. The
+      // masthead (and its scope subtitle) dissolved, so there's no chrome to
+      // update — just refetch in place rather than rebuilding DOM from scratch.
       this.cityScope = opts.cityScope ?? null
-      this.updateScopeChrome()
       void this.fetchAndRender()
       return
     }
@@ -307,7 +310,14 @@ export class KanbanModal {
   /**
    * Build the kanban DOM into `this.container`. Vellum's outer modal owns
    * close (via its own close button) — the kanban only renders the column
-   * grid, header, banner, and live region.
+   * grid, banner, and live region.
+   *
+   * The masthead band dissolved (board-chrome-redesign): no "Kanban" title,
+   * no scope subtitle, no stats line. Its three actions — Stash `+`, New idea
+   * `✶`, Refresh `↻` — folded into the three column heads, one per lane (see
+   * KanbanSurfaceRenderer.makeColumnAction). The Now board starts at the top
+   * of the modal with only a small top inset (CSS) clearing the workspace
+   * ✕ / new-window corner buttons.
    */
   private assembleChrome(): void {
     this.container = document.createElement('div')
@@ -315,84 +325,6 @@ export class KanbanModal {
     this.container.setAttribute('role', 'dialog')
     this.container.setAttribute('aria-modal', 'true')
     this.container.setAttribute('aria-label', 'Kanban')
-
-    const header = document.createElement('div')
-    header.className = 'kbn-header'
-
-    const title = document.createElement('div')
-    title.className = 'kbn-title'
-    appendCappedText(title, 'Kanban')
-    this.subtitleEl = document.createElement('div')
-    this.subtitleEl.className = 'kbn-subtitle'
-    this.subtitleEl.textContent = this.subtitleText()
-
-    // Title row (title + scope subtitle) and stats row stack vertically
-    // on the left so the header band — sized by the thumb-index — fills
-    // with content instead of leaving a horizontal stats line floating
-    // in the middle.
-    const titleRow = document.createElement('div')
-    titleRow.className = 'kbn-title-wrap'
-    titleRow.append(title, this.subtitleEl)
-
-    this.statusEl = document.createElement('div')
-    this.statusEl.className = 'kbn-status'
-    this.statusEl.textContent = 'Loading…'
-
-    const titleBlock = document.createElement('div')
-    titleBlock.className = 'kbn-title-block'
-    titleBlock.append(titleRow, this.statusEl)
-
-    // Bug 3: manual refresh button in the header. Lightens the refresh
-    // affordance (faded icon) so it doesn't compete with the stash trigger.
-    const refreshBtn = document.createElement('button')
-    refreshBtn.type = 'button'
-    refreshBtn.className = 'kbn-refresh-btn'
-    refreshBtn.setAttribute('aria-label', 'Refresh kanban')
-    refreshBtn.title = 'Refresh'
-    refreshBtn.textContent = '↻'
-    refreshBtn.addEventListener('click', () => {
-      void this.refreshFromSource()
-    })
-
-    header.append(titleBlock, refreshBtn)
-
-    // The `⊕ Global` scope-escape affordance retired with the thumb-index
-    // global-navigation constitution
-    // ([[ai-futures/portolan/vellum-reader/constitution-thumb-index-global-navigation]]).
-    // Scope flips happen by closing the modal and re-opening on the
-    // desired scope (the `← index` thumb-index button promotes city →
-    // global; the chrome bar's K chip + `k` hotkey re-enter on the
-    // currently-focused scope). Cards-in-place stay city-scoped for the
-    // life of this mount.
-
-    // Stash button: gold `+` at the header's right edge, mirroring the `n`
-    // hotkey owned by KanbanHost. We bind via callback so the React host
-    // keeps ownership of the StashForm modal state — KanbanModal just emits
-    // the click. Hidden when no callback wired (read-only contexts).
-    if (this.onStashClick !== undefined) {
-      const stashBtn = document.createElement('button')
-      stashBtn.type = 'button'
-      stashBtn.className = 'kbn-stash-btn'
-      stashBtn.setAttribute('aria-label', 'Stash a new fiber (n)')
-      stashBtn.title = 'Stash a new fiber (n)'
-      stashBtn.textContent = '+'
-      stashBtn.addEventListener('click', () => this.onStashClick?.())
-      header.append(stashBtn)
-    }
-
-    // New-idea button: chat-first capture. Sits next to the stash `+`; the
-    // host owns the CaptureForm modal state, we just emit the click. Hidden
-    // when no callback wired (read-only contexts).
-    if (this.onNewIdeaClick !== undefined) {
-      const newIdeaBtn = document.createElement('button')
-      newIdeaBtn.type = 'button'
-      newIdeaBtn.className = 'kbn-newidea-btn'
-      newIdeaBtn.setAttribute('aria-label', 'New idea — speak it into a card')
-      newIdeaBtn.title = 'New idea — speak it into a card'
-      newIdeaBtn.textContent = '✶'
-      newIdeaBtn.addEventListener('click', () => this.onNewIdeaClick?.())
-      header.append(newIdeaBtn)
-    }
 
     this.body = document.createElement('div')
     this.body.className = 'kbn-body'
@@ -415,7 +347,7 @@ export class KanbanModal {
     this.bannerEl.setAttribute('role', 'alert')
     this.bannerEl.style.display = 'none'
 
-    this.container.append(header, this.bannerEl, this.body, this.liveEl)
+    this.container.append(this.bannerEl, this.body, this.liveEl)
   }
 
   /** Reset all field state to "not mounted." DOM removal is `unmount()`'s
@@ -423,8 +355,6 @@ export class KanbanModal {
   private teardownState(): void {
     this.container = null
     this.body = null
-    this.statusEl = null
-    this.subtitleEl = null
     this.liveEl = null
     this.bannerEl = null
     this.dragSourceId = null
@@ -978,7 +908,6 @@ export class KanbanModal {
   private async fetchAndRender(): Promise<void> {
     this.lastFetchStartedAt = Date.now()
     const token = ++this.inflightFetchToken
-    if (this.statusEl) this.statusEl.textContent = 'Loading…'
     try {
       // First mount on a `#mode=kanban` deep link picks up the
       // boot-stashed prefetch (kicked off from index.html's inline
@@ -1012,7 +941,6 @@ export class KanbanModal {
       const sig = this.computeResponseSignature(data)
       const wasFirstRender = this.lastResponse === null
       this.lastResponse = data
-      if (this.statusEl) this.statusEl.textContent = ''
       if (!wasFirstRender && sig === this.lastResponseSig) return
       this.lastResponseSig = sig
       this.render(data)
@@ -1052,8 +980,7 @@ export class KanbanModal {
   }
 
   private renderError(msg: string): void {
-    if (!this.body || !this.statusEl) return
-    this.statusEl.textContent = ''
+    if (!this.body) return
     this.body.innerHTML = ''
     const errEl = document.createElement('div')
     errEl.className = 'kbn-error'
@@ -1062,34 +989,14 @@ export class KanbanModal {
   }
 
   private render(data: KanbanResponse): void {
-    if (!this.body || !this.statusEl) return
+    if (!this.body) return
 
     const scrollSnapshot = this.captureScrollSnapshot()
-    const { now, timeline, timelineWindow, stash, pinned, totals, temperedTotal, staleness } = data
+    const { now, timeline, timelineWindow, stash, pinned, staleness } = data
     this.timelinePastDays = timelineWindow.pastDays
-    const remoteState = data.remoteScope
-      ? staleness[data.remoteScope.originId]
-      : undefined
-    const remotePrefix = data.remoteScope && remoteState?.status === 'stale'
-      ? remoteDisconnectedText(data, remoteState)
-      : ''
-    const pastCount = timeline.past.length
-    const soonCount = totals.futureDated
-    // Stats line: only show buckets that have something. Drafts / in-flight /
-    // awaiting always render (the three Now lanes are the desk); other buckets
-    // drop out when zero so the line stays readable.
-    const parts: string[] = []
-    parts.push(`${totals.drafts} drafts`)
-    parts.push(`${totals.inFlight} in flight`)
-    parts.push(`${totals.awaitingReview} awaiting`)
-    if (totals.pinned > 0) parts.push(`${totals.pinned} pinned`)
-    if (pastCount > 0) parts.push(`${pastCount} landed`)
-    if (soonCount > 0) parts.push(`${soonCount} soon`)
-    if (totals.stash > 0) parts.push(`${totals.stash} stashed`)
-    if (temperedTotal > 0) parts.push(`${temperedTotal} tempered`)
-    const remoteShuttleText = formatRemoteShuttleDiagnostics(data.shuttleDiagnostics)
-    if (remoteShuttleText) parts.push(remoteShuttleText)
-    this.statusEl.textContent = remotePrefix + parts.join(' · ')
+    // The masthead stats line dissolved (board-chrome-redesign) — the board
+    // speaks for itself (column counts, the Pinned/Timeline/Stash sections),
+    // and stale origins already dim their cards + show "waiting on <host>".
 
     // Tear down any per-render observers from the previous strip before we
     // throw away the DOM nodes they observed.
@@ -1379,11 +1286,6 @@ export class KanbanModal {
     await this.fetchAndRender()
   }
 
-  /** Scope cue only; global kanban does not need an implementation subtitle. */
-  private subtitleText(): string {
-    return this.cityScope?.cityName ?? ''
-  }
-
   /** Bug 3: lightweight auto-poll while mounted. 15s interval. */
   private startPolling(): void {
     this.stopPolling()
@@ -1400,14 +1302,6 @@ export class KanbanModal {
       window.clearInterval(this.pollTimer)
       this.pollTimer = null
     }
-  }
-
-  /** Update DOM that depends on `cityScope` after a scope swap. */
-  private updateScopeChrome(): void {
-    if (this.subtitleEl) this.subtitleEl.textContent = this.subtitleText()
-    // The `⊕ Global` scope-escape button retired with the thumb-index
-    // global-navigation constitution — scope flips no longer happen
-    // in-place from inside the kanban tab.
   }
 
   /**
@@ -1828,20 +1722,6 @@ export function applyOptimisticPin(
   })
 }
 
-function remoteDisconnectedText(
-  data: KanbanResponse,
-  state: KanbanOriginStaleness,
-): string {
-  const hostname = data.remoteScope?.hostname ?? state.hostname ?? 'remote'
-  const totals = data.totals
-  const hasCards =
-    totals.drafts + totals.inFlight +
-    totals.awaitingReview + totals.past + totals.futureDated + totals.stash > 0
-  return hasCards
-    ? `Remote city ${hostname} disconnected; showing last snapshot · `
-    : `Remote city ${hostname} disconnected; no Kanban snapshot yet · `
-}
-
 function shuttleDiagnosticsSignature(
   diagnostics: KanbanResponse['shuttleDiagnostics'] | undefined,
 ): Array<Pick<RemoteShuttleSnapshotDiagnostic, 'originId' | 'receivedAt' | 'eligibleCount' | 'blockedCount' | 'orphanCount'>> {
@@ -1856,23 +1736,3 @@ function shuttleDiagnosticsSignature(
     .sort((a, b) => a.originId.localeCompare(b.originId))
 }
 
-function formatRemoteShuttleDiagnostics(
-  diagnostics: KanbanResponse['shuttleDiagnostics'] | undefined,
-): string {
-  const snapshots = diagnostics?.remoteSnapshots ?? []
-  if (snapshots.length === 0) return ''
-
-  return snapshots
-    .slice()
-    .sort((a, b) => a.originId.localeCompare(b.originId))
-    .map((entry) => {
-      const host = entry.originId.replace(/^remote-/, '')
-      const eligible = entry.eligibleCount ?? '?'
-      const blocked = entry.blockedCount ?? '?'
-      const orphan = entry.orphanCount ?? '?'
-      const age = formatRelative(entry.receivedAt)
-      const suffix = age ? ` @ ${age}` : ''
-      return `Shuttle ${host}: ${eligible}/${blocked}/${orphan}${suffix}`
-    })
-    .join(' · ')
-}

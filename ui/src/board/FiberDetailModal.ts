@@ -7,9 +7,9 @@ import {
   attachPanelDrag,
   attachPanelResize,
   readPanelGeometry,
-  type PanelGeometry,
 } from './FloatingPanelChrome.js'
-import { FileViewerPanel } from './FileViewerPanel.js'
+import { buildFileViewer, basenameOf, isScrollableFile } from './FileViewerPanel.js'
+import { fileBytesUrl } from './utils.js'
 import './FiberDetailModal.css'
 
 /**
@@ -21,6 +21,88 @@ let lastGeometry: { left: number; top: number; width: number; height: number } |
 
 const MIN_WIDTH = 380
 const MIN_HEIGHT = 320
+
+/** Single-column reading width. The panel opens here; the right column grows
+ *  it. Mirrors the old default (≤950 / 92vw). */
+const SINGLE_COL_WIDTH = 950
+/** How much wider the panel grows when the right column reveals — enough for a
+ *  comfortable file zone beside the reading column, capped to the viewport. */
+const TWO_COL_EXTRA = 620
+/** Left/right split as a fraction of the two-column inner width — the default
+ *  divider position before the user drags it. */
+const DEFAULT_SPLIT = 0.5
+const MIN_PANE_FRAC = 0.28
+
+/**
+ * One sent deliverable on a card's trail. `fullPath` is the absolute path the
+ * `/api/v1/file` route reads; `sessionId` is the worker session that pushed it
+ * (display-only).
+ */
+interface SentFile {
+  fullPath: string
+  basename: string
+  timestamp: number
+  sessionId?: string
+}
+
+/**
+ * Per-card right-column UI state, persisted to localStorage under
+ * `shuttle:detail:<uid>`. The `open` array is recency-ordered — index 0 is the
+ * most-recently-activated file (top of the accordion). Each entry carries its
+ * own expanded/collapsed state and (for iframe-rendered files) the scroll
+ * offset to restore on rehydrate.
+ */
+interface DetailPersist {
+  /** Fraction of the two-column inner width given to the LEFT (card) pane. */
+  split?: number
+  open: Array<{ path: string; expanded: boolean; scroll: number }>
+}
+
+/**
+ * One open file in the right-column accordion. Owns its DOM (the collapsible
+ * panel element + its viewer body) and the live state the persistence writer
+ * reads: `expanded`, and `scroll` (the last-known iframe scroll offset, kept
+ * fresh by a scroll listener while open, and applied on the iframe's `load` to
+ * restore a rehydrated position). `viewerBuilt` guards lazy viewer construction
+ * — a collapsed panel doesn't fetch its file until first expanded.
+ */
+interface OpenFileEntry {
+  file: SentFile
+  panel: HTMLElement
+  body: HTMLElement
+  expanded: boolean
+  scroll: number
+  viewerBuilt: boolean
+  /** The same-origin iframe, once built — the scroll-restore target. */
+  iframe: HTMLIFrameElement | null
+}
+
+const PERSIST_PREFIX = 'shuttle:detail:'
+
+function loadPersist(uid: string): DetailPersist {
+  if (!uid) return { open: [] }
+  try {
+    const raw = window.localStorage.getItem(PERSIST_PREFIX + uid)
+    if (!raw) return { open: [] }
+    const parsed = JSON.parse(raw) as DetailPersist
+    return { split: parsed.split, open: Array.isArray(parsed.open) ? parsed.open : [] }
+  } catch {
+    return { open: [] }
+  }
+}
+
+function savePersist(uid: string, state: DetailPersist): void {
+  if (!uid) return
+  try {
+    if (state.open.length === 0 && state.split === undefined) {
+      window.localStorage.removeItem(PERSIST_PREFIX + uid)
+    } else {
+      window.localStorage.setItem(PERSIST_PREFIX + uid, JSON.stringify(state))
+    }
+  } catch {
+    /* storage full / disabled — persistence is best-effort */
+  }
+}
 
 /**
  * One entry of the daemon's `GET /api/v1/agents` registry. The axis metadata
@@ -112,21 +194,30 @@ export class FiberDetailModal {
    * legacy in-panel `runTransition` fetch runs.
    */
   private readonly onTransition?: (card: KanbanCard, target: ColumnKind) => void
-  /** Escalate a sent deliverable to vellum's full file workspace (the
-   *  viewer panel's ↗). Wired from the parent kanban's onOpenFile
-   *  (→ mountContext.openFile → portolan's openFile helper); absent in
-   *  tests/embeds, where the viewer panel just omits the glyph. */
-  private readonly onOpenFile?: (fullPath: string, originId: string) => void
-  /** Portolan backend base (`:4004`) — the sent-files trail lives there
-   *  (it's activity-stream data, not fiber state), unlike every shuttle-
-   *  routed verb on `shuttleBase`. Overridable for tests. */
-  private readonly portolanBase: string
-  /** Floating sent-file viewer — a sibling panel, so clicking a deliverable
-   *  shows it *beside* the card instead of mode-switching the workspace. */
-  private readonly fileViewer: FileViewerPanel
-  /** Where this panel sat before sliding into split view — restored (with
-   *  the same glide) when the viewer closes. Null when not in split. */
-  private preSplitGeometry: PanelGeometry | null = null
+  // ── Two-column file viewer state (the right column) ─────────────────────
+  /** The card the panel is currently showing — every accordion action
+   *  (open/close/expand/scroll) keys its persistence off `card.uid`. */
+  private card: KanbanCard | null = null
+  /** The full sent-files trail (newest-first), fetched once per panel-open.
+   *  The left-column launcher renders from this. */
+  private sentFiles: SentFile[] = []
+  /** Open files in recency order — index 0 is the top of the accordion.
+   *  Each entry owns its DOM and live scroll/expanded state; this is the
+   *  authority the persistence writer serializes. */
+  private openFiles: OpenFileEntry[] = []
+  /** The right column's scrollable accordion host. Null in single-column. */
+  private rightCol: HTMLElement | null = null
+  /** The left column wrapper (card chrome + body). Always present once open. */
+  private leftCol: HTMLElement | null = null
+  /** The divider between the two columns (drag to resize the split). */
+  private divider: HTMLElement | null = null
+  /** Left-pane width fraction of the two-column inner width (drag-set). */
+  private splitFrac = DEFAULT_SPLIT
+  /** Debounce handle for scroll-position persistence writes. */
+  private scrollWriteTimer: number | null = null
+  /** The panel width remembered before the right column grew it, so closing
+   *  the last file glides back to the single-column measure. */
+  private singleColWidth = 0
 
   constructor(
     shuttleBase: string,
@@ -139,6 +230,10 @@ export class FiberDetailModal {
     onTransition?: (card: KanbanCard, target: ColumnKind) => void,
     onOpenWorker?: (tmuxSessionName: string, shuttleHost?: string) => void,
     resolveCityProjectPath?: (cityId: string) => string | undefined,
+    // `portolanBase` is still accepted in the options bag for call-site
+    // signature compatibility, but the standalone UI no longer talks to
+    // Portolan's retired `:4004` — sent files and bytes both route through the
+    // shuttle daemon (`shuttleBase`).
     opts?: { onOpenFile?: (fullPath: string, originId: string) => void; portolanBase?: string },
   ) {
     this.shuttleBase = shuttleBase
@@ -147,20 +242,11 @@ export class FiberDetailModal {
     this.onAttachFreshTmux = onAttachFreshTmux
     this.onTransition = onTransition
     this.onOpenWorker = onOpenWorker
-    this.onOpenFile = opts?.onOpenFile
-    this.portolanBase = opts?.portolanBase ?? 'http://localhost:4004'
-    this.fileViewer = new FileViewerPanel({
-      portolanBase: this.portolanBase,
-      onOpenInWorkspace: this.onOpenFile
-        ? (fullPath, originId) => {
-            // Escalating to the full file workspace: clear both panels so
-            // the workspace's file mode isn't hidden behind them.
-            this.close()
-            this.onOpenFile?.(fullPath, originId)
-          }
-        : undefined,
-      onClosed: () => this.exitSplitView(),
-    })
+    // `opts.onOpenFile` / `opts.portolanBase` are accepted for call-site
+    // signature compatibility (Portolan's full file workspace, the retired
+    // :4004 base) but unused — the standalone UI opens files in its own
+    // right-column accordion, all bytes via the shuttle daemon.
+    void opts
   }
 
   /**
@@ -195,6 +281,14 @@ export class FiberDetailModal {
     const title = document.createElement('div')
     title.className = 'kbn-detail-title'
     title.textContent = card.name
+
+    // Bind the card + load its persisted right-column state. The launcher and
+    // accordion read these; the persistence writer keys off `card.uid`.
+    this.card = card
+    this.openFiles = []
+    this.sentFiles = []
+    const persist = loadPersist(typeof card.uid === 'string' ? card.uid : '')
+    this.splitFrac = clampSplit(persist.split ?? DEFAULT_SPLIT)
 
     const pill = document.createElement('span')
     pill.className = `kbn-pill kbn-pill-${card.status === 'closed' ? 'closed' : card.status === 'active' ? 'active' : 'open'}`
@@ -258,18 +352,37 @@ export class FiberDetailModal {
     page.append(prose)
     void this.renderFiberBody(prose, card, overlay)
 
-    // ── Sent files strip ────────────────────────────────────────────────────
+    // ── Sent-files launcher ──────────────────────────────────────────────────
     // The deliverable trail: files the card's worker sessions pushed via
-    // SendUserFile, newest first, served by portolan's /sent-files keyed on
-    // the Claude session UUID the card carries (shuttle.session.id). Empty
-    // or unresolvable → the strip never mounts; the panel looks unchanged.
-    const sentFiles = this.buildSentFiles(card)
+    // SendUserFile, newest first. Mounts empty and self-populates from the
+    // daemon's /sent-files (events.jsonl fallback for older daemons). Clicking
+    // an entry opens it in the right-column accordion (revealing the column on
+    // first open). Empty trail → the launcher never reveals itself.
+    const launcher = this.buildSentFilesLauncher(card)
+
+    // ── Left column = the card (controls + launcher + body) ──────────────────
+    // The two columns share one panel. The header above spans both as the
+    // drag bar; below it, a flex row holds the left card column, a divider,
+    // and (once a file opens) the right accordion column.
+    const leftCol = document.createElement('div')
+    leftCol.className = 'kbn-detail-leftcol'
+    leftCol.append(controls, launcher, page)
+    this.leftCol = leftCol
+
+    const columns = document.createElement('div')
+    columns.className = 'kbn-detail-columns'
+    columns.append(leftCol)
 
     // ── Assemble ────────────────────────────────────────────────────────────
-    overlay.append(header, controls, sentFiles, page)
+    overlay.append(header, columns)
     this.attachResizeHandles(overlay)
     document.body.append(overlay)
     this.overlay = overlay
+
+    // Rehydrate the right column from persisted state, once the launcher's
+    // trail is known. The launcher fetch resolves it async; rehydration that
+    // needs a basename falls back to deriving it from the path.
+    this.rehydrateOpenFiles(card, persist)
 
     // Escape to close the panel. When the parent-fiber dropdown is open and
     // focus is inside it, yield to the dropdown's own keydown listener so it
@@ -289,9 +402,6 @@ export class FiberDetailModal {
     this.outsideHandler = (e: PointerEvent) => {
       const target = e.target as Node | null
       if (target && overlay.contains(target)) return
-      // The floating sent-file viewer is a sibling panel spawned from this
-      // one — interacting with it isn't "away".
-      if (target instanceof Element && target.closest('.kbn-fileview-overlay')) return
       this.close()
     }
     document.addEventListener('pointerdown', this.outsideHandler, true)
@@ -310,18 +420,26 @@ export class FiberDetailModal {
       window.clearTimeout(this.searchDebounce)
       this.searchDebounce = null
     }
+    // Flush any pending debounced scroll write before tearing down — the
+    // user's last reading position must persist even on a quick close.
+    if (this.scrollWriteTimer !== null) {
+      window.clearTimeout(this.scrollWriteTimer)
+      this.scrollWriteTimer = null
+      this.writePersist()
+    }
     this.fiberIndex = null
     for (const ro of this.embedObservers) ro.disconnect()
     this.embedObservers = []
     this.overlay?.remove()
     this.overlay = null
-    // The split is an arrangement between this panel and its viewer —
-    // closing the card dissolves it. Otherwise the orphaned viewer's later
-    // close would glide the *next* card to this card's stale pre-split
-    // spot. Clear the stash first: the viewer's onClosed → exitSplitView
-    // fires synchronously inside close() and must find nothing to restore.
-    this.preSplitGeometry = null
-    this.fileViewer.close()
+    // Right-column state is durable (localStorage) — clear only the live DOM
+    // refs so a re-open rebuilds cleanly.
+    this.card = null
+    this.sentFiles = []
+    this.openFiles = []
+    this.rightCol = null
+    this.leftCol = null
+    this.divider = null
   }
 
   /**
@@ -451,14 +569,15 @@ export class FiberDetailModal {
   // ── Panel geometry: default + remembered, drag, resize ────────────────────
 
   /** Default size: a reading column at nearly full viewport height — the
-   *  page wants vertical room; width stays a comfortable measure.
-   *  Remembered geometry wins when it still fits the viewport. */
+   *  page wants vertical room; width stays a comfortable measure. The panel
+   *  opens SINGLE-COLUMN at this width (the right column grows it later);
+   *  remembered geometry wins when it still fits the viewport. */
   private applyGeometry(overlay: HTMLElement): void {
     const vw = window.innerWidth
     const vh = window.innerHeight
     let g = lastGeometry
     if (g && (g.left > vw - 80 || g.top > vh - 80)) g = null
-    const width = g?.width ?? Math.min(950, Math.round(vw * 0.92))
+    const width = g?.width ?? Math.min(SINGLE_COL_WIDTH, Math.round(vw * 0.92))
     const height = g?.height ?? vh - 24
     const left = g?.left ?? Math.round((vw - width) / 2)
     const top = g?.top ?? Math.round((vh - height) / 2)
@@ -466,49 +585,119 @@ export class FiberDetailModal {
     overlay.style.top = `${Math.max(0, top)}px`
     overlay.style.width = `${width}px`
     overlay.style.height = `${height}px`
+    // Remember the single-column measure so closing the last file glides back.
+    this.singleColWidth = width
   }
 
   private rememberGeometry(overlay: HTMLElement): void {
     lastGeometry = readPanelGeometry(overlay)
+    // Track the user's chosen width while single-column so the glide-back
+    // target stays current; in two-column we keep the pre-grow value.
+    if (this.openFiles.length === 0) this.singleColWidth = overlay.offsetWidth
   }
 
-  // ── Split view: card left, sent-file viewer right ──────────────────────
+  // ── Two-column reveal / hide ────────────────────────────────────────────
 
-  /** Glide this panel to the left half of the viewport and open the viewer
-   *  on the right half. The pre-split position is stashed once (a second
-   *  file clicked mid-split keeps the original restore target) and *not*
-   *  written to `lastGeometry` — the split is a temporary arrangement, not
-   *  the user's chosen card position. */
-  private openInSplitView(fullPath: string, originId: string): void {
+  /** Grow the panel and reveal the right-column accordion. Idempotent — a
+   *  second file opening into an already-revealed column just adds a panel.
+   *  The width grows by TWO_COL_EXTRA (capped to the viewport, keeping the
+   *  panel on-screen), and the divider lands at the persisted/default split. */
+  private revealRightColumn(): void {
+    if (this.rightCol || !this.overlay || !this.leftCol) return
     const overlay = this.overlay
-    if (!overlay) {
-      this.fileViewer.open(fullPath, originId)
-      return
-    }
-    const GUTTER = 12
-    const vw = window.innerWidth
-    const vh = window.innerHeight
-    const half = Math.floor((vw - 3 * GUTTER) / 2)
-    const top = GUTTER
-    const height = vh - 2 * GUTTER
+    const columns = this.leftCol.parentElement
+    if (!columns) return
 
-    if (!this.fileViewer.isOpen()) {
-      this.preSplitGeometry = readPanelGeometry(overlay)
-    }
-    animatePanelGeometry(overlay, { left: GUTTER, top, width: half, height })
-    this.fileViewer.open(fullPath, originId, {
-      geometry: { left: 2 * GUTTER + half, top, width: half, height },
+    const right = document.createElement('div')
+    right.className = 'kbn-detail-rightcol'
+    const accordion = document.createElement('div')
+    accordion.className = 'kbn-detail-accordion'
+    right.append(accordion)
+    this.rightCol = accordion
+
+    const divider = document.createElement('div')
+    divider.className = 'kbn-detail-divider'
+    divider.setAttribute('role', 'separator')
+    divider.setAttribute('aria-orientation', 'vertical')
+    divider.setAttribute('aria-label', 'Resize columns')
+    this.attachDividerDrag(divider)
+    this.divider = divider
+
+    columns.append(divider, right)
+    overlay.classList.add('kbn-detail-twocol')
+    this.applySplit()
+
+    // Grow the panel rightward, keeping it on-screen. Animate the geometry.
+    const vw = window.innerWidth
+    const grown = Math.min(this.singleColWidth + TWO_COL_EXTRA, vw - 24)
+    const left = Math.max(0, Math.min(overlay.offsetLeft, vw - grown - 12))
+    animatePanelGeometry(overlay, {
+      left,
+      top: overlay.offsetTop,
+      width: grown,
+      height: overlay.offsetHeight,
     })
+    lastGeometry = { left, top: overlay.offsetTop, width: grown, height: overlay.offsetHeight }
   }
 
-  /** Viewer closed (×, Escape, ↗, or replaced): glide the panel back to
-   *  where it sat before the split. No-ops when the panel itself is gone
-   *  or was never split. */
-  private exitSplitView(): void {
-    if (this.overlay && this.preSplitGeometry) {
-      animatePanelGeometry(this.overlay, this.preSplitGeometry)
-    }
-    this.preSplitGeometry = null
+  /** The last file closed: dissolve the right column and glide back to the
+   *  single-column measure. */
+  private hideRightColumn(): void {
+    if (!this.rightCol || !this.overlay) return
+    const overlay = this.overlay
+    this.rightCol.parentElement?.remove() // the .kbn-detail-rightcol wrapper
+    this.divider?.remove()
+    this.rightCol = null
+    this.divider = null
+    overlay.classList.remove('kbn-detail-twocol')
+
+    const vw = window.innerWidth
+    const width = Math.min(this.singleColWidth || SINGLE_COL_WIDTH, vw - 24)
+    const left = Math.max(0, Math.min(overlay.offsetLeft, vw - width - 12))
+    animatePanelGeometry(overlay, {
+      left,
+      top: overlay.offsetTop,
+      width,
+      height: overlay.offsetHeight,
+    })
+    lastGeometry = { left, top: overlay.offsetTop, width, height: overlay.offsetHeight }
+  }
+
+  /** Apply the current split fraction to the two columns via flex-basis. */
+  private applySplit(): void {
+    if (!this.leftCol) return
+    const leftPct = clampSplit(this.splitFrac) * 100
+    this.leftCol.style.flex = `0 0 ${leftPct}%`
+  }
+
+  /** Drag the divider to repartition the two columns. Writes the new split
+   *  fraction to persistence on settle. Iframes are veiled mid-drag (the
+   *  panel-level dragging class does that) so the pointer math stays clean. */
+  private attachDividerDrag(divider: HTMLElement): void {
+    divider.addEventListener('pointerdown', (e: PointerEvent) => {
+      e.preventDefault()
+      e.stopPropagation()
+      const overlay = this.overlay
+      const columns = this.leftCol?.parentElement
+      if (!overlay || !columns) return
+      overlay.classList.add('kbn-detail-dragging')
+      const rect = columns.getBoundingClientRect()
+      const onMove = (ev: PointerEvent) => {
+        const frac = (ev.clientX - rect.left) / rect.width
+        this.splitFrac = clampSplit(frac)
+        this.applySplit()
+      }
+      const onUp = () => {
+        window.removeEventListener('pointermove', onMove)
+        window.removeEventListener('pointerup', onUp)
+        window.removeEventListener('pointercancel', onUp)
+        overlay.classList.remove('kbn-detail-dragging')
+        this.writePersist()
+      }
+      window.addEventListener('pointermove', onMove)
+      window.addEventListener('pointerup', onUp)
+      window.addEventListener('pointercancel', onUp)
+    })
   }
 
   /** Header-strip drag. Plain pointer drag — the header is dedicated chrome,
@@ -1253,81 +1442,358 @@ export class FiberDetailModal {
     body.append(actionsSec, this.buildRule(), grid, footer)
   }
 
-  // ── Private helpers ─────────────────────────────────────────────────────────
+  // ── Sent files: launcher + two-column accordion ─────────────────────────
 
   /**
-   * Container for the sent-files strip. Mounts empty (display:none via the
-   * `kbn-detail-sent-empty` class) and self-populates from
-   * `GET /sent-files?uid=<card.uid>` — the fiber ULID is the durable key
-   * the tracker files every shuttle worker's sends under; the legacy
-   * `shuttle.session.id`, when frontmatter still carries one, rides along
-   * as `sessionId`. Only reveals itself when the trail has entries, so
-   * cards without deliverables pay zero visual cost. Each row click hands
-   * the absolute path to `onOpenFile` (vellum file viewer, owner-routed by
-   * the card's origin for remote paths).
+   * The left-column sent-files launcher. Mounts empty (hidden) and self-
+   * populates from {@link fetchSentFiles}: the daemon's `/api/v1/sent-files`
+   * endpoint first, falling back to parsing `events.jsonl` over `/api/v1/file`
+   * for older local daemons. Only reveals itself when the trail has entries,
+   * so cards without deliverables pay zero visual cost. Each entry is a button
+   * that opens (or re-activates) the file in the right-column accordion.
    */
-  private buildSentFiles(card: KanbanCard): HTMLElement {
+  private buildSentFilesLauncher(card: KanbanCard): HTMLElement {
     const wrap = document.createElement('div')
     wrap.className = 'kbn-detail-sent kbn-detail-sent-empty'
-    const params = new URLSearchParams()
-    const uid = typeof card.uid === 'string' ? card.uid.trim() : ''
-    const sessionId = typeof card.sessionId === 'string' ? card.sessionId.trim() : ''
-    if (uid) params.set('uid', uid)
-    if (sessionId) params.set('sessionId', sessionId)
-    if (!uid && !sessionId) return wrap
+
+    const heading = document.createElement('div')
+    heading.className = 'kbn-detail-sent-heading'
+    heading.textContent = 'Sent files'
+
+    const list = document.createElement('div')
+    list.className = 'kbn-detail-sent-list'
+    list.setAttribute('role', 'list')
+    wrap.append(heading, list)
 
     const overlayAtBuild = () => this.overlay
-
-    void fetch(`${this.portolanBase}/sent-files?${params.toString()}`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data: { files?: Array<{ fullPath: string; basename: string; timestamp: number }> } | null) => {
-        const files = data?.files ?? []
-        // Panel may have closed/reopened while the fetch was in flight.
-        if (files.length === 0 || !overlayAtBuild()?.contains(wrap)) return
-
-        const heading = document.createElement('div')
-        heading.className = 'kbn-detail-sent-heading'
-        heading.textContent = 'Sent files'
-
-        const list = document.createElement('div')
-        list.className = 'kbn-detail-sent-list'
-        list.setAttribute('role', 'list')
-        for (const file of files) {
-          const row = document.createElement('button')
-          row.type = 'button'
-          row.className = 'kbn-detail-sent-file'
-          row.setAttribute('role', 'listitem')
-          row.title = file.fullPath
-          row.dataset.fullPath = file.fullPath
-
-          const name = document.createElement('span')
-          name.className = 'kbn-detail-sent-name'
-          name.textContent = file.basename
-
-          const when = document.createElement('span')
-          when.className = 'kbn-detail-sent-when'
-          when.textContent = relativeTime(file.timestamp)
-
-          row.append(name, when)
-          row.addEventListener('click', (e) => {
-            e.stopPropagation()
-            // Split view: this panel glides to the left half, the viewer
-            // takes the right; closing the viewer glides the panel back.
-            // Both stay non-modal. The viewer's ↗ escalates to the full
-            // file workspace via onOpenFile.
-            this.openInSplitView(file.fullPath, card.originId)
-          })
-          list.append(row)
-        }
-
-        wrap.append(heading, list)
-        wrap.classList.remove('kbn-detail-sent-empty')
-      })
-      .catch(() => {
-        // Backend unreachable (tests, embeds) — strip stays hidden.
-      })
+    void this.fetchSentFiles(card).then((files) => {
+      // Panel may have closed/reopened while the fetch was in flight.
+      if (!overlayAtBuild()?.contains(wrap)) return
+      this.sentFiles = files
+      if (files.length === 0) return
+      this.renderLauncher(list, card)
+      wrap.classList.remove('kbn-detail-sent-empty')
+      // A rehydration that arrived before the trail did can now mark which
+      // launcher entries are open.
+      this.syncLauncherActiveState()
+    })
 
     return wrap
+  }
+
+  /** (Re)render the launcher rows from `this.sentFiles`, newest-first. */
+  private renderLauncher(list: HTMLElement, card: KanbanCard): void {
+    list.replaceChildren()
+    for (const file of this.sentFiles) {
+      const row = document.createElement('button')
+      row.type = 'button'
+      row.className = 'kbn-detail-sent-file'
+      row.setAttribute('role', 'listitem')
+      row.title = file.fullPath
+      row.dataset.fullPath = file.fullPath
+
+      const name = document.createElement('span')
+      name.className = 'kbn-detail-sent-name'
+      name.textContent = file.basename
+
+      const when = document.createElement('span')
+      when.className = 'kbn-detail-sent-when'
+      when.textContent = relativeTime(file.timestamp)
+
+      row.append(name, when)
+      row.addEventListener('click', (e) => {
+        e.stopPropagation()
+        this.activateFile(file, card)
+      })
+      list.append(row)
+    }
+  }
+
+  /** Mark launcher entries whose file is currently open in the accordion. */
+  private syncLauncherActiveState(): void {
+    const openPaths = new Set(this.openFiles.map((e) => e.file.fullPath))
+    this.leftCol
+      ?.querySelectorAll<HTMLElement>('.kbn-detail-sent-file')
+      .forEach((row) => {
+        const open = !!row.dataset.fullPath && openPaths.has(row.dataset.fullPath)
+        row.classList.toggle('kbn-detail-sent-file-open', open)
+      })
+  }
+
+  // ── The accordion ───────────────────────────────────────────────────────
+
+  /**
+   * Open `file` in the right-column accordion, or — if already open — bump it
+   * to the top and expand it. Revealing the right column on first open. This
+   * is the single entry the launcher and rehydration both funnel through, so
+   * recency + persistence stay consistent.
+   */
+  private activateFile(file: SentFile, card: KanbanCard, opts?: { expanded?: boolean; scroll?: number; persist?: boolean }): void {
+    const existing = this.openFiles.find((e) => e.file.fullPath === file.fullPath)
+    if (existing) {
+      // Re-activate: move to top + expand.
+      this.openFiles = [existing, ...this.openFiles.filter((e) => e !== existing)]
+      this.setExpanded(existing, true)
+      this.relayoutAccordion()
+      this.syncLauncherActiveState()
+      if (opts?.persist !== false) this.writePersist()
+      existing.panel.scrollIntoView({ block: 'nearest' })
+      return
+    }
+
+    this.revealRightColumn()
+    const entry = this.buildAccordionEntry(file, card, opts?.expanded ?? true, opts?.scroll ?? 0)
+    // Newest activation goes to the top of the recency order.
+    this.openFiles = [entry, ...this.openFiles]
+    this.relayoutAccordion()
+    this.syncLauncherActiveState()
+    if (opts?.persist !== false) this.writePersist()
+  }
+
+  /**
+   * Build one collapsible accordion panel for `file`. The viewer body is built
+   * lazily on first expand (a collapsed panel doesn't fetch its file), and the
+   * iframe variant restores `initialScroll` on load and keeps `entry.scroll`
+   * fresh via a debounced scroll listener.
+   */
+  private buildAccordionEntry(
+    file: SentFile,
+    card: KanbanCard,
+    expanded: boolean,
+    initialScroll: number,
+  ): OpenFileEntry {
+    const panel = document.createElement('div')
+    panel.className = 'kbn-detail-acc-panel'
+
+    const head = document.createElement('div')
+    head.className = 'kbn-detail-acc-head'
+    head.setAttribute('role', 'button')
+    head.tabIndex = 0
+
+    const chevron = document.createElement('span')
+    chevron.className = 'kbn-detail-acc-chevron'
+    chevron.setAttribute('aria-hidden', 'true')
+    chevron.textContent = expanded ? '▾' : '▸'
+
+    const name = document.createElement('span')
+    name.className = 'kbn-detail-acc-name'
+    name.textContent = file.basename
+    name.title = file.fullPath
+
+    const closeBtn = document.createElement('button')
+    closeBtn.type = 'button'
+    closeBtn.className = 'kbn-detail-acc-close'
+    closeBtn.setAttribute('aria-label', `Close ${file.basename}`)
+    closeBtn.textContent = '✕'
+    closeBtn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      this.closeFile(entry)
+    })
+
+    head.append(chevron, name, closeBtn)
+
+    const body = document.createElement('div')
+    body.className = 'kbn-detail-acc-body'
+
+    const entry: OpenFileEntry = {
+      file,
+      panel,
+      body,
+      expanded,
+      scroll: initialScroll,
+      viewerBuilt: false,
+      iframe: null,
+    }
+
+    const activate = () => {
+      // Clicking a collapsed header expands + bumps; clicking an expanded one
+      // collapses it (keeping the others), per the accordion contract.
+      if (entry.expanded) {
+        this.setExpanded(entry, false)
+        this.writePersist()
+      } else {
+        this.activateFile(file, card)
+      }
+    }
+    head.addEventListener('click', activate)
+    head.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault()
+        activate()
+      }
+    })
+
+    panel.append(head, body)
+    if (expanded) this.buildEntryViewer(entry, card)
+    this.reflectExpanded(entry)
+    return entry
+  }
+
+  /** Build the viewer body for an entry (idempotent — once per entry). Wires
+   *  scroll-restore + a debounced scroll-position writer for iframe files. */
+  private buildEntryViewer(entry: OpenFileEntry, card: KanbanCard): void {
+    if (entry.viewerBuilt) return
+    entry.viewerBuilt = true
+    const scrollable = isScrollableFile(entry.file.fullPath)
+    const viewer = buildFileViewer(
+      this.shuttleBase,
+      entry.file.fullPath,
+      card.originId,
+      scrollable
+        ? (iframe) => {
+            entry.iframe = iframe
+            // Restore the persisted reading position once the doc has loaded
+            // (same-origin: served from the app's own daemon).
+            try {
+              iframe.contentWindow?.scrollTo(0, entry.scroll)
+              const win = iframe.contentWindow
+              if (win) {
+                win.addEventListener('scroll', () => {
+                  entry.scroll = win.scrollY
+                  this.queueScrollWrite()
+                }, { passive: true })
+              }
+            } catch {
+              /* cross-origin / unreadable — no scroll restore */
+            }
+          }
+        : undefined,
+    )
+    entry.body.append(viewer)
+  }
+
+  /** Expand or collapse an entry, building its viewer on first expand. */
+  private setExpanded(entry: OpenFileEntry, expanded: boolean): void {
+    if (entry.expanded === expanded) {
+      if (expanded && !entry.viewerBuilt && this.card) this.buildEntryViewer(entry, this.card)
+      return
+    }
+    entry.expanded = expanded
+    if (expanded && !entry.viewerBuilt && this.card) this.buildEntryViewer(entry, this.card)
+    this.reflectExpanded(entry)
+  }
+
+  /** Mirror an entry's expanded state into its DOM (class + chevron + body). */
+  private reflectExpanded(entry: OpenFileEntry): void {
+    entry.panel.classList.toggle('kbn-detail-acc-expanded', entry.expanded)
+    const chevron = entry.panel.querySelector('.kbn-detail-acc-chevron')
+    if (chevron) chevron.textContent = entry.expanded ? '▾' : '▸'
+    entry.body.hidden = !entry.expanded
+  }
+
+  /** Re-append accordion panels in recency order (index 0 on top). */
+  private relayoutAccordion(): void {
+    if (!this.rightCol) return
+    for (const entry of this.openFiles) {
+      this.rightCol.append(entry.panel) // append moves existing nodes
+      this.reflectExpanded(entry)
+    }
+  }
+
+  /** Close one open file. Dissolves the right column if it was the last. */
+  private closeFile(entry: OpenFileEntry): void {
+    entry.panel.remove()
+    this.openFiles = this.openFiles.filter((e) => e !== entry)
+    this.syncLauncherActiveState()
+    if (this.openFiles.length === 0) this.hideRightColumn()
+    this.writePersist()
+  }
+
+  /** Debounced scroll-position persistence. Open/close/expand write
+   *  immediately; scroll is debounced so a flick of the wheel doesn't hammer
+   *  localStorage. */
+  private queueScrollWrite(): void {
+    if (this.scrollWriteTimer !== null) window.clearTimeout(this.scrollWriteTimer)
+    this.scrollWriteTimer = window.setTimeout(() => {
+      this.scrollWriteTimer = null
+      this.writePersist()
+    }, 400)
+  }
+
+  /** Serialize the current right-column state to localStorage. */
+  private writePersist(): void {
+    const uid = typeof this.card?.uid === 'string' ? this.card.uid : ''
+    if (!uid) return
+    savePersist(uid, {
+      split: this.openFiles.length > 0 ? this.splitFrac : undefined,
+      open: this.openFiles.map((e) => ({
+        path: e.file.fullPath,
+        expanded: e.expanded,
+        scroll: e.scroll,
+      })),
+    })
+  }
+
+  /**
+   * Rebuild the right column from persisted state on panel-open. Files are
+   * activated oldest-first so the saved recency order (index 0 = top) is
+   * reproduced, with scroll/expanded carried through. Entries whose path is no
+   * longer on the (eventually-loaded) trail are pruned silently — but the
+   * rehydrate fires immediately off the persisted paths so the column is there
+   * before the trail fetch resolves. A path the trail later disowns is dropped
+   * on the next write.
+   */
+  private rehydrateOpenFiles(card: KanbanCard, persist: DetailPersist): void {
+    if (persist.open.length === 0) return
+    // Reverse so the FIRST persisted entry (top of accordion) ends up on top
+    // after each activation prepends.
+    for (const saved of [...persist.open].reverse()) {
+      const file: SentFile = {
+        fullPath: saved.path,
+        basename: basenameOf(saved.path),
+        timestamp: 0,
+      }
+      this.activateFile(file, card, {
+        expanded: saved.expanded,
+        scroll: saved.scroll,
+        persist: false,
+      })
+    }
+  }
+
+  /**
+   * The card's sent-files trail. Tries the daemon's `GET /api/v1/sent-files`
+   * first (committed; deploys on the next daemon restart). If that 404s/fails
+   * AND the origin is local, falls back to fetching `events.jsonl` via
+   * `/api/v1/file` and parsing it client-side — local-only, because the file
+   * is ~10 MB and must never be pulled over a slow remote tunnel. The parse is
+   * one-shot per panel-open (this method runs once from the launcher build).
+   */
+  private async fetchSentFiles(card: KanbanCard): Promise<SentFile[]> {
+    const uid = typeof card.uid === 'string' ? card.uid.trim() : ''
+    const sessionId = typeof card.sessionId === 'string' ? card.sessionId.trim() : ''
+    if (!uid && !sessionId) return []
+
+    // ── Primary: the daemon endpoint ──
+    const params = new URLSearchParams()
+    if (uid) params.set('uid', uid)
+    if (card.originId) params.set('origin', card.originId)
+    if (sessionId) params.set('sessionId', sessionId)
+    try {
+      const res = await fetch(`${this.shuttleBase}/api/v1/sent-files?${params.toString()}`)
+      if (res.ok) {
+        const data = (await res.json()) as { files?: SentFile[] }
+        if (Array.isArray(data.files)) return data.files
+      }
+      // A non-ok (404 on an older daemon) falls through to the fallback.
+    } catch {
+      // Network error — fall through to the local events.jsonl fallback.
+    }
+
+    // ── Fallback: parse events.jsonl over /file (LOCAL origin only) ──
+    const local = !card.originId || card.originId === 'local'
+    if (!local) return []
+    const home = homeFromDir(card.fiberDir)
+    if (!home) return []
+    const eventsPath = `${home}/.portolan/data/events.jsonl`
+    try {
+      const res = await fetch(fileBytesUrl(this.shuttleBase, eventsPath, 'local'))
+      if (!res.ok) return []
+      const text = await res.text()
+      return parseSentFilesFromEvents(text, uid, sessionId)
+    } catch {
+      return []
+    }
   }
 
   private buildSection(label: string): HTMLElement {
@@ -2038,8 +2504,10 @@ export class FiberDetailModal {
   }
 }
 
-/** Compact "2m / 3h / 5d ago" stamp for the sent-files strip. */
+/** Compact "2m / 3h / 5d ago" stamp for the sent-files launcher. A zero/absent
+ *  timestamp (a rehydrated entry whose trail hasn't loaded) renders blank. */
 function relativeTime(timestamp: number): string {
+  if (!timestamp) return ''
   const deltaMs = Date.now() - timestamp
   if (deltaMs < 60_000) return 'just now'
   const minutes = Math.floor(deltaMs / 60_000)
@@ -2047,4 +2515,81 @@ function relativeTime(timestamp: number): string {
   const hours = Math.floor(minutes / 60)
   if (hours < 24) return `${hours}h ago`
   return `${Math.floor(hours / 24)}d ago`
+}
+
+/** Clamp a left-pane split fraction so neither column collapses. */
+function clampSplit(frac: number): number {
+  return Math.max(MIN_PANE_FRAC, Math.min(1 - MIN_PANE_FRAC, frac))
+}
+
+/**
+ * Derive the user's home dir from a fiber's directory — the first two path
+ * segments on macOS/Linux (`/Users/<name>` or `/home/<name>`). The
+ * events.jsonl fallback reads `<home>/.portolan/data/events.jsonl`. Returns
+ * null for a path too shallow to carry a home (or absent).
+ */
+function homeFromDir(dir: string | undefined): string | null {
+  if (!dir || !dir.startsWith('/')) return null
+  const segs = dir.split('/').filter(Boolean)
+  if (segs.length < 2) return null
+  return `/${segs[0]}/${segs[1]}`
+}
+
+/** The ULID embedded in a tmux session name (`<slug>-<ULID>-shuttle`). */
+const TMUX_ULID_RE = /-([0-9A-HJKMNP-TV-Z]{26})-shuttle$/
+
+/**
+ * Parse a card's sent-files trail from a raw `events.jsonl` blob (the local
+ * fallback for daemons that predate `/api/v1/sent-files`). Keeps `SendUserFile`
+ * pre_tool_use events whose embedded fiber ULID (from `tmuxSession`) — or
+ * `sessionId` — matches the card's uid, flattens `toolInput.files`, dedupes by
+ * path keeping the newest, and sorts newest-first.
+ */
+function parseSentFilesFromEvents(text: string, uid: string, sessionId: string): SentFile[] {
+  const byPath = new Map<string, SentFile>()
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    let ev: {
+      tool?: string
+      tmuxSession?: string
+      sessionId?: string
+      timestamp?: number | string
+      toolInput?: { files?: unknown }
+    }
+    try {
+      ev = JSON.parse(trimmed)
+    } catch {
+      continue
+    }
+    if (ev.tool !== 'SendUserFile') continue
+
+    const tmuxUlid = typeof ev.tmuxSession === 'string'
+      ? ev.tmuxSession.match(TMUX_ULID_RE)?.[1]
+      : undefined
+    const matches =
+      (uid && (tmuxUlid === uid || ev.sessionId === uid)) ||
+      (sessionId && ev.sessionId === sessionId)
+    if (!matches) continue
+
+    const files = Array.isArray(ev.toolInput?.files) ? ev.toolInput.files : []
+    const ts = typeof ev.timestamp === 'number'
+      ? ev.timestamp
+      : typeof ev.timestamp === 'string'
+        ? Date.parse(ev.timestamp) || 0
+        : 0
+    for (const f of files) {
+      if (typeof f !== 'string' || !f) continue
+      const prev = byPath.get(f)
+      if (!prev || ts > prev.timestamp) {
+        byPath.set(f, {
+          fullPath: f,
+          basename: f.split('/').filter(Boolean).pop() ?? f,
+          timestamp: ts,
+          sessionId: typeof ev.sessionId === 'string' ? ev.sessionId : undefined,
+        })
+      }
+    }
+  }
+  return [...byPath.values()].sort((a, b) => b.timestamp - a.timestamp)
 }

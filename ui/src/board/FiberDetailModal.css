@@ -558,6 +558,174 @@
 .kbn-detail-rh-se { bottom: -3px; right: -3px; width: 15px; height: 15px; cursor: nwse-resize; }
 .kbn-detail-rh-sw { bottom: -3px; left: -3px; width: 15px; height: 15px; cursor: nesw-resize; }
 
+/* ── Two-column shell: card on the left, file accordion on the right ──────
+   The overlay is a flex column (header on top, then .kbn-detail-columns).
+   .kbn-detail-columns is the flex ROW holding the left card column, an
+   optional divider, and the right accordion column. Single-column = just
+   the left column at full width; the right column reveals on first file
+   open (FiberDetailModal.revealRightColumn) and the panel grows. */
+.kbn-detail-columns {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+}
+.kbn-detail-leftcol {
+  flex: 1 1 100%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+/* In two-column the left pane is sized by JS flex-basis (the split fraction);
+   the right pane takes the remainder. A subtle inner edge marks the seam when
+   the divider isn't hovered. */
+.kbn-detail-overlay.kbn-detail-twocol .kbn-detail-leftcol {
+  flex-grow: 0;
+  flex-shrink: 0;
+}
+
+/* The draggable divider — a slim ruled gutter with a centered grip. Widens
+   its hit area beyond its visual line via padding-collapse (the ::before grip
+   is the visible mark; the element itself is the 10px target). */
+.kbn-detail-divider {
+  flex: 0 0 10px;
+  position: relative;
+  cursor: col-resize;
+  background: linear-gradient(
+    rgba(27, 22, 17, 0.04),
+    rgba(27, 22, 17, 0.06)
+  );
+  border-left: 1px solid rgba(27, 22, 17, 0.10);
+  border-right: 1px solid rgba(255, 251, 237, 0.5);
+  touch-action: none;
+  z-index: 4;
+}
+.kbn-detail-divider::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 2px;
+  height: 34px;
+  border-radius: 2px;
+  background: rgba(27, 22, 17, 0.22);
+  box-shadow:
+    -3px 0 0 -1px rgba(27, 22, 17, 0.14),
+    3px 0 0 -1px rgba(27, 22, 17, 0.14);
+  transition: background 0.15s ease;
+}
+.kbn-detail-divider:hover::before {
+  background: var(--porch-ochre, #C2963B);
+}
+
+/* The right column: a vellum file zone, the accordion scrolls inside it. */
+.kbn-detail-rightcol {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--porch-panel, #EDE8E0);
+  background-image:
+    radial-gradient(ellipse 600px 400px at 80% 8%, rgba(255, 251, 237, 0.4), transparent 60%);
+}
+.kbn-detail-accordion {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 12px 16px;
+}
+
+/* ── One accordion panel ─────────────────────────────────────────────────
+   A collapsible file cell: a header (chevron + basename + close) over a
+   viewer body that renders by extension. Recency-sorted by JS (top = most
+   recently activated). Multiple may be expanded for compare. */
+.kbn-detail-acc-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid rgba(27, 22, 17, 0.14);
+  border-radius: 4px;
+  background: #FFFDF6;
+  box-shadow: 0 1px 2px rgba(27, 22, 17, 0.06);
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+/* An expanded panel grows to fill the column so its file gets real reading
+   room; collapsed panels stay as slim header bars. When several are expanded
+   they share the space evenly (flex:1 each). */
+.kbn-detail-acc-panel.kbn-detail-acc-expanded {
+  flex: 1 1 0;
+  min-height: 180px;
+}
+.kbn-detail-acc-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px 7px 10px;
+  cursor: pointer;
+  flex: 0 0 auto;
+  border-bottom: 1px solid transparent;
+  background: linear-gradient(rgba(154, 123, 53, 0.06), rgba(154, 123, 53, 0.03));
+  user-select: none;
+}
+.kbn-detail-acc-head:hover {
+  background: linear-gradient(rgba(154, 123, 53, 0.12), rgba(154, 123, 53, 0.06));
+}
+.kbn-detail-acc-head:focus-visible {
+  outline: 2px solid rgba(154, 123, 53, 0.5);
+  outline-offset: -2px;
+}
+.kbn-detail-acc-expanded .kbn-detail-acc-head {
+  border-bottom-color: rgba(27, 22, 17, 0.10);
+}
+.kbn-detail-acc-chevron {
+  flex: 0 0 auto;
+  width: 11px;
+  font-size: 10px;
+  color: #9A7B35;
+}
+.kbn-detail-acc-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 12px;
+  color: #2E2A26;
+}
+.kbn-detail-acc-close {
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  color: #9A8F80;
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 5px;
+  border-radius: 2px;
+  cursor: pointer;
+}
+.kbn-detail-acc-close:hover {
+  color: #8C3B2E;
+  background: rgba(140, 59, 46, 0.08);
+}
+.kbn-detail-acc-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  background: #FFFDF6;
+}
+.kbn-detail-acc-body[hidden] {
+  display: none;
+}
+
 /* ── The vellum page pane ────────────────────────────────────────────── */
 .kbn-detail-page {
   flex: 1;
@@ -822,12 +990,17 @@
 /* The deliverable trail between the controls cluster and the page pane.
    Hidden until /sent-files returns entries (see buildSentFiles). */
 .kbn-detail-sent {
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 8px 14px 10px;
+  gap: 5px;
+  padding: 9px 14px 11px;
   border-top: 1px solid rgba(27, 22, 17, 0.08);
   background: rgba(154, 123, 53, 0.05);
+  /* The launcher can hold many entries on a long-running card; cap its height
+     and let it scroll so it never pushes the body off-screen. */
+  max-height: 30cqh;
+  overflow-y: auto;
 }
 .kbn-detail-sent-empty {
   display: none;
@@ -861,6 +1034,16 @@
 .kbn-detail-sent-file:hover {
   border-color: #9A7B35;
   background: rgba(255, 251, 237, 0.95);
+}
+/* An entry whose file is open in the right-column accordion: a filled ochre
+   chip so the launcher mirrors what's on screen at a glance. */
+.kbn-detail-sent-file-open {
+  border-color: var(--porch-ochre, #C2963B);
+  background: rgba(196, 147, 51, 0.18);
+  color: #5e4a1f;
+}
+.kbn-detail-sent-file-open .kbn-detail-sent-when {
+  color: #8a7a4a;
 }
 .kbn-detail-sent-name {
   overflow: hidden;

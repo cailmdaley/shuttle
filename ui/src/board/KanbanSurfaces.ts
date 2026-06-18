@@ -93,6 +93,15 @@ interface KanbanSurfaceRendererOptions {
   openDetail: (card: KanbanCard, column: ColumnKind) => void
   openWorker?: (tmuxSessionName: string, shuttleHost?: string) => void
   setTimelineAdaptiveCleanup: (cleanup: (() => void) | null) => void
+  /** Stash a new fiber — the Drafts head's `+` action. Omit to render the
+   *  Drafts head title + count alone (read-only context). */
+  onStashClick?: () => void
+  /** Open the chat-first capture — the In flight head's `✶` action. Omit to
+   *  render the In flight head title + count alone. */
+  onNewIdeaClick?: () => void
+  /** Re-fetch the board — the Awaiting review head's `↻` action. Always wired
+   *  (refresh is never read-only). */
+  onRefresh: () => void
 }
 
 export class KanbanSurfaceRenderer {
@@ -110,6 +119,9 @@ export class KanbanSurfaceRenderer {
   private readonly openDetail: (card: KanbanCard, column: ColumnKind) => void
   private readonly openWorker?: (tmuxSessionName: string, shuttleHost?: string) => void
   private readonly setTimelineAdaptiveCleanup: (cleanup: (() => void) | null) => void
+  private readonly onStashClick?: () => void
+  private readonly onNewIdeaClick?: () => void
+  private readonly onRefresh: () => void
   /** Horizontal edge-scroll for the timeline wrap during drag. Lets the
    *  user drag a card from Now toward the timeline's left/right edge to
    *  auto-scroll into off-screen days. Separate from the body's vertical
@@ -129,6 +141,9 @@ export class KanbanSurfaceRenderer {
     this.openDetail = options.openDetail
     this.openWorker = options.openWorker
     this.setTimelineAdaptiveCleanup = options.setTimelineAdaptiveCleanup
+    this.onStashClick = options.onStashClick
+    this.onNewIdeaClick = options.onNewIdeaClick
+    this.onRefresh = options.onRefresh
   }
 
   /** Render the Now surface: section header + 3-column board. */
@@ -907,9 +922,14 @@ export class KanbanSurfaceRenderer {
     col.setAttribute('aria-label', `${title} (${cards.length})`)
     col.dataset.column = kind
 
-    const head = document.createElement('button')
-    head.type = 'button'
+    // The head is a focusable drop target (keyboard column-nav focuses it; the
+    // DnD handlers below route a drop on it through the lifecycle transition).
+    // It's a `div[role=button]`, not a `<button>`, so the per-kind action below
+    // can nest a real `<button>` inside it without button-in-button invalidity.
+    const head = document.createElement('div')
     head.className = 'kbn-col-head'
+    head.tabIndex = 0
+    head.setAttribute('role', 'button')
     head.setAttribute('aria-label', `Drop here to move to ${title}`)
     const headTitle = document.createElement('h2')
     headTitle.className = 'kbn-col-title'
@@ -917,7 +937,14 @@ export class KanbanSurfaceRenderer {
     const headCount = document.createElement('span')
     headCount.className = 'kbn-col-count'
     headCount.textContent = String(cards.length)
-    head.append(headTitle, headCount)
+    // Title + count cluster on the left; the per-kind action sits at the right
+    // edge (the head is `justify-content: space-between`).
+    const headLabel = document.createElement('div')
+    headLabel.className = 'kbn-col-head-label'
+    headLabel.append(headTitle, headCount)
+    head.append(headLabel)
+    const action = this.makeColumnAction(kind)
+    if (action) head.append(action)
 
     const dropToColumn = (e: DragEvent): void => {
       e.preventDefault()
@@ -967,6 +994,62 @@ export class KanbanSurfaceRenderer {
 
     col.append(head, list)
     return col
+  }
+
+  /**
+   * The per-lane head action — one tinted round button at the column head's
+   * right edge, the verb that feeds the lane (color = lane identity):
+   *
+   *   Drafts          → Stash `+`  (ochre)   onStashClick
+   *   In flight       → New idea `✶` (cobalt) onNewIdeaClick
+   *   Awaiting review → Refresh `↻` (teal)   onRefresh
+   *
+   * Returns null for a lane whose callback isn't wired (read-only context) —
+   * those heads render title + count alone. Refresh is always available.
+   * Every button stops click propagation (the head is itself a focusable drop
+   * target). Refresh spins its glyph briefly so in-flight state rides the
+   * button, not a `.kbn-status` text line.
+   */
+  private makeColumnAction(kind: ColumnKind): HTMLButtonElement | null {
+    const spec =
+      kind === 'drafts'
+        ? this.onStashClick && {
+            glyph: '+', modifier: 'drafts',
+            label: 'Stash a new fiber (n)', onClick: this.onStashClick,
+          }
+        : kind === 'inFlight'
+          ? this.onNewIdeaClick && {
+              glyph: '✶', modifier: 'inFlight',
+              label: 'New idea — speak it into a card', onClick: this.onNewIdeaClick,
+            }
+          : kind === 'awaitingReview'
+            ? {
+                glyph: '↻', modifier: 'awaitingReview',
+                label: 'Refresh the board', onClick: this.onRefresh, spin: true,
+              }
+            : null
+    if (!spec) return null
+
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.className = `kbn-col-action kbn-col-action-${spec.modifier}`
+    btn.textContent = spec.glyph
+    btn.setAttribute('aria-label', spec.label)
+    btn.title = spec.label
+    btn.addEventListener('click', (e) => {
+      // The head is a drop target + focusable; a click on its action must not
+      // bubble up to it (or to the column's open-detail / drag wiring).
+      e.stopPropagation()
+      if ('spin' in spec && spec.spin) {
+        btn.classList.remove('kbn-col-action-spinning')
+        // Reflow so a back-to-back refresh re-triggers the animation.
+        void btn.offsetWidth
+        btn.classList.add('kbn-col-action-spinning')
+        window.setTimeout(() => btn.classList.remove('kbn-col-action-spinning'), 650)
+      }
+      spec.onClick()
+    })
+    return btn
   }
 
   /**

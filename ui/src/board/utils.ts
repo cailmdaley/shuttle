@@ -177,6 +177,24 @@ function encodePathParam(abs: string): string {
 }
 
 /**
+ * Build the URL a sent deliverable's *raw bytes* resolve to through the
+ * daemon's owner-routed file route (`GET /api/v1/file?path=<ABSOLUTE>&origin=`).
+ * This is the single repoint away from Portolan's retired `:4004`
+ * `/project-file/…?standalone=1`: the daemon streams html/pdf/image/audio/text
+ * with the right Content-Type, and HTML served as `text/html` is natively
+ * iframe-scrollable — no `standalone` height-handshake. `origin` is appended
+ * only for a remote-owned file, mirroring the route's local-when-absent
+ * contract. `base` is the shuttle daemon base (`:4000`), '' for a same-origin
+ * (daemon-served) bundle.
+ */
+export function fileBytesUrl(base: string, fullPath: string, originId: string): string {
+  const abs = fullPath.startsWith('/') ? fullPath : `/${fullPath}`
+  let url = `${base}${FILE_ROUTE}?path=${encodePathParam(abs)}`
+  if (originId && originId !== 'local') url += `&origin=${encodeURIComponent(originId)}`
+  return url
+}
+
+/**
  * Build the URL for the ASTRA paper render of an `astra.yaml`. The paper entry
  * (`paper.html`) bakes a project *dir* — the dir holding the astra.yaml — so we
  * resolve the file path, take its dirname, and pass it (owner-routed by origin)
