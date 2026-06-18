@@ -516,9 +516,21 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
+  # The most recent harness session UUID recoverable from felt history.
+  #
+  # Scans ALL of history (`--last 0`), not a fixed window. The session id lives
+  # in the rare "worker dispatched ... session=<uuid>" event, while every worker
+  # exit appends a "worker exited (...)" event that carries NO session id
+  # (`log_worker_exit` logs agent= only — `meta.session` is the tmux name, not
+  # the harness UUID). So a redispatch storm floods history with session-less
+  # exit events, and any fixed `--last N` window buries the dispatch event past
+  # the cap — the lookup returns nil and the resume path fails
+  # `:missing_session_id` even though the id is on record, blocking the fiber
+  # indefinitely (the "morning-post blocked for days" pathology). `find_value`
+  # returns the FIRST (newest-first) session-bearing event regardless of depth.
   defp latest_history_session_id(fiber_id, opts) do
     fiber_id
-    |> query_history(["--last", "20", "--json"], opts)
+    |> query_history(["--last", "0", "--json"], opts)
     |> Enum.find_value(fn event ->
       event
       |> get_in(["payload", "text"])

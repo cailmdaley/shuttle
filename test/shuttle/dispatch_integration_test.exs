@@ -411,6 +411,61 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert script =~ "Shuttle resumed your previous session"
   end
 
+  test "session id is recovered when a redispatch storm buries the dispatch event", %{
+    host: host
+  } do
+    # Regression: a human-led oneshot left `status: active` gets redispatched
+    # every poll; each worker exits :normal_exit and `log_worker_exit` appends a
+    # SESSION-LESS "worker exited" event. The session id lives only in the rare
+    # "worker dispatched ... session=<uuid>" event, which a fixed `--last N`
+    # history window buries once enough exit events pile up — the resume lookup
+    # then returns nil → :missing_session_id → the fiber blocks indefinitely
+    # ("in-flight but never aloft"). The lookup must scan all of history.
+    write_fiber(host, "tests/storm-buried-session", """
+    ---
+    name: Storm-buried session fiber
+    status: active
+    tags:
+      - constitution
+    shuttle:
+      kind: oneshot
+      agent: claude-opus
+      host: test-host
+    ---
+    A human-led oneshot whose one dispatch event is buried under an exit storm.
+    """)
+
+    append_dispatch_event(host, "tests/storm-buried-session",
+      agent: "claude-opus",
+      session: "buried-session-uuid"
+    )
+
+    # The storm: production-shaped, session-less exit events (mirrors
+    # `log_worker_exit`, which logs agent= only). Far more than any fixed window.
+    for _ <- 1..30 do
+      append_freeform_exit(
+        host,
+        "tests/storm-buried-session",
+        "worker exited (:normal_exit); agent=claude-opus"
+      )
+    end
+
+    append_review_comment(host, "tests/storm-buried-session",
+      summary: "Resume previous",
+      resume_mode: "previous"
+    )
+
+    assert {:ok, _} =
+             Dispatcher.dispatch("tests/storm-buried-session",
+               runner: IntegrationRunner,
+               felt_store: host
+             )
+
+    script = read_run_script()
+    assert script =~ "--resume 'buried-session-uuid'"
+    refute script =~ "missing_session_id"
+  end
+
   test "resume previous dispatch reaches each harness-specific resume command", %{host: host} do
     matrix = [
       {"claude-sonnet", "claude-session-111", ["claude", "--resume 'claude-session-111'", "<<<"],
