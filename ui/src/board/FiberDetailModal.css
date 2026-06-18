@@ -657,135 +657,79 @@
     radial-gradient(ellipse 540px 460px at 8% 96%, rgba(27, 22, 17, 0.04), transparent 64%);
   box-shadow: inset 7px 0 14px -10px rgba(27, 22, 17, 0.22);
 }
-.kbn-detail-accordion {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow-y: auto;
+/* ── Tab strip ────────────────────────────────────────────────────────────
+   A row of manuscript index-tabs across the top of the right column — one per
+   open file, stable order. The active tab is lit + raised and seams into the
+   full view below it; inactive tabs sit back. Overflows horizontally (thin
+   rule scrollbar) when a card has many deliverables. */
+.kbn-detail-tabstrip {
+  flex: 0 0 auto;
   display: flex;
-  flex-direction: column;
-  gap: 11px;
-  padding: 13px 13px 18px;
+  align-items: flex-end;
+  gap: 3px;
+  padding: 7px 9px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
   scrollbar-width: thin;
-  scrollbar-color: rgba(154, 123, 53, 0.35) transparent;
+  scrollbar-color: rgba(154, 123, 53, 0.3) transparent;
+  background: linear-gradient(rgba(27, 22, 17, 0.05), rgba(27, 22, 17, 0));
+  border-bottom: 1px solid rgba(154, 123, 53, 0.28);
 }
-.kbn-detail-accordion::-webkit-scrollbar { width: 9px; }
-.kbn-detail-accordion::-webkit-scrollbar-thumb {
+.kbn-detail-tabstrip::-webkit-scrollbar { height: 6px; }
+.kbn-detail-tabstrip::-webkit-scrollbar-thumb {
   background: rgba(154, 123, 53, 0.3);
   border-radius: 6px;
-  border: 2px solid transparent;
-  background-clip: content-box;
 }
-.kbn-detail-accordion::-webkit-scrollbar-thumb:hover {
-  background: rgba(154, 123, 53, 0.5);
-  background-clip: content-box;
-}
-
-/* ── One accordion panel ─────────────────────────────────────────────────
-   A collapsible file cell: a header (chevron + basename + close) over a
-   viewer body that renders by extension. Recency-sorted by JS (top = most
-   recently activated). Multiple may be expanded for compare. */
-.kbn-detail-acc-panel {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  border: 1px solid rgba(27, 22, 17, 0.13);
-  border-radius: 5px;
-  background: var(--porch-rag, #FFFDF6);
-  box-shadow:
-    0 1px 0 rgba(255, 251, 237, 0.7) inset,
-    0 1px 2px rgba(27, 22, 17, 0.05),
-    0 5px 14px -8px rgba(27, 22, 17, 0.16);
-  overflow: hidden;
-  flex: 0 0 auto;
-  /* A freshly opened panel slides in from the launcher; collapsing/recency
-     re-order reuses the same node so it only fires once, on creation. */
-  animation: kbn-acc-reveal 0.32s cubic-bezier(0.22, 0.61, 0.36, 1) both;
-  transition: box-shadow 0.18s ease, border-color 0.18s ease;
-}
-@keyframes kbn-acc-reveal {
-  from { opacity: 0; transform: translateY(-7px) scale(0.992); }
-  to   { opacity: 1; transform: none; }
-}
-/* An expanded panel grows to fill the column so its file gets real reading
-   room; collapsed panels stay as slim header bars. When several are expanded
-   they share the space evenly (flex:1 each). The expanded panel lifts a touch
-   and wears a gilt left spine — the same ochre rule the outcome lede carries,
-   so an open file reads as a quoted page. */
-.kbn-detail-acc-panel.kbn-detail-acc-expanded {
-  flex: 1 1 0;
-  min-height: 184px;
-  border-color: rgba(154, 123, 53, 0.34);
-  box-shadow:
-    0 1px 0 rgba(255, 251, 237, 0.8) inset,
-    0 2px 4px rgba(27, 22, 17, 0.06),
-    0 9px 22px -10px rgba(27, 22, 17, 0.2);
-}
-/* The collapsed bar wants a subtle hover lift so it reads as openable. */
-.kbn-detail-acc-panel:not(.kbn-detail-acc-expanded):hover {
-  border-color: rgba(154, 123, 53, 0.4);
-  box-shadow:
-    0 1px 0 rgba(255, 251, 237, 0.7) inset,
-    0 2px 5px rgba(27, 22, 17, 0.08),
-    0 7px 16px -9px rgba(27, 22, 17, 0.2);
-}
-@media (prefers-reduced-motion: reduce) {
-  .kbn-detail-acc-panel { animation: none; }
-}
-.kbn-detail-acc-head {
+.kbn-detail-tab {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 220px;
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 8px 9px 8px 12px;
+  gap: 7px;
+  padding: 6px 8px 7px 11px;
   cursor: pointer;
-  flex: 0 0 auto;
-  position: relative;
-  border-bottom: 1px solid transparent;
-  background: linear-gradient(rgba(154, 123, 53, 0.07), rgba(154, 123, 53, 0.025));
+  border: 1px solid rgba(27, 22, 17, 0.12);
+  border-bottom: none;
+  border-radius: 7px 7px 0 0;
+  background: linear-gradient(rgba(154, 123, 53, 0.06), rgba(154, 123, 53, 0.02));
+  color: #6A6155;
   user-select: none;
-  transition: background 0.16s ease;
+  position: relative;
+  top: 1px; /* tuck inactive tabs a hair below the seam */
+  transition: background 0.16s ease, color 0.16s ease, top 0.14s ease, box-shadow 0.16s ease;
 }
-.kbn-detail-acc-head:hover {
-  background: linear-gradient(rgba(154, 123, 53, 0.15), rgba(154, 123, 53, 0.07));
+.kbn-detail-tab:hover {
+  background: linear-gradient(rgba(154, 123, 53, 0.13), rgba(154, 123, 53, 0.05));
+  color: #4A443C;
 }
-.kbn-detail-acc-head:focus-visible {
+.kbn-detail-tab:focus-visible {
   outline: 2px solid rgba(154, 123, 53, 0.5);
   outline-offset: -2px;
 }
-/* The gilt spine: a ruled ochre edge on an expanded panel's header, lit like
-   the lede's left border. Drawn as a ::before so it sits flush with the rounded
-   panel corner and never disturbs the header's flex flow. */
-.kbn-detail-acc-head::before {
+/* The active tab: lifted to the seam, lit parchment, a gilt top rule, and a
+   bottom edge the same colour as the view below so it reads as one surface. */
+.kbn-detail-tab-active {
+  top: 1px;
+  background: var(--porch-rag, #FFFDF6);
+  color: #2E2418;
+  border-color: rgba(154, 123, 53, 0.4);
+  box-shadow:
+    inset 0 2px 0 var(--porch-ochre, #C2963B),
+    0 -2px 7px -3px rgba(27, 22, 17, 0.18);
+}
+/* Seam: the active tab's bottom border matches the view background, hiding the
+   strip's bottom rule under it. */
+.kbn-detail-tab-active::after {
   content: "";
   position: absolute;
   left: 0;
-  top: 0;
-  bottom: 0;
-  width: 3px;
-  background: var(--porch-ochre, #C2963B);
-  opacity: 0;
-  transition: opacity 0.18s ease;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  background: var(--porch-rag, #FFFDF6);
 }
-.kbn-detail-acc-expanded .kbn-detail-acc-head {
-  background: linear-gradient(rgba(154, 123, 53, 0.16), rgba(154, 123, 53, 0.07));
-  border-bottom-color: rgba(154, 123, 53, 0.22);
-}
-.kbn-detail-acc-expanded .kbn-detail-acc-head::before {
-  opacity: 1;
-}
-.kbn-detail-acc-chevron {
-  flex: 0 0 auto;
-  width: 12px;
-  font-size: 9px;
-  line-height: 1;
-  color: #9A7B35;
-  text-align: center;
-  transition: transform 0.18s ease, color 0.16s ease;
-}
-.kbn-detail-acc-head:hover .kbn-detail-acc-chevron { color: #6B5526; }
-/* A small marginal mark for the file kind — an illuminated dot tinted by
-   extension (set in TS as data-kind). Purely decorative; the basename carries
-   the meaning. */
-.kbn-detail-acc-kind {
+.kbn-detail-tab-kind {
   flex: 0 0 auto;
   width: 7px;
   height: 7px;
@@ -793,10 +737,10 @@
   background: rgba(154, 123, 53, 0.55);
   box-shadow: 0 0 0 1px rgba(27, 22, 17, 0.08);
 }
-.kbn-detail-acc-head[data-kind="image"] .kbn-detail-acc-kind { background: var(--porch-verdigris, #3F8278); }
-.kbn-detail-acc-head[data-kind="audio"] .kbn-detail-acc-kind { background: var(--porch-cobalt, #3D5BA0); }
-.kbn-detail-acc-head[data-kind="doc"]   .kbn-detail-acc-kind { background: var(--porch-ochre, #C2963B); }
-.kbn-detail-acc-name {
+.kbn-detail-tab[data-kind="image"] .kbn-detail-tab-kind { background: var(--porch-verdigris, #3F8278); }
+.kbn-detail-tab[data-kind="audio"] .kbn-detail-tab-kind { background: var(--porch-cobalt, #3D5BA0); }
+.kbn-detail-tab[data-kind="doc"]   .kbn-detail-tab-kind { background: var(--porch-ochre, #C2963B); }
+.kbn-detail-tab-name {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
@@ -805,41 +749,69 @@
   font-family: var(--font-mono, 'JetBrains Mono', monospace);
   font-size: 12px;
   letter-spacing: 0.01em;
-  color: #4A443C;
-  transition: color 0.16s ease;
 }
-.kbn-detail-acc-expanded .kbn-detail-acc-name {
-  color: #2E2418;
-  font-weight: 600;
-}
-.kbn-detail-acc-close {
+.kbn-detail-tab-active .kbn-detail-tab-name { font-weight: 600; }
+.kbn-detail-tab-close {
   flex: 0 0 auto;
   border: none;
   background: transparent;
   color: #9A8F80;
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1;
-  padding: 4px 6px;
+  padding: 3px 4px;
   border-radius: 3px;
   cursor: pointer;
-  opacity: 0.7;
+  opacity: 0;
   transition: color 0.14s ease, background 0.14s ease, opacity 0.14s ease;
 }
-.kbn-detail-acc-head:hover .kbn-detail-acc-close { opacity: 1; }
-.kbn-detail-acc-close:hover {
+.kbn-detail-tab:hover .kbn-detail-tab-close,
+.kbn-detail-tab-active .kbn-detail-tab-close { opacity: 0.7; }
+.kbn-detail-tab-close:hover {
   color: #8C3B2E;
   background: rgba(140, 59, 46, 0.1);
   opacity: 1;
 }
-.kbn-detail-acc-body {
+
+/* ── The full-view area ───────────────────────────────────────────────────
+   One file fills the column. Only the active tab's cell is shown; the rest
+   stay built-but-hidden so switching tabs keeps each file's scroll + zoom.
+   The cell is the pan surface: Cmd-scroll sets `zoom` on the viewer, which
+   grows its layout box, and the cell (overflow:auto) scrolls to pan. */
+.kbn-detail-views {
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
-  background: #FFFDF6;
+  flex-direction: column;
+  background: var(--porch-rag, #FFFDF6);
 }
-.kbn-detail-acc-body[hidden] {
-  display: none;
+.kbn-detail-view-cell {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  position: relative;
+  background: var(--porch-rag, #FFFDF6);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(154, 123, 53, 0.35) transparent;
 }
+.kbn-detail-view-cell[hidden] { display: none; }
+.kbn-detail-view-cell::-webkit-scrollbar { width: 9px; height: 9px; }
+.kbn-detail-view-cell::-webkit-scrollbar-thumb {
+  background: rgba(154, 123, 53, 0.3);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+/* The viewer fills the cell at zoom 1; `zoom` > 1 grows it and the cell pans.
+   `zoom` (not transform) so the scaled box affects layout → real scrollbars. */
+.kbn-detail-view-cell > .kbn-fileview-frame-wrap { width: 100%; height: 100%; }
+/* Image fills the cell as a full-view plate on a vellum mat (centered); the
+   whole figure is visible at zoom 1, Cmd-scroll magnifies from there. */
+.kbn-detail-view-cell > .kbn-fileview-image-wrap {
+  width: 100%;
+  min-height: 100%;
+  box-sizing: border-box;
+}
+.kbn-detail-view-cell > .kbn-fileview-audio { padding: 28px; }
 
 /* ── The vellum page pane ────────────────────────────────────────────── */
 .kbn-detail-page {

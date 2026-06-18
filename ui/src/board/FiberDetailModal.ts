@@ -55,34 +55,40 @@ interface SentFile {
 interface DetailPersist {
   /** Fraction of the two-column inner width given to the LEFT (card) pane. */
   split?: number
+  /** Full path of the active (front-most) tab — restored on reopen. */
+  active?: string
   /**
    * `basename` is the file's display label as the trail provided it — which can
    * differ from the path tail in the disambiguation case (two distinct files
    * both literally named `report.html`, distinguished as
    * `standalone-kanban-report.html` vs `morning-post-report.html`). Persisting
-   * it keeps the accordion header label stable across reload; legacy records
-   * without it fall back to `basenameOf(path)`.
+   * it keeps the tab label stable across reload; legacy records without it fall
+   * back to `basenameOf(path)`. `zoom` is the per-file Cmd-scroll magnification
+   * (1 = native), `scroll` the last reading offset — both restored per tab.
    */
-  open: Array<{ path: string; basename?: string; expanded: boolean; scroll: number }>
+  open: Array<{ path: string; basename?: string; scroll: number; zoom?: number }>
 }
 
 /**
- * One open file in the right-column accordion. Owns its DOM (the collapsible
- * panel element + its viewer body) and the live state the persistence writer
- * reads: `expanded`, and `scroll` (the last-known iframe scroll offset, kept
- * fresh by a scroll listener while open, and applied on the iframe's `load` to
- * restore a rehydrated position). `viewerBuilt` guards lazy viewer construction
- * — a collapsed panel doesn't fetch its file until first expanded.
+ * One open file in the right-column TABBED viewer. Owns its DOM: the `tab`
+ * button in the tab strip and the full-bleed `cell` that renders the file
+ * (only the active tab's cell is shown — the others stay built-but-hidden so
+ * switching tabs preserves scroll, zoom, and iframe load state, browser-tab
+ * style). Live state the persistence writer reads: `scroll` (last iframe/cell
+ * reading offset) and `zoom` (Cmd-scroll magnification, 1 = native). The viewer
+ * is built once, on first activation (`viewerBuilt`).
  */
 interface OpenFileEntry {
   file: SentFile
-  panel: HTMLElement
-  body: HTMLElement
-  expanded: boolean
+  tab: HTMLElement
+  cell: HTMLElement
   scroll: number
+  zoom: number
   viewerBuilt: boolean
   /** The same-origin iframe, once built — the scroll-restore target. */
   iframe: HTMLIFrameElement | null
+  /** The element transform-scale zoom is applied to (img or iframe wrap). */
+  zoomTarget: HTMLElement | null
 }
 
 const PERSIST_PREFIX = 'shuttle:detail:'
@@ -93,7 +99,7 @@ function loadPersist(uid: string): DetailPersist {
     const raw = window.localStorage.getItem(PERSIST_PREFIX + uid)
     if (!raw) return { open: [] }
     const parsed = JSON.parse(raw) as DetailPersist
-    return { split: parsed.split, open: Array.isArray(parsed.open) ? parsed.open : [] }
+    return { split: parsed.split, active: parsed.active, open: Array.isArray(parsed.open) ? parsed.open : [] }
   } catch {
     return { open: [] }
   }
@@ -209,12 +215,19 @@ export class FiberDetailModal {
   /** The full sent-files trail (newest-first), fetched once per panel-open.
    *  The left-column launcher renders from this. */
   private sentFiles: SentFile[] = []
-  /** Open files in recency order — index 0 is the top of the accordion.
-   *  Each entry owns its DOM and live scroll/expanded state; this is the
-   *  authority the persistence writer serializes. */
+  /** Open files in stable open-order (the tab order — tabs don't reorder on
+   *  click, browser-style). Each entry owns its tab + view cell + live
+   *  scroll/zoom state; this is the authority the persistence writer
+   *  serializes. The active tab is tracked separately by `activePath`. */
   private openFiles: OpenFileEntry[] = []
-  /** The right column's scrollable accordion host. Null in single-column. */
+  /** Full path of the active (shown) file, or null. The active tab's cell is
+   *  visible; every other open cell stays built-but-hidden. */
+  private activePath: string | null = null
+  /** The right column's views host (holds every open file's cell; only the
+   *  active one is shown). Null in single-column. */
   private rightCol: HTMLElement | null = null
+  /** The right column's tab strip (one tab per open file). Null single-column. */
+  private tabStrip: HTMLElement | null = null
   /** The left column wrapper (card chrome + body). Always present once open. */
   private leftCol: HTMLElement | null = null
   /** The divider between the two columns (drag to resize the split). */
@@ -294,6 +307,7 @@ export class FiberDetailModal {
     // accordion read these; the persistence writer keys off `card.uid`.
     this.card = card
     this.openFiles = []
+    this.activePath = null
     this.sentFiles = []
     const persist = loadPersist(typeof card.uid === 'string' ? card.uid : '')
     this.splitFrac = clampSplit(persist.split ?? DEFAULT_SPLIT)
@@ -445,7 +459,9 @@ export class FiberDetailModal {
     this.card = null
     this.sentFiles = []
     this.openFiles = []
+    this.activePath = null
     this.rightCol = null
+    this.tabStrip = null
     this.leftCol = null
     this.divider = null
   }
@@ -618,10 +634,23 @@ export class FiberDetailModal {
 
     const right = document.createElement('div')
     right.className = 'kbn-detail-rightcol'
-    const accordion = document.createElement('div')
-    accordion.className = 'kbn-detail-accordion'
-    right.append(accordion)
-    this.rightCol = accordion
+
+    // Tab strip on top (one tab per open file); full-bleed views below it
+    // (every open file's cell, only the active one shown). "A full view, but a
+    // quick back-and-forth clicker" — tabs cost the full view no width.
+    const tabs = document.createElement('div')
+    tabs.className = 'kbn-detail-tabstrip'
+    tabs.setAttribute('role', 'tablist')
+    this.tabStrip = tabs
+
+    const views = document.createElement('div')
+    views.className = 'kbn-detail-views'
+    this.rightCol = views
+
+    // Cmd/Ctrl + wheel zooms the active file (images, HTML, PDF — everything).
+    views.addEventListener('wheel', (e) => this.handleZoomWheel(e), { passive: false })
+
+    right.append(tabs, views)
 
     const divider = document.createElement('div')
     divider.className = 'kbn-detail-divider'
@@ -656,6 +685,7 @@ export class FiberDetailModal {
     this.rightCol.parentElement?.remove() // the .kbn-detail-rightcol wrapper
     this.divider?.remove()
     this.rightCol = null
+    this.tabStrip = null
     this.divider = null
     overlay.classList.remove('kbn-detail-twocol')
     // Clear the inline flex-basis applySplit() wrote so the left column falls
@@ -1560,7 +1590,7 @@ export class FiberDetailModal {
       const label = labelByPath.get(entry.file.fullPath)
       if (label && label !== entry.file.basename) {
         entry.file.basename = label
-        const name = entry.panel.querySelector('.kbn-detail-acc-name')
+        const name = entry.tab.querySelector('.kbn-detail-tab-name')
         if (name) name.textContent = label
       }
     }
@@ -1568,124 +1598,105 @@ export class FiberDetailModal {
     this.writePersist()
   }
 
-  // ── The accordion ───────────────────────────────────────────────────────
+  // ── The tabbed full-view ────────────────────────────────────────────────
 
   /**
-   * Open `file` in the right-column accordion, or — if already open — bump it
-   * to the top and expand it. Revealing the right column on first open. This
-   * is the single entry the launcher and rehydration both funnel through, so
-   * recency + persistence stay consistent.
+   * Open `file` in the right column and make it the active (shown) tab. If it's
+   * already open, just switch to its tab — tabs keep a stable open-order
+   * (browser-style; they don't reorder on click). This is the single entry the
+   * launcher and rehydration both funnel through, so the tab set + persistence
+   * stay consistent.
    */
-  private activateFile(file: SentFile, card: KanbanCard, opts?: { expanded?: boolean; scroll?: number; persist?: boolean }): void {
-    const existing = this.openFiles.find((e) => e.file.fullPath === file.fullPath)
-    if (existing) {
-      // Re-activate: move to top + expand.
-      this.openFiles = [existing, ...this.openFiles.filter((e) => e !== existing)]
-      this.setExpanded(existing, true)
-      this.relayoutAccordion()
-      this.syncLauncherActiveState()
-      if (opts?.persist !== false) this.writePersist()
-      existing.panel.scrollIntoView({ block: 'nearest' })
-      return
-    }
-
-    this.revealRightColumn()
-    const entry = this.buildAccordionEntry(file, card, opts?.expanded ?? true, opts?.scroll ?? 0)
-    // Newest activation goes to the top of the recency order.
-    this.openFiles = [entry, ...this.openFiles]
-    this.relayoutAccordion()
+  private activateFile(file: SentFile, card: KanbanCard, opts?: { scroll?: number; zoom?: number; persist?: boolean }): void {
+    const entry =
+      this.openFiles.find((e) => e.file.fullPath === file.fullPath) ??
+      this.addOpenFile(file, card, opts?.scroll ?? 0, opts?.zoom ?? 1)
+    this.setActive(entry, card)
     this.syncLauncherActiveState()
     if (opts?.persist !== false) this.writePersist()
   }
 
   /**
-   * Build one collapsible accordion panel for `file`. The viewer body is built
-   * lazily on first expand (a collapsed panel doesn't fetch its file), and the
-   * iframe variant restores `initialScroll` on load and keeps `entry.scroll`
-   * fresh via a debounced scroll listener.
+   * Build a new tab + its (empty) view cell and append both in stable
+   * open-order. Reveals the right column on the first open. Does NOT activate
+   * or build the viewer — `setActive` does that lazily on first view, so
+   * background tabs cost nothing until clicked.
    */
-  private buildAccordionEntry(
-    file: SentFile,
-    card: KanbanCard,
-    expanded: boolean,
-    initialScroll: number,
-  ): OpenFileEntry {
-    const panel = document.createElement('div')
-    panel.className = 'kbn-detail-acc-panel'
+  private addOpenFile(file: SentFile, card: KanbanCard, scroll: number, zoom: number): OpenFileEntry {
+    this.revealRightColumn()
 
-    const head = document.createElement('div')
-    head.className = 'kbn-detail-acc-head'
-    head.setAttribute('role', 'button')
-    head.tabIndex = 0
-    // Decorative file-kind cue (image/audio/doc) — drives the marginal dot's
-    // tint in CSS; the basename carries the meaning, so this is purely visual.
-    head.dataset.kind = fileKind(file.fullPath)
+    const tab = document.createElement('button')
+    tab.type = 'button'
+    tab.className = 'kbn-detail-tab'
+    tab.setAttribute('role', 'tab')
+    tab.title = file.fullPath
+    // Decorative file-kind cue (image/audio/doc) → the tab's marginal dot tint.
+    tab.dataset.kind = fileKind(file.fullPath)
 
-    const chevron = document.createElement('span')
-    chevron.className = 'kbn-detail-acc-chevron'
-    chevron.setAttribute('aria-hidden', 'true')
-    chevron.textContent = expanded ? '▾' : '▸'
-
-    const kind = document.createElement('span')
-    kind.className = 'kbn-detail-acc-kind'
-    kind.setAttribute('aria-hidden', 'true')
+    const kindDot = document.createElement('span')
+    kindDot.className = 'kbn-detail-tab-kind'
+    kindDot.setAttribute('aria-hidden', 'true')
 
     const name = document.createElement('span')
-    name.className = 'kbn-detail-acc-name'
+    name.className = 'kbn-detail-tab-name'
     name.textContent = file.basename
-    name.title = file.fullPath
 
     const closeBtn = document.createElement('button')
     closeBtn.type = 'button'
-    closeBtn.className = 'kbn-detail-acc-close'
+    closeBtn.className = 'kbn-detail-tab-close'
     closeBtn.setAttribute('aria-label', `Close ${file.basename}`)
     closeBtn.textContent = '✕'
+
+    tab.append(kindDot, name, closeBtn)
+
+    const cell = document.createElement('div')
+    cell.className = 'kbn-detail-view-cell'
+    cell.hidden = true
+
+    const entry: OpenFileEntry = {
+      file,
+      tab,
+      cell,
+      scroll,
+      zoom,
+      viewerBuilt: false,
+      iframe: null,
+      zoomTarget: null,
+    }
+
+    tab.addEventListener('click', () => {
+      this.setActive(entry, card)
+      this.syncLauncherActiveState()
+      this.writePersist()
+    })
     closeBtn.addEventListener('click', (e) => {
       e.stopPropagation()
       this.closeFile(entry)
     })
 
-    head.append(chevron, kind, name, closeBtn)
-
-    const body = document.createElement('div')
-    body.className = 'kbn-detail-acc-body'
-
-    const entry: OpenFileEntry = {
-      file,
-      panel,
-      body,
-      expanded,
-      scroll: initialScroll,
-      viewerBuilt: false,
-      iframe: null,
-    }
-
-    const activate = () => {
-      // Clicking a collapsed header expands + bumps; clicking an expanded one
-      // collapses it (keeping the others), per the accordion contract.
-      if (entry.expanded) {
-        this.setExpanded(entry, false)
-        this.writePersist()
-      } else {
-        this.activateFile(file, card)
-      }
-    }
-    head.addEventListener('click', activate)
-    head.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault()
-        activate()
-      }
-    })
-
-    panel.append(head, body)
-    if (expanded) this.buildEntryViewer(entry, card)
-    this.reflectExpanded(entry)
+    this.openFiles = [...this.openFiles, entry]
+    this.tabStrip?.append(tab)
+    this.rightCol?.append(cell)
     return entry
   }
 
-  /** Build the viewer body for an entry (idempotent — once per entry). Wires
-   *  scroll-restore + a debounced scroll-position writer for iframe files. */
+  /** Make `entry` the active tab: show its cell (build its viewer on first
+   *  view), hide the rest, highlight its tab. Preserves every other open
+   *  cell's DOM (scroll + zoom survive the switch). */
+  private setActive(entry: OpenFileEntry, card: KanbanCard): void {
+    this.activePath = entry.file.fullPath
+    if (!entry.viewerBuilt) this.buildEntryViewer(entry, card)
+    for (const e of this.openFiles) {
+      const on = e === entry
+      e.cell.hidden = !on
+      e.tab.classList.toggle('kbn-detail-tab-active', on)
+      e.tab.setAttribute('aria-selected', String(on))
+    }
+  }
+
+  /** Build the viewer for an entry (idempotent — once per entry). Wires
+   *  scroll-restore + a debounced scroll-position writer for iframe files, and
+   *  records the element Cmd-scroll zoom scales. */
   private buildEntryViewer(entry: OpenFileEntry, card: KanbanCard): void {
     if (entry.viewerBuilt) return
     entry.viewerBuilt = true
@@ -1714,41 +1725,64 @@ export class FiberDetailModal {
           }
         : undefined,
     )
-    entry.body.append(viewer)
+    entry.cell.append(viewer)
+    // The whole viewer element is the zoom target — scaling it magnifies the
+    // image / iframe render uniformly; the cell (overflow:auto) becomes the pan
+    // surface. Restore any persisted zoom.
+    entry.zoomTarget = viewer
+    this.applyZoom(entry)
   }
 
-  /** Expand or collapse an entry, building its viewer on first expand. */
-  private setExpanded(entry: OpenFileEntry, expanded: boolean): void {
-    if (entry.expanded === expanded) {
-      if (expanded && !entry.viewerBuilt && this.card) this.buildEntryViewer(entry, this.card)
-      return
-    }
-    entry.expanded = expanded
-    if (expanded && !entry.viewerBuilt && this.card) this.buildEntryViewer(entry, this.card)
-    this.reflectExpanded(entry)
+  /** Cmd/Ctrl + wheel over the active file zooms it, anchored on the cursor
+   *  (the point under the pointer stays put). Works for images, HTML, and PDF —
+   *  it scales the rendered viewer box and pans via the cell's scroll. A plain
+   *  wheel (no modifier) is left alone, so normal scrolling still works. */
+  private handleZoomWheel(e: WheelEvent): void {
+    if (!(e.metaKey || e.ctrlKey)) return
+    const entry = this.openFiles.find((x) => x.file.fullPath === this.activePath)
+    if (!entry || !entry.zoomTarget) return
+    e.preventDefault()
+    const cell = entry.cell
+    const rect = cell.getBoundingClientRect()
+    const cursorX = e.clientX - rect.left
+    const cursorY = e.clientY - rect.top
+    const zOld = entry.zoom
+    const zNew = Math.min(6, Math.max(0.25, zOld * Math.exp(-e.deltaY * 0.0015)))
+    if (zNew === zOld) return
+    // Content-space point under the cursor (pre-zoom) — keep it fixed.
+    const px = (cell.scrollLeft + cursorX) / zOld
+    const py = (cell.scrollTop + cursorY) / zOld
+    entry.zoom = zNew
+    this.applyZoom(entry)
+    cell.scrollLeft = px * zNew - cursorX
+    cell.scrollTop = py * zNew - cursorY
+    this.queueScrollWrite()
   }
 
-  /** Mirror an entry's expanded state into its DOM (class + chevron + body). */
-  private reflectExpanded(entry: OpenFileEntry): void {
-    entry.panel.classList.toggle('kbn-detail-acc-expanded', entry.expanded)
-    const chevron = entry.panel.querySelector('.kbn-detail-acc-chevron')
-    if (chevron) chevron.textContent = entry.expanded ? '▾' : '▸'
-    entry.body.hidden = !entry.expanded
+  /** Mirror an entry's zoom into its viewer element via the CSS `zoom`
+   *  property (Chromium): unlike `transform: scale`, `zoom` grows the element's
+   *  layout box, so the cell's `overflow:auto` gives real scrollbars to pan the
+   *  magnified file. */
+  private applyZoom(entry: OpenFileEntry): void {
+    const t = entry.zoomTarget
+    if (!t) return
+    if (entry.zoom === 1) t.style.removeProperty('zoom')
+    else t.style.setProperty('zoom', String(entry.zoom))
   }
 
-  /** Re-append accordion panels in recency order (index 0 on top). */
-  private relayoutAccordion(): void {
-    if (!this.rightCol) return
-    for (const entry of this.openFiles) {
-      this.rightCol.append(entry.panel) // append moves existing nodes
-      this.reflectExpanded(entry)
-    }
-  }
-
-  /** Close one open file. Dissolves the right column if it was the last. */
+  /** Close one open file. Switches to the nearest remaining tab if it was
+   *  active; dissolves the right column if it was the last. */
   private closeFile(entry: OpenFileEntry): void {
-    entry.panel.remove()
+    const wasActive = this.activePath === entry.file.fullPath
+    const idx = this.openFiles.indexOf(entry)
+    entry.tab.remove()
+    entry.cell.remove()
     this.openFiles = this.openFiles.filter((e) => e !== entry)
+    if (wasActive) {
+      this.activePath = null
+      const next = this.openFiles[idx] ?? this.openFiles[idx - 1]
+      if (next && this.card) this.setActive(next, this.card)
+    }
     this.syncLauncherActiveState()
     if (this.openFiles.length === 0) this.hideRightColumn()
     this.writePersist()
@@ -1771,11 +1805,12 @@ export class FiberDetailModal {
     if (!uid) return
     savePersist(uid, {
       split: this.openFiles.length > 0 ? this.splitFrac : undefined,
+      active: this.activePath ?? undefined,
       open: this.openFiles.map((e) => ({
         path: e.file.fullPath,
         basename: e.file.basename,
-        expanded: e.expanded,
         scroll: e.scroll,
+        zoom: e.zoom,
       })),
     })
   }
@@ -1791,9 +1826,9 @@ export class FiberDetailModal {
    */
   private rehydrateOpenFiles(card: KanbanCard, persist: DetailPersist): void {
     if (persist.open.length === 0) return
-    // Reverse so the FIRST persisted entry (top of accordion) ends up on top
-    // after each activation prepends.
-    for (const saved of [...persist.open].reverse()) {
+    // Add every tab in the saved (stable) order without activating — building
+    // each viewer lazily would load every iframe up front.
+    for (const saved of persist.open) {
       const file: SentFile = {
         fullPath: saved.path,
         // Prefer the persisted display label (preserves the disambiguated
@@ -1801,12 +1836,15 @@ export class FiberDetailModal {
         basename: saved.basename ?? basenameOf(saved.path),
         timestamp: 0,
       }
-      this.activateFile(file, card, {
-        expanded: saved.expanded,
-        scroll: saved.scroll,
-        persist: false,
-      })
+      this.addOpenFile(file, card, saved.scroll, saved.zoom ?? 1)
     }
+    // Restore the active tab (persisted, else the last opened) — this builds
+    // only that one viewer; the others build on first click.
+    const active =
+      this.openFiles.find((e) => e.file.fullPath === persist.active) ??
+      this.openFiles[this.openFiles.length - 1]
+    if (active) this.setActive(active, card)
+    this.syncLauncherActiveState()
   }
 
   /**
