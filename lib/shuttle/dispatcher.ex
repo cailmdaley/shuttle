@@ -1105,7 +1105,22 @@ defmodule Shuttle.Dispatcher do
         )
 
         resume_prompt = render_resume_prompt(fiber_id, prompt_opts)
-        command = Agents.build_resume_command(agent, session_id, resume_prompt)
+        resume_command = Agents.build_resume_command(agent, session_id, resume_prompt)
+
+        # Try resume; fall back to a fresh launch if the harness can't resume the
+        # target session. claude --resume exits non-zero ("No conversation found")
+        # when the on-disk transcript is gone — without a fallback the worker dies
+        # in <1s and, because the daemon keeps re-selecting the same id from
+        # history, the fiber flaps forever and can never be launched (the
+        # own-words deadlock). The fallback reuses the SAME session id, so
+        # `claude --session-id <id>` recreates the transcript under it and the next
+        # resume succeeds — the fiber self-heals. `||` keeps the resume failure
+        # non-fatal under `set -e`; harness-agnostic (no knowledge of where any CLI
+        # stores transcripts — the run itself reports success or failure).
+        fallback_command =
+          fresh_fallback_command(agent, fiber_id, session_id, prompt_context, prompt_opts)
+
+        command = "#{resume_command} || #{fallback_command}"
 
         # claude --resume shows an interactive "you're about to use a
         # previous session" warning that only an Enter keypress at the
@@ -1149,6 +1164,22 @@ defmodule Shuttle.Dispatcher do
           error ->
             error
         end
+    end
+  end
+
+  # The fresh launch a resume falls back to when the target session is gone.
+  # Carries the FULL dispatch prompt (the worker is starting a new conversation,
+  # not waking an existing one). For claude it reuses the resume target's id via
+  # `--session-id`, so the new session is created UNDER that id and the next
+  # dispatch can resume it — the fiber self-heals after one fresh run. Other
+  # harnesses get a plain fresh session (no --session-id); they still recover (the
+  # launch succeeds), they just don't reuse the id.
+  defp fresh_fallback_command(agent, fiber_id, session_id, prompt_context, opts) do
+    prompt = render_context_prompt(fiber_id, prompt_context, opts)
+
+    case agent.cli do
+      "claude" -> Agents.build_command(agent, prompt, session_id: session_id)
+      _ -> Agents.build_command(agent, prompt)
     end
   end
 
