@@ -590,18 +590,33 @@
    its hit area beyond its visual line via padding-collapse (the ::before grip
    is the visible mark; the element itself is the 10px target). */
 .kbn-detail-divider {
-  flex: 0 0 10px;
+  flex: 0 0 11px;
   position: relative;
   cursor: col-resize;
   background: linear-gradient(
-    rgba(27, 22, 17, 0.04),
-    rgba(27, 22, 17, 0.06)
+    90deg,
+    rgba(255, 251, 237, 0.45),
+    rgba(27, 22, 17, 0.05) 45%,
+    rgba(27, 22, 17, 0.07) 55%,
+    rgba(255, 251, 237, 0.3)
   );
-  border-left: 1px solid rgba(27, 22, 17, 0.10);
-  border-right: 1px solid rgba(255, 251, 237, 0.5);
+  border-left: 1px solid rgba(27, 22, 17, 0.09);
+  border-right: 1px solid rgba(255, 251, 237, 0.45);
   touch-action: none;
   z-index: 4;
+  transition: background 0.16s ease;
 }
+.kbn-detail-divider:hover,
+.kbn-detail-overlay.kbn-detail-resizing .kbn-detail-divider {
+  background: linear-gradient(
+    90deg,
+    rgba(194, 150, 59, 0.08),
+    rgba(194, 150, 59, 0.16) 50%,
+    rgba(194, 150, 59, 0.08)
+  );
+}
+/* The grip: a slim ruled pair of beads centered in the gutter — a manuscript
+   binding stitch. Gilds on hover/drag. */
 .kbn-detail-divider::before {
   content: "";
   position: absolute;
@@ -609,28 +624,38 @@
   left: 50%;
   transform: translate(-50%, -50%);
   width: 2px;
-  height: 34px;
+  height: 38px;
   border-radius: 2px;
-  background: rgba(27, 22, 17, 0.22);
+  background: rgba(27, 22, 17, 0.2);
   box-shadow:
-    -3px 0 0 -1px rgba(27, 22, 17, 0.14),
-    3px 0 0 -1px rgba(27, 22, 17, 0.14);
-  transition: background 0.15s ease;
+    -3px 0 0 -1px rgba(27, 22, 17, 0.12),
+    3px 0 0 -1px rgba(27, 22, 17, 0.12);
+  transition: background 0.16s ease, height 0.16s ease, box-shadow 0.16s ease;
 }
-.kbn-detail-divider:hover::before {
+.kbn-detail-divider:hover::before,
+.kbn-detail-overlay.kbn-detail-resizing .kbn-detail-divider::before {
   background: var(--porch-ochre, #C2963B);
+  height: 52px;
+  box-shadow:
+    -3px 0 0 -1px rgba(194, 150, 59, 0.55),
+    3px 0 0 -1px rgba(194, 150, 59, 0.55);
 }
 
-/* The right column: a vellum file zone, the accordion scrolls inside it. */
+/* The right column: a vellum file zone, the accordion scrolls inside it.
+   A touch darker and warmer than the left card so the seam reads as a true
+   fold in the page — the deliverables sit on their own shelf of vellum, lit
+   from the top corner. */
 .kbn-detail-rightcol {
   flex: 1 1 0;
   min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  background: var(--porch-panel, #EDE8E0);
+  background: var(--porch-panel, #E8E0D2);
   background-image:
-    radial-gradient(ellipse 600px 400px at 80% 8%, rgba(255, 251, 237, 0.4), transparent 60%);
+    radial-gradient(ellipse 620px 420px at 82% 4%, rgba(255, 251, 237, 0.55), transparent 62%),
+    radial-gradient(ellipse 540px 460px at 8% 96%, rgba(27, 22, 17, 0.04), transparent 64%);
+  box-shadow: inset 7px 0 14px -10px rgba(27, 22, 17, 0.22);
 }
 .kbn-detail-accordion {
   flex: 1 1 auto;
@@ -638,8 +663,21 @@
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 12px 12px 16px;
+  gap: 11px;
+  padding: 13px 13px 18px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(154, 123, 53, 0.35) transparent;
+}
+.kbn-detail-accordion::-webkit-scrollbar { width: 9px; }
+.kbn-detail-accordion::-webkit-scrollbar-thumb {
+  background: rgba(154, 123, 53, 0.3);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+.kbn-detail-accordion::-webkit-scrollbar-thumb:hover {
+  background: rgba(154, 123, 53, 0.5);
+  background-clip: content-box;
 }
 
 /* ── One accordion panel ─────────────────────────────────────────────────
@@ -650,47 +688,114 @@
   display: flex;
   flex-direction: column;
   min-height: 0;
-  border: 1px solid rgba(27, 22, 17, 0.14);
-  border-radius: 4px;
-  background: #FFFDF6;
-  box-shadow: 0 1px 2px rgba(27, 22, 17, 0.06);
+  border: 1px solid rgba(27, 22, 17, 0.13);
+  border-radius: 5px;
+  background: var(--porch-rag, #FFFDF6);
+  box-shadow:
+    0 1px 0 rgba(255, 251, 237, 0.7) inset,
+    0 1px 2px rgba(27, 22, 17, 0.05),
+    0 5px 14px -8px rgba(27, 22, 17, 0.16);
   overflow: hidden;
   flex: 0 0 auto;
+  /* A freshly opened panel slides in from the launcher; collapsing/recency
+     re-order reuses the same node so it only fires once, on creation. */
+  animation: kbn-acc-reveal 0.32s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  transition: box-shadow 0.18s ease, border-color 0.18s ease;
+}
+@keyframes kbn-acc-reveal {
+  from { opacity: 0; transform: translateY(-7px) scale(0.992); }
+  to   { opacity: 1; transform: none; }
 }
 /* An expanded panel grows to fill the column so its file gets real reading
    room; collapsed panels stay as slim header bars. When several are expanded
-   they share the space evenly (flex:1 each). */
+   they share the space evenly (flex:1 each). The expanded panel lifts a touch
+   and wears a gilt left spine — the same ochre rule the outcome lede carries,
+   so an open file reads as a quoted page. */
 .kbn-detail-acc-panel.kbn-detail-acc-expanded {
   flex: 1 1 0;
-  min-height: 180px;
+  min-height: 184px;
+  border-color: rgba(154, 123, 53, 0.34);
+  box-shadow:
+    0 1px 0 rgba(255, 251, 237, 0.8) inset,
+    0 2px 4px rgba(27, 22, 17, 0.06),
+    0 9px 22px -10px rgba(27, 22, 17, 0.2);
+}
+/* The collapsed bar wants a subtle hover lift so it reads as openable. */
+.kbn-detail-acc-panel:not(.kbn-detail-acc-expanded):hover {
+  border-color: rgba(154, 123, 53, 0.4);
+  box-shadow:
+    0 1px 0 rgba(255, 251, 237, 0.7) inset,
+    0 2px 5px rgba(27, 22, 17, 0.08),
+    0 7px 16px -9px rgba(27, 22, 17, 0.2);
+}
+@media (prefers-reduced-motion: reduce) {
+  .kbn-detail-acc-panel { animation: none; }
 }
 .kbn-detail-acc-head {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 7px 8px 7px 10px;
+  gap: 9px;
+  padding: 8px 9px 8px 12px;
   cursor: pointer;
   flex: 0 0 auto;
+  position: relative;
   border-bottom: 1px solid transparent;
-  background: linear-gradient(rgba(154, 123, 53, 0.06), rgba(154, 123, 53, 0.03));
+  background: linear-gradient(rgba(154, 123, 53, 0.07), rgba(154, 123, 53, 0.025));
   user-select: none;
+  transition: background 0.16s ease;
 }
 .kbn-detail-acc-head:hover {
-  background: linear-gradient(rgba(154, 123, 53, 0.12), rgba(154, 123, 53, 0.06));
+  background: linear-gradient(rgba(154, 123, 53, 0.15), rgba(154, 123, 53, 0.07));
 }
 .kbn-detail-acc-head:focus-visible {
   outline: 2px solid rgba(154, 123, 53, 0.5);
   outline-offset: -2px;
 }
+/* The gilt spine: a ruled ochre edge on an expanded panel's header, lit like
+   the lede's left border. Drawn as a ::before so it sits flush with the rounded
+   panel corner and never disturbs the header's flex flow. */
+.kbn-detail-acc-head::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--porch-ochre, #C2963B);
+  opacity: 0;
+  transition: opacity 0.18s ease;
+}
 .kbn-detail-acc-expanded .kbn-detail-acc-head {
-  border-bottom-color: rgba(27, 22, 17, 0.10);
+  background: linear-gradient(rgba(154, 123, 53, 0.16), rgba(154, 123, 53, 0.07));
+  border-bottom-color: rgba(154, 123, 53, 0.22);
+}
+.kbn-detail-acc-expanded .kbn-detail-acc-head::before {
+  opacity: 1;
 }
 .kbn-detail-acc-chevron {
   flex: 0 0 auto;
-  width: 11px;
-  font-size: 10px;
+  width: 12px;
+  font-size: 9px;
+  line-height: 1;
   color: #9A7B35;
+  text-align: center;
+  transition: transform 0.18s ease, color 0.16s ease;
 }
+.kbn-detail-acc-head:hover .kbn-detail-acc-chevron { color: #6B5526; }
+/* A small marginal mark for the file kind — an illuminated dot tinted by
+   extension (set in TS as data-kind). Purely decorative; the basename carries
+   the meaning. */
+.kbn-detail-acc-kind {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgba(154, 123, 53, 0.55);
+  box-shadow: 0 0 0 1px rgba(27, 22, 17, 0.08);
+}
+.kbn-detail-acc-head[data-kind="image"] .kbn-detail-acc-kind { background: var(--porch-verdigris, #3F8278); }
+.kbn-detail-acc-head[data-kind="audio"] .kbn-detail-acc-kind { background: var(--porch-cobalt, #3D5BA0); }
+.kbn-detail-acc-head[data-kind="doc"]   .kbn-detail-acc-kind { background: var(--porch-ochre, #C2963B); }
 .kbn-detail-acc-name {
   flex: 1 1 auto;
   min-width: 0;
@@ -699,7 +804,13 @@
   white-space: nowrap;
   font-family: var(--font-mono, 'JetBrains Mono', monospace);
   font-size: 12px;
-  color: #2E2A26;
+  letter-spacing: 0.01em;
+  color: #4A443C;
+  transition: color 0.16s ease;
+}
+.kbn-detail-acc-expanded .kbn-detail-acc-name {
+  color: #2E2418;
+  font-weight: 600;
 }
 .kbn-detail-acc-close {
   flex: 0 0 auto;
@@ -708,13 +819,17 @@
   color: #9A8F80;
   font-size: 12px;
   line-height: 1;
-  padding: 3px 5px;
-  border-radius: 2px;
+  padding: 4px 6px;
+  border-radius: 3px;
   cursor: pointer;
+  opacity: 0.7;
+  transition: color 0.14s ease, background 0.14s ease, opacity 0.14s ease;
 }
+.kbn-detail-acc-head:hover .kbn-detail-acc-close { opacity: 1; }
 .kbn-detail-acc-close:hover {
   color: #8C3B2E;
-  background: rgba(140, 59, 46, 0.08);
+  background: rgba(140, 59, 46, 0.1);
+  opacity: 1;
 }
 .kbn-detail-acc-body {
   flex: 1 1 auto;
@@ -993,65 +1108,131 @@
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 5px;
-  padding: 9px 14px 11px;
+  gap: 7px;
+  padding: 10px 16px 12px;
   border-top: 1px solid rgba(27, 22, 17, 0.08);
-  background: rgba(154, 123, 53, 0.05);
+  /* A faint warm shelf of vellum the deliverables rest on, lit from above by a
+     hairline highlight so the strip reads as its own band of the page. */
+  background:
+    linear-gradient(rgba(255, 251, 237, 0.5), transparent 12px),
+    rgba(154, 123, 53, 0.055);
+  box-shadow: inset 0 1px 0 rgba(255, 251, 237, 0.55);
   /* The launcher can hold many entries on a long-running card; cap its height
      and let it scroll so it never pushes the body off-screen. */
   max-height: 30cqh;
   overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(154, 123, 53, 0.3) transparent;
 }
 .kbn-detail-sent-empty {
   display: none;
 }
 .kbn-detail-sent-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-family: var(--font-mono, 'JetBrains Mono', monospace);
   font-size: 9.5px;
-  letter-spacing: 0.14em;
+  letter-spacing: 0.16em;
   text-transform: uppercase;
-  color: #9A8F80;
+  color: #9A7B35;
+}
+/* A short gilt rule after the label — the manuscript section mark. */
+.kbn-detail-sent-heading::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: linear-gradient(90deg, rgba(154, 123, 53, 0.28), transparent 70%);
 }
 .kbn-detail-sent-list {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 8px;
+  gap: 6px 7px;
 }
+/* A deliverable ticket: a small tactile chip that lifts on hover and fills with
+   ochre when its file is open in the accordion. */
 .kbn-detail-sent-file {
   display: inline-flex;
   align-items: baseline;
-  gap: 6px;
+  gap: 7px;
   max-width: 100%;
-  padding: 2px 8px;
-  border: 1px solid rgba(154, 123, 53, 0.35);
-  border-radius: 3px;
-  background: rgba(255, 251, 237, 0.6);
+  padding: 3px 9px 4px;
+  border: 1px solid rgba(154, 123, 53, 0.32);
+  border-radius: 4px;
+  background:
+    linear-gradient(rgba(255, 251, 237, 0.85), rgba(255, 251, 237, 0.55));
+  box-shadow:
+    0 1px 0 rgba(255, 251, 237, 0.7) inset,
+    0 1px 2px rgba(27, 22, 17, 0.05);
   font-family: var(--font-mono, 'JetBrains Mono', monospace);
   font-size: 11px;
-  color: #2E2A26;
+  color: #4A443C;
   cursor: pointer;
+  transition: border-color 0.14s ease, background 0.14s ease, box-shadow 0.14s ease, transform 0.12s ease, color 0.14s ease;
 }
 .kbn-detail-sent-file:hover {
-  border-color: #9A7B35;
-  background: rgba(255, 251, 237, 0.95);
+  border-color: rgba(154, 123, 53, 0.62);
+  background: linear-gradient(#FFFDF6, rgba(255, 251, 237, 0.85));
+  box-shadow:
+    0 1px 0 rgba(255, 251, 237, 0.85) inset,
+    0 3px 7px -2px rgba(27, 22, 17, 0.18);
+  transform: translateY(-1px);
+  color: #2E2A26;
+}
+.kbn-detail-sent-file:active {
+  transform: translateY(0);
+  box-shadow:
+    0 1px 0 rgba(255, 251, 237, 0.6) inset,
+    0 1px 2px rgba(27, 22, 17, 0.06);
+}
+.kbn-detail-sent-file:focus-visible {
+  outline: 2px solid rgba(154, 123, 53, 0.5);
+  outline-offset: 1px;
 }
 /* An entry whose file is open in the right-column accordion: a filled ochre
-   chip so the launcher mirrors what's on screen at a glance. */
+   ticket with a leading gilt bead, so the launcher mirrors what's on screen at
+   a glance. */
 .kbn-detail-sent-file-open {
   border-color: var(--porch-ochre, #C2963B);
-  background: rgba(196, 147, 51, 0.18);
+  background: linear-gradient(rgba(196, 147, 51, 0.22), rgba(196, 147, 51, 0.14));
   color: #5e4a1f;
+  box-shadow:
+    0 1px 0 rgba(255, 251, 237, 0.5) inset,
+    0 1px 2px rgba(27, 22, 17, 0.05);
 }
-.kbn-detail-sent-file-open .kbn-detail-sent-when {
-  color: #8a7a4a;
+.kbn-detail-sent-file-open:hover {
+  border-color: var(--porch-ochre, #C2963B);
+  background: linear-gradient(rgba(196, 147, 51, 0.3), rgba(196, 147, 51, 0.18));
+  color: #4a3a16;
 }
 .kbn-detail-sent-name {
+  position: relative;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* The open ticket grows a gilt bead before its name. */
+.kbn-detail-sent-file-open .kbn-detail-sent-name {
+  padding-left: 12px;
+}
+.kbn-detail-sent-file-open .kbn-detail-sent-name::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--porch-ochre, #C2963B);
+  box-shadow: 0 0 0 1px rgba(110, 85, 38, 0.25);
+}
 .kbn-detail-sent-when {
   flex-shrink: 0;
   font-size: 9.5px;
-  color: #7A7368;
+  letter-spacing: 0.02em;
+  color: #9A8F80;
+}
+.kbn-detail-sent-file-open .kbn-detail-sent-when {
+  color: #8a7a4a;
 }

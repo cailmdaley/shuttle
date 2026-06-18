@@ -8,7 +8,7 @@ import {
   attachPanelResize,
   readPanelGeometry,
 } from './FloatingPanelChrome.js'
-import { buildFileViewer, basenameOf, isScrollableFile } from './FileViewerPanel.js'
+import { buildFileViewer, basenameOf, isScrollableFile, extOf, IMAGE_EXTS, AUDIO_EXTS } from './FileViewerPanel.js'
 import { fileBytesUrl } from './utils.js'
 import './FiberDetailModal.css'
 
@@ -55,7 +55,15 @@ interface SentFile {
 interface DetailPersist {
   /** Fraction of the two-column inner width given to the LEFT (card) pane. */
   split?: number
-  open: Array<{ path: string; expanded: boolean; scroll: number }>
+  /**
+   * `basename` is the file's display label as the trail provided it — which can
+   * differ from the path tail in the disambiguation case (two distinct files
+   * both literally named `report.html`, distinguished as
+   * `standalone-kanban-report.html` vs `morning-post-report.html`). Persisting
+   * it keeps the accordion header label stable across reload; legacy records
+   * without it fall back to `basenameOf(path)`.
+   */
+  open: Array<{ path: string; basename?: string; expanded: boolean; scroll: number }>
 }
 
 /**
@@ -650,6 +658,10 @@ export class FiberDetailModal {
     this.rightCol = null
     this.divider = null
     overlay.classList.remove('kbn-detail-twocol')
+    // Clear the inline flex-basis applySplit() wrote so the left column falls
+    // back to the CSS default `.kbn-detail-leftcol { flex: 1 1 100% }` and
+    // fills the single-column width — otherwise it stays stuck at the split %.
+    this.leftCol?.style.removeProperty('flex')
 
     const vw = window.innerWidth
     const width = Math.min(this.singleColWidth || SINGLE_COL_WIDTH, vw - 24)
@@ -1469,7 +1481,21 @@ export class FiberDetailModal {
     void this.fetchSentFiles(card).then((files) => {
       // Panel may have closed/reopened while the fetch was in flight.
       if (!overlayAtBuild()?.contains(wrap)) return
-      this.sentFiles = files
+      // Disambiguate same-named files BEFORE anything reads the trail. Neither
+      // real data source distinguishes two files both literally named
+      // `report.html` (the endpoint and the events.jsonl parser each emit a bare
+      // path tail), so without this the launcher and accordion would show two
+      // identical `report.html` rows — defeating the whole "tell them apart"
+      // ask. The disambiguated label flows into the launcher, the accordion
+      // header, and persistence uniformly.
+      this.sentFiles = disambiguateBasenames(files)
+      // Reconcile any already-rehydrated accordion entries against the trail's
+      // (now disambiguated) basename. Rehydration fires off persisted records
+      // before the trail resolves; a legacy record (no persisted basename) or
+      // one whose disambiguated label has since changed gets corrected here so
+      // the accordion header matches the launcher rather than collapsing to the
+      // bare path tail.
+      this.reconcileOpenBasenames(this.sentFiles)
       if (files.length === 0) return
       this.renderLauncher(list, card)
       wrap.classList.remove('kbn-detail-sent-empty')
@@ -1518,6 +1544,28 @@ export class FiberDetailModal {
         const open = !!row.dataset.fullPath && openPaths.has(row.dataset.fullPath)
         row.classList.toggle('kbn-detail-sent-file-open', open)
       })
+  }
+
+  /**
+   * Once the trail resolves, align each open accordion entry's display label
+   * with the trail's authoritative basename (matched by full path). Without
+   * this, an entry rehydrated from a legacy persist record — or before the
+   * trail's disambiguation ran — would keep the bare path tail, producing two
+   * visually identical `report.html` headers for two genuinely distinct files.
+   */
+  private reconcileOpenBasenames(files: SentFile[]): void {
+    if (this.openFiles.length === 0) return
+    const labelByPath = new Map(files.map((f) => [f.fullPath, f.basename]))
+    for (const entry of this.openFiles) {
+      const label = labelByPath.get(entry.file.fullPath)
+      if (label && label !== entry.file.basename) {
+        entry.file.basename = label
+        const name = entry.panel.querySelector('.kbn-detail-acc-name')
+        if (name) name.textContent = label
+      }
+    }
+    // Persist the corrected labels so the next reload starts from truth.
+    this.writePersist()
   }
 
   // ── The accordion ───────────────────────────────────────────────────────
@@ -1569,11 +1617,18 @@ export class FiberDetailModal {
     head.className = 'kbn-detail-acc-head'
     head.setAttribute('role', 'button')
     head.tabIndex = 0
+    // Decorative file-kind cue (image/audio/doc) — drives the marginal dot's
+    // tint in CSS; the basename carries the meaning, so this is purely visual.
+    head.dataset.kind = fileKind(file.fullPath)
 
     const chevron = document.createElement('span')
     chevron.className = 'kbn-detail-acc-chevron'
     chevron.setAttribute('aria-hidden', 'true')
     chevron.textContent = expanded ? '▾' : '▸'
+
+    const kind = document.createElement('span')
+    kind.className = 'kbn-detail-acc-kind'
+    kind.setAttribute('aria-hidden', 'true')
 
     const name = document.createElement('span')
     name.className = 'kbn-detail-acc-name'
@@ -1590,7 +1645,7 @@ export class FiberDetailModal {
       this.closeFile(entry)
     })
 
-    head.append(chevron, name, closeBtn)
+    head.append(chevron, kind, name, closeBtn)
 
     const body = document.createElement('div')
     body.className = 'kbn-detail-acc-body'
@@ -1718,6 +1773,7 @@ export class FiberDetailModal {
       split: this.openFiles.length > 0 ? this.splitFrac : undefined,
       open: this.openFiles.map((e) => ({
         path: e.file.fullPath,
+        basename: e.file.basename,
         expanded: e.expanded,
         scroll: e.scroll,
       })),
@@ -1740,7 +1796,9 @@ export class FiberDetailModal {
     for (const saved of [...persist.open].reverse()) {
       const file: SentFile = {
         fullPath: saved.path,
-        basename: basenameOf(saved.path),
+        // Prefer the persisted display label (preserves the disambiguated
+        // basename); fall back to the path tail for legacy records.
+        basename: saved.basename ?? basenameOf(saved.path),
         timestamp: 0,
       }
       this.activateFile(file, card, {
@@ -1780,9 +1838,24 @@ export class FiberDetailModal {
       // Network error — fall through to the local events.jsonl fallback.
     }
 
-    // ── Fallback: parse events.jsonl over /file (LOCAL origin only) ──
-    const local = !card.originId || card.originId === 'local'
-    if (!local) return []
+    // ── Fallback: parse the LOCAL events.jsonl over /file ──
+    // The old gate was `card.originId === 'local'`, which is NEVER true for a
+    // real local card: the composite feed stamps local rows with the daemon's
+    // own host id (`own_host_id()`, e.g. `dapmcw68`) and sets the feed's top-
+    // level `host` to that same id — so a local card has `originId === feed.host`
+    // (a hostname), not the literal `'local'`. That false gate short-circuited
+    // the fallback for every real local card, so until `/api/v1/sent-files`
+    // deploys, cards showed no sent files — the exact bug this path exists to
+    // fix.
+    //
+    // `FiberDetailModal` isn't handed `feed.host`, so we can't name the local
+    // host from the card alone. We don't need to: the read below is pinned to
+    // the LOCAL daemon (`fileBytesUrl(..., 'local')` emits no `&origin=`, so the
+    // route reads this machine's file — never a remote tunnel). A remote card's
+    // sends live in the *remote* host's events.jsonl, so parsing the local log
+    // for a remote uid simply yields `[]`. Thus the only real gate is "can we
+    // derive a home to point at" — and the cost is bounded (one local read,
+    // once per panel-open, primary endpoint already tried).
     const home = homeFromDir(card.fiberDir)
     if (!home) return []
     const eventsPath = `${home}/.portolan/data/events.jsonl`
@@ -2522,12 +2595,62 @@ function clampSplit(frac: number): number {
   return Math.max(MIN_PANE_FRAC, Math.min(1 - MIN_PANE_FRAC, frac))
 }
 
+/** Decorative file-kind class for the accordion header's marginal dot. Mirrors
+ *  the viewer's own by-extension dispatch (image / audio / everything-else),
+ *  so the dot's tint tracks how the file actually renders. Purely visual. */
+function fileKind(path: string): 'image' | 'audio' | 'doc' {
+  const ext = extOf(path)
+  if (IMAGE_EXTS.has(ext)) return 'image'
+  if (AUDIO_EXTS.has(ext)) return 'audio'
+  return 'doc'
+}
+
 /**
  * Derive the user's home dir from a fiber's directory — the first two path
  * segments on macOS/Linux (`/Users/<name>` or `/home/<name>`). The
  * events.jsonl fallback reads `<home>/.portolan/data/events.jsonl`. Returns
  * null for a path too shallow to carry a home (or absent).
  */
+/**
+ * Give each sent file a display label that's unique within the trail. The data
+ * sources (the `/api/v1/sent-files` endpoint and the events.jsonl parser) each
+ * emit a bare path tail, so two distinct files both named `report.html` would be
+ * indistinguishable in the launcher and the accordion. Where a basename
+ * collides, walk up the path one parent segment at a time, prefixing
+ * `parent-…/basename` (joined by `/`) until every colliding file's label is
+ * distinct (e.g. `morning-post/report.html` vs `standalone-kanban/report.html`).
+ * Files whose basename is already unique keep the bare name. The full path stays
+ * available as the row/header `title` tooltip. Returns a new array; inputs are
+ * not mutated (recency order is preserved).
+ */
+function disambiguateBasenames(files: SentFile[]): SentFile[] {
+  const tail = (p: string) => p.split('/').filter(Boolean)
+  const byBase = new Map<string, SentFile[]>()
+  for (const f of files) {
+    const base = tail(f.fullPath).pop() ?? f.fullPath
+    ;(byBase.get(base) ?? byBase.set(base, []).get(base)!).push(f)
+  }
+  const labelFor = new Map<string, string>()
+  for (const [base, group] of byBase) {
+    if (group.length === 1) {
+      labelFor.set(group[0].fullPath, base)
+      continue
+    }
+    // Collision: extend each label leftward until all are distinct (or we run
+    // out of parent segments — then the fullest path stands in).
+    const segs = group.map((f) => tail(f.fullPath))
+    let depth = 1
+    const maxDepth = Math.max(...segs.map((s) => s.length))
+    while (depth < maxDepth) {
+      depth += 1
+      const labels = segs.map((s) => s.slice(-depth).join('/'))
+      if (new Set(labels).size === group.length) break
+    }
+    group.forEach((f, i) => labelFor.set(f.fullPath, segs[i].slice(-depth).join('/')))
+  }
+  return files.map((f) => ({ ...f, basename: labelFor.get(f.fullPath) ?? f.basename }))
+}
+
 function homeFromDir(dir: string | undefined): string | null {
   if (!dir || !dir.startsWith('/')) return null
   const segs = dir.split('/').filter(Boolean)

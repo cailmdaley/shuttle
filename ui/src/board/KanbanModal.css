@@ -797,11 +797,19 @@
      illuminated title rather than hanging from its baseline. */
   display: flex; align-items: center; justify-content: space-between;
   width: 100%;
+  /* border-box so the side padding sits INSIDE the 100% width. Without it the
+     content-box head measures 100% + 28px (its own h-padding) — wider than the
+     column — so the right-aligned round action hangs ~28px past the column edge
+     and `.kbn-col`'s `overflow:hidden` slices it into a half-moon. With
+     border-box the action seats against the right padding, fully inside the
+     clip box. */
+  box-sizing: border-box;
   /* Padding hugs the illuminated character — top/bottom just enough to
      keep the F1 flourish overlay from clipping the hairline rule or the
-     column edge above. Side padding stays generous so the rule reads as
-     ruled, not bracketed. */
-  padding: 4px 14px 3px;
+     column edge above. The right pad is widened to 12px so the 28px circle
+     clears its 2-4px drop shadow + the 1.06 hover scale without touching the
+     column's clip edge; left stays generous so the rule reads as ruled. */
+  padding: 4px 12px 3px 14px;
   border: none;
   /* Single hairline rule under the head — a touch warmer than the
      previous near-invisible setting so it reads as a deliberate stroke,

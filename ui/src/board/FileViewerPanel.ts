@@ -58,11 +58,16 @@ export function buildFileViewer(
   const src = fileViewerSrc(shuttleBase, fullPath, originId)
 
   if (IMAGE_EXTS.has(ext)) {
+    // Mount the plate on a vellum mat so it reads as a mounted figure, centered
+    // with breathing room, rather than a bitmap bled to the cell edge.
+    const wrap = document.createElement('div')
+    wrap.className = 'kbn-fileview-image-wrap'
     const img = document.createElement('img')
     img.className = 'kbn-fileview-image'
     img.src = src
     img.alt = basenameOf(fullPath)
-    return img
+    wrap.append(img)
+    return wrap
   }
 
   if (AUDIO_EXTS.has(ext)) {

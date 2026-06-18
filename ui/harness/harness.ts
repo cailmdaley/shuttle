@@ -22,9 +22,20 @@
  *
  * Query params drive the scenario:
  *   ?open=2        — pre-open the first 2 sent files into the accordion
+ *   ?close=1       — open 1 file, then close it → the panel must GLIDE BACK to a
+ *                    proper full-width single column (regression guard: the
+ *                    left column must not stay stuck at the split flex-basis)
  *   ?recency=1     — open 3, then re-activate the oldest to show it bump to top
  *   ?reload=1      — open 2 files, tear the modal down, re-instantiate +
  *                    re-open the SAME card → confirm persistence rehydrates
+ *   ?fallback=1    — make `/api/v1/sent-files` 404 (an older daemon) and serve
+ *                    a real events.jsonl blob over `/api/v1/file` → exercises
+ *                    the events.jsonl FALLBACK path for a realistic LOCAL card
+ *                    (originId = a hostname, NOT the literal 'local'). This is
+ *                    the path the default scenario can't reach (it mocks the
+ *                    endpoint 200), so it's the only guard against the gate bug
+ *                    where `originId === 'local'` short-circuited every real
+ *                    local card.
  */
 import { FiberDetailModal } from '../src/board/FiberDetailModal.js'
 import type { KanbanCard } from '../src/board/KanbanTypes.js'
@@ -62,6 +73,19 @@ const MOCK_SENT_FILES = [
   { fullPath: '/Users/cd280747/loom/.felt/ai-futures/portolan/standalone-kanban/report.html', basename: 'standalone-kanban-report.html', timestamp: Date.now() - 5 * 24 * 60 * 60_000, sessionId: '' },
 ]
 
+// A realistic events.jsonl blob for the ?fallback scenario: three SendUserFile
+// pre_tool_use events whose tmux ULID == MOCK_UID, files == the same three
+// deliverables. The parser keys off `tool`, `tmuxSession` (ULID), numeric
+// `timestamp`, and `toolInput.files` — exactly the real hook shape. The two
+// `report.html` rows share a basename, so this also exercises disambiguation on
+// the real fallback data (not just the disambiguated endpoint mock).
+const FALLBACK_EVENTS_JSONL = [
+  { tool: 'SendUserFile', tmuxSession: `morning-post-${MOCK_UID}-shuttle`, sessionId: 's1', timestamp: Date.now() - 5 * 24 * 60 * 60_000, toolInput: { files: ['/Users/cd280747/loom/.felt/ai-futures/portolan/standalone-kanban/report.html'] } },
+  { tool: 'PreToolUse', tmuxSession: `morning-post-${MOCK_UID}-shuttle`, timestamp: Date.now() - 60_000 },
+  { tool: 'SendUserFile', tmuxSession: `morning-post-${MOCK_UID}-shuttle`, sessionId: 's1', timestamp: Date.now() - 48 * 60_000, toolInput: { files: ['/Users/cd280747/loom/.felt/work/spectra/desi-bao-v1.png'] } },
+  { tool: 'SendUserFile', tmuxSession: `morning-post-${MOCK_UID}-shuttle`, sessionId: 's1', timestamp: Date.now() - 2 * 60_000, toolInput: { files: ['/Users/cd280747/loom/.felt/loom/email/morning-post/report.html'] } },
+].map((e) => JSON.stringify(e)).join('\n')
+
 // Map a mock daemon path → a real fixture file:// URL for the iframe/img.
 const FIXTURE_MAP: Record<string, string> = {
   '/Users/cd280747/loom/.felt/loom/email/morning-post/report.html': FIXTURE_REPORT,
@@ -76,7 +100,12 @@ const MOCK_CARD: KanbanCard = {
   path: '/Users/cd280747/loom/.felt/ai-futures/portolan/standalone-kanban/board-chrome-redesign/board-chrome-redesign.md',
   fiberDir: '/Users/cd280747/loom/.felt/ai-futures/portolan/standalone-kanban/board-chrome-redesign',
   feltStore: '/Users/cd280747/loom',
-  originId: 'local',
+  // A real LOCAL card's originId is the daemon's own host id (a hostname), NOT
+  // the literal 'local' — the composite feed stamps local rows with
+  // own_host_id() and sets feed.host to the same. Using the realistic shape
+  // here is what lets the ?fallback scenario exercise the (previously broken)
+  // local-ness gate; 'local' would have masked the bug.
+  originId: 'dapmcw68',
   status: 'active',
   outcome: 'BUILDING: chrome redesign + the new two-column multi-file viewer for the fiber panel. This lede shows the manuscript outcome treatment.',
   tags: ['constitution', 'kanban', 'portolan', 'design'],
@@ -85,6 +114,7 @@ const MOCK_CARD: KanbanCard = {
 }
 
 // ── Fetch stub: stand in for the daemon ──────────────────────────────────────
+const FALLBACK_MODE = new URLSearchParams(location.search).get('fallback') === '1'
 const realFetch = window.fetch.bind(window)
 window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
@@ -94,8 +124,19 @@ window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url.includes('/api/v1/fibers/') && url.includes('body=true')) {
     return json({ fibers: [{ fiber: { body: MOCK_BODY } }] })
   }
-  // Sent files (the proper endpoint — exercises the PRIMARY data path)
-  if (url.includes('/api/v1/sent-files')) return json({ files: MOCK_SENT_FILES })
+  // events.jsonl over the /file route — the FALLBACK data source. Matched
+  // before the generic /file pass-through; only relevant in ?fallback mode.
+  if (FALLBACK_MODE && url.includes('/api/v1/file') && url.includes('events.jsonl')) {
+    return new Response(FALLBACK_EVENTS_JSONL, { status: 200, headers: { 'Content-Type': 'text/plain' } })
+  }
+  // Sent files. Default: the proper endpoint (PRIMARY data path). In ?fallback
+  // mode: 404 like an older daemon, forcing the events.jsonl fallback so the
+  // local-ness gate is actually exercised for a realistic (hostname) originId.
+  if (url.includes('/api/v1/sent-files')) {
+    return FALLBACK_MODE
+      ? new Response('not found', { status: 404 })
+      : json({ files: MOCK_SENT_FILES })
+  }
   // Parent-picker index
   if (url.includes('/api/v1/fibers') && !url.includes('body=true')) return json({ fibers: [] })
   // Agent registry
@@ -159,6 +200,18 @@ window.setTimeout(() => {
   const openN = Number(params.get('open') ?? '0')
   const recency = params.get('recency') === '1'
   const reload = params.get('reload') === '1'
+  const closeLast = params.get('close') === '1'
+
+  if (closeLast) {
+    // Open the newest file, then close it via the accordion ✕. The panel must
+    // glide back to a full-width single column — guards the hideRightColumn()
+    // bug where the left column stayed pinned at the split flex-basis.
+    launcherClick(0)
+    window.setTimeout(() => {
+      document.querySelector<HTMLButtonElement>('.kbn-detail-acc-close')?.click()
+    }, 350)
+    return
+  }
 
   if (reload) {
     // Open the first two files (newest first → file 0, then file 1), give them
