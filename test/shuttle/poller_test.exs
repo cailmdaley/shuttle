@@ -319,6 +319,23 @@ defmodule Shuttle.PollerTest do
   # :poll_world → apply → dispatch → spawn_tmux), and under CPU load (the full
   # suite, or a tight repeat loop) a tick that used to land in <500ms can slip
   # well past it. The tight ceiling was the dominant intrinsic-timing flake here.
+  # Companion to wait_until for when the check IS the assertion (e.g. a pattern
+  # match or a snapshot-shape assert). A fixed `Process.sleep` before such an
+  # assert raced the async poll under load; this re-runs the assertion every 25ms
+  # (~3s ceiling), catching its own failure, so it passes the instant the polled
+  # state settles and costs nothing when it already has.
+  defp assert_eventually(fun, attempts \\ 120) do
+    fun.()
+  rescue
+    error in [ExUnit.AssertionError, MatchError] ->
+      if attempts > 0 do
+        Process.sleep(25)
+        assert_eventually(fun, attempts - 1)
+      else
+        reraise(error, __STACKTRACE__)
+      end
+  end
+
   defp wait_until(fun, attempts \\ 120)
   defp wait_until(fun, 0), do: fun.()
 
@@ -1255,9 +1272,10 @@ defmodule Shuttle.PollerTest do
       )
 
     send(poller, :run_poll_cycle)
-    Process.sleep(100)
 
-    assert [%{fiber_id: ^fiber_id, state: "running"}] = Poller.snapshot(poller).eligible
+    assert_eventually(fn ->
+      assert [%{fiber_id: ^fiber_id, state: "running"}] = Poller.snapshot(poller).eligible
+    end)
   end
 
   # Awaiting is a DOCUMENT fact (status:closed + untempered), not a runtime-store
@@ -1291,14 +1309,15 @@ defmodule Shuttle.PollerTest do
       )
 
     send(poller, :run_poll_cycle)
-    Process.sleep(100)
 
-    {:ok, actions} = Poller.actions_for(poller, fiber_id, [])
-    ids = Enum.map(actions, &(Map.get(&1, :id) || Map.get(&1, "id")))
-    assert "accept-run" in ids
+    assert_eventually(fn ->
+      {:ok, actions} = Poller.actions_for(poller, fiber_id, [])
+      ids = Enum.map(actions, &(Map.get(&1, :id) || Map.get(&1, "id")))
+      assert "accept-run" in ids
 
-    assert {:ok, %{id: "accept-run"}} =
-             Poller.resolve_action(poller, fiber_id, "tempered", [])
+      assert {:ok, %{id: "accept-run"}} =
+               Poller.resolve_action(poller, fiber_id, "tempered", [])
+    end)
   end
 
   # Accepting a standing run through the Poller re-arms the felt document
@@ -1459,14 +1478,15 @@ defmodule Shuttle.PollerTest do
     Process.sleep(50)
 
     send(poller, :run_poll_cycle)
-    Process.sleep(50)
 
-    new_session_count =
-      MockRunner.commands()
-      |> Enum.filter(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
-      |> length()
+    assert_eventually(fn ->
+      new_session_count =
+        MockRunner.commands()
+        |> Enum.filter(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
+        |> length()
 
-    assert new_session_count == 1
+      assert new_session_count == 1
+    end)
   end
 
   test "ad-hoc dispatch refuses an awaiting standing role only when NOT forced" do
@@ -1783,12 +1803,13 @@ defmodule Shuttle.PollerTest do
       )
 
     send(poller, :run_poll_cycle)
-    Process.sleep(100)
 
-    assert [%{fiber_id: "tests/standing-due", state: "running", run_id: run_id}] =
-             Poller.snapshot(poller).eligible
+    assert_eventually(fn ->
+      assert [%{fiber_id: "tests/standing-due", state: "running", run_id: run_id}] =
+               Poller.snapshot(poller).eligible
 
-    assert is_binary(run_id)
+      assert is_binary(run_id)
+    end)
 
     # Simulate the worker exit. In production the exit handler's standing branch
     # writes status:closed to the felt document (mark_standing_awaiting) BEFORE it
@@ -1819,14 +1840,15 @@ defmodule Shuttle.PollerTest do
     refute Enum.any?(Poller.snapshot(poller).retrying, &(&1.fiber_id == "tests/standing-due"))
 
     send(poller, :run_poll_cycle)
-    Process.sleep(50)
 
-    new_session_count =
-      MockRunner.commands()
-      |> Enum.filter(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
-      |> length()
+    assert_eventually(fn ->
+      new_session_count =
+        MockRunner.commands()
+        |> Enum.filter(fn {cmd, args} -> cmd == "tmux" and hd(args) == "new-session" end)
+        |> length()
 
-    assert new_session_count == 1
+      assert new_session_count == 1
+    end)
 
     refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
              cmd == "felt" and Enum.take(args, 2) == ["standing", "review"]
@@ -2004,13 +2026,14 @@ defmodule Shuttle.PollerTest do
       )
 
     send(poller, :run_poll_cycle)
-    Process.sleep(100)
 
-    commands = MockRunner.commands()
+    assert_eventually(fn ->
+      commands = MockRunner.commands()
 
-    assert Enum.any?(commands, fn {cmd, args} ->
-             cmd == "tmux" and hd(args) == "new-session"
-           end)
+      assert Enum.any?(commands, fn {cmd, args} ->
+               cmd == "tmux" and hd(args) == "new-session"
+             end)
+    end)
   end
 
   test "poller does not double-dispatch" do
@@ -2058,20 +2081,22 @@ defmodule Shuttle.PollerTest do
 
     # Dispatch
     send(poller, :run_poll_cycle)
-    Process.sleep(100)
 
-    snap1 = Poller.snapshot(poller)
-    assert length(snap1.eligible) == 1
+    assert_eventually(fn ->
+      snap1 = Poller.snapshot(poller)
+      assert length(snap1.eligible) == 1
+    end)
 
     # Simulate worker exit (tmux session dies). The claim is released; the fiber
     # is no longer running and no longer retrying (the retry queue is gone).
     MockRunner.remove_tmux_session(Dispatcher.session_name("tests/haiku-retry"))
     send(poller, {:worker_exited, "tests/haiku-retry", :normal_exit, false})
-    Process.sleep(50)
 
-    snap2 = Poller.snapshot(poller)
-    assert length(snap2.eligible) == 0
-    assert snap2.retrying == []
+    assert_eventually(fn ->
+      snap2 = Poller.snapshot(poller)
+      assert length(snap2.eligible) == 0
+      assert snap2.retrying == []
+    end)
 
     # The next poll re-dispatches it: a second new-session call.
     send(poller, :run_poll_cycle)
@@ -2235,11 +2260,12 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_fiber("tests/haiku-close", %{fiber | "status" => "closed"})
     MockRunner.remove_tmux_session(Dispatcher.session_name("tests/haiku-close"))
     send(poller, {:worker_exited, "tests/haiku-close", :normal_exit, false})
-    Process.sleep(50)
 
-    snap = Poller.snapshot(poller)
-    assert snap.claimed_count == 0
-    assert length(snap.retrying) == 0
+    assert_eventually(fn ->
+      snap = Poller.snapshot(poller)
+      assert snap.claimed_count == 0
+      assert length(snap.retrying) == 0
+    end)
   end
 
   test "poller adopts orphan tmux sessions on startup" do
@@ -2254,11 +2280,11 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
-    Process.sleep(100)
-
-    snap = Poller.snapshot(poller)
-    assert length(snap.eligible) == 1
-    assert hd(snap.eligible).fiber_id == "tests/orphan"
+    assert_eventually(fn ->
+      snap = Poller.snapshot(poller)
+      assert length(snap.eligible) == 1
+      assert hd(snap.eligible).fiber_id == "tests/orphan"
+    end)
   end
 
   test "poller adopts a uid-carrying fiber's worker under the new uid-keyed session" do
@@ -2276,10 +2302,10 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
-    Process.sleep(100)
-
-    snap = Poller.snapshot(poller)
-    assert Enum.any?(snap.eligible, &(&1.fiber_id == fiber_id and &1.state == "running"))
+    assert_eventually(fn ->
+      snap = Poller.snapshot(poller)
+      assert Enum.any?(snap.eligible, &(&1.fiber_id == fiber_id and &1.state == "running"))
+    end)
   end
 
   test "poller adopts a uid-carrying fiber's LEGACY-named worker (dual-recognition)" do
@@ -2302,10 +2328,10 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
-    Process.sleep(100)
-
-    snap = Poller.snapshot(poller)
-    assert Enum.any?(snap.eligible, &(&1.fiber_id == fiber_id and &1.state == "running"))
+    assert_eventually(fn ->
+      snap = Poller.snapshot(poller)
+      assert Enum.any?(snap.eligible, &(&1.fiber_id == fiber_id and &1.state == "running"))
+    end)
   end
 
   test "poller adopts a live orphan session for a looping pinned role (no duplicate dispatch)" do
@@ -2335,12 +2361,12 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
-    Process.sleep(100)
+    assert_eventually(fn ->
+      snap = Poller.snapshot(poller)
 
-    snap = Poller.snapshot(poller)
-
-    assert Enum.any?(snap.eligible, &(&1.fiber_id == fiber_id and &1.state == "running")),
-           "a resting pinned role with a live orphan session must be adopted as running"
+      assert Enum.any?(snap.eligible, &(&1.fiber_id == fiber_id and &1.state == "running")),
+             "a resting pinned role with a live orphan session must be adopted as running"
+    end)
   end
 
   # Retries collapsed into the poll loop (slice 6): a status:active oneshot whose
@@ -2759,16 +2785,17 @@ defmodule Shuttle.PollerTest do
       )
 
     send(poller, :run_poll_cycle)
-    Process.sleep(100)
 
     # tmux args: ["new-session", "-d", "-s", session, "-c", work_dir, "bash", "-l", script]
     # work_dir is at index 5
-    {_, args} =
-      Enum.find(MockRunner.commands(), fn {cmd, args} ->
-        cmd == "tmux" and hd(args) == "new-session"
-      end)
+    assert_eventually(fn ->
+      {_, args} =
+        Enum.find(MockRunner.commands(), fn {cmd, args} ->
+          cmd == "tmux" and hd(args) == "new-session"
+        end)
 
-    assert Enum.at(args, 5) == project_dir
+      assert Enum.at(args, 5) == project_dir
+    end)
   after
     File.rm_rf(Path.join(System.tmp_dir!(), "shuttle-test-proj-*"))
   end
@@ -2832,11 +2859,11 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
-    Process.sleep(100)
-
-    snap = Poller.snapshot(poller)
-    assert [%{fiber_id: ^fiber_id, tmux_session: session}] = snap.eligible
-    assert session == Dispatcher.session_name(fiber_id)
+    assert_eventually(fn ->
+      snap = Poller.snapshot(poller)
+      assert [%{fiber_id: ^fiber_id, tmux_session: session}] = snap.eligible
+      assert session == Dispatcher.session_name(fiber_id)
+    end)
   end
 
   # Regression: a fiber with a shuttle: block but *no* constitution tag must be
@@ -3319,9 +3346,10 @@ defmodule Shuttle.PollerTest do
 
     File.write!(config_path, Jason.encode!(%{"version" => 1, "felt_stores" => ["/tmp/host-c"]}))
     send(poller, :run_poll_cycle)
-    Process.sleep(50)
 
-    assert Poller.snapshot(poller).felt_stores == ["/tmp/host-c"]
+    assert_eventually(fn ->
+      assert Poller.snapshot(poller).felt_stores == ["/tmp/host-c"]
+    end)
   end
 
   # ── Claim (write-and-claim) ──

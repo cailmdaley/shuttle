@@ -164,11 +164,17 @@ defmodule Shuttle.RemoteFiberRegistryTest do
       # auto_poll: true exercises the real production path: the tick spawns a
       # Task.Supervisor.async_nolink fetch and folds the result in via
       # handle_info, rather than refresh_now's inline fetch.
+      # tick_interval drives the auto-poll cadence (fast: fetch on the first
+      # tick — `due?` is true with no prior attempt). poll_interval drives the
+      # STALENESS threshold (stale_multiplier × poll_interval); keep it generous
+      # so the freshly-fetched feed still reads `stale: false` by the time
+      # wait_for_feed returns and we assert — at 5ms the threshold was ~5ms, so
+      # any scheduling jitter flipped the feed stale before the assertion.
       pid =
         start_supervised!(
           {RemoteFiberRegistry,
            name: :reg_async,
-           remotes: [candide(poll_interval_ms: 5)],
+           remotes: [candide(poll_interval_ms: 60_000)],
            client: MockClient,
            tick_interval_ms: 5,
            auto_poll: true}
