@@ -991,65 +991,7 @@ export class FiberDetailModal {
       actionsSec.append(actionsRow, actionsErr)
     }
 
-    // ── Tags ──────────────────────────────────────────────────────────────
-    // Chip editor matching the kanban grid card's inline tag editor. Adding
-    // a tag commits immediately on Enter; removing via the × chip button
-    // does the same. Chips reflect server state, edits atomic.
-    const tagsSec = this.buildSection('Tags')
-    const tagsErr = document.createElement('div')
-    tagsErr.className = 'kbn-detail-error'
-    tagsErr.style.display = 'none'
-
-    const tagsRow = document.createElement('div')
-    tagsRow.className = 'kbn-detail-tags-row'
-    const tagsState: { current: string[] } = {
-      current: (card.tags ?? []).filter((t) => t !== 'constitution'),
-    }
-    const tagInput = document.createElement('input')
-    tagInput.type = 'text'
-    tagInput.className = 'kbn-detail-tag-input'
-    tagInput.placeholder = 'add tag…'
-    tagInput.setAttribute('aria-label', 'Add a tag')
-    tagInput.addEventListener('mousedown', (e) => e.stopPropagation())
-    tagInput.addEventListener('click', (e) => e.stopPropagation())
-    tagInput.addEventListener('keydown', (e) => {
-      if (e.key !== 'Enter') return
-      e.preventDefault()
-      const val = tagInput.value.trim()
-      if (!val || tagsState.current.includes(val)) {
-        tagInput.value = ''
-        return
-      }
-      const next = [...tagsState.current, val]
-      void this.runTagsSave(card, next, scope, tagsState, tagsRow, tagInput, tagsErr)
-    })
-
-    const renderTags = (): void => {
-      Array.from(tagsRow.querySelectorAll('.kbn-detail-tag-chip')).forEach((n) => n.remove())
-      for (const t of tagsState.current) {
-        const chip = document.createElement('span')
-        chip.className = 'kbn-detail-tag-chip'
-        const lbl = document.createElement('span')
-        lbl.textContent = t
-        const rm = document.createElement('button')
-        rm.type = 'button'
-        rm.className = 'kbn-detail-tag-remove'
-        rm.textContent = '×'
-        rm.setAttribute('aria-label', `Remove tag ${t}`)
-        rm.addEventListener('click', (e) => {
-          e.stopPropagation()
-          const next = tagsState.current.filter((x) => x !== t)
-          void this.runTagsSave(card, next, scope, tagsState, tagsRow, tagInput, tagsErr)
-        })
-        chip.append(lbl, rm)
-        tagsRow.insertBefore(chip, tagInput)
-      }
-    }
-    tagsRow.append(tagInput)
-    renderTags()
-    // Cache the renderer on the row so runTagsSave can re-render after success.
-    ;(tagsRow as unknown as { _renderTags: () => void })._renderTags = renderTags
-    tagsSec.append(tagsRow, tagsErr)
+    // Tags editor removed (Cail) — not needed in the detail panel.
 
     // ── Worker (shuttle options) ──────────────────────────────────────────
     // Console-style editor for the fiber's shuttle frontmatter block: agent,
@@ -1544,7 +1486,7 @@ export class FiberDetailModal {
     grid.className = 'kbn-detail-controls-grid'
     const metaCol = document.createElement('div')
     metaCol.className = 'kbn-detail-controls-grid-col'
-    metaCol.append(tagsSec, parentSec)
+    metaCol.append(parentSec)
     grid.append(dispatchSec, metaCol)
 
     body.append(actionsSec, this.buildRule(), grid, footer)
@@ -2048,12 +1990,6 @@ export class FiberDetailModal {
     return `${this.shuttleBase}/api/v1/dispatch`
   }
 
-  /** Shuttle daemon raw frontmatter writer (add/remove/set/unset/due diffs),
-   *  owner-routed by `origin`. Drives tag add/remove. */
-  private feltEditUrl(): string {
-    return `${this.shuttleBase}/api/v1/felt-edit`
-  }
-
   /** POST one `/api/v1/lifecycle` action; the daemon answers plain text, so
    *  a !ok body is the error message verbatim. */
   private async postLifecycle(body: Record<string, unknown>): Promise<void> {
@@ -2233,65 +2169,6 @@ export class FiberDetailModal {
     errorEl.style.display = ''
     btn.disabled = false
     btn.textContent = originalBtnText
-  }
-
-  /**
-   * Persist the new tag set via the daemon's `/api/v1/felt-edit` and re-render
-   * the chip row on success. Stays open — tags are an inline edit, not a final
-   * gesture, so the panel doesn't close.
-   *
-   * felt-edit takes add/remove DIFFS, not a full set, so we diff the desired
-   * full tag set against the card's current full set. `constitution` (if
-   * present) sits in both, so it never lands in add or remove — it's preserved
-   * untouched without needing to be re-sent.
-   */
-  private async runTagsSave(
-    card: KanbanCard,
-    tags: string[],
-    _cityId: string | undefined,
-    state: { current: string[] },
-    _row: HTMLElement,
-    input: HTMLInputElement,
-    errorEl: HTMLElement,
-  ): Promise<void> {
-    errorEl.style.display = 'none'
-    // The visible chips filter `constitution` out (it's not user-editable),
-    // but it must survive the edit — so the desired full set re-includes it.
-    const fullTags = (card.tags ?? []).includes('constitution')
-      ? ['constitution', ...tags.filter((t) => t !== 'constitution')]
-      : tags
-    const current = card.tags ?? []
-    const add = fullTags.filter((t) => !current.includes(t))
-    const remove = current.filter((t) => !fullTags.includes(t))
-    // Nothing changed (e.g. re-adding an existing tag) — skip the round-trip.
-    if (add.length === 0 && remove.length === 0) {
-      input.value = ''
-      return
-    }
-    try {
-      const res = await fetch(this.feltEditUrl(), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fiber_id: card.id, origin: card.originId, add, remove }),
-      })
-      if (!res.ok) {
-        const detail = await res.text().catch(() => `${res.status}`)
-        throw new Error(detail || `tags ${res.status}`)
-      }
-      // Mirror server state into local; clear input; re-render chips.
-      state.current = tags.filter((t) => t !== 'constitution')
-      // Update the card object so future reads of card.tags see the new set.
-      card.tags = fullTags
-      input.value = ''
-      const ren = (_row as unknown as { _renderTags?: () => void })._renderTags
-      if (typeof ren === 'function') ren()
-      // Inform parent kanban so the grid card refreshes with the new tags.
-      this.onSaved()
-    } catch (err: unknown) {
-      const msg = (err as { message?: string })?.message ?? String(err)
-      errorEl.textContent = msg
-      errorEl.style.display = ''
-    }
   }
 
   /**

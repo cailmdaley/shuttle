@@ -334,7 +334,8 @@
 .kbn-detail-field-row {
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 7px 10px;
 }
 .kbn-detail-label {
   font-family: var(--font-mono, 'JetBrains Mono', monospace);
@@ -590,9 +591,7 @@
   padding: 0 4px 0 0;
   cursor: grab;
   touch-action: none;
-  background: linear-gradient(rgba(255, 251, 237, 0.45), rgba(27, 22, 17, 0.015));
-  border-bottom: 1px solid rgba(154, 123, 53, 0.3);
-  box-shadow: inset 0 1px 0 rgba(255, 251, 237, 0.55);
+  border-bottom: 1px solid rgba(27, 22, 17, 0.13);
 }
 .kbn-detail-overlay.kbn-detail-dragging .kbn-fileview-bar {
   cursor: grabbing;
@@ -641,54 +640,37 @@
   background: rgba(154, 123, 53, 0.3);
   border-radius: 6px;
 }
+/* Flat manuscript tabs — no rounded tops, no gradients, no raised browser-tab
+   shadow. Just ink on parchment: a muted label, and the active one marked by
+   darker ink + a gilt underline sitting on the bar's hairline. Matches the
+   card's charcoal-rule + gilt-accent vocabulary. */
 .kbn-detail-tab {
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 220px;
+  max-width: 240px;
   display: flex;
   align-items: center;
-  gap: 7px;
-  padding: 6px 8px 7px 11px;
+  gap: 6px;
+  padding: 8px 10px 7px;
   cursor: pointer;
-  border: 1px solid rgba(27, 22, 17, 0.12);
-  border-bottom: none;
-  border-radius: 7px 7px 0 0;
-  background: linear-gradient(rgba(154, 123, 53, 0.06), rgba(154, 123, 53, 0.02));
-  color: #6A6155;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: #8A8073;
   user-select: none;
-  position: relative;
-  top: 1px; /* tuck inactive tabs a hair below the seam */
-  transition: background 0.16s ease, color 0.16s ease, top 0.14s ease, box-shadow 0.16s ease;
+  transition: color 0.14s ease, border-color 0.14s ease, background 0.14s ease;
 }
 .kbn-detail-tab:hover {
-  background: linear-gradient(rgba(154, 123, 53, 0.13), rgba(154, 123, 53, 0.05));
   color: #4A443C;
+  background: rgba(27, 22, 17, 0.03);
 }
 .kbn-detail-tab:focus-visible {
-  outline: 2px solid rgba(154, 123, 53, 0.5);
+  outline: 2px solid rgba(154, 123, 53, 0.45);
   outline-offset: -2px;
 }
-/* The active tab: lifted to the seam, lit parchment, a gilt top rule, and a
-   bottom edge the same colour as the view below so it reads as one surface. */
 .kbn-detail-tab-active {
-  top: 1px;
-  background: var(--porch-rag, #FFFDF6);
   color: #2E2418;
-  border-color: rgba(154, 123, 53, 0.4);
-  box-shadow:
-    inset 0 2px 0 var(--porch-ochre, #C2963B),
-    0 -2px 7px -3px rgba(27, 22, 17, 0.18);
-}
-/* Seam: the active tab's bottom border matches the view background, hiding the
-   strip's bottom rule under it. */
-.kbn-detail-tab-active::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: -1px;
-  height: 2px;
-  background: var(--porch-rag, #FFFDF6);
+  border-bottom-color: var(--porch-ochre, #C2963B);
 }
 .kbn-detail-tab-name {
   flex: 1 1 auto;
