@@ -577,42 +577,32 @@
     radial-gradient(ellipse 540px 460px at 8% 96%, rgba(27, 22, 17, 0.04), transparent 64%);
 }
 
-/* The window header: a slim manuscript drag bar — the file title to the left,
-   a ✕ to the right — echoing the card's .kbn-detail-header at a smaller scale,
-   with a gilt hairline beneath it that seams into the tab strip below (the two
-   together read as a hand-bound window head). */
-.kbn-fileview-win-header {
+/* ── The chrome bar = the tab strip itself ─────────────────────────────────
+   The viewer window has NO separate title bar: the tabs ARE the titles, and
+   this bar is the window's drag handle (empty areas drag; the tab/✕ buttons
+   opt out). It holds the horizontally-scrolling tabs (flex:1) and, pinned to
+   the right, a ✕ that closes the whole viewer. One bar, not two. */
+.kbn-fileview-bar {
   flex: 0 0 auto;
   display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 12px 8px 15px;
+  align-items: flex-end;
+  gap: 4px;
+  padding: 0 4px 0 0;
   cursor: grab;
   touch-action: none;
-  background:
-    linear-gradient(rgba(255, 251, 237, 0.5), rgba(255, 251, 237, 0));
-  border-bottom: 1px solid rgba(154, 123, 53, 0.32);
-  box-shadow: inset 0 1px 0 rgba(255, 251, 237, 0.6);
+  background: linear-gradient(rgba(255, 251, 237, 0.45), rgba(27, 22, 17, 0.015));
+  border-bottom: 1px solid rgba(154, 123, 53, 0.3);
+  box-shadow: inset 0 1px 0 rgba(255, 251, 237, 0.55);
 }
-.kbn-detail-overlay.kbn-detail-dragging .kbn-fileview-win-header {
+.kbn-detail-overlay.kbn-detail-dragging .kbn-fileview-bar {
   cursor: grabbing;
-}
-.kbn-fileview-win-title {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--font-mono, 'JetBrains Mono', monospace);
-  font-size: 11px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: #9A7B35;
 }
 .kbn-fileview-win-close {
   flex: 0 0 auto;
+  align-self: center;
   width: 20px;
   height: 20px;
+  margin-bottom: 3px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -625,27 +615,26 @@
   border-radius: 2px;
 }
 .kbn-fileview-win-close:hover {
-  color: #1B1611;
-  background: rgba(27, 22, 17, 0.06);
+  color: #8C3B2E;
+  background: rgba(140, 59, 46, 0.1);
 }
 
 /* ── Tab strip ────────────────────────────────────────────────────────────
-   A row of manuscript index-tabs across the top of the viewer window — one per
-   open file, stable order. The active tab is lit + raised and seams into the
-   full view below it; inactive tabs sit back. Overflows horizontally (thin
-   rule scrollbar) when a card has many deliverables. */
+   The row of manuscript index-tabs inside the chrome bar — one per open file,
+   stable order. The active tab is lit + raised and seams into the full view
+   below; inactive tabs sit back. Scrolls horizontally (thin rule scrollbar)
+   when a card has many deliverables; the ✕ stays pinned outside this scroll. */
 .kbn-detail-tabstrip {
-  flex: 0 0 auto;
+  flex: 1 1 auto;
+  min-width: 0;
   display: flex;
   align-items: flex-end;
   gap: 3px;
-  padding: 7px 9px 0;
+  padding: 7px 0 0 9px;
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: thin;
   scrollbar-color: rgba(154, 123, 53, 0.3) transparent;
-  background: linear-gradient(rgba(27, 22, 17, 0.05), rgba(27, 22, 17, 0));
-  border-bottom: 1px solid rgba(154, 123, 53, 0.28);
 }
 .kbn-detail-tabstrip::-webkit-scrollbar { height: 6px; }
 .kbn-detail-tabstrip::-webkit-scrollbar-thumb {

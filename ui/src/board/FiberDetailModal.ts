@@ -295,9 +295,6 @@ export class FiberDetailModal {
    *  the INTENDED geometry (default / restored / half-and-half / dragged), never
    *  a mid-animation read, so the persisted arrangement is exact. */
   private cardGeom: PanelGeometry | null = null
-  /** The viewer window header's title span — tracks the active file's
-   *  basename (or "Sent files" when nothing is active). */
-  private viewerTitle: HTMLElement | null = null
   /** Debounce handle for scroll-position persistence writes. */
   private scrollWriteTimer: number | null = null
 
@@ -524,7 +521,6 @@ export class FiberDetailModal {
     // a pair bound to one card. (closeViewerWindow nulls the viewer refs.)
     this.viewerWindow?.remove()
     this.viewerWindow = null
-    this.viewerTitle = null
     this.overlay?.remove()
     this.overlay = null
     // Viewer state is durable (localStorage) — clear only the live DOM refs so
@@ -711,33 +707,32 @@ export class FiberDetailModal {
     win.setAttribute('role', 'dialog')
     win.setAttribute('aria-label', 'Sent files')
 
-    // ── Window header: a slim manuscript drag bar (title left, ✕ right) ──
-    const winHeader = document.createElement('div')
-    winHeader.className = 'kbn-fileview-win-header'
+    // ── Chrome bar: the tab strip IS the window chrome ──
+    // No separate title bar — the tabs are the titles, and the bar itself is
+    // the drag handle (empty areas drag; the tab/✕ buttons opt out of drag).
+    // A trailing ✕, pinned right of the horizontally-scrolling tabs, closes the
+    // whole viewer (every file) at once; the card stays.
+    const bar = document.createElement('div')
+    bar.className = 'kbn-fileview-bar'
 
-    const winTitle = document.createElement('span')
-    winTitle.className = 'kbn-fileview-win-title'
-    winTitle.textContent = 'Sent files'
-    this.viewerTitle = winTitle
+    const tabs = document.createElement('div')
+    tabs.className = 'kbn-detail-tabstrip'
+    tabs.setAttribute('role', 'tablist')
+    this.tabStrip = tabs
 
     const winClose = document.createElement('button')
     winClose.type = 'button'
     winClose.className = 'kbn-fileview-win-close'
     winClose.setAttribute('aria-label', 'Close file viewer')
+    winClose.title = 'Close all files'
     winClose.textContent = '×'
     winClose.addEventListener('click', (e) => {
       e.stopPropagation()
-      // The ✕ closes the whole viewer — every open file — but leaves the card.
       this.closeViewerWindow()
       this.writePersist()
     })
-    winHeader.append(winTitle, winClose)
 
-    // ── Tab strip + full-bleed views ──
-    const tabs = document.createElement('div')
-    tabs.className = 'kbn-detail-tabstrip'
-    tabs.setAttribute('role', 'tablist')
-    this.tabStrip = tabs
+    bar.append(tabs, winClose)
 
     const views = document.createElement('div')
     views.className = 'kbn-detail-views'
@@ -746,7 +741,7 @@ export class FiberDetailModal {
     // Cmd/Ctrl + wheel zooms the active file (images, HTML, PDF — everything).
     views.addEventListener('wheel', (e) => this.handleZoomWheel(e), { passive: false })
 
-    win.append(winHeader, tabs, views)
+    win.append(bar, views)
 
     // ── Geometry ──
     // Remembered placement for this card wins; otherwise the default is
@@ -773,7 +768,7 @@ export class FiberDetailModal {
     // Drag (header bar) + resize (eight edge/corner zones) — independent of
     // the card, reusing the same chrome helpers + handle CSS. Both remember the
     // window's new geometry for this card.
-    attachPanelDrag(win, winHeader, { draggingClass: 'kbn-detail-dragging', onSettle: rememberViewer })
+    attachPanelDrag(win, bar, { draggingClass: 'kbn-detail-dragging', onSettle: rememberViewer })
     attachPanelResize(win, {
       handleClassPrefix: 'kbn-detail-rh',
       resizingClass: 'kbn-detail-resizing',
@@ -798,7 +793,6 @@ export class FiberDetailModal {
     if (this.viewerWindow) this.viewerGeom = readPanelGeometry(this.viewerWindow)
     this.viewerWindow?.remove()
     this.viewerWindow = null
-    this.viewerTitle = null
     this.rightCol = null
     this.tabStrip = null
     // The tabs + cells lived inside the window; the live open-file set dies
@@ -806,14 +800,6 @@ export class FiberDetailModal {
     this.openFiles = []
     this.activePath = null
     this.syncLauncherActiveState()
-  }
-
-  /** Sync the viewer window's header title to the active file's basename (or
-   *  "Sent files" when nothing is active). */
-  private syncViewerTitle(): void {
-    if (!this.viewerTitle) return
-    const active = this.openFiles.find((e) => e.file.fullPath === this.activePath)
-    this.viewerTitle.textContent = active ? active.file.basename : 'Sent files'
   }
 
   /** Header-strip drag. Plain pointer drag — the header is dedicated chrome,
@@ -1768,7 +1754,6 @@ export class FiberDetailModal {
       e.tab.classList.toggle('kbn-detail-tab-active', on)
       e.tab.setAttribute('aria-selected', String(on))
     }
-    this.syncViewerTitle()
     if (!entry.viewerBuilt) this.buildEntryViewer(entry, card)
   }
 
@@ -1888,7 +1873,6 @@ export class FiberDetailModal {
       if (next && this.card) this.setActive(next, this.card)
     }
     this.syncLauncherActiveState()
-    this.syncViewerTitle()
     if (this.openFiles.length === 0) this.closeViewerWindow()
     this.writePersist()
   }
