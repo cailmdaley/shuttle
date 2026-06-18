@@ -1,23 +1,44 @@
 /**
- * Offline visual-verification harness for the board's detail panel + chrome.
+ * Offline visual-verification harness for the board's two-column file viewer.
  *
  * WHY THIS EXISTS: the live daemon (:4000) is unreachable from any sandboxed
  * process (loopback is network-isolated; curl AND headless chromium both get
  * ECONNREFUSED). So the board can't be verified against the running daemon.
  * This harness builds a single self-contained IIFE bundle that mounts the real
- * components with MOCKED daemon responses, openable via `file://` and
- * screenshot-able with agent-browser. It is the verification surface for the
- * board-chrome-redesign constitution. Build: `npm run harness`. Open the
- * emitted harness-dist/index.html via file:// and screenshot.
+ * FiberDetailModal with MOCKED daemon responses, openable via `file://` and
+ * screenshot-able with agent-browser. Build: `npx vite build -c
+ * vite.harness.config.ts`; open the emitted harness-dist/index.html via file://.
  *
- * It stubs `window.fetch` for every daemon route the components touch, so what
- * you see is the real DOM/CSS the daemon would serve — only the data is mock.
+ * Two interception layers:
+ *  1. `window.fetch` is stubbed for every daemon route the components touch
+ *     (fiber body, agents, the parent index, and crucially the SENT-FILES
+ *     list) — so the data is mock but the DOM/CSS is the real thing.
+ *  2. The viewer's iframe/img `src` is a REAL navigation (NOT intercepted by
+ *     the fetch stub). To show real file content in the accordion, a
+ *     MutationObserver rewrites each `/api/v1/file?path=…` URL to a `file://`
+ *     URL of a local fixture (a real report.html / png), keyed by the mock
+ *     path. The accordion CHROME + LAYOUT is what we're judging; the fixtures
+ *     make it concrete.
+ *
+ * Query params drive the scenario:
+ *   ?open=2        — pre-open the first 2 sent files into the accordion
+ *   ?recency=1     — open 3, then re-activate the oldest to show it bump to top
+ *   ?reload=1      — open 2 files, tear the modal down, re-instantiate +
+ *                    re-open the SAME card → confirm persistence rehydrates
  */
 import { FiberDetailModal } from '../src/board/FiberDetailModal.js'
 import type { KanbanCard } from '../src/board/KanbanTypes.js'
 
 // ── Mock data ────────────────────────────────────────────────────────────────
 const MOCK_UID = '01KVBR1F9BWBVKF97473PV67K8'
+
+// Real fixtures shipped on disk — the viewer's iframe/img point at these via
+// file:// so the accordion shows actual content. (Absolute file:// URLs; the
+// rewriter maps a mock daemon path to one of these.)
+const FIXTURE_REPORT = 'file:///Users/cd280747/loom/.felt/loom/email/morning-post/report.html'
+const FIXTURE_REPORT2 = 'file:///Users/cd280747/loom/.felt/ai-futures/portolan/standalone-kanban/report.html'
+const FIXTURE_PNG = 'file:///Users/cd280747/loom/.felt/ai-futures/analysis-frontispiece/desi-bao-v1-deterministic.png'
+
 const MOCK_BODY = `The standalone Shuttle board is a lean web client the daemon serves at \`:4000\`.
 
 ## Desired State
@@ -36,10 +57,17 @@ while we iterate on the **two-column file viewer** offline.
 More prose. The point of the harness is faithful CSS, not faithful data.`
 
 const MOCK_SENT_FILES = [
-  { fullPath: '/Users/cd280747/loom/.felt/loom/email/morning-post/report.html', basename: 'report.html', timestamp: 1781735408221, sessionId: '' },
-  { fullPath: '/tmp/board-redesign-mockup.png', basename: 'board-redesign-mockup.png', timestamp: 1781732477899, sessionId: '' },
-  { fullPath: '/Users/cd280747/loom/.felt/work/Tutorials/shapepipe-overview/shapepipe-overview.html', basename: 'shapepipe-overview.html', timestamp: 1781276942949, sessionId: '' },
+  { fullPath: '/Users/cd280747/loom/.felt/loom/email/morning-post/report.html', basename: 'report.html', timestamp: Date.now() - 2 * 60_000, sessionId: '' },
+  { fullPath: '/Users/cd280747/loom/.felt/work/spectra/desi-bao-v1.png', basename: 'desi-bao-v1.png', timestamp: Date.now() - 48 * 60_000, sessionId: '' },
+  { fullPath: '/Users/cd280747/loom/.felt/ai-futures/portolan/standalone-kanban/report.html', basename: 'standalone-kanban-report.html', timestamp: Date.now() - 5 * 24 * 60 * 60_000, sessionId: '' },
 ]
+
+// Map a mock daemon path → a real fixture file:// URL for the iframe/img.
+const FIXTURE_MAP: Record<string, string> = {
+  '/Users/cd280747/loom/.felt/loom/email/morning-post/report.html': FIXTURE_REPORT,
+  '/Users/cd280747/loom/.felt/ai-futures/portolan/standalone-kanban/report.html': FIXTURE_REPORT2,
+  '/Users/cd280747/loom/.felt/work/spectra/desi-bao-v1.png': FIXTURE_PNG,
+}
 
 const MOCK_CARD: KanbanCard = {
   id: 'ai-futures/portolan/standalone-kanban/board-chrome-redesign',
@@ -66,32 +94,99 @@ window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url.includes('/api/v1/fibers/') && url.includes('body=true')) {
     return json({ fibers: [{ fiber: { body: MOCK_BODY } }] })
   }
-  // Sent files (proper endpoint, once it exists)
+  // Sent files (the proper endpoint — exercises the PRIMARY data path)
   if (url.includes('/api/v1/sent-files')) return json({ files: MOCK_SENT_FILES })
   // Parent-picker index
   if (url.includes('/api/v1/fibers') && !url.includes('body=true')) return json({ fibers: [] })
   // Agent registry
   if (url.includes('/api/v1/agents')) return json({ agents: [] })
-  // Legacy :4004 sent-files (current code path) — answer it too so the CURRENT
-  // build shows files in the harness even before the repoint lands.
-  if (url.includes('/sent-files')) return json({ files: MOCK_SENT_FILES })
 
   return realFetch(input as RequestInfo, init)
 }) as typeof fetch
 
+// ── Fixture rewriter: point real iframe/img navigations at file:// fixtures ──
+// The viewer builds `/api/v1/file?path=<ABS>` URLs; rewrite each to its fixture.
+function rewriteToFixture(el: HTMLImageElement | HTMLIFrameElement): void {
+  const src = el.getAttribute('src') ?? ''
+  const m = src.match(/[?&]path=([^&]+)/)
+  if (!m) return
+  let abs: string
+  try { abs = decodeURIComponent(m[1].replace(/%7E/g, '~')) } catch { abs = m[1] }
+  const fixture = FIXTURE_MAP[abs]
+  if (fixture && el.src !== fixture) el.src = fixture
+}
+const fixtureObserver = new MutationObserver((muts) => {
+  for (const mut of muts) {
+    for (const node of mut.addedNodes) {
+      if (!(node instanceof Element)) continue
+      node.querySelectorAll<HTMLImageElement | HTMLIFrameElement>('iframe.kbn-fileview-frame, img.kbn-fileview-image')
+        .forEach(rewriteToFixture)
+      if (node.matches('iframe.kbn-fileview-frame, img.kbn-fileview-image')) {
+        rewriteToFixture(node as HTMLIFrameElement)
+      }
+    }
+  }
+})
+fixtureObserver.observe(document.body, { childList: true, subtree: true })
+
 // ── Mount ────────────────────────────────────────────────────────────────────
 const params = new URLSearchParams(location.search)
-const modal = new FiberDetailModal(
-  '', // shuttleBase relative
-  () => {},
-  () => {},
-  undefined,
-  undefined,
-  undefined,
-  undefined,
-  {},
-)
+
+function makeModal(): FiberDetailModal {
+  return new FiberDetailModal(
+    '', // shuttleBase relative
+    () => {},
+    () => {},
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    {},
+  )
+}
+
+let modal = makeModal()
 modal.open(MOCK_CARD)
+
+// Drive scenarios after the launcher's sent-files fetch resolves (a microtask
+// or two). A short delay lets the launcher render so click-driving works.
+const launcherClick = (n: number) => {
+  const rows = document.querySelectorAll<HTMLButtonElement>('.kbn-detail-sent-file')
+  rows[n]?.click()
+}
+
+window.setTimeout(() => {
+  const openN = Number(params.get('open') ?? '0')
+  const recency = params.get('recency') === '1'
+  const reload = params.get('reload') === '1'
+
+  if (reload) {
+    // Open the first two files (newest first → file 0, then file 1), give them
+    // scroll, then tear down and re-instantiate the SAME card to prove
+    // persistence rehydrates the exact open set + order.
+    launcherClick(0)
+    launcherClick(1)
+    window.setTimeout(() => {
+      modal.close()
+      modal = makeModal()
+      modal.open(MOCK_CARD)
+      ;(window as unknown as { __harness: unknown }).__harness = { modal, MOCK_CARD, MOCK_SENT_FILES }
+    }, 700)
+    return
+  }
+
+  if (recency) {
+    // Open all three (0,1,2) then re-activate the LAST-opened-into-bottom (the
+    // oldest file, index 2 in the launcher) to bump it to the top.
+    launcherClick(0)
+    launcherClick(1)
+    launcherClick(2)
+    window.setTimeout(() => launcherClick(2), 350)
+    return
+  }
+
+  for (let i = 0; i < openN; i++) launcherClick(i)
+}, 250)
+
 // expose for agent-browser-driven interaction
 ;(window as unknown as { __harness: unknown }).__harness = { modal, MOCK_CARD, MOCK_SENT_FILES }
-void params
