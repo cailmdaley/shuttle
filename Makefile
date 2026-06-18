@@ -18,8 +18,19 @@ LOG := $(HOME)/Library/Logs/shuttle.log
 # `[b]in` prevents pgrep from matching its own shell command.
 PIDPATTERN := [b]in/shuttle -B .* -extra \.?/?bin/shuttle start
 CLI_DEST := $(HOME)/go/bin/shuttle-ctl
+AGENT_LABEL := io.shuttle.daemon
+AGENT_PLIST := $(HOME)/Library/LaunchAgents/$(AGENT_LABEL).plist
+# Felt stores the launchd daemon polls. Defaults to the loom aggregate (~/loom,
+# outside ~/Documents) so the agent touches no TCC-protected path and needs no
+# Full Disk Access. Override to add stores: make install-agent AGENT_LOOM_HOMES=~/loom,/some/other
+AGENT_LOOM_HOMES ?= $(HOME)/loom
+# The daemon's PATH, captured from a login shell at install time so it carries
+# Homebrew (escript/erl), ~/.local/bin (felt), ~/go/bin (shuttle-ctl), etc. —
+# launchd's own env is too bare, and sourcing the profile at runtime under
+# launchd doesn't reconstruct it. This is the user's real PATH, frozen.
+AGENT_PATH ?= $(shell /bin/bash -lc 'echo $$PATH')
 
-.PHONY: all build cli start stop restart logs status clean help
+.PHONY: all build cli start stop restart logs status clean help install-agent uninstall-agent
 
 # share/agents.json is the single source of truth for the agent registry.
 # The Elixir daemon reads it at compile/runtime. The Go CLI reads it at
@@ -43,6 +54,8 @@ help:
 	@echo "  make start    — start daemon detached (logs → $(LOG))"
 	@echo "  make stop     — SIGTERM the running daemon"
 	@echo "  make restart  — build + stop + start"
+	@echo "  make install-agent   — durable launchd keep-alive (crash + login restart)"
+	@echo "  make uninstall-agent — remove the launchd agent"
 	@echo "  make logs     — tail -f the daemon log"
 	@echo "  make status   — shuttle-ctl ps + snapshot summary"
 	@echo "  make clean    — remove _build and stray .beam files"
@@ -91,6 +104,37 @@ stop:
 	fi
 
 restart: build stop start
+
+# ── Durable launch (macOS LaunchAgent) ──────────────────────────────────
+# Shuttle's own keep-alive, independent of any other process. Installs a
+# launchd agent that restarts the daemon on crash (KeepAlive) and starts it
+# at login (RunAtLoad). This replaces leaning on an external supervisor for
+# the local production surface. The escript is built first so the agent has a
+# binary to run; `make stop` clears any nohup-spawned daemon so launchd owns
+# the single live instance.
+install-agent: build stop
+	@case "$(CURDIR)" in \
+	  $(HOME)/Documents/*|$(HOME)/Desktop/*|$(HOME)/Downloads/*) \
+	    echo "⚠️  $(CURDIR) is under a TCC-protected folder (~/Documents, ~/Desktop,"; \
+	    echo "    ~/Downloads). launchd-spawned processes are blocked from these, and"; \
+	    echo "    Full Disk Access does NOT inherit across the launchd process tree —"; \
+	    echo "    so the daemon will crash-loop or silently fail its felt-store walks."; \
+	    echo "    Fix: run from a checkout OUTSIDE these folders (canonical: ~/dev/shuttle)."; \
+	    echo "    Installing the agent anyway, but it will not work from here." ;; \
+	esac
+	@mkdir -p $(HOME)/Library/LaunchAgents
+	@sed -e 's#__SHUTTLE_DIR__#$(CURDIR)#g' -e 's#__LOG__#$(LOG)#g' \
+	  -e 's#__LOOM_HOMES__#$(AGENT_LOOM_HOMES)#g' -e 's#__PATH__#$(AGENT_PATH)#g' \
+	  share/io.shuttle.daemon.plist.template > $(AGENT_PLIST)
+	@launchctl unload $(AGENT_PLIST) 2>/dev/null || true
+	@launchctl load $(AGENT_PLIST)
+	@echo "loaded $(AGENT_LABEL) → daemon will keep-alive + start at login"
+	@echo "logs → $(LOG)   (launchctl list | grep shuttle  to inspect)"
+
+uninstall-agent:
+	@launchctl unload $(AGENT_PLIST) 2>/dev/null || true
+	@rm -f $(AGENT_PLIST)
+	@echo "unloaded + removed $(AGENT_LABEL)"
 
 logs:
 	@tail -f $(LOG)
