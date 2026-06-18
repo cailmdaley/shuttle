@@ -32,3 +32,7 @@ shuttle-*.tar
 
 # felt symlink (user-local; points to the user's felt store)
 .felt
+
+# offline verification harness build output
+ui/harness-dist/
+ui/harness-board-dist/
