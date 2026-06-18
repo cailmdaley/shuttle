@@ -857,10 +857,14 @@ defmodule Shuttle.RemoteRegistry.Client.Default do
     request = {String.to_charlist(url), []}
     http_opts = [{:timeout, timeout_ms}, {:connect_timeout, timeout_ms}]
 
-    case :httpc.request(:get, request, http_opts, []) do
+    # `body_format: :binary` returns the response body as a raw binary. Without
+    # it, httpc returns a charlist of *bytes*, and `List.to_string/1` then reads
+    # each byte as a Unicode codepoint and re-UTF-8-encodes it — double-encoding
+    # every multibyte char (— × é …). ASCII survives (< 128), so the corruption
+    # hides until a special character appears. Keep this binary-safe like get_file/2.
+    case :httpc.request(:get, request, http_opts, body_format: :binary) do
       {:ok, {{_, 200, _}, _headers, body}} ->
-        body_str = if is_list(body), do: List.to_string(body), else: body
-        {:ok, body_str}
+        {:ok, body}
 
       {:ok, {{_, status, _}, _headers, _body}} ->
         {:error, {:http_status, status}}
@@ -883,10 +887,9 @@ defmodule Shuttle.RemoteRegistry.Client.Default do
 
     http_opts = [{:timeout, timeout_ms}, {:connect_timeout, timeout_ms}]
 
-    case :httpc.request(:post, request, http_opts, []) do
+    case :httpc.request(:post, request, http_opts, body_format: :binary) do
       {:ok, {{_, status, _}, _headers, resp_body}} ->
-        body_str = if is_list(resp_body), do: List.to_string(resp_body), else: resp_body
-        {:ok, status, body_str}
+        {:ok, status, resp_body}
 
       {:error, reason} ->
         {:error, reason}
