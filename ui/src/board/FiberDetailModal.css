@@ -729,17 +729,6 @@
   height: 2px;
   background: var(--porch-rag, #FFFDF6);
 }
-.kbn-detail-tab-kind {
-  flex: 0 0 auto;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: rgba(154, 123, 53, 0.55);
-  box-shadow: 0 0 0 1px rgba(27, 22, 17, 0.08);
-}
-.kbn-detail-tab[data-kind="image"] .kbn-detail-tab-kind { background: var(--porch-verdigris, #3F8278); }
-.kbn-detail-tab[data-kind="audio"] .kbn-detail-tab-kind { background: var(--porch-cobalt, #3D5BA0); }
-.kbn-detail-tab[data-kind="doc"]   .kbn-detail-tab-kind { background: var(--porch-ochre, #C2963B); }
 .kbn-detail-tab-name {
   flex: 1 1 auto;
   min-width: 0;
@@ -806,10 +795,27 @@
 .kbn-detail-view-cell > .kbn-fileview-frame-wrap { width: 100%; height: 100%; }
 /* Image fills the cell as a full-view plate on a vellum mat (centered); the
    whole figure is visible at zoom 1, Cmd-scroll magnifies from there. */
+/* Image as a full-width plate, top-aligned (block, not flex-centered): the
+   whole figure fills the column width at zoom 1, and Cmd-scroll `zoom` grows it
+   PAST that — explicit `width:100%` (not object-fit/max-width) gives the image a
+   concrete layout size that `zoom` actually multiplies, so the cell overflows
+   and pans in both axes. (max-width/contain absorbed the zoom → the fit-width
+   "cap" Cail hit.) */
 .kbn-detail-view-cell > .kbn-fileview-image-wrap {
+  display: block;
   width: 100%;
   min-height: 100%;
   box-sizing: border-box;
+  padding: 0;
+}
+.kbn-detail-view-cell > .kbn-fileview-image-wrap > .kbn-fileview-image {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-width: none;
+  max-height: none;
+  object-fit: initial;
+  border-radius: 0;
 }
 .kbn-detail-view-cell > .kbn-fileview-audio { padding: 28px; }
 
