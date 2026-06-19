@@ -36,7 +36,7 @@ AGENT_PATH ?= $(shell /bin/bash -lc 'echo $$PATH')
 # ~/.ssh/agent.sock is the stable login-agent path; override if yours differs.
 AGENT_SSH_AUTH_SOCK ?= $(HOME)/.ssh/agent.sock
 
-.PHONY: all build cli start stop restart logs status clean help install-agent uninstall-agent install-hook
+.PHONY: all build cli start stop restart logs status clean help install-agent uninstall-agent
 
 # share/agents.json is the single source of truth for the agent registry.
 # The Elixir daemon reads it at compile/runtime. The Go CLI reads it at
@@ -62,7 +62,6 @@ help:
 	@echo "  make restart  — build + stop + start"
 	@echo "  make install-agent   — durable launchd keep-alive (crash + login restart)"
 	@echo "  make uninstall-agent — remove the launchd agent"
-	@echo "  make install-hook    — print the ~/.claude/settings.json hook registration"
 	@echo "  make logs     — tail -f the daemon log"
 	@echo "  make status   — shuttle-ctl ps + snapshot summary"
 	@echo "  make clean    — remove _build and stray .beam files"
@@ -143,22 +142,6 @@ uninstall-agent:
 	@launchctl unload $(AGENT_PLIST) 2>/dev/null || true
 	@rm -f $(AGENT_PLIST)
 	@echo "unloaded + removed $(AGENT_LABEL)"
-
-# ── Own the Claude Code event stream ────────────────────────────────────
-# Shuttle's WaitingTracker + SentFiles read share/shuttle-hook.sh's output at
-# ~/.shuttle/events.jsonl (with a Portolan fallback). This target prints the
-# one-line settings.json registration to wire the hook into Claude Code — it
-# does NOT edit ~/.claude/settings.json for you (that file is yours to own).
-install-hook:
-	@echo "Add this to the \"hooks\" block of ~/.claude/settings.json so every"
-	@echo "Claude Code hook event runs Shuttle's hook (repeat the command entry"
-	@echo "under each event you want tracked: PreToolUse PostToolUse Stop"
-	@echo "SubagentStop SessionStart SessionEnd UserPromptSubmit Notification):"
-	@echo ""
-	@echo '  "PreToolUse": [ { "hooks": [ { "type": "command",'
-	@echo '      "command": "$(CURDIR)/share/shuttle-hook.sh" } ] } ]'
-	@echo ""
-	@echo "events land in \$$SHUTTLE_EVENTS_FILE (default ~/.shuttle/events.jsonl)"
 
 logs:
 	@tail -f $(LOG)
