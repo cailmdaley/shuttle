@@ -37,8 +37,6 @@ defmodule Shuttle.Poller do
     WorkerWatcher
   }
 
-  @pubsub_topic "shuttle:snapshot"
-
   @default_poll_interval_ms 30_000
   @default_max_concurrent_workers 10
   @default_heartbeat_interval_ms 5_000
@@ -81,7 +79,6 @@ defmodule Shuttle.Poller do
       # reconciles entries whose tmux session has died.
       running: %{},
       claimed: MapSet.new(),
-      waiters: %{},
       reservations: %{},
       standing_roles: [],
       orphans: [],
@@ -325,17 +322,6 @@ defmodule Shuttle.Poller do
     )
   end
 
-  @spec wait_for_tempered(String.t(), non_neg_integer(), keyword()) ::
-          {:ok, atom()} | {:error, term()}
-  def wait_for_tempered(fiber_id, timeout_ms, opts \\ []),
-    do: wait_for_tempered(__MODULE__, fiber_id, timeout_ms, opts)
-
-  @spec wait_for_tempered(GenServer.server(), String.t(), non_neg_integer(), keyword()) ::
-          {:ok, atom()} | {:error, term()}
-  def wait_for_tempered(server, fiber_id, timeout_ms, opts) do
-    GenServer.call(server, {:wait, fiber_id, timeout_ms, opts})
-  end
-
   @spec reserve_resource(String.t(), String.t(), non_neg_integer(), String.t()) ::
           {:ok, atom()} | {:error, String.t()}
   def reserve_resource(resource, host, duration_ms, fiber_id),
@@ -492,7 +478,6 @@ defmodule Shuttle.Poller do
       |> Map.put(:poll_check_in_progress, false)
       |> schedule_tick(state.poll_interval_ms)
 
-    broadcast_snapshot(state)
     {:noreply, state}
   end
 
@@ -504,37 +489,12 @@ defmodule Shuttle.Poller do
       |> Map.put(:poll_check_in_progress, false)
       |> schedule_tick(state.poll_interval_ms)
 
-    broadcast_snapshot(state)
     {:noreply, state}
   end
 
   def handle_info({:worker_exited, fiber_id, reason, session_alive?}, state) do
     state = handle_worker_exit(state, fiber_id, reason, session_alive?)
-    broadcast_snapshot(state)
     {:noreply, state}
-  end
-
-  def handle_info({:wait_timeout, fiber_id, waiter_id}, state) do
-    waiters = Map.get(state.waiters, fiber_id, [])
-    {timed_out, remaining} = Enum.split_with(waiters, fn waiter -> waiter.id == waiter_id end)
-
-    Enum.each(timed_out, fn waiter ->
-      if waiter.pid, do: send(waiter.pid, {:wait_timeout, fiber_id})
-
-      if waiter.channel_topic do
-        Phoenix.PubSub.broadcast(Shuttle.PubSub, waiter.channel_topic, %{
-          event: "timed_out",
-          fiber_id: fiber_id
-        })
-      end
-    end)
-
-    new_waiters =
-      if remaining == [],
-        do: Map.delete(state.waiters, fiber_id),
-        else: Map.put(state.waiters, fiber_id, remaining)
-
-    {:noreply, %{state | waiters: new_waiters}}
   end
 
   def handle_info(msg, state) do
@@ -605,7 +565,6 @@ defmodule Shuttle.Poller do
         _ = state.runner.cmd("tmux", ["kill-session", "-t", session], stderr_to_stdout: true)
         # Pure runtime teardown — drop running entry + claim, no status write.
         state = remove_running(state, runtime_key)
-        broadcast_snapshot(state)
         {:reply, {:ok, session}, state}
     end
   end
@@ -703,51 +662,6 @@ defmodule Shuttle.Poller do
       end
 
     {:reply, result, state}
-  end
-
-  def handle_call({:wait, fiber_id, timeout_ms, opts}, _from, state) do
-    fiber_id = address_for_identifier(state, fiber_id)
-    channel_topic = Keyword.get(opts, :channel_topic)
-    notify_pid = Keyword.get(opts, :notify_pid)
-    waiter_id = Keyword.get(opts, :waiter_id, make_ref())
-
-    case fetch_fiber_full(fiber_id, state) do
-      {:ok, fiber} ->
-        if Map.get(fiber, "tempered", false) do
-          if notify_pid, do: send(notify_pid, {:tempered, fiber_id})
-
-          if channel_topic do
-            Phoenix.PubSub.broadcast(Shuttle.PubSub, channel_topic, %{
-              event: "tempered",
-              fiber_id: fiber_id
-            })
-          end
-
-          {:reply, {:ok, :already_tempered}, state}
-        else
-          timeout_ref =
-            Process.send_after(self(), {:wait_timeout, fiber_id, waiter_id}, timeout_ms)
-
-          waiters = Map.get(state.waiters, fiber_id, [])
-          waiters = replace_matching_waiter(waiters, channel_topic, notify_pid)
-
-          waiters = [
-            %{
-              id: waiter_id,
-              pid: notify_pid,
-              timeout_ref: timeout_ref,
-              channel_topic: channel_topic
-            }
-            | waiters
-          ]
-
-          {:reply, {:ok, :monitoring},
-           %{state | waiters: Map.put(state.waiters, fiber_id, waiters)}}
-        end
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
   end
 
   def handle_call({:reserve, resource, host, duration_ms, fiber_id}, _from, state) do
@@ -980,12 +894,6 @@ defmodule Shuttle.Poller do
   defp format_block_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
   defp format_block_reason(reason) when is_binary(reason), do: reason
   defp format_block_reason(reason), do: inspect(reason)
-
-  defp broadcast_snapshot(state) do
-    snap = build_snapshot(state)
-    Phoenix.PubSub.broadcast(Shuttle.PubSub, @pubsub_topic, {:snapshot, snap})
-    snap
-  end
 
   # ── Dispatch ──
 
@@ -2250,7 +2158,6 @@ defmodule Shuttle.Poller do
                 dispatch_failures: Map.delete(state.dispatch_failures, fiber_id)
             }
 
-            broadcast_snapshot(state)
             {state, {:ok, session}}
 
           {:error, reason} ->
@@ -2401,7 +2308,6 @@ defmodule Shuttle.Poller do
 
         log_worker_claim(fiber_id, agent.id, Keyword.get(opts, :session_uuid), state)
         state = refresh_document_entry(state, fiber_id)
-        broadcast_snapshot(state)
         Logger.info("Claimed session #{session} for #{fiber_id} (agent=#{agent.id})")
         {state, {:ok, %{session: session, agent_id: agent.id}}}
 
@@ -2476,7 +2382,6 @@ defmodule Shuttle.Poller do
     state = reconcile_fiber_closures(state)
     state = reconcile_missing_running_sessions(state)
     state = reconcile_orphaned_sessions(state)
-    state = reconcile_waiters(state)
     state = clean_expired_reservations(state)
     state
   end
@@ -2679,13 +2584,6 @@ defmodule Shuttle.Poller do
   # ── Worker Exit Handling ──
 
   defp handle_worker_exit(%State{} = state, fiber_id, reason, _session_alive?) do
-    # Notify any channel subscribers watching this worker
-    Phoenix.PubSub.broadcast(
-      Shuttle.PubSub,
-      "shuttle:worker:#{fiber_id}",
-      {:worker_exited, fiber_id, reason}
-    )
-
     case running_key(state, fiber_id) do
       nil ->
         state
@@ -2850,25 +2748,6 @@ defmodule Shuttle.Poller do
     %{state | claimed: MapSet.delete(state.claimed, fiber_id)}
   end
 
-  defp replace_matching_waiter(waiters, nil, nil), do: waiters
-
-  defp replace_matching_waiter(waiters, channel_topic, notify_pid) do
-    {replaced, remaining} =
-      Enum.split_with(waiters, fn waiter ->
-        (channel_topic && waiter.channel_topic == channel_topic) or
-          (notify_pid && waiter.pid == notify_pid)
-      end)
-
-    Enum.each(replaced, &cancel_waiter_timeout/1)
-    remaining
-  end
-
-  defp cancel_waiter_timeout(%{timeout_ref: timeout_ref}) when is_reference(timeout_ref) do
-    Process.cancel_timer(timeout_ref)
-  end
-
-  defp cancel_waiter_timeout(_), do: :ok
-
   defp remove_running(%State{} = state, fiber_id) do
     metadata = Map.get(state.running, fiber_id, %{})
     address = fiber_address(metadata)
@@ -2941,54 +2820,6 @@ defmodule Shuttle.Poller do
           "log_worker_exit: no felt store found for #{fiber_id}; skipping history event"
         )
     end
-  end
-
-  defp reconcile_waiters(%State{waiters: waiters} = state) when map_size(waiters) == 0, do: state
-
-  defp reconcile_waiters(%State{} = state) do
-    remaining =
-      Enum.filter(state.waiters, fn {fiber_id, waiters_list} ->
-        case fetch_fiber_full(fiber_id, state) do
-          {:ok, fiber} ->
-            if Map.get(fiber, "tempered", false) do
-              Enum.each(waiters_list, fn waiter ->
-                cancel_waiter_timeout(waiter)
-
-                if waiter.pid, do: send(waiter.pid, {:tempered, fiber_id})
-
-                if waiter.channel_topic do
-                  Phoenix.PubSub.broadcast(Shuttle.PubSub, waiter.channel_topic, %{
-                    event: "tempered",
-                    fiber_id: fiber_id
-                  })
-                end
-              end)
-
-              false
-            else
-              true
-            end
-
-          {:error, _} ->
-            Enum.each(waiters_list, fn waiter ->
-              cancel_waiter_timeout(waiter)
-
-              if waiter.pid, do: send(waiter.pid, {:tempered_error, fiber_id, :not_found})
-
-              if waiter.channel_topic do
-                Phoenix.PubSub.broadcast(Shuttle.PubSub, waiter.channel_topic, %{
-                  event: "error",
-                  fiber_id: fiber_id,
-                  reason: "not_found"
-                })
-              end
-            end)
-
-            false
-        end
-      end)
-
-    %{state | waiters: Map.new(remaining)}
   end
 
   defp clean_expired_reservations(%State{} = state) do
@@ -3426,15 +3257,12 @@ defmodule Shuttle.Poller do
         }
       end)
 
-    waiters =
-      Enum.map(state.waiters, fn {fiber_id, waiters_list} ->
-        %{fiber_id: fiber_id, waiter_count: length(waiters_list)}
-      end)
-
     Map.merge(snap, %{
       running_detail: running_detail,
       reservations: reservations,
-      waiters: waiters
+      # No waiters: the Channel transport (the only producer) was removed; the
+      # key stays for payload-shape stability and is always empty.
+      waiters: []
     })
   end
 end

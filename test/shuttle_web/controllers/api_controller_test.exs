@@ -6,13 +6,11 @@ defmodule ShuttleWeb.APIControllerTest do
   use ExUnit.Case
   import Plug.Conn
   import Phoenix.ConnTest
-  import Phoenix.ChannelTest, except: [connect: 3]
 
   @endpoint ShuttleWeb.Endpoint
 
   alias Shuttle.Poller
   alias Shuttle.Dispatcher
-  alias ShuttleWeb.UserSocket
 
   # ── Mock Runner ──
 
@@ -830,105 +828,6 @@ defmodule ShuttleWeb.APIControllerTest do
     assert StubPostClient.last() == nil
   end
 
-  # ── POST /api/v1/wait ──
-
-  test "wait returns monitoring for active fiber" do
-    fiber = make_fiber("tests/wait-active")
-    MockRunner.set_fiber("tests/wait-active", fiber)
-
-    conn =
-      post(
-        api_conn(),
-        "/api/v1/wait",
-        Jason.encode!(%{
-          "fiber_id" => "tests/wait-active",
-          "timeout_ms" => 5000
-        })
-      )
-
-    assert conn.status == 200
-    body = Jason.decode!(conn.resp_body)
-    assert body["accepted"] == true
-    assert body["status"] == "monitoring"
-    assert body["channel_topic"] == "shuttle:wait:tests/wait-active"
-  end
-
-  test "wait returns already_tempered for tempered fiber" do
-    fiber = make_fiber("tests/wait-tempered", %{"tempered" => true})
-    MockRunner.set_fiber("tests/wait-tempered", fiber)
-
-    conn =
-      post(
-        api_conn(),
-        "/api/v1/wait",
-        Jason.encode!(%{
-          "fiber_id" => "tests/wait-tempered"
-        })
-      )
-
-    assert conn.status == 200
-    body = Jason.decode!(conn.resp_body)
-    assert body["accepted"] == true
-    assert body["status"] == "already_tempered"
-  end
-
-  test "wait channel receives tempered event" do
-    fiber = make_fiber("tests/wait-channel")
-    MockRunner.set_fiber("tests/wait-channel", fiber)
-
-    conn =
-      post(
-        api_conn(),
-        "/api/v1/wait",
-        Jason.encode!(%{
-          "fiber_id" => "tests/wait-channel",
-          "timeout_ms" => 5_000
-        })
-      )
-
-    assert conn.status == 200
-    body = Jason.decode!(conn.resp_body)
-
-    {:ok, socket} = Phoenix.ChannelTest.connect(UserSocket, %{}, connect_info: %{})
-    {:ok, _reply, _channel_socket} = subscribe_and_join(socket, body["channel_topic"], %{})
-
-    MockRunner.set_fiber("tests/wait-channel", Map.put(fiber, "tempered", true))
-    send(Shuttle.Poller, :run_poll_cycle)
-
-    assert_push("tempered", payload, 500)
-    assert payload.fiber_id == "tests/wait-channel"
-  end
-
-  test "wait channel receives timeout event" do
-    fiber = make_fiber("tests/wait-timeout")
-    MockRunner.set_fiber("tests/wait-timeout", fiber)
-
-    # The wait timer starts when the POST registers the waiter, but we only
-    # subscribe to the channel AFTER the response — and Phoenix doesn't buffer a
-    # broadcast for a not-yet-joined subscriber. A 20ms timeout could fire before
-    # the connect+join finished (especially under load), so the "timed_out" push
-    # was missed. 300ms comfortably outlasts the subscribe; assert_push waits for
-    # the push, so the test is still fast.
-    conn =
-      post(
-        api_conn(),
-        "/api/v1/wait",
-        Jason.encode!(%{
-          "fiber_id" => "tests/wait-timeout",
-          "timeout_ms" => 300
-        })
-      )
-
-    assert conn.status == 200
-    body = Jason.decode!(conn.resp_body)
-
-    {:ok, socket} = Phoenix.ChannelTest.connect(UserSocket, %{}, connect_info: %{})
-    {:ok, _reply, _channel_socket} = subscribe_and_join(socket, body["channel_topic"], %{})
-
-    assert_push("timed_out", payload, 2000)
-    assert payload.fiber_id == "tests/wait-timeout"
-  end
-
   # ── POST /api/v1/reserve ──
 
   test "reserve succeeds for available resource" do
@@ -1196,25 +1095,4 @@ defmodule ShuttleWeb.APIControllerTest do
     end
   end
 
-  # ── Worker Channel ──
-
-  test "worker channel broadcasts exit events" do
-    fiber = make_fiber("tests/channel")
-    MockRunner.set_fiber("tests/channel", fiber)
-    MockRunner.set_shuttle("tests/channel", @oneshot_shuttle)
-
-    send(Shuttle.Poller, :run_poll_cycle)
-    Process.sleep(100)
-
-    {:ok, socket} = Phoenix.ChannelTest.connect(UserSocket, %{}, connect_info: %{})
-
-    {:ok, _reply, _channel_socket} =
-      subscribe_and_join(socket, "shuttle:worker:tests/channel", %{})
-
-    MockRunner.remove_tmux_session(Dispatcher.session_name("tests/channel"))
-    send(Shuttle.Poller, {:worker_exited, "tests/channel", :normal_exit, false})
-
-    assert_push("worker_exited", payload, 2000)
-    assert payload.fiber_id == "tests/channel"
-  end
 end
