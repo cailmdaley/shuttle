@@ -45,10 +45,6 @@ defmodule Shuttle.Poller do
   @pubsub_topic "shuttle:snapshot"
 
   @default_poll_interval_ms 30_000
-  # Floor for the standing cron due-window so a fast test poll interval still
-  # catches a tick that fired a beat before the poll. Cron resolution is one
-  # minute, so the window must comfortably exceed it.
-  @min_due_window_ms 90_000
   @default_max_concurrent_workers 10
   @default_heartbeat_interval_ms 5_000
   @default_stall_timeout_ms 300_000
@@ -123,16 +119,13 @@ defmodule Shuttle.Poller do
       # (frontmatter edit, pause, close).
       dispatch_failures: %{},
       # %{fiber_id => unix_ms} — the instant a standing role was re-armed by
-      # accept/resume. The cron due-window's backward edge is clamped to this
-      # (`window_start = max(now - window, rearmed_at)`) so the occurrence that
-      # JUST ran — whose tick is still inside the ~90s backward window — is not
-      # re-served the moment accept flips closed→active. Without it, accept
-      # clears the `closed` "already-ran" gate while the served tick is still in
-      # window, and the role re-fires immediately, popping straight back to
-      # awaiting review (the standing-role temper oscillation). NOT persisted:
-      # entries go stale harmlessly once `now - rearmed_at` exceeds the window
-      # (the clamp degrades to `now - window`), and a restart loses nothing the
-      # window wouldn't already have aged out.
+      # accept/resume. One of the "last serviced" signals the due rule anchors on
+      # (alongside felt-history worker events and the role's creation): it marks
+      # the just-served occurrence so the role isn't immediately re-served when
+      # accept flips closed→active. Belt-and-suspenders to the durable history
+      # signal — it covers the window where a transient felt read fails right after
+      # accept. NOT persisted; a restart loses nothing the history signal doesn't
+      # already carry.
       rearmed_at: %{}
     ]
   end
@@ -3135,6 +3128,25 @@ defmodule Shuttle.Poller do
   # don't-re-fire signal — eligible?'s `status == "closed"` clause already
   # excludes it before this is reached, and the `active → closed → active`
   # document transition is the per-cycle "already ran this cycle" gate.
+  # The one standing-role dispatch rule: an active role is due when a scheduled
+  # occurrence has elapsed since it was last serviced. "Last serviced" is the most
+  # recent of — the latest worker dispatch/exit in felt history (durable across
+  # restarts), the in-memory re-arm stamp, or the role's creation if it has never
+  # run. Expressed against the cron primitive as the lookback `now - last_serviced`:
+  # `due_by_cron?` then asks "did a tick fire after the last service, at or before
+  # now?" — i.e. is there an unrun occurrence. (A non-positive lookback ⇒ nothing
+  # elapsed since service ⇒ not due, handled by `due_by_cron?`'s guard.)
+  #
+  # This makes the schedule SELF-CATCHING: a fire missed because the daemon was
+  # down or the laptop asleep at the cron instant runs on the next poll instead —
+  # however late. One catch-up fires, not a backlog: the run writes a fresh
+  # "worker dispatched" event, advancing the anchor to ~now, so the next poll sees
+  # only the next FUTURE occurrence.
+  #
+  # Awaiting review can't relaunch: a role that ran is `status: closed` until a
+  # human tempers (accepts) it back to `active`, and `eligible?`'s status gate
+  # excludes closed before this is ever reached. So this rule only governs an
+  # already-armed role; it never resurrects one pending review.
   defp standing_role_due?(fiber, state) do
     fiber_id = Map.get(fiber, "id", "")
 
@@ -3143,39 +3155,66 @@ defmodule Shuttle.Poller do
          true <- dependencies_satisfied?(fiber_id, state),
          {:ok, role} <- fetch_standing_role(fiber_id, state) do
       now = DateTime.utc_now()
-      window = rearm_clamped_window(state, fiber_id, now)
-      StandingRole.due_by_cron?(role, now, window)
+      now_ms = DateTime.to_unix(now, :millisecond)
+      lookback = now_ms - last_serviced_at_ms(fiber, fiber_id, state, now_ms)
+      StandingRole.due_by_cron?(role, now, lookback)
     else
       _ -> false
     end
   end
 
-  # The due-window, with its backward edge clamped to the role's last re-arm
-  # instant: `window_start = max(now - base_window, rearmed_at)`, expressed as a
-  # window length `min(base_window, now - rearmed_at)`. A role re-armed `n` ms
-  # ago can only serve ticks newer than `n` ms — so the occurrence that just ran
-  # (whose tick is at-or-before the re-arm) is never re-served. `due_by_cron?`
-  # treats a non-positive window as "not due", which is correct at the instant
-  # of re-arm. Roles never re-armed (or re-armed long ago) get the full window.
-  defp rearm_clamped_window(state, fiber_id, now) do
-    base = due_window_ms(state)
-
-    case Map.get(state.rearmed_at, fiber_id) do
-      nil -> base
-      rearmed_ms -> min(base, DateTime.to_unix(now, :millisecond) - rearmed_ms)
+  # Unix-ms the role was last serviced — the most recent of its worker lifecycle
+  # events, its re-arm stamp, and its creation. Defaults to `now_ms` (⇒ zero
+  # lookback ⇒ not due) only in the impossible case that none are known.
+  defp last_serviced_at_ms(fiber, fiber_id, state, now_ms) do
+    [
+      last_service_event_ms(fiber_id, state),
+      Map.get(state.rearmed_at, fiber_id),
+      created_at_ms(fiber)
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> case do
+      [] -> now_ms
+      list -> Enum.max(list)
     end
   end
 
-  # The cron due-window: a standing tick is due if it fired inside
-  # `(now - window, now]`. Anchored to the poll interval (doubled for jitter
-  # slack, with a floor) so consecutive polls' windows overlap and no tick falls
-  # between them, while a tick that fired before the window — daemon down across
-  # it — is skipped, not replayed (the morning-post-drift rule).
-  defp due_window_ms(%State{poll_interval_ms: interval})
-       when is_integer(interval) and interval > 0,
-       do: max(interval * 2, @min_due_window_ms)
+  # Unix-ms of the most recent worker lifecycle event ("worker dispatched" /
+  # "worker exited") in felt history. nil when there are none (never run) or felt
+  # is unreadable.
+  defp last_service_event_ms(fiber_id, state) do
+    with {:ok, felt_store} <- host_for_fiber(fiber_id, state),
+         {output, 0} <-
+           System.cmd("felt", ["-C", felt_store, "history", fiber_id, "--last", "20", "--json"],
+             stderr_to_stdout: true
+           ),
+         {:ok, events} when is_list(events) <- Jason.decode(output) do
+      events
+      |> Enum.filter(fn event ->
+        text = get_in(event, ["payload", "text"]) || ""
+        String.contains?(text, "worker dispatched") or String.contains?(text, "worker exited")
+      end)
+      |> Enum.map(&iso_to_unix_ms(Map.get(&1, "occurred_at")))
+      |> Enum.reject(&is_nil/1)
+      |> case do
+        [] -> nil
+        list -> Enum.max(list)
+      end
+    else
+      _ -> nil
+    end
+  end
 
-  defp due_window_ms(_), do: @min_due_window_ms
+  defp created_at_ms(fiber), do: iso_to_unix_ms(Map.get(fiber, "created_at"))
+
+  defp iso_to_unix_ms(iso) when is_binary(iso) and iso != "" do
+    case DateTime.from_iso8601(iso) do
+      {:ok, dt, _} -> DateTime.to_unix(dt, :millisecond)
+      _ -> nil
+    end
+  end
+
+  defp iso_to_unix_ms(_), do: nil
 
   defp dispatch_prompt_context(fiber, state, opts) do
     fiber_id = Map.get(fiber, "id", "")
