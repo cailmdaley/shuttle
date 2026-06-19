@@ -152,7 +152,7 @@ defmodule ShuttleWeb.SentFilesControllerTest do
   end
 
   describe "local serve" do
-    test "200 with the fiber's trail from $PORTOLAN_EVENTS_FILE" do
+    test "200 with the fiber's trail from the events stream" do
       path =
         write_fixture([
           event(%{"timestamp" => 10, "toolInput" => %{"files" => ["/tmp/local.html"]}}),
@@ -214,15 +214,21 @@ defmodule ShuttleWeb.SentFilesControllerTest do
     end
   end
 
-  # Point the reader's default path at a fixture for the controller's local
-  # branch, restoring the prior env on exit.
+  # Point the reader's primary path (Shuttle owns the stream now) at a fixture for
+  # the controller's local branch. Clear the legacy Portolan vars and
+  # SHUTTLE_DATA_DIR so resolution is unambiguous and never leaks to the real
+  # ~/.shuttle/events.jsonl on the dev machine. Restores prior env on exit.
   defp with_events_file(path) do
-    previous = System.get_env("PORTOLAN_EVENTS_FILE")
-    System.put_env("PORTOLAN_EVENTS_FILE", path)
+    keys = ~w(SHUTTLE_EVENTS_FILE SHUTTLE_DATA_DIR PORTOLAN_EVENTS_FILE PORTOLAN_DATA_DIR)
+    previous = Map.new(keys, &{&1, System.get_env(&1)})
+
+    Enum.each(keys, &System.delete_env/1)
+    System.put_env("SHUTTLE_EVENTS_FILE", path)
 
     on_exit(fn ->
-      if previous, do: System.put_env("PORTOLAN_EVENTS_FILE", previous),
-        else: System.delete_env("PORTOLAN_EVENTS_FILE")
+      Enum.each(previous, fn {k, v} ->
+        if v, do: System.put_env(k, v), else: System.delete_env(k)
+      end)
     end)
   end
 
