@@ -22,6 +22,7 @@ defmodule ShuttleWeb.FiberController do
   """
 
   use Phoenix.Controller, formats: [:json]
+  import ShuttleWeb.RelayHelpers, only: [relay_json: 3]
 
   alias Shuttle.{FeltStores, FrontmatterEdit, OriginRouter}
 
@@ -34,7 +35,7 @@ defmodule ShuttleWeb.FiberController do
   def create(conn, params) do
     case OriginRouter.route(Map.get(params, "origin")) do
       {:remote, remote} ->
-        relay_json(conn, OriginRouter.forward(remote, "/api/v1/fiber/create", conn.body_params))
+        relay_json(conn, OriginRouter.forward(remote, "/api/v1/fiber/create", conn.body_params), &forward_failed/2)
 
       :local ->
         create_local(conn, params)
@@ -60,18 +61,10 @@ defmodule ShuttleWeb.FiberController do
     end
   end
 
-  # Relay the owning remote's verbatim response (the create returns JSON either
-  # way), or surface a tunnel failure as a 502 — the same shape CaptureController
-  # uses for its forwarded spawn.
-  defp relay_json(conn, {:forwarded, status, body}) do
-    conn |> put_resp_content_type("application/json") |> send_resp(status, body)
-  end
-
-  defp relay_json(conn, {:error, {:forward_failed, name, reason}}) do
-    conn
-    |> put_status(502)
-    |> json(%{error: "forward_failed", origin: name, detail: inspect(reason)})
-  end
+  # The tunnel-failure body for a forwarded create (its own shape: a flat
+  # `error`/`origin`/`detail`, not the `*: false` envelope the spawn endpoints use).
+  defp forward_failed(name, reason),
+    do: %{error: "forward_failed", origin: name, detail: inspect(reason)}
 
   defp normalize_frontmatter(params, name) do
     case Map.get(params, "frontmatter", %{}) do

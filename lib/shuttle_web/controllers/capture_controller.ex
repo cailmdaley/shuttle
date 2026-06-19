@@ -21,12 +21,14 @@ defmodule ShuttleWeb.CaptureController do
 
   use Phoenix.Controller, formats: [:json]
 
+  import ShuttleWeb.RelayHelpers, only: [relay_json: 3, present?: 1]
+
   alias Shuttle.OriginRouter
 
   def create(conn, params) do
     case OriginRouter.route(Map.get(params, "origin")) do
       {:remote, remote} ->
-        relay_json(conn, OriginRouter.forward(remote, "/api/v1/capture", conn.body_params))
+        relay_json(conn, OriginRouter.forward(remote, "/api/v1/capture", conn.body_params), &capture_failed/2)
 
       :local ->
         create_local(conn, params)
@@ -75,15 +77,6 @@ defmodule ShuttleWeb.CaptureController do
   defp error_code(reason) when is_binary(reason), do: reason
   defp error_code(reason), do: inspect(reason)
 
-  defp present?(value), do: is_binary(value) and value != ""
-
-  defp relay_json(conn, {:forwarded, status, body}) do
-    conn |> put_resp_content_type("application/json") |> send_resp(status, body)
-  end
-
-  defp relay_json(conn, {:error, {:forward_failed, name, reason}}) do
-    conn
-    |> put_status(502)
-    |> json(%{spawned: false, reason: "forward_failed", origin: name, error: inspect(reason)})
-  end
+  defp capture_failed(name, reason),
+    do: %{spawned: false, reason: "forward_failed", origin: name, error: inspect(reason)}
 end

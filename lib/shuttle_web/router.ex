@@ -22,9 +22,6 @@ defmodule ShuttleWeb.Router do
     # Spawn-without-constitution: launch a capture session from a free-text
     # prompt; the session files the fiber and claims itself.
     post("/capture", CaptureController, :create)
-    get("/actions/*fiber_id", ActionsController, :show)
-    post("/actions/resolve", ActionsController, :resolve)
-    post("/actions/invoke", ActionsController, :invoke)
     # The unified kanban write-plane: one call hides resolve + invoke +
     # owner-routing (local invoke, or forward to the owning remote daemon's
     # own /transition). Supersedes the kanban's prior two-leg resolve/invoke.
@@ -46,7 +43,6 @@ defmodule ShuttleWeb.Router do
     # feeds, concatenated with reconciled per-host liveness.
     get("/fibers/composite", FiberDocumentsController, :composite)
     get("/fibers/*id", FiberDocumentsController, :show)
-    get("/origins", OriginsController, :show)
     post("/lifecycle", LifecycleController, :create)
     post("/felt-history", FeltHistoryController, :create)
     post("/felt-edit", FeltEditController, :create)
