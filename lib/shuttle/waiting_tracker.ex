@@ -106,49 +106,19 @@ defmodule Shuttle.WaitingTracker do
   end
 
   @doc """
-  Default host-local events stream path, honoring the same env the hook reads.
+  Default host-local events stream path, honoring the same env the hook writes.
 
-  Shuttle owns its own stream now: prefer the Shuttle-owned path
-  (`SHUTTLE_EVENTS_FILE`, else `$SHUTTLE_DATA_DIR/events.jsonl`, default
-  `~/.shuttle/events.jsonl` — written by `share/shuttle-hook.sh`). Fall back to
-  the legacy Portolan path (`PORTOLAN_EVENTS_FILE` / `~/.portolan/data/events.jsonl`)
-  when the Shuttle file is absent or empty, so behavior is unchanged until the
-  Shuttle hook is installed, then it transparently switches.
+  Shuttle owns its own stream: `SHUTTLE_EVENTS_FILE`, else
+  `$SHUTTLE_DATA_DIR/events.jsonl`, default `~/.shuttle/events.jsonl` — written by
+  `~/loom/hooks/shuttle-hook.sh` (registered by `loom/setup.sh`).
   """
   def default_events_file do
-    shuttle = shuttle_events_file()
-
-    if nonempty_file?(shuttle) do
-      shuttle
-    else
-      portolan = portolan_events_file()
-      if nonempty_file?(portolan), do: portolan, else: shuttle
-    end
-  end
-
-  defp shuttle_events_file do
     System.get_env("SHUTTLE_EVENTS_FILE") ||
       Path.join(
         System.get_env("SHUTTLE_DATA_DIR") ||
           Path.join(System.user_home!() || "/root", ".shuttle"),
         "events.jsonl"
       )
-  end
-
-  defp portolan_events_file do
-    System.get_env("PORTOLAN_EVENTS_FILE") ||
-      Path.join(
-        System.get_env("PORTOLAN_DATA_DIR") ||
-          Path.join(System.user_home!() || "/root", ".portolan/data"),
-        "events.jsonl"
-      )
-  end
-
-  defp nonempty_file?(path) do
-    case File.stat(path) do
-      {:ok, %{size: size}} when size > 0 -> true
-      _ -> false
-    end
   end
 
   # ── Server ──
