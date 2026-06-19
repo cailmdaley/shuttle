@@ -231,7 +231,7 @@ defmodule Shuttle.Dispatcher do
   """
   @spec check_resume_intent(String.t(), map(), keyword()) ::
           :fresh | {:previous, String.t()} | {:error, :missing_session_id}
-  def check_resume_intent(fiber_id, _fiber, opts \\ []) do
+  def check_resume_intent(fiber_id, fiber, opts \\ []) do
     felt_store = Keyword.get(opts, :felt_store, default_felt_store())
 
     since_args =
@@ -240,31 +240,111 @@ defmodule Shuttle.Dispatcher do
         _ -> []
       end
 
-    case query_history(
-           fiber_id,
-           ["--kind", "review-comment", "--last", "1", "--json"] ++ since_args,
+    resume_mode =
+      case query_history(
+             fiber_id,
+             ["--kind", "review-comment", "--last", "1", "--json"] ++ since_args,
+             felt_store: felt_store
+           ) do
+        [event | _] -> get_in(event, ["payload", "resume_mode"])
+        _ -> nil
+      end
+
+    session_id =
+      Keyword.get(opts, :session_id) ||
+        latest_history_session_id(fiber_id, felt_store: felt_store)
+
+    cond do
+      # A human explicitly asked to resume (kanban Resume button stamps
+      # resume_mode:previous). Honor it, or surface the missing-id error.
+      resume_mode == "previous" ->
+        if is_binary(session_id) and session_id != "",
+          do: {:previous, session_id},
+          else: {:error, :missing_session_id}
+
+      # No human directive: decide fresh-vs-resume by whether the previous
+      # worker handed off cleanly. This is the autonomous-loop path.
+      true ->
+        decide_continuation(fiber_id, fiber, session_id, felt_store)
+    end
+  end
+
+  # The autonomous fresh-vs-resume decision when there is no human resume
+  # directive. A long-running oneshot loops across sessions: a worker exits, the
+  # next poll re-dispatches and continues. The question is whether the previous
+  # session ended CLEANLY (it filed a `--kind handoff` marker as its last act —
+  # then the next worker starts fresh and reads the handoff) or DIED mid-thought
+  # (no handoff — the process was killed, common on remote machines — then the
+  # fresh worker loses the in-flight reasoning and loops). On a dirty death we
+  # resume the prior transcript instead; the `resume || fresh-same-id` self-heal
+  # makes resume safe even if the transcript is gone.
+  #
+  # Scoped to oneshots: pinned roles park on session-end (human Resume handles
+  # their resume), and standing roles dispatch discrete scheduled occurrences
+  # (always fresh). First run / no prior session → fresh (nothing to resume).
+  defp decide_continuation(fiber_id, fiber, session_id, felt_store) do
+    cond do
+      fiber_kind(fiber) != "oneshot" -> :fresh
+      not (is_binary(session_id) and session_id != "") -> :fresh
+      clean_handoff_since_last_dispatch?(fiber_id, felt_store) -> :fresh
+      true -> {:previous, session_id}
+    end
+  end
+
+  # True iff the previous session closed cleanly: a worker-authored `--kind
+  # handoff` event exists at or after the last "worker dispatched" event. felt's
+  # default history view shows only `editorial` events (the daemon's dispatch/exit
+  # logs), so typed handoff events must be queried separately by kind — exactly
+  # like review-comments. We therefore compare timestamps across the two queries.
+  #
+  # Defaults to clean (fresh) when the last session start can't be located, so
+  # uncertainty never forces a surprising mid-transcript resume; but a located
+  # dispatch with no handoff after it → died mid-thought → resume.
+  defp clean_handoff_since_last_dispatch?(fiber_id, felt_store) do
+    dispatch_ts = latest_dispatch_ts(fiber_id, felt_store)
+    handoff_ts = latest_handoff_ts(fiber_id, felt_store)
+
+    cond do
+      is_nil(dispatch_ts) -> true
+      is_nil(handoff_ts) -> false
+      true -> DateTime.compare(handoff_ts, dispatch_ts) != :lt
+    end
+  end
+
+  # Timestamp of the most recent worker-authored clean-handoff marker, or nil.
+  defp latest_handoff_ts(fiber_id, felt_store) do
+    case query_history(fiber_id, ["--kind", "handoff", "--last", "1", "--json"],
            felt_store: felt_store
          ) do
-      [event | _] ->
-        resume_mode = get_in(event, ["payload", "resume_mode"])
+      [event | _] -> parse_event_ts(event)
+      _ -> nil
+    end
+  end
 
-        session_id =
-          Keyword.get(opts, :session_id) ||
-            latest_history_session_id(fiber_id, felt_store: felt_store)
+  # Timestamp of the most recent "worker dispatched" event (the last session
+  # start), or nil. These are plain editorial events the daemon writes at spawn;
+  # take the max occurred_at rather than trusting list order.
+  defp latest_dispatch_ts(fiber_id, felt_store) do
+    query_history(fiber_id, ["--last", "30", "--json"], felt_store: felt_store)
+    |> Enum.filter(&String.contains?(get_in(&1, ["payload", "text"]) || "", "worker dispatched"))
+    |> Enum.map(&parse_event_ts/1)
+    |> Enum.reject(&is_nil/1)
+    |> case do
+      [] -> nil
+      tss -> Enum.max_by(tss, &DateTime.to_unix(&1, :microsecond))
+    end
+  end
 
-        case {resume_mode, session_id} do
-          {"previous", session_id} when is_binary(session_id) and session_id != "" ->
-            {:previous, session_id}
-
-          {"previous", _} ->
-            {:error, :missing_session_id}
-
-          _ ->
-            :fresh
+  defp parse_event_ts(event) do
+    case Map.get(event, "occurred_at") do
+      iso when is_binary(iso) ->
+        case DateTime.from_iso8601(iso) do
+          {:ok, dt, _} -> dt
+          _ -> nil
         end
 
       _ ->
-        :fresh
+        nil
     end
   end
 
@@ -588,7 +668,10 @@ defmodule Shuttle.Dispatcher do
     Run:   #{run_id}
     """
 
-    compose_prompt(header, fiber_id, opts)
+    # A standing run is definitionally standing — declare it here so the exit
+    # contract is right regardless of how the caller threaded opts (the handoff
+    # marker is a oneshot-loop mechanism; standing rides its run-id editorial).
+    compose_prompt(header, fiber_id, Keyword.put(opts, :kind, "standing"))
   end
 
   @doc false
@@ -700,11 +783,23 @@ defmodule Shuttle.Dispatcher do
     )
   end
 
-  defp render_exit_contract(_kind) do
+  # Standing (scheduled cron) roles dispatch discrete occurrences and never use
+  # the oneshot handoff-resume mechanism (decide_continuation returns :fresh for
+  # them), so they keep the plain exit contract — the run handoff rides their
+  # run-id editorial event, per the skill's Standing Roles section.
+  defp render_exit_contract("standing") do
     render_block(
       "Exit Contract",
       nil,
       "This is an autonomous Shuttle worker. After you update outcome/history, file findings, and commit at a clean checkpoint, your final action must be `kill $PPID` — unless the dispatch directive or the constitution explicitly asks you to wait for a human (a 2FA gate, a send-in-his-voice step, a \"talk to me first\" signal); then drive to that checkpoint and stay alive there instead. Do not substitute a normal chat final response for worker exit; the handoff belongs in the fiber."
+    )
+  end
+
+  defp render_exit_contract(_kind) do
+    render_block(
+      "Exit Contract",
+      nil,
+      "This is an autonomous Shuttle worker. After you update outcome/history, file findings, and commit at a clean checkpoint, file your handoff as the SECOND-to-last action — `felt history append <fiber-id> --kind handoff --summary \"<what you did; where the next session picks up>\"` — and then your final action must be `kill $PPID`. The handoff marker is load-bearing: it tells the daemon you closed cleanly, so the next dispatch starts fresh and reads your note. WITHOUT it, a session that simply died (the process was killed mid-thought — common on remote machines) is indistinguishable from a clean exit, so the daemon RESUMES your transcript instead of looping a fresh, context-less worker. Exception: if the dispatch directive or constitution explicitly asks you to wait for a human (a 2FA gate, a send-in-his-voice step, a \"talk to me first\" signal), drive to that checkpoint and stay alive there instead — no handoff, no kill. Do not substitute a normal chat final response for worker exit; the handoff belongs in the fiber."
     )
   end
 

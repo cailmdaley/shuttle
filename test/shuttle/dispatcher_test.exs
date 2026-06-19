@@ -179,8 +179,13 @@ defmodule Shuttle.DispatcherTest do
     assert prompt =~ "Exit Contract"
     assert prompt =~ "kill $PPID"
     assert prompt =~ "Do not substitute a normal chat final response"
-    refute prompt =~ "felt history append"
     refute prompt =~ "Exit before context is half-full"
+
+    # A oneshot must be told to file the clean-handoff marker before exit — it's
+    # the signal that distinguishes a clean close (next worker starts fresh) from
+    # a mid-thought death (daemon resumes the transcript).
+    assert prompt =~ "--kind handoff"
+    assert prompt =~ "felt history append"
   end
 
   test "render_prompt for a pinned role inverts the exit contract to stay-alive" do
@@ -797,21 +802,78 @@ defmodule Shuttle.DispatcherTest do
 
   test "resolve_resume_intent defers to check_resume_intent for non-ad-hoc dispatches" do
     # The delegation boundary: anything other than {:standing_run, _, :ad_hoc}
-    # takes the existing review-comment-driven path. With no felt history in
-    # the test env, check_resume_intent returns :fresh as the safe default —
+    # takes the existing review-comment-driven path. Point at an empty felt store
+    # so there's no history to resume and the deterministic result is :fresh —
     # but it's the path being taken that matters, not the value.
     fiber = %{}
+    empty_store = Path.join(System.tmp_dir!(), "shuttle-empty-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(empty_store)
+    on_exit(fn -> File.rm_rf!(empty_store) end)
 
     # Scheduled standing run: defer
     assert Dispatcher.resolve_resume_intent(
              {:standing_run, "20260508T070000+0000"},
              "tests/haiku",
              fiber,
-             nil
+             empty_store
            ) == :fresh
 
     # Plain constitution dispatch: defer
-    assert Dispatcher.resolve_resume_intent(:constitution, "tests/haiku", fiber, nil) == :fresh
+    assert Dispatcher.resolve_resume_intent(:constitution, "tests/haiku", fiber, empty_store) ==
+             :fresh
+  end
+
+  describe "check_resume_intent — oneshot resume-on-no-handoff discriminator" do
+    setup do
+      store = Path.join(System.tmp_dir!(), "shuttle-handoff-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(store)
+      # `felt init` creates `.felt/` in its CWD (not the `-C` target), so init via
+      # cd:; once `.felt/` exists, `-C store` works for the rest.
+      felt = fn args -> {_, 0} = System.cmd("felt", ["-C", store | args], cd: store, stderr_to_stdout: true) end
+      {_, 0} = System.cmd("felt", ["init"], cd: store, stderr_to_stdout: true)
+      felt.(["add", "task", "A oneshot task"])
+
+      felt.([
+        "history",
+        "append",
+        "task",
+        "--summary",
+        "worker dispatched (agent=claude-opus) session=aaaa-bbbb-cccc-dddd"
+      ])
+
+      on_exit(fn -> File.rm_rf!(store) end)
+      %{store: store, felt: felt}
+    end
+
+    test "resumes the prior session when the worker died without a handoff", ctx do
+      # Only a "worker dispatched" event on file (the daemon logs that at spawn);
+      # the session vanished with no worker-authored handoff marker after it →
+      # died mid-thought → resume the transcript rather than loop a fresh worker.
+      fiber = %{"shuttle" => %{"kind" => "oneshot"}}
+
+      assert {:previous, "aaaa-bbbb-cccc-dddd"} =
+               Dispatcher.check_resume_intent("task", fiber, felt_store: ctx.store)
+    end
+
+    test "starts fresh when the worker left a clean --kind handoff marker", ctx do
+      ctx.felt.(["history", "append", "task", "--kind", "handoff", "--summary", "did X; next: Y"])
+      fiber = %{"shuttle" => %{"kind" => "oneshot"}}
+      assert :fresh = Dispatcher.check_resume_intent("task", fiber, felt_store: ctx.store)
+    end
+
+    test "a standing role is never auto-resumed (fresh even with no handoff)", ctx do
+      # Scope guard: only oneshots use this mechanism. A standing role dispatches
+      # discrete scheduled occurrences — always fresh.
+      fiber = %{"shuttle" => %{"kind" => "standing"}}
+      assert :fresh = Dispatcher.check_resume_intent("task", fiber, felt_store: ctx.store)
+    end
+
+    test "no prior session (first run) starts fresh", ctx do
+      # A store with the fiber but NO dispatch event → no session id to resume.
+      ctx.felt.(["add", "fresh-task", "Never dispatched"])
+      fiber = %{"shuttle" => %{"kind" => "oneshot"}}
+      assert :fresh = Dispatcher.check_resume_intent("fresh-task", fiber, felt_store: ctx.store)
+    end
   end
 
   test "render_resume_prompt names the fiber and repeats the exit contract" do
