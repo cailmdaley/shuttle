@@ -46,11 +46,11 @@ defmodule Shuttle.RemoteFiberRegistry do
   use GenServer
   require Logger
 
+  alias Shuttle.RegistryCommon
   alias Shuttle.Remote
 
   @default_tick_interval_ms 1_000
   @default_request_timeout_ms 20_000
-  @registry_read_timeout_ms 30_000
 
   defmodule State do
     @moduledoc false
@@ -103,11 +103,11 @@ defmodule Shuttle.RemoteFiberRegistry do
   def feeds, do: feeds(__MODULE__)
 
   @spec feeds(GenServer.server()) :: %{String.t() => map()}
-  def feeds(server), do: feeds(server, @registry_read_timeout_ms)
+  def feeds(server), do: feeds(server, RegistryCommon.read_timeout_ms())
 
   @spec feeds(GenServer.server(), non_neg_integer()) :: %{String.t() => map()}
   def feeds(server, timeout_ms) when is_integer(timeout_ms) and timeout_ms >= 0 do
-    if registry_alive?(server) do
+    if RegistryCommon.registry_alive?(server) do
       GenServer.call(server, :feeds, timeout_ms)
     else
       %{}
@@ -123,15 +123,8 @@ defmodule Shuttle.RemoteFiberRegistry do
   def refresh_now, do: refresh_now(__MODULE__)
 
   @spec refresh_now(GenServer.server()) :: :ok
-  def refresh_now(server), do: GenServer.call(server, :refresh_now, @registry_read_timeout_ms)
-
-  defp registry_alive?(server) do
-    case GenServer.whereis(server) do
-      nil -> false
-      pid when is_pid(pid) -> Process.alive?(pid)
-      _ -> false
-    end
-  end
+  def refresh_now(server),
+    do: GenServer.call(server, :refresh_now, RegistryCommon.read_timeout_ms())
 
   # ── Server ──
 
@@ -140,7 +133,7 @@ defmodule Shuttle.RemoteFiberRegistry do
     remotes =
       opts
       |> Keyword.get(:remotes, Application.get_env(:shuttle, :remotes, []))
-      |> normalize_remotes()
+      |> RegistryCommon.normalize_remotes()
 
     state = %State{
       remotes: remotes,
@@ -162,7 +155,7 @@ defmodule Shuttle.RemoteFiberRegistry do
       if remotes == [] or not auto_poll do
         state
       else
-        schedule_tick(state, 0)
+        RegistryCommon.schedule_tick(state, 0)
       end
 
     {:ok, state}
@@ -189,7 +182,7 @@ defmodule Shuttle.RemoteFiberRegistry do
   @impl true
   def handle_info({:tick, _token}, state) do
     state = start_due_fetches(state)
-    state = schedule_tick(state, state.tick_interval_ms)
+    state = RegistryCommon.schedule_tick(state, state.tick_interval_ms)
     {:noreply, state}
   end
 
@@ -353,22 +346,4 @@ defmodule Shuttle.RemoteFiberRegistry do
 
   defp stale?(%{stale: flag}, _now), do: flag
 
-  # ── Tick scheduling ──
-
-  defp schedule_tick(%State{} = state, delay_ms) do
-    if is_reference(state.tick_timer_ref) do
-      Process.cancel_timer(state.tick_timer_ref)
-    end
-
-    token = make_ref()
-    timer_ref = Process.send_after(self(), {:tick, token}, delay_ms)
-    %{state | tick_timer_ref: timer_ref}
-  end
-
-  defp normalize_remotes(entries) do
-    Enum.flat_map(entries, fn
-      %Remote{} = r -> [r]
-      other -> List.wrap(Remote.from_config(other))
-    end)
-  end
 end

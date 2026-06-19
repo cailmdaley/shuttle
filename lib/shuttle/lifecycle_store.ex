@@ -10,8 +10,8 @@ defmodule Shuttle.LifecycleStore do
   to the document; `mark_awaiting` is the worker-exit writer that flips it closed.
   `rearm` is the force-dispatch open: it writes `status: active` for any perennial
   role — standing or pinned — so the board's strip → In-flight "start" gesture
-  loops a parked pinned role (open → active). There is no runtime store (slice 6
-  deleted it) and no review axis (slice 4 removed it): the document carries the
+  loops a parked pinned role (open → active). There is no runtime store and no
+  review axis: the document carries the
   entire lifecycle, and `next_due` is recomputed from the cron schedule on the
   next poll. Pinned is not cyclical (Option D): it loops while active and parks
   at open, so it has no accept/awaiting cycle here — only the `rearm` open.
@@ -20,9 +20,9 @@ defmodule Shuttle.LifecycleStore do
   alias Shuttle.{Cron, FeltStores, FrontmatterEdit}
 
   # Legacy + daemon-owned shuttle keys wiped from the block on every accept /
-  # resume / mark-awaiting rewrite (clean cutover, slice 5: `enabled` and
-  # `review` are gone; `next_due_at` / `last_run_at` / `session` are
-  # daemon-owned and don't live in the synced document).
+  # resume / mark-awaiting rewrite: `enabled` and `review` no longer exist;
+  # `next_due_at` / `last_run_at` / `session` are daemon-owned and don't live in
+  # the synced document.
   @runtime_keys ~w(enabled review next_due_at last_run_at session)
 
   @spec accept(String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
@@ -32,7 +32,7 @@ defmodule Shuttle.LifecycleStore do
          :ok <- require_standing(shuttle),
          :ok <- require_doc_acceptable(frontmatter) do
       # Awaiting is `status: closed` + untempered in the document itself — there
-      # is no `review.state` (slice 4 removed the review axis). Recognize it
+      # is no `review.state` axis. Recognize it
       # straight from the doc and re-arm, advancing the cron recurrence (next_due
       # from the schedule). The previous run's outcome is preserved — it stays
       # the card's headline until the next run overwrites it (accept no longer
@@ -48,7 +48,7 @@ defmodule Shuttle.LifecycleStore do
          {:ok, next_due_at} <- Cron.next_occurrence(schedule, DateTime.utc_now()) do
       # The document carries the entire lifecycle: writing `status: active` re-arms
       # the role, and `next_due` is recomputed from the cron schedule on the next
-      # poll. There is no runtime row to upsert (slice 6).
+      # poll. There is no runtime row to upsert.
       write_fiber!(path, raw_fm, body, rearm_ops() ++ evict_runtime_ops())
 
       {:ok, "accepted run for #{fiber_id}\n  next due: #{DateTime.to_iso8601(next_due_at)}\n"}
@@ -69,8 +69,7 @@ defmodule Shuttle.LifecycleStore do
     now = DateTime.utc_now()
 
     # Re-arm by writing `status: active`; the next poll's cron window picks the
-    # role up immediately (the active document IS the re-queue). No runtime row
-    # (slice 6).
+    # role up immediately (the active document IS the re-queue). No runtime row.
     write_fiber!(path, raw_fm, body, rearm_ops() ++ evict_runtime_ops())
 
     {:ok,
@@ -87,8 +86,8 @@ defmodule Shuttle.LifecycleStore do
   don't-re-fire gate: a closed role is never dispatch-eligible, so the
   `active → closed → active` cycle encodes "already ran this occurrence."
 
-  Awaiting is fully doc-representable: there is no review axis (slice 4) and no
-  runtime row (slice 6), so this is a single felt write. It is the mirror of
+  Awaiting is fully doc-representable: there is no review axis and no
+  runtime row, so this is a single felt write. It is the mirror of
   `update_document` (the accept re-arm) — it sets `status: closed` where accept
   sets `status: active`. Atomic via `write_fiber!` (tmp + rename). A no-op-shaped
   error (not standing / unreadable) returns `{:error, _}` so the caller can log
@@ -214,8 +213,8 @@ defmodule Shuttle.LifecycleStore do
 
   # Awaiting, read straight from the document: `status: closed` with no verdict
   # (`tempered` unset). `tempered: false` (composted) and `tempered: true` are
-  # termini, not awaiting. This is the sole accept/resume precondition (slice 4:
-  # no `review.state` to consult).
+  # termini, not awaiting. This is the sole accept/resume precondition — there
+  # is no `review.state` to consult.
   defp doc_awaiting?(frontmatter) do
     Map.get(frontmatter, "status") == "closed" and is_nil(Map.get(frontmatter, "tempered"))
   end
@@ -287,7 +286,7 @@ defmodule Shuttle.LifecycleStore do
   defp require_schedule(_), do: {:error, "fiber has no schedule"}
 
   # accept/resume/rearm all re-arm a role by writing `status: active` back to the
-  # document — the sole dispatch gate (slice 5: no enabled flag, no review
+  # document — the sole dispatch gate (there is no enabled flag, no review
   # block). tempered and closed-at are deleted so the card leaves the
   # Awaiting/Tempered/Composted columns. Emitted as surgical edits against the
   # raw frontmatter text, NOT a re-serialization of the whole map: every other

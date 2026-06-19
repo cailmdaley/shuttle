@@ -41,6 +41,7 @@ defmodule Shuttle.RemoteRegistry do
   require Logger
 
   alias Shuttle.Remote
+  alias Shuttle.RegistryCommon
   alias Shuttle.Runner
 
   @pubsub_topic "shuttle:remotes"
@@ -48,7 +49,6 @@ defmodule Shuttle.RemoteRegistry do
   @default_bounce_wait_ms 5_000
   @default_restart_wait_ms 10_000
   @default_backoff_schedule_ms [30_000, 120_000, 600_000, 1_800_000]
-  @registry_read_timeout_ms 30_000
   @ssh_connect_timeout_s 8
 
   defmodule Recovery do
@@ -131,12 +131,12 @@ defmodule Shuttle.RemoteRegistry do
 
   @spec snapshots(GenServer.server()) :: %{String.t() => map()}
   def snapshots(server) do
-    snapshots(server, @registry_read_timeout_ms)
+    snapshots(server, RegistryCommon.read_timeout_ms())
   end
 
   @spec snapshots(GenServer.server(), non_neg_integer()) :: %{String.t() => map()}
   def snapshots(server, timeout_ms) when is_integer(timeout_ms) and timeout_ms >= 0 do
-    if registry_alive?(server) do
+    if RegistryCommon.registry_alive?(server) do
       GenServer.call(server, :snapshots, timeout_ms)
     else
       %{}
@@ -152,8 +152,8 @@ defmodule Shuttle.RemoteRegistry do
 
   @spec snapshot(GenServer.server(), String.t()) :: map() | nil
   def snapshot(server, name) do
-    if registry_alive?(server) do
-      GenServer.call(server, {:snapshot, name}, @registry_read_timeout_ms)
+    if RegistryCommon.registry_alive?(server) do
+      GenServer.call(server, {:snapshot, name}, RegistryCommon.read_timeout_ms())
     else
       nil
     end
@@ -172,14 +172,6 @@ defmodule Shuttle.RemoteRegistry do
     GenServer.call(server, :poll_now)
   end
 
-  defp registry_alive?(server) do
-    case GenServer.whereis(server) do
-      nil -> false
-      pid when is_pid(pid) -> Process.alive?(pid)
-      _ -> false
-    end
-  end
-
   # ── Server ──
 
   @impl true
@@ -187,7 +179,7 @@ defmodule Shuttle.RemoteRegistry do
     remotes =
       opts
       |> Keyword.get(:remotes, Application.get_env(:shuttle, :remotes, []))
-      |> normalize_remotes()
+      |> RegistryCommon.normalize_remotes()
 
     client = Keyword.get(opts, :client, Shuttle.RemoteRegistry.Client.Default)
     runner = Keyword.get(opts, :runner, Runner.Default)
@@ -229,7 +221,7 @@ defmodule Shuttle.RemoteRegistry do
       if remotes == [] or not auto_poll do
         state
       else
-        schedule_tick(state, 0)
+        RegistryCommon.schedule_tick(state, 0)
       end
 
     {:ok, state}
@@ -252,7 +244,7 @@ defmodule Shuttle.RemoteRegistry do
   @impl true
   def handle_info({:tick, _token}, state) do
     state = poll_all(state)
-    state = schedule_tick(state, state.tick_interval_ms)
+    state = RegistryCommon.schedule_tick(state, state.tick_interval_ms)
     broadcast(state)
     {:noreply, state}
   end
@@ -554,7 +546,7 @@ defmodule Shuttle.RemoteRegistry do
     end
   end
 
-  defp success_entry(%{remote: remote} = entry, snapshot, now) do
+  defp success_entry(%{remote: remote}, snapshot, now) do
     %{
       snapshot: snapshot,
       last_polled_at: now,
@@ -564,7 +556,6 @@ defmodule Shuttle.RemoteRegistry do
       remote: remote,
       recovery: %Recovery{}
     }
-    |> merge_entry_defaults(entry)
   end
 
   defp normal_failure_entry(%{recovery: %Recovery{} = recovery} = entry, reason, threshold, now) do
@@ -633,10 +624,6 @@ defmodule Shuttle.RemoteRegistry do
   defp next_backoff_ms(_recovery, _schedule), do: List.last(@default_backoff_schedule_ms)
 
   defp with_recovery(entry, %Recovery{} = recovery), do: Map.put(entry, :recovery, recovery)
-
-  defp merge_entry_defaults(entry, prev) do
-    Map.put_new(entry, :snapshot, Map.get(prev, :snapshot))
-  end
 
   defp add_ms(%DateTime{} = dt, ms) when is_integer(ms) do
     DateTime.add(dt, ms, :millisecond)
@@ -767,18 +754,6 @@ defmodule Shuttle.RemoteRegistry do
     }
   end
 
-  # ── Tick scheduling ──
-
-  defp schedule_tick(%State{} = state, delay_ms) do
-    if is_reference(state.tick_timer_ref) do
-      Process.cancel_timer(state.tick_timer_ref)
-    end
-
-    token = make_ref()
-    timer_ref = Process.send_after(self(), {:tick, token}, delay_ms)
-    %{state | tick_timer_ref: timer_ref}
-  end
-
   defp broadcast(%State{} = state) do
     if Process.whereis(Shuttle.PubSub) do
       Phoenix.PubSub.broadcast(
@@ -803,13 +778,6 @@ defmodule Shuttle.RemoteRegistry do
       remote: remote,
       recovery: %Recovery{}
     }
-  end
-
-  defp normalize_remotes(entries) do
-    Enum.flat_map(entries, fn
-      %Remote{} = r -> [r]
-      other -> List.wrap(Remote.from_config(other))
-    end)
   end
 end
 
