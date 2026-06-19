@@ -10,8 +10,9 @@ defmodule ShuttleWeb.FeltHistoryController do
   """
 
   use Phoenix.Controller, formats: [:json]
+  import ShuttleWeb.RelayHelpers, only: [relay_text: 2]
 
-  alias Shuttle.{FeltStores, OriginRouter}
+  alias Shuttle.{Felt, FeltStores, OriginRouter}
 
   def create(conn, %{"fiber_id" => fiber_id, "kind" => kind, "summary" => summary} = params)
       when is_binary(fiber_id) and is_binary(kind) and is_binary(summary) do
@@ -49,16 +50,6 @@ defmodule ShuttleWeb.FeltHistoryController do
     end
   end
 
-  defp relay_text(conn, {:forwarded, status, body}) do
-    conn |> put_resp_content_type("text/plain") |> send_resp(status, body)
-  end
-
-  defp relay_text(conn, {:error, {:forward_failed, name, reason}}) do
-    conn
-    |> put_resp_content_type("text/plain")
-    |> send_resp(502, "forward to #{name} failed: #{inspect(reason)}")
-  end
-
   defp host_for_fiber(fiber_id) do
     case FeltStores.resolve_fiber(fiber_id) do
       {:ok, %{host: host, fiber_id: address}} -> {:ok, host, address}
@@ -74,12 +65,7 @@ defmodule ShuttleWeb.FeltHistoryController do
       |> normalize_fields()
       |> Enum.reduce(args, fn {key, value}, acc -> acc ++ ["--field", "#{key}=#{value}"] end)
 
-    case System.cmd("felt", args, stderr_to_stdout: true) do
-      {output, 0} -> {:ok, output}
-      {output, status} -> {:command_error, status, output}
-    end
-  rescue
-    e in ErlangError -> {:error, Exception.message(e)}
+    Felt.run(args)
   end
 
   defp normalize_fields(fields) when is_map(fields) do

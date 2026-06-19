@@ -10,9 +10,8 @@ defmodule ShuttleWeb.TransitionController do
   pick a daemon URL itself — `Shuttle.Transition` hides all of it.
 
   Replaces the kanban's prior two-leg dance (resolve on the local daemon, then
-  invoke on the owning daemon, with Portolan picking the URL from `/origins`).
-  The legacy `/actions/{resolve,invoke}` endpoints remain until the frontend
-  cutover removes their last caller.
+  invoke on the owning daemon). This is the sole write-plane; the resolve +
+  invoke pipeline and its HTTP-status mapping live in `Shuttle.Transition`.
   """
 
   use Phoenix.Controller, formats: [:json]

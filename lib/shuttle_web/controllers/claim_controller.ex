@@ -21,12 +21,14 @@ defmodule ShuttleWeb.ClaimController do
 
   use Phoenix.Controller, formats: [:json]
 
+  import ShuttleWeb.RelayHelpers, only: [relay_json: 3, present?: 1]
+
   alias Shuttle.OriginRouter
 
   def create(conn, params) do
     case OriginRouter.route(Map.get(params, "origin")) do
       {:remote, remote} ->
-        relay_json(conn, OriginRouter.forward(remote, "/api/v1/claim", conn.body_params))
+        relay_json(conn, OriginRouter.forward(remote, "/api/v1/claim", conn.body_params), &claim_failed/2)
 
       :local ->
         create_local(conn, params)
@@ -74,15 +76,6 @@ defmodule ShuttleWeb.ClaimController do
   defp error_status(:rename_failed), do: {500, "rename_failed"}
   defp error_status(other), do: {500, inspect(other)}
 
-  defp present?(value), do: is_binary(value) and value != ""
-
-  defp relay_json(conn, {:forwarded, status, body}) do
-    conn |> put_resp_content_type("application/json") |> send_resp(status, body)
-  end
-
-  defp relay_json(conn, {:error, {:forward_failed, name, reason}}) do
-    conn
-    |> put_status(502)
-    |> json(%{claimed: false, reason: "forward_failed", origin: name, error: inspect(reason)})
-  end
+  defp claim_failed(name, reason),
+    do: %{claimed: false, reason: "forward_failed", origin: name, error: inspect(reason)}
 end

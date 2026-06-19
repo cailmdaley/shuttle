@@ -18,6 +18,7 @@ defmodule ShuttleWeb.LifecycleController do
   """
 
   use Phoenix.Controller, formats: [:json]
+  import ShuttleWeb.RelayHelpers, only: [relay_text: 2]
 
   alias Shuttle.{FeltStores, LifecycleService, OriginRouter}
 
@@ -55,16 +56,6 @@ defmodule ShuttleWeb.LifecycleController do
         |> put_resp_content_type("text/plain")
         |> send_resp(422, "shuttle exited #{status}: #{output}")
     end
-  end
-
-  defp relay_text(conn, {:forwarded, status, body}) do
-    conn |> put_resp_content_type("text/plain") |> send_resp(status, body)
-  end
-
-  defp relay_text(conn, {:error, {:forward_failed, name, reason}}) do
-    conn
-    |> put_resp_content_type("text/plain")
-    |> send_resp(502, "forward to #{name} failed: #{inspect(reason)}")
   end
 
   defp action(%{"action" => action}) when action in @allowed, do: {:ok, action}

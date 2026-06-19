@@ -15,12 +15,14 @@ defmodule ShuttleWeb.DispatchController do
 
   use Phoenix.Controller, formats: [:json]
 
+  import ShuttleWeb.RelayHelpers, only: [relay_json: 3]
+
   alias Shuttle.OriginRouter
 
   def create(conn, params) do
     case OriginRouter.route(Map.get(params, "origin")) do
       {:remote, remote} ->
-        relay_json(conn, OriginRouter.forward(remote, "/api/v1/dispatch", conn.body_params))
+        relay_json(conn, OriginRouter.forward(remote, "/api/v1/dispatch", conn.body_params), &dispatch_failed/2)
 
       :local ->
         create_local(conn, params)
@@ -98,17 +100,8 @@ defmodule ShuttleWeb.DispatchController do
     end
   end
 
-  # Relay a forwarded remote response verbatim (the body is already JSON the
-  # owning daemon produced), or surface a tunnel failure as JSON.
-  defp relay_json(conn, {:forwarded, status, body}) do
-    conn |> put_resp_content_type("application/json") |> send_resp(status, body)
-  end
-
-  defp relay_json(conn, {:error, {:forward_failed, name, reason}}) do
-    conn
-    |> put_status(502)
-    |> json(%{dispatched: false, reason: "forward_failed", origin: name, error: inspect(reason)})
-  end
+  defp dispatch_failed(name, reason),
+    do: %{dispatched: false, reason: "forward_failed", origin: name, error: inspect(reason)}
 
   defp truthy?(value) when value in [true, "true", "1", 1], do: true
   defp truthy?(_), do: false
