@@ -9,12 +9,14 @@ defmodule Shuttle.Poller.Snapshot do
   preserve it exactly.
 
   State-coupled helpers that the rest of the poller also relies on
-  (`fiber_address/1`, `uid_for_fiber/3`, `metadata_uid/1`, `runtime_seconds/2`,
-  `standing_role_snapshots/4`) stay in `Shuttle.Poller` as the single source of
-  truth and are called back into from here.
+  (`fiber_address/1`, `uid_for_fiber/3`, `metadata_uid/1`, `runtime_seconds/2`)
+  stay in `Shuttle.Poller` as the single source of truth and are called back
+  into from here. `standing_role_snapshots/4` lives in
+  `Shuttle.Poller.StandingRoles`.
   """
 
   alias Shuttle.Poller
+  alias Shuttle.Poller.StandingRoles
   alias Shuttle.Poller.State
 
   @spec build_snapshot(State.t()) :: map()
@@ -67,7 +69,7 @@ defmodule Shuttle.Poller.Snapshot do
       # stays (empty) for snapshot-shape stability with API/kanban consumers.
       retrying: [],
       standing_roles:
-        Poller.standing_role_snapshots(state.standing_roles, state.running, now, state),
+        StandingRoles.standing_role_snapshots(state.standing_roles, state.running, now, state),
       claimed_count: MapSet.size(state.claimed),
       max_concurrent: state.max_concurrent_workers,
       document_cache: stringify_keys(state.document_cache_stats)
