@@ -32,8 +32,7 @@ defmodule Shuttle.Transition do
        relayed response's `origin`. Terminating in one hop: a fiber has exactly
        one owner, and the owner never re-forwards.
 
-  Both this service's `/transition` endpoint and the legacy `/actions/invoke`
-  endpoint share `invoke/2` and `http_error/1`, so the invoke pipeline and its
+  This service's `/transition` endpoint uses `invoke/2` and `http_error/1`, so the invoke pipeline and its
   status mapping have a single implementation.
   """
 
@@ -92,7 +91,7 @@ defmodule Shuttle.Transition do
 
   @doc """
   The invoke pipeline: validate the action id, confirm it is available for the
-  fiber right now, then perform the mutation. Shared with `/actions/invoke`.
+  fiber right now, then perform the mutation.
   """
   @spec invoke(String.t(), String.t()) :: :ok | {:error, term()}
   def invoke(fiber_id, action) do
