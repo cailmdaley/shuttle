@@ -401,15 +401,11 @@ defmodule Shuttle.FiberDocuments do
   defp logical_id(fiber, fallback) do
     case Map.get(fiber, "uid") do
       uid when is_binary(uid) ->
-        if ulid?(uid), do: uid, else: fallback
+        if Shuttle.ULID.valid?(uid), do: uid, else: fallback
 
       _ ->
         fallback
     end
-  end
-
-  defp ulid?(value) do
-    String.match?(value, ~r/^[0-9A-HJKMNP-TV-Z]{26}$/)
   end
 
   defp store_errors({:ok, _rows}), do: []

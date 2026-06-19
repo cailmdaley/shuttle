@@ -1609,55 +1609,13 @@ defmodule Shuttle.Poller do
   end
 
   # Realpath of `<host>/.felt`, resolving symlinks along the path so the
-  # ownership prefix matches felt's symlink-resolved `path`. Resolves segment by
-  # segment via `:file.read_link`; falls back to `Path.expand` for any segment
-  # that isn't a symlink. Self-contained so the poller carries no cross-module
-  # realpath dependency.
+  # ownership prefix matches felt's symlink-resolved `path`. See Shuttle.Realpath.
   defp store_felt_realpath(host) do
     felt_dir = host |> Path.join(".felt") |> Path.expand()
 
-    case resolve_realpath(felt_dir) do
+    case Shuttle.Realpath.resolve(felt_dir) do
       {:ok, resolved} -> resolved
       {:error, _} -> felt_dir
-    end
-  end
-
-  @max_symlink_hops 40
-
-  defp resolve_realpath(path) do
-    case Path.split(Path.expand(path)) do
-      ["/" | rest] -> resolve_realpath_segments("/", rest, 0)
-      [first | rest] -> resolve_realpath_segments(first, rest, 0)
-      [] -> {:error, :empty_path}
-    end
-  end
-
-  defp resolve_realpath_segments(current, [], _hops), do: {:ok, current}
-
-  defp resolve_realpath_segments(_current, _segments, hops) when hops > @max_symlink_hops,
-    do: {:error, :symlink_loop}
-
-  defp resolve_realpath_segments(current, [segment | rest], hops) do
-    candidate = Path.join(current, segment)
-
-    case :file.read_link(String.to_charlist(candidate)) do
-      {:ok, target} ->
-        target_path = List.to_string(target)
-
-        expanded_target =
-          case Path.type(target_path) do
-            :absolute -> Path.expand(target_path)
-            _ -> Path.expand(target_path, Path.dirname(candidate))
-          end
-
-        case Path.split(expanded_target) do
-          ["/" | target_rest] -> resolve_realpath_segments("/", target_rest ++ rest, hops + 1)
-          [first | target_rest] -> resolve_realpath_segments(first, target_rest ++ rest, hops + 1)
-          [] -> {:error, :empty_target}
-        end
-
-      {:error, _} ->
-        resolve_realpath_segments(candidate, rest, hops)
     end
   end
 

@@ -140,7 +140,7 @@ defmodule Shuttle.FeltStores do
             # A symlink: a substore link iff it resolves to an external real
             # `.felt` directory. Detected here, never descended.
             {:ok, %File.Stat{type: :symlink}} ->
-              with {:ok, real} <- resolve_realpath(path),
+              with {:ok, real} <- Shuttle.Realpath.resolve(path),
                    ".felt" <- Path.basename(real),
                    true <- File.dir?(real),
                    false <- inside?(real, store_real) do
@@ -252,7 +252,7 @@ defmodule Shuttle.FeltStores do
   # reading the carried `path`, and assigning ownership by that path. Skipped
   # entirely for non-ULID identifiers (those resolve via `show_resolution`).
   defp uid_resolution(hosts, uid) do
-    if ulid?(uid) do
+    if Shuttle.ULID.valid?(uid) do
       Enum.find_value(hosts, fn host ->
         case felt_ls_json(host) do
           {:ok, rows} when is_list(rows) ->
@@ -301,48 +301,9 @@ defmodule Shuttle.FeltStores do
   defp store_felt_realpath(host) do
     felt_dir = host |> Path.join(".felt") |> Path.expand()
 
-    case resolve_realpath(felt_dir) do
+    case Shuttle.Realpath.resolve(felt_dir) do
       {:ok, resolved} -> resolved
       {:error, _} -> felt_dir
-    end
-  end
-
-  @max_symlink_hops 40
-
-  defp resolve_realpath(path) do
-    case Path.split(Path.expand(path)) do
-      ["/" | rest] -> resolve_realpath_segments("/", rest, 0)
-      [first | rest] -> resolve_realpath_segments(first, rest, 0)
-      [] -> {:error, :empty_path}
-    end
-  end
-
-  defp resolve_realpath_segments(current, [], _hops), do: {:ok, current}
-
-  defp resolve_realpath_segments(_current, _segments, hops) when hops > @max_symlink_hops,
-    do: {:error, :symlink_loop}
-
-  defp resolve_realpath_segments(current, [segment | rest], hops) do
-    candidate = Path.join(current, segment)
-
-    case :file.read_link(String.to_charlist(candidate)) do
-      {:ok, target} ->
-        target_path = List.to_string(target)
-
-        expanded_target =
-          case Path.type(target_path) do
-            :absolute -> Path.expand(target_path)
-            _ -> Path.expand(target_path, Path.dirname(candidate))
-          end
-
-        case Path.split(expanded_target) do
-          ["/" | target_rest] -> resolve_realpath_segments("/", target_rest ++ rest, hops + 1)
-          [first | target_rest] -> resolve_realpath_segments(first, target_rest ++ rest, hops + 1)
-          [] -> {:error, :empty_target}
-        end
-
-      {:error, _} ->
-        resolve_realpath_segments(candidate, rest, hops)
     end
   end
 
@@ -374,16 +335,10 @@ defmodule Shuttle.FeltStores do
   end
 
   defp ulid_or_nil(value) when is_binary(value) do
-    if ulid?(value), do: value, else: nil
+    if Shuttle.ULID.valid?(value), do: value, else: nil
   end
 
   defp ulid_or_nil(_), do: nil
-
-  defp ulid?(value) when is_binary(value) do
-    String.match?(value, ~r/^[0-9A-HJKMNP-TV-Z]{26}$/)
-  end
-
-  defp ulid?(_), do: false
 
   @spec registered_hosts() :: host_list()
   def registered_hosts do
