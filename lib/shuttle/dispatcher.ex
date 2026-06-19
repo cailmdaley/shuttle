@@ -97,7 +97,8 @@ defmodule Shuttle.Dispatcher do
           resume_intent ->
             create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent,
               felt_store: felt_store,
-              uid: uid
+              uid: uid,
+              kind: fiber_kind(fiber)
             )
         end
       end
@@ -658,7 +659,7 @@ defmodule Shuttle.Dispatcher do
     # fresh directive.
     [
       header,
-      render_exit_contract(),
+      render_exit_contract(Keyword.get(opts, :kind, "oneshot")),
       render_headless_notice(Keyword.get(opts, :headless, false)),
       render_user_message_block(fiber_id, felt_opts)
     ]
@@ -683,7 +684,23 @@ defmodule Shuttle.Dispatcher do
 
   defp render_headless_notice(_), do: ""
 
-  defp render_exit_contract do
+  # Pinned roles invert the default exit contract. A pinned role is an
+  # INTERACTIVE INTERFACE — a status hub, a debug intake — that a human drives;
+  # the session IS the interface, so a worker that runs out of immediate work
+  # must STAY ALIVE and wait, not `kill $PPID`. The poll loop never re-spawns a
+  # pinned role (see Poller.filter_eligible/2), so a worker that exits leaves the
+  # interface dark until the human manually resumes it — exactly the dead-chat
+  # gap that made this fix necessary. The session ends when the human ends it
+  # (parking the role: `active → open`), never autonomously.
+  defp render_exit_contract("pinned") do
+    render_block(
+      "Exit Contract",
+      nil,
+      "This is a pinned interactive role — a standing interface a human drives, not a one-shot task. Keep the fiber current as you work (outcome, history, findings, commits at clean checkpoints), but when you run out of immediate work DO NOT `kill $PPID`: stay alive and wait for the next message. The session is the interface; it ends only when the human parks the role (`active → open`), not when you finish the task at hand. The poll loop will not re-spawn this role, so exiting goes dark on the human until they manually resume — don't. Reply normally and wait when there's nothing left to drive."
+    )
+  end
+
+  defp render_exit_contract(_kind) do
     render_block(
       "Exit Contract",
       nil,
@@ -849,7 +866,7 @@ defmodule Shuttle.Dispatcher do
 
     [
       String.trim(header),
-      render_exit_contract(),
+      render_exit_contract("oneshot"),
       render_block("From User", nil, String.trim(yap))
     ]
     |> Enum.join("\n\n")
@@ -1077,6 +1094,19 @@ defmodule Shuttle.Dispatcher do
       {:error, "agent #{agent.id} requires a model but none configured"}
     else
       :ok
+    end
+  end
+
+  # The shuttle block's `kind` (new-format) / `mode` (old-format), defaulting to
+  # "oneshot". Threaded into the prompt so the exit contract can diverge for
+  # pinned interactive roles (stay alive) vs oneshot/standing work (exit).
+  defp fiber_kind(fiber) do
+    case Map.get(fiber, "shuttle") do
+      shuttle when is_map(shuttle) ->
+        Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot"))
+
+      _ ->
+        "oneshot"
     end
   end
 
