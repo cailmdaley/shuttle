@@ -1,15 +1,11 @@
 defmodule Shuttle.Dispatcher do
   @moduledoc """
-  Dispatches a single worker for a felt constitution fiber.
-
-  Reproduces the behavior of shuttle-worker.sh in Elixir:
+  Dispatches a single worker for a felt constitution fiber:
   - Locates the fiber via felt CLI
   - Checks status (refuses closed)
   - Checks for existing tmux session
   - Creates tmux session with dispatch prompt
   - Invokes the resolved agent wrapper
-
-  Stage 2: one-shot dispatch only. No poller, no watcher, no retry.
   """
 
   require Logger
@@ -53,7 +49,7 @@ defmodule Shuttle.Dispatcher do
     * `:runtime_session_id` — prior session UUID the caller already resolved (a
       live in-memory watcher record within the daemon's lifetime). Falls back to
       felt history (`latest_history_session_id`) when absent, which is the
-      durable home post-slice-6 (no runtime store, no doc-resident session).
+      durable home (no runtime store, no doc-resident session).
   """
   @spec dispatch(String.t(), keyword()) :: dispatch_result()
   def dispatch(fiber_id, opts \\ []) do
@@ -163,7 +159,7 @@ defmodule Shuttle.Dispatcher do
 
   # The lower bound for the review-comment lookup on a standing run: the
   # timestamp of the most recent worker-exit event in felt history. felt history
-  # is the chronological substrate (slice 4 — the document no longer carries a
+  # is the chronological substrate (the document no longer carries a
   # `review.run_id`), so the run window starts where the awaiting run ended. A
   # resume directive is filed AFTER the run exits, so it lands at or after this
   # bound and `check_resume_intent --since` finds it; a stale directive from an
@@ -316,7 +312,7 @@ defmodule Shuttle.Dispatcher do
     case query_history(fiber_id, ["--kind", "handoff", "--last", "1", "--json"],
            felt_store: felt_store
          ) do
-      [event | _] -> parse_event_ts(event)
+      [event | _] -> parse_occurred_at(Map.get(event, "occurred_at"))
       _ -> nil
     end
   end
@@ -327,24 +323,11 @@ defmodule Shuttle.Dispatcher do
   defp latest_dispatch_ts(fiber_id, felt_store) do
     query_history(fiber_id, ["--last", "30", "--json"], felt_store: felt_store)
     |> Enum.filter(&String.contains?(get_in(&1, ["payload", "text"]) || "", "worker dispatched"))
-    |> Enum.map(&parse_event_ts/1)
+    |> Enum.map(&parse_occurred_at(Map.get(&1, "occurred_at")))
     |> Enum.reject(&is_nil/1)
     |> case do
       [] -> nil
       tss -> Enum.max_by(tss, &DateTime.to_unix(&1, :microsecond))
-    end
-  end
-
-  defp parse_event_ts(event) do
-    case Map.get(event, "occurred_at") do
-      iso when is_binary(iso) ->
-        case DateTime.from_iso8601(iso) do
-          {:ok, dt, _} -> dt
-          _ -> nil
-        end
-
-      _ ->
-        nil
     end
   end
 
@@ -1052,22 +1035,20 @@ defmodule Shuttle.Dispatcher do
 
     case run_felt(runner, ["show", fiber_id, "--json"]) do
       {:ok, output} ->
-        case Jason.decode(output) do
-          {:ok, fiber} -> {:ok, fiber}
-          {:error, _} -> {:error, "invalid fiber JSON"}
-        end
+        decode_fiber(output)
 
       {:error, _} ->
         case run_felt(runner, ["show", fiber_id, "--json"], cd: felt_store) do
-          {:ok, output} ->
-            case Jason.decode(output) do
-              {:ok, fiber} -> {:ok, fiber}
-              {:error, _} -> {:error, "invalid fiber JSON"}
-            end
-
-          {:error, _} ->
-            {:error, :not_found}
+          {:ok, output} -> decode_fiber(output)
+          {:error, _} -> {:error, :not_found}
         end
+    end
+  end
+
+  defp decode_fiber(output) do
+    case Jason.decode(output) do
+      {:ok, fiber} -> {:ok, fiber}
+      {:error, _} -> {:error, "invalid fiber JSON"}
     end
   end
 
@@ -1089,11 +1070,10 @@ defmodule Shuttle.Dispatcher do
 
   # Force-dispatch reopens the fiber as part of the same transaction. Without
   # this, force lets the worker spawn (the closed gate above is relaxed) but
-  # `status: closed`, `tempered`, and `closed_at` stay on disk — Portolan's
-  # `classifyFiber` keeps the card in `awaitingReview` / `tempered` /
-  # `composted` forever, even though a worker is now running. Reopen
-  # (status=active, tempered cleared, closed_at cleared) lets the runningWorker
-  # check classify the card as `inFlight` on the next poll.
+  # `status: closed`, `tempered`, and `closed_at` stay on disk — the kanban
+  # keeps the card in its closed/tempered column forever, even though a worker
+  # is now running. Reopen (status=active, tempered cleared, closed_at cleared)
+  # lets the card reclassify as in-flight on the next poll.
   #
   # Skips the shell-out when the fiber is already in a clean active state —
   # re-dispatching a healthy in-flight oneshot shouldn't rewrite
@@ -1355,7 +1335,7 @@ defmodule Shuttle.Dispatcher do
 
   # Record the session UUID in felt history after a successful fresh dispatch, so
   # "Resume previous" can recover it across a daemon restart. felt history is the
-  # chronological substrate and the only durable session-id home post-slice-6 (no
+  # chronological substrate and the only durable session-id home (no
   # runtime store, no doc-resident `shuttle.session` block); `latest_history_
   # session_id` parses the `session=<uuid>` token back out at the next dispatch,
   # and the worker-exit event reads it the same way.
@@ -1631,17 +1611,16 @@ defmodule Shuttle.Dispatcher do
     # kitty tab. Waiting until the first non-control client attaches lets
     # the harness initialize at the kitty terminal's real size.
     #
-    # Control-mode clients (Portolan's `tmux -C attach -r` wterm preview)
-    # don't count — they declare a fake 200x50 and don't represent a
-    # human attach. Filter them out via `client_control_mode=0`.
+    # Control-mode clients (`tmux -C attach -r` previews) don't count —
+    # they declare a fake 200x50 and don't represent a human attach.
+    # Filter them out via `client_control_mode=0`.
     #
-    # The expected client of this gate is Portolan's auto-attach in the
-    # kanban modal's dispatch-success path (`onAttachFreshTmux` → kitty
-    # `launch --type=tab tmux attach`), which lands in ~300-500ms. The
-    # 10s timeout is the safety net for the rare cases where that auto-
-    # attach can't run — kitty isn't running, the daemon was dispatched
-    # by a non-Portolan client (CLI, scheduled standing role with no
-    # human in the loop). After the timeout the harness proceeds at the
+    # The expected client of this gate is an auto-attach in the kanban's
+    # dispatch-success path (kitty `launch --type=tab tmux attach`), which
+    # lands in ~300-500ms. The 10s timeout is the safety net for the rare
+    # cases where that auto-attach can't run — kitty isn't running, or the
+    # daemon was dispatched with no human in the loop (CLI, scheduled
+    # standing role). After the timeout the harness proceeds at the
     # default-size, same as the world before this gate existed.
     wait_for_client_block =
       if session != "" and not headless do
