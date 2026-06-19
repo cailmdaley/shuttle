@@ -1008,32 +1008,45 @@ defmodule Shuttle.PollerTest do
            end)
   end
 
-  test "poller auto-dispatches a LOOPING (status:active) pinned role, like a oneshot" do
-    # Option D: a pinned role at status:active is LOOPING — eligible and
-    # dispatched on the poll, exactly like an active oneshot. (Old model: the
-    # poller hard-skipped every pinned role; the never-auto-dispatch branch is
-    # gone.) The parked rest state is status:open, covered by the sibling test.
-    fiber = make_fiber("tests/pinned-looping", %{"status" => "active"})
-    MockRunner.set_fiber("tests/pinned-looping", fiber)
-    MockRunner.set_shuttle("tests/pinned-looping", "kind: pinned\n", "active")
+  test "poller does NOT auto-dispatch a status:active pinned role (it's an interface, not a loop)" do
+    # A pinned role is an INTERACTIVE INTERFACE: the human starts it, the worker
+    # stays attached, the session ends when the human ends it. The autonomous
+    # poll loop must never re-spawn it — a status:active pinned role whose session
+    # ended (human closed the chat, worker crashed) would otherwise re-dispatch
+    # every tick, surveying-and-exiting, burning tokens (the shapepipe loop).
+    # The exclusion lives in filter_eligible/2 (the tick), NOT in eligible? — so
+    # force-dispatch still launches it (covered below).
+    fiber = make_fiber("tests/pinned-active", %{"status" => "active"})
+    MockRunner.set_fiber("tests/pinned-active", fiber)
+    MockRunner.set_shuttle("tests/pinned-active", "kind: pinned\nagent: claude-opus\n", "active")
 
     {:ok, poller} =
       start_poller!(
-        name: :test_poller_pinned_looping,
+        name: :test_poller_pinned_active,
         runner: MockRunner,
         poll_interval_ms: 60_000,
         felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
+    # Flush the poll cycle through the GenServer mailbox.
+    _ = Poller.snapshot(poller)
+
+    refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session"
+           end),
+           "the autonomous tick must not spawn a worker for a pinned role"
+
+    # But an explicit force-dispatch (the strip's "start"/"Resume" gesture) DOES
+    # launch it — pinned roles are human-dispatch-only, not never-dispatch.
+    assert {:ok, _session} =
+             Poller.dispatch_fiber(poller, "tests/pinned-active", force: true, ad_hoc: true)
 
     assert wait_until(fn ->
              Enum.any?(MockRunner.commands(), fn {cmd, args} ->
                cmd == "tmux" and hd(args) == "new-session"
              end)
            end)
-
-    assert Enum.any?(Poller.snapshot(poller).eligible, &(&1.fiber_id == "tests/pinned-looping"))
   end
 
   test "poller does NOT auto-dispatch a PARKED (status:open) pinned role" do
@@ -1063,11 +1076,12 @@ defmodule Shuttle.PollerTest do
     refute Enum.any?(Poller.snapshot(poller).eligible, &(&1.fiber_id == "tests/pinned-parked"))
   end
 
-  test "a LOOPING pinned worker exit leaves the role active and re-dispatches next poll" do
-    # Option D: a pinned role at status:active is looping. On worker-exit-while-
-    # active it must stay status:active (NOT marked awaiting like a standing role)
-    # so the next poll re-dispatches it — that's the loop. Only STANDING/cron
-    # roles mark awaiting; a pinned worker that's genuinely done self-closes.
+  test "a pinned worker exit leaves the role active but the next poll does NOT re-dispatch" do
+    # A pinned worker exit must leave the document status:active (NOT marked
+    # awaiting/closed like a standing role) — the interface stays "open" for the
+    # human to resume. But the autonomous poll must NOT re-spawn it: that
+    # combination (active + sessionless + no re-dispatch) is the whole fix.
+    # Reverting filter_eligible's pinned guard re-arms the shapepipe token loop.
     #
     # The exit handler routes through felt (LifecycleStore → FeltStores.resolve_
     # fiber), so the mock fiber must be felt-resolvable: point LOOM_HOMES at the
@@ -1115,10 +1129,12 @@ defmodule Shuttle.PollerTest do
     refute doc =~ ~r/status:\s*closed/
     refute doc =~ "closed-at"
 
-    # The loop: the next poll re-dispatches the still-active, no-longer-running
-    # role (a SECOND new-session for the same session name).
+    # No loop: the next poll does NOT re-dispatch the still-active, no-longer-
+    # running pinned role. The session count stays at 1 — the human must resume
+    # it explicitly. (Reverting the pinned guard flips this to a second launch.)
     send(poller, :run_poll_cycle)
-    assert wait_until(fn -> new_sessions.() == 2 end)
+    _ = Poller.snapshot(poller)
+    assert new_sessions.() == 1
   end
 
   test "a standing worker exit DOES close the role to awaiting-review (status:closed)" do

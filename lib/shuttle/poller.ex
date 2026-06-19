@@ -1668,8 +1668,33 @@ defmodule Shuttle.Poller do
     end
   end
 
+  # The autonomous-tick eligibility filter. Beyond the shared `eligible?`
+  # predicate, the tick excludes pinned roles: a pinned role is an INTERACTIVE
+  # INTERFACE (a status hub, a debug intake), not autonomous work. The human
+  # starts it (drag-to-in-flight / New session / Resume — all force-dispatch),
+  # the worker stays attached as the interface, and the session ends when the
+  # human ends it. The poll loop must never re-spawn it: a pinned `active` role
+  # whose session has ended (human closed the chat, worker crashed) would
+  # otherwise re-dispatch every tick — surveying, finding nothing, exiting —
+  # burning tokens on an idle interface (the shapepipe redispatch loop). Pinned
+  # roles remain explicitly dispatchable: force-dispatch bypasses this entirely,
+  # and a plain `shuttle-ctl dispatch <id>` still routes through `eligible?`
+  # (which has no pinned gate), so only the *autonomous* path is severed.
+  # See [[ai-futures/shuttle/findings/finding-pinned-roles-are-interfaces-not-loops]].
   defp filter_eligible(candidates, state) do
-    Enum.filter(candidates, fn fiber -> eligible?(fiber, state) end)
+    Enum.filter(candidates, fn fiber ->
+      eligible?(fiber, state) and not pinned_role?(fiber)
+    end)
+  end
+
+  defp pinned_role?(fiber) do
+    case Map.get(fiber, "shuttle") do
+      shuttle when is_map(shuttle) ->
+        Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot")) == "pinned"
+
+      _ ->
+        false
+    end
   end
 
   defp eligible?(fiber, state) do
@@ -1718,14 +1743,15 @@ defmodule Shuttle.Poller do
         MapSet.member?(state.claimed, fiber_id) ->
           false
 
-        # A pinned role dispatches exactly like a oneshot: an `active` pinned
-        # fiber is LOOPING — eligible → dispatch → worker exits active →
-        # re-dispatch next poll, until a worker sets `status: closed` or a human
-        # parks it (`active → open`, the `pause` verb). `open` is the parked rest
-        # state, already excluded by the `status != "active"` gate above. So
-        # pinned needs no bespoke branch here; it falls through to the oneshot
-        # dependency check below. (Option D: parked=open, looping=active — the
-        # never-auto-dispatch special case was deleted.)
+        # Pinned roles need no bespoke branch HERE: this predicate also serves
+        # the explicit-dispatch path (`shuttle-ctl dispatch`, plain POST
+        # /dispatch), where a pinned role IS eligible — it's a human asking for
+        # it. The autonomous tick is what must never loop a pinned interface;
+        # that exclusion lives in `filter_eligible/2` (the tick's only caller),
+        # not here. A pinned `active` role with no live session therefore sits
+        # idle until the human re-attaches, instead of re-dispatching every
+        # poll. (Supersedes Option D's "active pinned = looping" model, which
+        # burned tokens re-surveying idle interfaces.)
 
         # Standing roles have additional preconditions; oneshots go to dep check.
         # Support both new-format (kind:) and old-format (mode:) shuttle blocks.

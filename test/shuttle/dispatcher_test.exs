@@ -183,6 +183,24 @@ defmodule Shuttle.DispatcherTest do
     refute prompt =~ "Exit before context is half-full"
   end
 
+  test "render_prompt for a pinned role inverts the exit contract to stay-alive" do
+    # A pinned role is an interactive interface — the worker must NOT kill $PPID
+    # when it runs out of immediate work; it stays attached and waits. The
+    # default (oneshot) contract is the opposite, so the two must not collide.
+    pinned = Dispatcher.render_prompt("tests/haiku", kind: "pinned")
+    assert pinned =~ "Exit Contract"
+    assert pinned =~ "pinned interactive role"
+    assert pinned =~ "DO NOT `kill $PPID`"
+    assert pinned =~ "stay alive and wait"
+    # The autonomous kill-on-exit instruction must be absent for pinned.
+    refute pinned =~ "your final action must be `kill $PPID`"
+
+    # Oneshot (the default) keeps the kill-on-exit contract.
+    oneshot = Dispatcher.render_prompt("tests/haiku")
+    assert oneshot =~ "your final action must be `kill $PPID`"
+    refute oneshot =~ "pinned interactive role"
+  end
+
   test "render_prompt carries the headless notice only when headless: true" do
     # Headless (-p) workers run unattended — the prompt must tell them the
     # human-gate exception can't apply, or they may park at a checkpoint that
