@@ -3059,7 +3059,7 @@ defmodule Shuttle.Poller do
   # command, the host directory it ran in, the exit status, and trimmed
   # stderr. felt's own stderr for a nonexistent store can be empty (it just
   # finds no index), which previously bubbled up as a BLANK `{:error, ""}` →
-  # an undiagnosable 500 at the ActionsController boundary. Including the host
+  # an undiagnosable 500 at the HTTP boundary. Including the host
   # path names the actual fault — typically a felt-store path that doesn't
   # exist on this machine (a foreign absolute path registered by another
   # host's portolan).
