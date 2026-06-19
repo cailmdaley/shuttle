@@ -1098,15 +1098,17 @@ defmodule Shuttle.Poller do
 
   # ── Orphan Resurrection ──
 
-  # Downtime recovery for standing roles, on the tmux-scan substrate (slice 6:
-  # replaces the runtime-store-keyed `reconcile_dispatched_dead_fibers` +
-  # `maybe_resurrect_orphan`). A standing role whose worker exited while the
-  # daemon was down never fired `handle_worker_exit`, so its document stays armed
-  # (status:active, no verdict) and would re-fire on the next poll. Scan tmux: an
-  # owned, armed standing role with NO live session and NO live watcher → mark it
-  # awaiting (status:closed). Oneshots need no analog here — a status:active
-  # oneshot with no live session is simply eligible again next tick (retries
-  # collapsed into the poll loop), and the cron window gates standing redispatch.
+  # Downtime recovery for perennial roles (standing + pinned), on the tmux-scan
+  # substrate (slice 6: replaces the runtime-store-keyed
+  # `reconcile_dispatched_dead_fibers` + `maybe_resurrect_orphan`). A perennial
+  # role whose worker exited while the daemon was down never fired
+  # `handle_worker_exit`, so its document stays `status:active` with no live
+  # session. Scan tmux: an owned, active role with NO live session and NO live
+  # watcher → a standing role is marked awaiting (status:closed) so the cron
+  # doesn't re-fire; a pinned role is parked (status:open) back to the strip so a
+  # dead interface neither sits stuck `active` in In-flight nor relaunches.
+  # Oneshots need no analog — a status:active oneshot with no live session is
+  # simply eligible again next tick (retries collapsed into the poll loop).
   #
   # `adopt_orphans` (init) and `reconcile_orphaned_sessions` (per-poll) handle
   # the *live* analog: a tmux session exists, we just aren't watching it. This
@@ -1136,9 +1138,10 @@ defmodule Shuttle.Poller do
       not host_owned?(shuttle, state.own_host_id) ->
         state
 
-      # Oneshots: no awaiting-on-down handling — status:active + no live session
-      # just re-dispatches next tick (retries are the poll loop now).
-      kind != "standing" ->
+      # Oneshots: no on-down handling — status:active + no live session just
+      # re-dispatches next tick (retries are the poll loop now). Standing and
+      # pinned both reconcile (different terminal action, below); oneshots don't.
+      kind not in ["standing", "pinned"] ->
         state
 
       # Only an armed role can regress into a phantom re-fire; closed/tempered
@@ -1167,6 +1170,19 @@ defmodule Shuttle.Poller do
       # already exited (the daily-practice "armed, not-yet-due, never-dispatched-
       # this-cycle" shape) is left alone so its next cron tick fires.
       not standing_role_dispatched_unexited?(fiber_id, state) ->
+        state
+
+      # Daemon-down analog of handle_worker_exit, split by kind:
+      #  • standing → awaiting (status:closed) so the cron doesn't re-fire;
+      #  • pinned   → parked (status:open) back to the strip, so a dead interface
+      #    doesn't sit stuck `active` in In-flight and never relaunches itself.
+      kind == "pinned" ->
+        Logger.info(
+          "Pinned role #{fiber_id} active with an un-exited dispatch but no live tmux " <>
+            "session/watcher — session ended while daemon was down; parking (status:open)"
+        )
+
+        mark_pinned_parked(fiber_id)
         state
 
       true ->
@@ -2782,27 +2798,30 @@ defmodule Shuttle.Poller do
                     # anchor, both doc-representable. Write BEFORE release_claim
                     # so the document reflects awaiting before the claim frees (a
                     # re-poll racing the release then reads `status: closed` and
-                    # skips re-dispatch). Pinned roles do NOT come here
-                    # (`standing_role?` is standing-only): they loop instead, so
-                    # they fall through to the resting branch below and stay
-                    # `status: active`, which re-dispatches next poll.
+                    # skips re-dispatch).
                     mark_standing_awaiting(fiber_id)
 
                     release_claim(state, fiber_id)
 
+                  pinned_role?(fiber) ->
+                    # A PINNED interactive role's session ended — the human killed
+                    # the tmux session, the worker crashed, or it exited despite
+                    # the stay-alive contract. The role must NOT relaunch (the
+                    # poller's filter_eligible already excludes pinned from the
+                    # autonomous tick) and must NOT get stuck `active` with no live
+                    # worker in In-flight. Park it back to the strip by writing
+                    # `active → open`; the human re-attaches with Resume
+                    # (force-dispatch → rearm). Write BEFORE release_claim so the
+                    # document reflects the parked state before the claim frees.
+                    mark_pinned_parked(fiber_id)
+
+                    release_claim(state, fiber_id)
+
                   true ->
-                    # Still active — just release the claim. Two shapes land here,
-                    # and both re-dispatch on the next poll (status:active + no
-                    # live session → eligible):
-                    #  • A LOOPING pinned role: it stays `status: active` and the
-                    #    next poll re-dispatches it (Option D: active=looping). A
-                    #    human parks it by dragging In-flight → strip, which writes
-                    #    `active → open` (the `pause` verb); `open` then fails the
-                    #    eligible? status gate and the loop stops.
-                    #  • A multi-session oneshot continuation: the next poll
-                    #    re-picks it and starts a fresh session (no
-                    #    resume_mode:previous on file — retries collapsed into the
-                    #    poll loop, slice 6).
+                    # A still-active ONESHOT continuation: the next poll re-picks
+                    # it and starts a fresh session (status:active + no live
+                    # session → eligible; no resume_mode:previous on file —
+                    # retries collapsed into the poll loop, slice 6).
                     release_claim(state, fiber_id)
                 end
 
@@ -2826,6 +2845,22 @@ defmodule Shuttle.Poller do
 
       {:error, reason} ->
         Logger.warning("Failed to mark standing role #{fiber_id} awaiting on exit: #{reason}")
+        :error
+    end
+  end
+
+  # Park a pinned interactive role back to the strip (`status: open`) on session
+  # end. Best-effort, same contract as mark_standing_awaiting: a failed felt
+  # write must not crash the exit-handling state machine (the worker is already
+  # gone), so we log and continue. The felt-history exit event is written
+  # separately by `log_worker_exit`.
+  defp mark_pinned_parked(fiber_id) do
+    case LifecycleStore.park(fiber_id) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Failed to park pinned role #{fiber_id} on exit: #{reason}")
         :error
     end
   end
