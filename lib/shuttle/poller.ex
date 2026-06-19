@@ -1339,7 +1339,7 @@ defmodule Shuttle.Poller do
     case Shuttle.FiberDocuments.get(fiber_id, felt_stores: state.felt_stores) do
       {:ok, %{fibers: [entry | _]}} ->
         fiber = Map.get(entry, :fiber, %{})
-        key = document_cache_key(fiber)
+        key = Shuttle.Poller.DocumentCache.cache_key(fiber)
         cached = %{modified_at: Map.get(fiber, "modified_at"), entry: entry}
         %{state | document_cache: Map.put(without_fiber, key, cached)}
 
@@ -1353,72 +1353,12 @@ defmodule Shuttle.Poller do
     end
   end
 
+  # The poll-cycle document cache lives in `Shuttle.Poller.DocumentCache`; the
+  # cache itself stays on `State`. felt shell-out is injected as a closure so
+  # `run_felt/3` stays private to the poller.
   defp refresh_document_cache(%State{} = state, candidates, host_map) do
-    previous = state.document_cache
-
-    {cache, stats} =
-      Enum.reduce(candidates, {%{}, %{hits: 0, misses: 0}}, fn candidate, {cache_acc, stats} ->
-        key = document_cache_key(candidate)
-        modified_at = Map.get(candidate, "modified_at")
-        cached = Map.get(previous, key)
-
-        if reusable_document_cache_entry?(cached, modified_at) do
-          {Map.put(cache_acc, key, cached), Map.update!(stats, :hits, &(&1 + 1))}
-        else
-          case fetch_document_cache_entry(state, candidate, host_map) do
-            {:ok, entry} ->
-              cached = %{modified_at: modified_at, entry: entry}
-              {Map.put(cache_acc, key, cached), Map.update!(stats, :misses, &(&1 + 1))}
-
-            {:error, reason} ->
-              Logger.warning(
-                "document cache refresh skipped #{Map.get(candidate, "id", "(unknown)")}: #{inspect(reason)}"
-              )
-
-              if cached do
-                {Map.put(cache_acc, key, cached), Map.update!(stats, :hits, &(&1 + 1))}
-              else
-                {cache_acc, Map.update!(stats, :misses, &(&1 + 1))}
-              end
-          end
-        end
-      end)
-
-    stats =
-      stats
-      |> Map.put(:evictions, max(map_size(previous) - map_size(cache), 0))
-      |> Map.put(:entries, map_size(cache))
-
-    {cache, stats}
-  end
-
-  defp document_cache_key(candidate) do
-    case Map.get(candidate, "uid") do
-      uid when is_binary(uid) and uid != "" -> uid
-      _ -> Map.get(candidate, "id", "")
-    end
-  end
-
-  defp reusable_document_cache_entry?(%{modified_at: modified_at, entry: entry}, modified_at)
-       when is_map(entry),
-       do: true
-
-  defp reusable_document_cache_entry?(_, _), do: false
-
-  defp fetch_document_cache_entry(state, candidate, host_map) do
-    with id when is_binary(id) and id != "" <- Map.get(candidate, "id"),
-         store when is_binary(store) <- Map.get(host_map, id),
-         {:ok, output} <- run_felt(store, state.runner, ["show", id, "--json"]),
-         {:ok, %{} = fiber} <- Jason.decode(output),
-         [entry | _] <- Shuttle.FiberDocuments.entries_for_fiber(store, Map.delete(fiber, "body")) do
-      {:ok, entry}
-    else
-      nil -> {:error, :missing_store}
-      "" -> {:error, :missing_id}
-      {:error, error} -> {:error, error}
-      [] -> {:error, :invalid_entry}
-      _ -> {:error, :invalid_json}
-    end
+    run_felt = fn store, args -> run_felt(store, state.runner, args) end
+    Shuttle.Poller.DocumentCache.refresh(state, candidates, host_map, run_felt)
   end
 
   # Read one host's shuttle fibers via felt's JSON, keeping only those
