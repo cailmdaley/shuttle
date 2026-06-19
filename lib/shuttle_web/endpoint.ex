@@ -1,23 +1,11 @@
 defmodule ShuttleWeb.Endpoint do
   @moduledoc """
-  Minimal Phoenix endpoint for the reactive snapshot surface.
+  Phoenix endpoint serving the daemon's HTTP API and the static UI bundle.
 
-  Serves WebSocket connections for Phoenix Channels only.
-  No static files, no sessions, no HTML — just the snapshot channel.
+  The UI HTTP-polls — there is no WebSocket/Channel transport.
   """
 
   use Phoenix.Endpoint, otp_app: :shuttle
-
-  @session_options [
-    store: :cookie,
-    key: "_shuttle_key",
-    signing_salt: "shuttlesalt",
-    same_site: "Lax"
-  ]
-
-  socket "/socket", ShuttleWeb.UserSocket,
-    websocket: true,
-    longpoll: false
 
   plug Plug.RequestId
   plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
@@ -40,6 +28,5 @@ defmodule ShuttleWeb.Endpoint do
   plug ShuttleWeb.CORSPlug
   plug Plug.MethodOverride
   plug Plug.Head
-  plug Plug.Session, @session_options
   plug ShuttleWeb.Router
 end
