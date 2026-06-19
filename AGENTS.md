@@ -30,12 +30,19 @@ and Shuttle as one thing rather than two that shell to each other.
 Live runtime couplings (these silently break or no-op without Portolan, and are
 the real severing work):
 
-- **`lib/shuttle/waiting_tracker.ex`** — reads Portolan's Claude Code hook-event
-  stream (`~/.portolan/data/events.jsonl`, written by `~/loom/hooks/portolan-hook.sh`)
-  to derive per-session activity / "waiting" phase. Env `PORTOLAN_EVENTS_FILE` /
-  `PORTOLAN_DATA_DIR`. Without Portolan's hook installed, the feed is empty and
-  session-activity is blank. Severing means Shuttle owning its own hook + event
-  path.
+- **`lib/shuttle/waiting_tracker.ex`** (and `sent_files.ex`, which delegates to
+  its `default_events_file/0`) — read the Claude Code hook-event stream to derive
+  per-session activity / "waiting" phase and the sent-files trail. **Shuttle now
+  owns its own stream:** the readers prefer the Shuttle-owned path
+  (`SHUTTLE_EVENTS_FILE`, else `$SHUTTLE_DATA_DIR/events.jsonl`, default
+  `~/.shuttle/events.jsonl`, written by `share/shuttle-hook.sh`) and **fall back**
+  to the legacy Portolan path (`PORTOLAN_EVENTS_FILE` /
+  `~/.portolan/data/events.jsonl`, written by `~/loom/hooks/portolan-hook.sh`)
+  only when the Shuttle file is absent or empty. So behavior is unchanged until
+  the Shuttle hook is installed (see "Owning the event stream" below), then it
+  transparently switches. The event shape is identical, so the parsers are
+  unchanged. Fully severing means dropping the Portolan fallback once the hook is
+  installed everywhere.
 - **UI `:4004` backend (`ui/src/board/FiberDetailModal.ts`, `FileViewerPanel.ts`)** —
   `portolanBase` defaults to `http://localhost:4004` and the standalone
   `KanbanModal` never overrides it, so **Sent-files**, **Save-to-downloads**, and
@@ -134,6 +141,37 @@ the LaunchAgent is macOS-only.
 escape hatch — granting FDA to each I/O binary in the tree (`…/erlang/<v>/…/beam.smp`,
 re-granted after every erlang upgrade, plus `~/.local/bin/felt`) — but it's
 fragile and per-binary; relocating out of Documents is the supported fix.
+
+### Owning the event stream — `share/shuttle-hook.sh`
+
+Shuttle derives per-session activity (`WaitingTracker`) and the sent-files trail
+(`SentFiles`) from a Claude Code hook-event stream. `share/shuttle-hook.sh`
+appends one JSON line per hook event to `$SHUTTLE_EVENTS_FILE` (default
+`~/.shuttle/events.jsonl`, dir `$SHUTTLE_DATA_DIR`), in the same shape the legacy
+`portolan-hook.sh` writes, so the daemon no longer depends on Portolan's hook.
+Until this hook is installed, the readers fall back to Portolan's
+`~/.portolan/data/events.jsonl`, so nothing breaks in the meantime.
+
+Install by registering the script in `~/.claude/settings.json`'s `hooks` block —
+one `command` entry per event you want tracked. `make install-hook` prints the
+exact snippet (it does not edit your settings.json):
+
+```json
+"hooks": {
+  "PreToolUse":       [ { "hooks": [ { "type": "command", "command": "/ABS/PATH/shuttle/share/shuttle-hook.sh" } ] } ],
+  "PostToolUse":      [ { "hooks": [ { "type": "command", "command": "/ABS/PATH/shuttle/share/shuttle-hook.sh" } ] } ],
+  "Stop":             [ { "hooks": [ { "type": "command", "command": "/ABS/PATH/shuttle/share/shuttle-hook.sh" } ] } ],
+  "SubagentStop":     [ { "hooks": [ { "type": "command", "command": "/ABS/PATH/shuttle/share/shuttle-hook.sh" } ] } ],
+  "SessionStart":     [ { "hooks": [ { "type": "command", "command": "/ABS/PATH/shuttle/share/shuttle-hook.sh" } ] } ],
+  "SessionEnd":       [ { "hooks": [ { "type": "command", "command": "/ABS/PATH/shuttle/share/shuttle-hook.sh" } ] } ],
+  "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "/ABS/PATH/shuttle/share/shuttle-hook.sh" } ] } ],
+  "Notification":     [ { "hooks": [ { "type": "command", "command": "/ABS/PATH/shuttle/share/shuttle-hook.sh" } ] } ]
+}
+```
+
+The hook needs `jq` on PATH; without it the hook exits silently and the readers
+keep using the Portolan fallback. On the clusters, install the same way under
+each host's `~/.claude/settings.json` so each daemon tails its own host's stream.
 
 **Connecting to candide and cineca (SSH auth — read this first).** The two
 remotes authenticate differently, and getting it wrong looks like "the host is
