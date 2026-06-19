@@ -96,19 +96,20 @@ defmodule Shuttle.StandingRole do
   defp due_by_schedule?(_, _), do: false
 
   @doc """
-  Cron-derived due check for the **dispatch** path: a valid role whose schedule
-  fired a tick inside the window `(now - window_ms, now]`.
+  Cron-derived due check for the **dispatch** path: true iff the schedule fired a
+  tick inside the lookback `(now - window_ms, now]`.
 
-  This is the slice-2 cutover: due-ness is computed straight from the cron
-  `schedule` and `now`, NOT from a stored `next_due_at`. The window anchors on
-  `now` and is the poll interval (plus jitter slack), so a tick is caught by the
-  first poll after it fires and **missed ticks are skipped, not replayed** — a
-  tick that fell before the window (daemon down across it) is gone, exactly the
-  morning-post-drift rule. Once a role fires, its document flips
-  `active → closed`, and `eligible?` excludes closed, so it cannot re-fire within
-  the same cycle even though the cron tick stays inside the window for a poll or
-  two; the `active → closed → active` document transition is the per-cycle gate,
-  not a stored timestamp.
+  Due-ness is computed straight from the cron `schedule` and `now`, NOT from a
+  stored `next_due_at`. This is a pure primitive — the *meaning* of the lookback
+  is the caller's. The poller (`standing_role_due?`) anchors it at the role's last
+  service (`now - last_serviced`), so "a tick in the lookback" means "an
+  occurrence elapsed since we last ran" — i.e. the schedule self-catches a fire
+  the daemon slept through, however late, rather than skipping it.
+
+  A single catch-up fires, not a backlog: once a role fires its document flips
+  `active → closed`, `eligible?` excludes closed, and the run advances the anchor
+  to ~now — so the `active → closed → accept` transition is the per-cycle gate,
+  not a timestamp, and an awaiting role never re-fires until a human tempers it.
 
   It does NOT consult `review.state` — the dispatch gate is the felt document's
   `status`/`tempered` (the poller checks those before calling this).

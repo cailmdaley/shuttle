@@ -1214,6 +1214,11 @@ defmodule Shuttle.PollerTest do
       """
     )
 
+    # Just serviced (a "worker dispatched" event at ~now): under the one due rule,
+    # a role is due only once a scheduled occurrence elapses AFTER its last
+    # service, so a freshly-serviced weekday-09:00 role is not due now.
+    append_dispatch_session("tests/standing-sleeping", "seed-recent")
+
     {:ok, poller} =
       start_poller!(
         name: :test_poller_standing_sleeping,
@@ -1250,6 +1255,9 @@ defmodule Shuttle.PollerTest do
         tz: Europe/Paris
       """
     )
+
+    # Recently serviced ⇒ not due now (so it stays scheduled, not running).
+    append_dispatch_session(fiber_id, "seed-recent")
 
     {:ok, poller} =
       start_poller!(
@@ -1303,6 +1311,47 @@ defmodule Shuttle.PollerTest do
     assert_eventually(fn ->
       assert [%{fiber_id: ^fiber_id, state: "running"}] = Poller.snapshot(poller).eligible
     end)
+  end
+
+  test "an awaiting-review (status:closed) standing role is NOT relaunched even with an elapsed occurrence" do
+    # Cail's rule, the other half of catch-up: a role that ran is awaiting review
+    # (status:closed) until a human tempers (accepts) it. Catch-up must never
+    # resurrect it — eligible?'s status gate excludes closed before the due rule
+    # is ever consulted. Every-minute schedule ⇒ an occurrence has certainly
+    # elapsed since the fixed past created_at, so only the closed gate stops it.
+    fiber_id = "tests/standing-awaiting-no-relaunch"
+
+    MockRunner.set_fiber(
+      fiber_id,
+      make_fiber(fiber_id, %{"status" => "closed", "tags" => ["constitution", "standing"]})
+    )
+
+    MockRunner.set_shuttle(
+      fiber_id,
+      """
+      kind: standing
+      agent: claude-sonnet
+      schedule:
+        expr: "* * * * *"
+        tz: Europe/Paris
+      """,
+      "closed"
+    )
+
+    {:ok, poller} =
+      start_poller!(
+        name: :test_poller_standing_awaiting_no_relaunch,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
+    send(poller, :run_poll_cycle)
+    Process.sleep(50)
+
+    refute Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "tmux" and hd(args) == "new-session"
+           end)
   end
 
   # Awaiting is a DOCUMENT fact (status:closed + untempered), not a runtime-store
@@ -1478,6 +1527,10 @@ defmodule Shuttle.PollerTest do
       next_due_at: "2999-01-01T09:00:00+01:00"
       """
     )
+
+    # Recently serviced ⇒ the scheduler treats it as not-due, so a plain dispatch
+    # is refused; only force/ad-hoc overrides (the point of this test).
+    append_dispatch_session(fiber_id, "seed-recent")
 
     {:ok, poller} =
       start_poller!(
@@ -1903,6 +1956,10 @@ defmodule Shuttle.PollerTest do
       """
     )
 
+    # Recently serviced ⇒ not due now (the stored next_due_at is ignored under the
+    # one due rule; what gates is "has an occurrence elapsed since last service").
+    append_dispatch_session("tests/standing-stale", "seed-recent")
+
     {:ok, poller} =
       start_poller!(
         name: :test_poller_standing_stale,
@@ -1951,6 +2008,9 @@ defmodule Shuttle.PollerTest do
         timezone: Europe/Paris
       """
     )
+
+    # Recently serviced ⇒ not due ⇒ stays "scheduled" (not dispatched/"running").
+    append_dispatch_session("tests/standing-review", "seed-recent")
 
     # A draft role (status: open) still reads scheduled in the schedule-derived
     # snapshot — paused/draft is a document fact (status), surfaced by the kanban

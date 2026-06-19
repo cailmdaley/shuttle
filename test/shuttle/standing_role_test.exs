@@ -79,11 +79,22 @@ defmodule Shuttle.StandingRoleTest do
       assert StandingRole.due_by_cron?(with_stray_review, now, @window_ms)
     end
 
-    test "a missed tick (daemon down across it) is not replayed" do
-      # The 10:00 tick fired five minutes before now; with a 90s window it is
-      # outside the window and is skipped rather than replayed.
+    test "a tick outside the lookback is not served (already handled / serviced since)" do
+      # The 10:00 tick fired five minutes before now; with a 90s lookback it is
+      # outside the window and not served. In the live system the lookback is
+      # `now - last_service`, so this is the shape of "we ran after this tick" —
+      # the per-cycle gate that stops a handled tick from re-firing.
       now = ~U[2026-06-02 10:05:00Z]
       refute StandingRole.due_by_cron?(cron_role("0 10 * * *"), now, @window_ms)
+    end
+
+    test "a missed tick IS replayed when the lookback reaches it (catch-up)" do
+      # The live system anchors the lookback at the role's last service, so a tick
+      # the daemon slept through is caught however late. The 10:00 tick fired five
+      # minutes ago; a lookback that spans the last service (6 min) makes it due —
+      # the catch-up that fires a Friday-08:00 chase when the laptop wakes later.
+      now = ~U[2026-06-02 10:05:00Z]
+      assert StandingRole.due_by_cron?(cron_role("0 10 * * *"), now, 6 * 60 * 1000)
     end
 
     test "an invalid role is never due" do
