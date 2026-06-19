@@ -410,6 +410,17 @@ defmodule Shuttle.PollerTest do
     if code != 0, do: raise("felt history append failed (#{code}): #{out}")
   end
 
+  defp append_handoff(id, summary \\ "did the work; next picks up at the next step") do
+    {out, code} =
+      System.cmd(
+        "felt",
+        ["-C", "/tmp", "history", "append", id, "--kind", "handoff", "--summary", summary],
+        stderr_to_stdout: true
+      )
+
+    if code != 0, do: raise("felt handoff append failed (#{code}): #{out}")
+  end
+
   # ── Tests ──
 
   test "poller discovers and dispatches eligible fibers" do
@@ -2207,50 +2218,62 @@ defmodule Shuttle.PollerTest do
     assert script =~ "stored-session-id"
   end
 
-  test "poller continuation re-dispatches fresh when no resume directive is on file" do
-    # Retries collapsed into the poll loop (slice 6). A multi-session oneshot's
-    # autonomous continuation re-dispatches through the normal poll path; with no
-    # `resume_mode: previous` review-comment on file, the dispatch is fresh — it
-    # does not resume a prior session UUID.
-    fiber_id = "tests/continuation-fresh"
+  test "poller continuation RESUMES a oneshot that died without a handoff marker" do
+    # The resume-on-no-handoff fix. A multi-session oneshot's autonomous
+    # continuation: a prior session id is on file but there is NO worker-authored
+    # `--kind handoff` after it — so the previous session died mid-thought (the
+    # remote-machine kill case), and the dispatch must RESUME the transcript
+    # rather than loop a fresh, context-less worker.
+    fiber_id = "tests/continuation-died"
 
-    fiber = make_fiber(fiber_id)
-    MockRunner.set_fiber(fiber_id, fiber)
+    MockRunner.set_fiber(fiber_id, make_fiber(fiber_id))
+    MockRunner.set_shuttle(fiber_id, "kind: oneshot\nagent: claude-sonnet\n")
 
-    MockRunner.set_shuttle(
-      fiber_id,
-      """
-      kind: oneshot
-      agent: claude-sonnet
-      """
-    )
-
-    # A prior session id exists in felt history, but no resume directive — so the
-    # autonomous re-dispatch must NOT resume it.
     append_dispatch_session(fiber_id, "old-session-id")
 
     {:ok, poller} =
       start_poller!(
-        name: :test_poller_continuation_fresh,
+        name: :test_poller_continuation_died,
         runner: MockRunner,
         poll_interval_ms: 60_000,
         felt_stores: ["/tmp"]
       )
 
     send(poller, :run_poll_cycle)
-    assert wait_until(fn -> length(new_session_scripts()) == 1 end, 80)
+    assert wait_until(fn -> new_session_scripts() != [] end, 80)
 
-    MockRunner.remove_tmux_session(Dispatcher.session_name(fiber_id))
-    send(poller, {:worker_exited, fiber_id, :normal_exit, false})
+    script = new_session_scripts() |> List.last() |> File.read!()
+    assert script =~ "--resume"
+    assert script =~ "old-session-id"
+  end
 
-    # Next poll re-dispatches the still-active oneshot.
+  test "poller continuation re-dispatches FRESH when the worker left a clean handoff" do
+    # The clean-close half: a `--kind handoff` event filed after the last
+    # dispatch marks an intentional handoff, so the continuation starts fresh and
+    # the next worker reads the handoff (the intentional loop, unchanged).
+    fiber_id = "tests/continuation-handoff"
+
+    MockRunner.set_fiber(fiber_id, make_fiber(fiber_id))
+    MockRunner.set_shuttle(fiber_id, "kind: oneshot\nagent: claude-sonnet\n")
+
+    append_dispatch_session(fiber_id, "old-session-id")
+    append_handoff(fiber_id)
+
+    {:ok, poller} =
+      start_poller!(
+        name: :test_poller_continuation_handoff,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        felt_stores: ["/tmp"]
+      )
+
     send(poller, :run_poll_cycle)
-    assert wait_until(fn -> length(new_session_scripts()) == 2 end, 80)
+    assert wait_until(fn -> new_session_scripts() != [] end, 80)
 
-    second_script = new_session_scripts() |> List.last() |> File.read!()
-    assert second_script =~ "Fiber: #{fiber_id}"
-    refute second_script =~ "--resume"
-    refute second_script =~ "old-session-id"
+    script = new_session_scripts() |> List.last() |> File.read!()
+    assert script =~ "Fiber: #{fiber_id}"
+    refute script =~ "--resume"
+    refute script =~ "old-session-id"
   end
 
   test "poller releases claim when worker exits and fiber is closed" do
