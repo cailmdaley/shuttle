@@ -38,6 +38,7 @@ defmodule Shuttle.Poller do
   }
 
   alias Shuttle.Poller.Snapshot
+  alias Shuttle.Poller.SessionReconciliation
   alias Shuttle.Poller.StandingRoles
 
   @default_poll_interval_ms 30_000
@@ -428,7 +429,7 @@ defmodule Shuttle.Poller do
     # `running` from tmux by adopting any live shuttle sessions — a restart
     # re-scans tmux and is immediately correct, and running work survives because
     # tmux owns the worker process.
-    state = adopt_orphans(state)
+    state = SessionReconciliation.adopt_orphans(state)
 
     # Schedule first tick immediately
     state = schedule_tick(state, 0)
@@ -744,7 +745,8 @@ defmodule Shuttle.Poller do
     end
   end
 
-  defp runtime_key_for_fiber(fiber) when is_map(fiber) do
+  @doc false
+  def runtime_key_for_fiber(fiber) when is_map(fiber) do
     fiber_id = fiber_address(fiber)
     metadata_uid(fiber) || fiber_id
   end
@@ -973,7 +975,8 @@ defmodule Shuttle.Poller do
   # realpath roots in lightcone) and the lightcone store claims it. A store
   # whose own `.felt/` is a symlink (case 1) owns nothing; the target store
   # enumerates it. Ownership is read from felt's path, never reverse-derived.
-  defp discover_candidates(state) do
+  @doc false
+  def discover_candidates(state) do
     {all_fibers, host_map, uid_map} =
       Enum.reduce(state.felt_stores, {[], %{}, %{}}, fn host, {acc_fibers, acc_map, acc_uids} ->
         case list_shuttle_fibers(host, state) do
@@ -1626,7 +1629,8 @@ defmodule Shuttle.Poller do
 
   # Returns the shuttle.agent name for a fiber, reading its block through felt.
   # Used by dispatch paths that don't already hold the block map.
-  defp fetch_shuttle_agent_name(fiber_id, state) do
+  @doc false
+  def fetch_shuttle_agent_name(fiber_id, state) do
     case fetch_shuttle_block(fiber_id, state) do
       {:ok, shuttle} -> shuttle_agent_from_block(shuttle)
       {:error, _} -> nil
@@ -1812,7 +1816,7 @@ defmodule Shuttle.Poller do
 
       {:error, :already_running} ->
         # Session exists but we don't have a watcher — adopt it
-        state = adopt_session(state, fiber_id)
+        state = SessionReconciliation.adopt_session(state, fiber_id)
         state = %{state | dispatch_failures: Map.delete(state.dispatch_failures, fiber_id)}
         {state, {:error, :already_running}}
 
@@ -2021,7 +2025,7 @@ defmodule Shuttle.Poller do
     state = %{state | orphans: []}
     state = reconcile_fiber_closures(state)
     state = reconcile_missing_running_sessions(state)
-    state = reconcile_orphaned_sessions(state)
+    state = SessionReconciliation.reconcile_orphaned_sessions(state)
     state = clean_expired_reservations(state)
     state
   end
@@ -2048,24 +2052,6 @@ defmodule Shuttle.Poller do
           state_acc
       end
     end)
-  end
-
-  defp reconcile_orphaned_sessions(%State{} = state) do
-    # Find tmux sessions that exist but have no watcher.
-    {:ok, sessions} = list_shuttle_sessions(state)
-    running_sessions = Enum.map(state.running, fn {_, meta} -> meta.session end) |> MapSet.new()
-
-    orphan_sessions = Enum.reject(sessions, &MapSet.member?(running_sessions, &1))
-
-    if orphan_sessions == [] do
-      state
-    else
-      lookup = candidate_session_lookup(state)
-
-      Enum.reduce(orphan_sessions, state, fn session, state_acc ->
-        adopt_known_orphan_session(state_acc, lookup, session)
-      end)
-    end
   end
 
   defp reconcile_missing_running_sessions(%State{running: running} = state)
@@ -2159,68 +2145,6 @@ defmodule Shuttle.Poller do
   # the legacy `mode:` field, defaulting to "oneshot".
   @doc false
   def role_kind(shuttle), do: Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot"))
-
-  defp adopt_orphans(%State{} = state) do
-    {:ok, sessions} = list_shuttle_sessions(state)
-    lookup = candidate_session_lookup(state)
-
-    Enum.reduce(sessions, state, fn session, state_acc ->
-      adopt_known_orphan_session(state_acc, lookup, session)
-    end)
-  end
-
-  # `session` is the *live* tmux session name to adopt. Callers that discovered
-  # a live orphan pass its exact name (which may be the legacy leaf-only form on
-  # a worker launched before the uid-keyed cutover); the default picks whichever
-  # of the fiber's name forms is actually live (preferring the uid-keyed name),
-  # for callers that only have the fiber identity.
-  defp adopt_session(state, fiber_id, session \\ nil) do
-    session =
-      session || live_session_for_fiber(state, fiber_id) ||
-        Dispatcher.session_name(fiber_id, uid_for_fiber(state, fiber_id))
-
-    case fetch_fiber_full(fiber_id, state) do
-      {:ok, fiber} ->
-        if Map.get(fiber, "status") != "closed" do
-          agent_name = fetch_shuttle_agent_name(fiber_id, state)
-          {:ok, agent} = Shuttle.Agents.resolve_by_name(agent_name)
-
-          now = DateTime.utc_now()
-
-          running_meta = %{
-            fiber_id: fiber_id,
-            session: session,
-            agent_id: agent.id,
-            uid: Map.get(fiber, "uid"),
-            started_at: now,
-            last_activity_at: now
-          }
-
-          case start_watcher(state, fiber_id, running_meta) do
-            {:ok, running_meta} ->
-              runtime_key = runtime_key_for_fiber(fiber)
-              running = Map.put(state.running, runtime_key, running_meta)
-
-              Logger.info("Adopted orphan session: #{session}")
-              %{state | running: running, claimed: MapSet.put(state.claimed, fiber_id)}
-
-            {:error, reason} ->
-              Logger.warning("Failed to adopt session #{session}: #{inspect(reason)}")
-              state
-          end
-        else
-          # Fiber is closed but tmux session still exists — kill it
-          Logger.info("Killing stale session for closed fiber: #{session}")
-          _ = state.runner.cmd("tmux", ["kill-session", "-t", session], stderr_to_stdout: true)
-          state
-        end
-
-      {:error, _} ->
-        # Fiber not found — skip, don't kill (could be from another host or test)
-        Logger.debug("Skipping orphan session for unknown fiber: #{session}")
-        state
-    end
-  end
 
   # ── Worker Exit Handling ──
 
@@ -2341,7 +2265,8 @@ defmodule Shuttle.Poller do
 
   # The fiber's *live* tmux session name (either form), preferring the uid-keyed
   # canonical name when both happen to exist. Returns nil when neither is live.
-  defp live_session_for_fiber(%State{} = state, fiber_id) do
+  @doc false
+  def live_session_for_fiber(%State{} = state, fiber_id) do
     fiber_id
     |> Dispatcher.session_names(uid_for_fiber(state, fiber_id))
     |> Enum.find(&already_running_session?(state, &1))
@@ -2368,7 +2293,8 @@ defmodule Shuttle.Poller do
     }
   end
 
-  defp start_watcher(%State{} = state, fiber_id, metadata) do
+  @doc false
+  def start_watcher(%State{} = state, fiber_id, metadata) do
     watcher_opts = [
       fiber_id: fiber_id,
       session: Map.fetch!(metadata, :session),
@@ -2450,7 +2376,8 @@ defmodule Shuttle.Poller do
 
   # Fetch a fiber's full JSON representation via the felt CLI. Routes to the
   # fiber's owning host via host_for_fiber/2 (cache → felt resolution).
-  defp fetch_fiber_full(fiber_id, state) do
+  @doc false
+  def fetch_fiber_full(fiber_id, state) do
     host =
       case host_for_fiber(fiber_id, state) do
         {:ok, h} -> h
@@ -2557,83 +2484,6 @@ defmodule Shuttle.Poller do
         trimmed = String.trim(to_string(output))
         detail = if trimmed == "", do: "(no output)", else: trimmed
         {:error, "felt #{Enum.join(args, " ")} (cd #{host}) exited #{status}: #{detail}"}
-    end
-  end
-
-  # Maps every live tmux session name a candidate could carry — both the
-  # uid-keyed canonical name and the legacy leaf-only name — back to its fiber,
-  # so orphan adoption recognizes a worker launched under either scheme. The
-  # uid-keyed entries are inherently collision-free; the legacy leaf-only
-  # entries keep the existing ambiguity guard (two fibers sharing a leaf resolve
-  # to `:ambiguous` and are skipped rather than mis-adopted).
-  defp candidate_session_lookup(%State{} = state) do
-    {:ok, candidates, _host_map, _uid_map} = discover_candidates(state)
-
-    candidates
-    |> Enum.reduce(%{}, fn fiber, acc ->
-      case {Map.get(fiber, "id"), Map.get(fiber, "status")} do
-        {fiber_id, status} when is_binary(fiber_id) and fiber_id != "" ->
-          bucket = if(status == "closed", do: :closed, else: :open)
-
-          # Record fiber_id in `bucket` of the session's grouped sets. `Map.update/4`
-          # inserts the default VERBATIM when the key is absent — the function is NOT
-          # applied to it — so the default must already carry fiber_id. Without this,
-          # a session name seen exactly once (every uid-keyed name is unique to one
-          # fiber) keeps empty sets, resolves to nil below, and the live worker is
-          # never adopted — the daemon-restart-drops-all-adoptions bug.
-          add_to_bucket = fn grouped -> Map.update!(grouped, bucket, &MapSet.put(&1, fiber_id)) end
-          singleton = add_to_bucket.(%{open: MapSet.new(), closed: MapSet.new()})
-
-          fiber_id
-          |> Dispatcher.session_names(Map.get(fiber, "uid"))
-          |> Enum.reduce(acc, fn session, acc2 ->
-            Map.update(acc2, session, singleton, add_to_bucket)
-          end)
-
-        _ ->
-          acc
-      end
-    end)
-    |> Enum.into(%{}, fn {session, grouped} ->
-      open_ids = Map.get(grouped, :open, MapSet.new()) |> MapSet.to_list()
-      closed_ids = Map.get(grouped, :closed, MapSet.new()) |> MapSet.to_list()
-
-      value =
-        cond do
-          length(open_ids) == 1 -> {:adopt, hd(open_ids)}
-          length(open_ids) > 1 -> :ambiguous
-          length(closed_ids) == 1 -> {:kill_closed, hd(closed_ids)}
-          length(closed_ids) > 1 -> :ambiguous
-          true -> nil
-        end
-
-      {session, value}
-    end)
-    |> Enum.reject(fn {_session, value} -> is_nil(value) end)
-    |> Map.new()
-  end
-
-  defp adopt_known_orphan_session(%State{} = state, lookup, session) do
-    case Map.get(lookup, session) do
-      {:adopt, fiber_id} ->
-        if running_key(state, fiber_id) != nil do
-          state
-        else
-          adopt_session(state, fiber_id, session)
-        end
-
-      {:kill_closed, fiber_id} ->
-        Logger.info("Killing stale session for closed fiber: #{fiber_id} session=#{session}")
-        _ = state.runner.cmd("tmux", ["kill-session", "-t", session], stderr_to_stdout: true)
-        state
-
-      :ambiguous ->
-        Logger.warning("Skipping orphan session with ambiguous leaf-only name: #{session}")
-        state
-
-      nil ->
-        Logger.debug("Skipping orphan session with no matching fiber: #{session}")
-        state
     end
   end
 
