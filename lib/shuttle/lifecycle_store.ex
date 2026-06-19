@@ -148,6 +148,37 @@ defmodule Shuttle.LifecycleStore do
   # …). The write path edits the raw text directly and never round-trips the map
   # through an emitter — that round-trip used to reorder keys and collapse block
   # scalars, breaking felt indexing (see Shuttle.FrontmatterEdit).
+  @doc """
+  Pinned-worker exit writer: park an interactive role back to its rest state by
+  writing `status: open` straight to the felt document — the strip resting state.
+
+  A pinned role is an interactive interface, not a loop: when its session ends
+  (the human killed the tmux session, a crash, or a clean exit), the role must
+  return to the **pinned strip** (`status: open`), not stay stuck `active` with
+  no live worker in In-flight, and not relaunch (the poller's `filter_eligible`
+  already excludes pinned from the autonomous tick). Resume from the strip
+  (force-dispatch → `rearm`) re-attaches.
+
+  Mirror of `mark_awaiting/1` (the standing-role closer, which writes
+  `status: closed`): this is the pinned closer. Pinned-only — a no-op-shaped
+  `{:error, _}` for any other kind so the exit path can log without crashing.
+  Idempotent: `{:ok, ...}` if already parked.
+  """
+  @spec park(String.t()) :: {:ok, String.t()} | {:error, String.t()}
+  def park(fiber_id) when is_binary(fiber_id) do
+    with {:ok, path, raw_fm, frontmatter, body} <- read_fiber(fiber_id),
+         {:ok, shuttle} <- shuttle_block(frontmatter),
+         :ok <- require_pinned(shuttle) do
+      if Map.get(frontmatter, "status") == "open" do
+        {:ok, "#{fiber_id} already parked\n"}
+      else
+        ops = [{:put, "status", "open"}, {:delete, "closed-at"}] ++ evict_runtime_ops()
+        write_fiber!(path, raw_fm, body, ops)
+        {:ok, "parked #{fiber_id} (status: open) on session end\n"}
+      end
+    end
+  end
+
   defp read_fiber(fiber_id) do
     with {:ok, path} <- resolve_fiber_path(fiber_id),
          {:ok, text} <- File.read(path),
@@ -243,6 +274,14 @@ defmodule Shuttle.LifecycleStore do
     do:
       {:error,
        "rearm only applies to standing or pinned roles (kind=#{inspect(Map.get(shuttle, "kind"))})"}
+
+  defp require_pinned(%{"kind" => "pinned"}), do: :ok
+  defp require_pinned(%{"mode" => "pinned"}), do: :ok
+
+  defp require_pinned(shuttle),
+    do:
+      {:error,
+       "park only applies to pinned roles (kind=#{inspect(Map.get(shuttle, "kind"))})"}
 
   defp require_schedule(%{"schedule" => schedule}) when is_map(schedule), do: {:ok, schedule}
   defp require_schedule(_), do: {:error, "fiber has no schedule"}

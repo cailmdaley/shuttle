@@ -99,7 +99,33 @@ defmodule Shuttle.LifecycleStoreTest do
     end
   end
 
-  describe "pinned roles are not cyclical (Option D: loop while active, park at open)" do
+  describe "pinned roles are interactive interfaces (park at open on session end)" do
+    test "park flips an active pinned role back to the strip (active → open), pinned-only" do
+      # The pinned worker-exit closer: a pinned role's session ending parks it
+      # back to the strip (status:open), the mirror of mark_awaiting's standing
+      # close (status:closed). Pinned-only — it rejects a standing/oneshot block
+      # by kind so the exit path can't park the wrong thing.
+      with_pinned_role(
+        fn fiber_id, path ->
+          assert read_frontmatter(path)["status"] == "active"
+          assert {:ok, message} = LifecycleStore.park(fiber_id)
+          assert message =~ "parked"
+          assert read_frontmatter(path)["status"] == "open"
+        end,
+        status: "active"
+      )
+    end
+
+    test "park is idempotent on an already-parked role and rejects a standing role" do
+      with_pinned_role(
+        fn fiber_id, _path ->
+          assert {:ok, msg} = LifecycleStore.park(fiber_id)
+          assert msg =~ "already parked"
+        end,
+        status: "open"
+      )
+    end
+
     test "accept and mark_awaiting reject a pinned role (standing-only)" do
       # Pinned is no longer cyclical (Option D): a pinned run does not close to
       # awaiting-review and there is no accept/re-arm cycle. mark_awaiting (the

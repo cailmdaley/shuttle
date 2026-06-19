@@ -1076,23 +1076,23 @@ defmodule Shuttle.PollerTest do
     refute Enum.any?(Poller.snapshot(poller).eligible, &(&1.fiber_id == "tests/pinned-parked"))
   end
 
-  test "a pinned worker exit leaves the role active but the next poll does NOT re-dispatch" do
-    # A pinned worker exit must leave the document status:active (NOT marked
-    # awaiting/closed like a standing role) — the interface stays "open" for the
-    # human to resume. But the autonomous poll must NOT re-spawn it: that
-    # combination (active + sessionless + no re-dispatch) is the whole fix.
-    # Reverting filter_eligible's pinned guard re-arms the shapepipe token loop.
+  test "a pinned worker exit parks the role back to the strip (status:open), no re-dispatch" do
+    # A pinned worker's session ending (human killed it, crash, or clean exit)
+    # PARKS the role back to the strip by writing active → open — it must NOT
+    # stay stuck `active` with no live worker in In-flight, and must NOT relaunch.
+    # This is the symmetric counterpart of a standing exit writing closed.
+    # Reverting LifecycleStore.park / the handle_worker_exit pinned branch leaves
+    # it active-but-dead; reverting filter_eligible's guard re-arms the loop.
     #
     # The exit handler routes through felt (LifecycleStore → FeltStores.resolve_
     # fiber), so the mock fiber must be felt-resolvable: point LOOM_HOMES at the
     # mock store the factory wrote to (/private/tmp/.felt). Without this a
-    # mark_awaiting regression would silently no-op — masking whether the gate
-    # even fired.
+    # park regression would silently no-op — masking whether the gate even fired.
     prev_loom = System.get_env("LOOM_HOMES")
     System.put_env("LOOM_HOMES", "/private/tmp")
     on_exit(fn -> if prev_loom, do: System.put_env("LOOM_HOMES", prev_loom), else: System.delete_env("LOOM_HOMES") end)
 
-    fiber_id = "tests/pinned-exit-loops"
+    fiber_id = "tests/pinned-exit-parks"
     leaf = fiber_id |> String.split("/") |> List.last()
     session = Dispatcher.session_name(fiber_id)
     MockRunner.set_fiber(fiber_id, make_fiber(fiber_id, %{"status" => "active"}))
@@ -1100,7 +1100,7 @@ defmodule Shuttle.PollerTest do
 
     {:ok, poller} =
       start_poller!(
-        name: :test_poller_pinned_exit_loops,
+        name: :test_poller_pinned_exit_parks,
         runner: MockRunner,
         poll_interval_ms: 60_000,
         felt_stores: ["/tmp"]
@@ -1116,21 +1116,21 @@ defmodule Shuttle.PollerTest do
     assert {:ok, _session} = Poller.dispatch_fiber(poller, fiber_id, force: true, ad_hoc: true)
     assert new_sessions.() == 1
 
-    # Worker exits while the document is still active (it did NOT self-close).
+    # Worker session ends while the document is still active (it did NOT self-close).
     MockRunner.remove_tmux_session(session)
     send(poller, {:worker_exited, fiber_id, :normal_exit, false})
     # Flush the GenServer mailbox so the exit write lands before the disk read.
     _ = Poller.snapshot(poller)
 
-    # The on-disk document is untouched: still active, never closed/awaiting.
-    # Reverting the exit gate to treat pinned as cyclical flips this to closed.
+    # The on-disk document is parked: active → open (back to the strip), and NOT
+    # marked closed/awaiting (that's the standing closer, not the pinned one).
     doc = File.read!("/private/tmp/.felt/#{fiber_id}/#{leaf}.md")
-    assert doc =~ ~r/status:\s*active/
+    assert doc =~ ~r/status:\s*open/
     refute doc =~ ~r/status:\s*closed/
     refute doc =~ "closed-at"
 
-    # No loop: the next poll does NOT re-dispatch the still-active, no-longer-
-    # running pinned role. The session count stays at 1 — the human must resume
+    # No loop: the next poll does NOT re-dispatch (now status:open anyway, and
+    # filter_eligible would exclude it even if active). Session count stays at 1.
     # it explicitly. (Reverting the pinned guard flips this to a second launch.)
     send(poller, :run_poll_cycle)
     _ = Poller.snapshot(poller)
