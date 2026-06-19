@@ -11,9 +11,9 @@ defmodule Shuttle.LifecycleService do
        so the felt-document write is atomic against poll cycles.
     2. Append a felt-history event recording the transition.
 
-  Awaiting is `status: closed` + untempered in the document itself (slice 4: no
+  Awaiting is `status: closed` + untempered in the document itself (there is no
   review axis); re-arm writes `status: active` and `next_due` is recomputed from
-  the cron schedule on the next poll (slice 6: no runtime store).
+  the cron schedule on the next poll (there is no runtime store).
   """
 
   alias Shuttle.{FeltStores, LifecycleStore, Poller}

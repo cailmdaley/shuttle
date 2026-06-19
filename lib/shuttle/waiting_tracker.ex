@@ -20,10 +20,10 @@ defmodule Shuttle.WaitingTracker do
 
   Each tracked session holds exactly one record — `%{type: String.t(), at: ms}`
   — the **raw type and real timestamp of its most recent event**. Every event
-  unconditionally overwrites it; there is no sticky/kind state machine. The
-  escalation the old machine hand-rolled now falls out of the natural event
-  order: Claude Code fires the idle `notification` hook *after* the `stop`, so
-  a long-idle worker becomes `attention` on its own.
+  unconditionally overwrites it; there is no sticky/kind state machine.
+  Escalation falls out of the natural event order: Claude Code fires the idle
+  `notification` hook *after* the `stop`, so a long-idle worker becomes
+  `attention` on its own.
 
   `at` is the event's **own** `timestamp` (epoch ms carried on every hook line),
   not the poll wall-clock — that's what makes idle-duration ranking real.
@@ -43,9 +43,10 @@ defmodule Shuttle.WaitingTracker do
       `"working"` no matter how long ago that event fired, so it sorts to the
       bottom of the in-flight column rather than masquerading as idle.
 
-  No 60s gate lives here anymore — the daemon reports the category and the real
-  timestamp, and the client computes idle (`clientNow - last_event_at`) to
-  decide whether to show a chip. Folding `subagent_stop` into `"waiting"` is
+  Idle gating lives on the client, not here: the daemon reports the category
+  and the real timestamp, and the client computes idle (`clientNow -
+  last_event_at`) to decide whether to show a chip. Folding `subagent_stop`
+  into `"waiting"` is
   deliberate under last-event-wins: a worker that just got a subagent result
   reads as `"waiting"` until its next `pre_tool_use`, which CC emits quickly.
 
@@ -108,7 +109,8 @@ defmodule Shuttle.WaitingTracker do
   def default_events_file do
     System.get_env("PORTOLAN_EVENTS_FILE") ||
       Path.join(
-        System.get_env("PORTOLAN_DATA_DIR") || Path.join(home(), ".portolan/data"),
+        System.get_env("PORTOLAN_DATA_DIR") ||
+          Path.join(System.user_home!() || "/root", ".portolan/data"),
         "events.jsonl"
       )
   end
@@ -282,6 +284,4 @@ defmodule Shuttle.WaitingTracker do
   defp now_ms(%State{}), do: default_clock()
 
   defp default_clock, do: System.system_time(:millisecond)
-
-  defp home, do: System.user_home!() || "/root"
 end

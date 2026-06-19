@@ -5,9 +5,9 @@ defmodule Shuttle.StandingRole do
   Standing roles are still felt fibers. Shuttle interprets the `shuttle:` block
   plus the document's `status`/`tempered` to decide whether a role is sleeping,
   due, or running. "Awaiting review" and "accepted/composted" are document facts
-  (`status:closed` + untempered / `tempered`), not a `review.state` axis (slice
-  4 removed that); the schedule-derived phase here only answers
-  sleeping/due/running for an armed role.
+  (`status:closed` + untempered / `tempered`), not a `review.state` axis — there
+  is none; the schedule-derived phase here only answers sleeping/due/running for
+  an armed role.
   """
 
   defstruct [
@@ -50,7 +50,7 @@ defmodule Shuttle.StandingRole do
 
   @doc """
   The schedule-derived display phase for an armed role, computed from cron +
-  liveness — NOT from `review.state` or `enabled` (slice 4/5: both axes gone).
+  liveness — NOT from `review.state` or `enabled` (neither axis exists).
   "Awaiting review", "accepted", and "paused/draft" are document facts
   (`status:closed` + untempered / `tempered`, and `status:open`), surfaced by the
   kanban classifier from the document, not derived here. This function only
@@ -77,7 +77,7 @@ defmodule Shuttle.StandingRole do
 
   # Display due-ness for `state/3`: a valid role whose cron schedule fired a tick
   # inside `(now - window, now]`. Pure cron — no stored next_due_at, no review
-  # gate (slice 4).
+  # gate.
   defp due_by_schedule?(%__MODULE__{schedule: schedule} = role, %DateTime{} = now) do
     window_start = DateTime.add(now, -@display_due_window_ms, :millisecond)
 
@@ -134,9 +134,9 @@ defmodule Shuttle.StandingRole do
   def due_by_cron?(_, _, _), do: false
 
   # Dispatch-path validity: a standing role with a parseable schedule. Both the
-  # dispatch and display paths now gate on schedule alone — the review/next_due
-  # validations are gone (slice 4: the document, not a review overlay, is the
-  # truth, and doc-sourced roles carry no stored next_due_at or review block).
+  # dispatch and display paths gate on schedule alone — there are no
+  # review/next_due validations: the document, not a review overlay, is the
+  # truth, and doc-sourced roles carry no stored next_due_at or review block.
   defp dispatchable?(%__MODULE__{mode: "standing", schedule: schedule}) do
     match?({:ok, %DateTime{}}, Shuttle.Cron.next_occurrence(schedule, DateTime.utc_now()))
   end
@@ -174,11 +174,9 @@ defmodule Shuttle.StandingRole do
   Run id for a *scheduled* (non-ad-hoc) standing dispatch — a display label for
   the prompt's `Run:` line, minted from `now`.
 
-  It is no longer load-bearing for resume continuity. The resume window-start
-  used to be parsed from this id, so a resumed run had to keep the awaiting
-  run's id (via `review.run_id`); slice 4 deleted `review`, and
-  `Dispatcher.run_window_start` now derives the window from felt history (the
-  last worker-exit event's timestamp). The id is therefore free to be a fresh
+  It is not load-bearing for resume continuity: `Dispatcher.run_window_start`
+  derives the resume window from felt history (the last worker-exit event's
+  timestamp), not from this id. The id is therefore free to be a fresh
   timestamp every dispatch.
   """
   @spec dispatch_run_id(t(), DateTime.t()) :: String.t()
@@ -209,7 +207,7 @@ defmodule Shuttle.StandingRole do
   end
 
   # Validity is the document's intrinsic shape: a standing role with a parseable
-  # cron schedule. Slice 4 deleted the review/next_due validations — the document
+  # cron schedule. There are no review/next_due validations — the document
   # (status + tempered) is the truth, and doc-sourced roles carry no review block
   # or stored next_due_at to validate against.
   defp validation_errors(%__MODULE__{} = role) do
