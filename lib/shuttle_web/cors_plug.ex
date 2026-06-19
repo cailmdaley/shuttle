@@ -2,17 +2,10 @@ defmodule ShuttleWeb.CORSPlug do
   @moduledoc """
   Hand-rolled CORS plug for the Shuttle API endpoints.
 
-  Allows the portolan kanban to call the daemon (127.0.0.1:4000) directly
-  from the browser. Covers all endpoints the kanban hits: GET /api/v1/agents
-  and POST /api/v1/dispatch.
-
-  Origin matching is allowlist-based — the dev-server localhost variants
-  AND the Tauri webview custom-protocol origins are admitted. The Tauri
-  origins are required because the bundled Portolan.app loads from a
-  custom protocol (not localhost:5173), so its fetches carry a non-http
-  Origin that the dev-only allowlist used to reject — manifesting as
-  "Load failed" / "Couldn't reach the Shuttle daemon" in the kanban modal
-  despite the daemon actually being up.
+  The browser UI is served same-origin from :4000, so CORS only matters for
+  the Vite dev server (and a legacy :3000 fallback) calling the daemon
+  directly during development. Origin matching is allowlist-based on those
+  localhost variants.
 
   Requests from non-allowed origins pass through without CORS headers
   (the browser will block them).
@@ -32,13 +25,6 @@ defmodule ShuttleWeb.CORSPlug do
     "http://127.0.0.1:3000",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    # Bundled Tauri webview custom-protocol origins. macOS/Linux default
-    # to `tauri://localhost`; Windows (and Tauri 2 with the `tauri.localhost`
-    # form) uses the http variant. Both are added so the same build runs
-    # cross-platform without a platform-specific shim.
-    "tauri://localhost",
-    "http://tauri.localhost",
-    "https://tauri.localhost",
   ]
 
   @allowed_methods "GET, POST, OPTIONS"
