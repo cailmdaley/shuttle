@@ -6,11 +6,6 @@ defmodule Shuttle.Poller do
   scheduling, and reconciliation. It starts `Shuttle.WorkerWatcher` processes
   under a `DynamicSupervisor` to track each worker's tmux session from outside.
 
-  Lifted from Symphony's orchestrator.ex with the integration layer replaced:
-  - Linear API → felt CLI
-  - Issue model → fiber model
-  - Codex app-server → tmux + agent CLI wrappers
-
   ## Multi-host support
 
   The Poller manages one or more felt stores on the same machine. Configure via:
@@ -47,7 +42,6 @@ defmodule Shuttle.Poller do
   @default_poll_interval_ms 30_000
   @default_max_concurrent_workers 10
   @default_heartbeat_interval_ms 5_000
-  @default_stall_timeout_ms 300_000
   @dispatch_call_timeout_ms 30_000
   @orchestrator_state_call_timeout_ms 30_000
 
@@ -66,8 +60,6 @@ defmodule Shuttle.Poller do
       :poll_interval_ms,
       :max_concurrent_workers,
       :heartbeat_interval_ms,
-      :stall_timeout_ms,
-      :next_poll_due_at_ms,
       :tick_timer_ref,
       :tick_token,
       # List of felt store directories, in resolution-priority order.
@@ -83,7 +75,7 @@ defmodule Shuttle.Poller do
       poll_check_in_progress: false,
       # In-memory watcher registry, keyed by intrinsic UID when known; metadata
       # carries :fiber_id as the felt address used for CLI shell-outs and public
-      # API payloads. NOT persisted (slice 6: no runtime store) — tmux is the
+      # API payloads. NOT persisted — tmux is the
       # source of truth for liveness, so a restart re-derives `running` by
       # adopting live shuttle sessions (`adopt_orphans`) and every poll
       # reconciles entries whose tmux session has died.
@@ -310,8 +302,8 @@ defmodule Shuttle.Poller do
   @doc """
   Run a standing-role lifecycle transition (`:accept` / `:resume`) through the
   Poller so the felt-document write is atomic against poll cycles. accept/resume
-  re-arm an awaiting role by writing `status: active` to the document (slice 6:
-  no runtime row); running the transition inside the GenServer keeps a concurrent
+  re-arm an awaiting role by writing `status: active` to the document; running
+  the transition inside the GenServer keeps a concurrent
   poll from reading a half-written document.
   """
   @spec lifecycle_transition(:accept | :resume, String.t(), keyword()) ::
@@ -406,8 +398,6 @@ defmodule Shuttle.Poller do
 
   @impl true
   def init(opts) do
-    now_ms = System.monotonic_time(:millisecond)
-
     {felt_stores, auto_discover} =
       case Keyword.fetch(opts, :felt_stores) do
         {:ok, hosts} -> {hosts, false}
@@ -435,8 +425,6 @@ defmodule Shuttle.Poller do
         Keyword.get(opts, :max_concurrent_workers, @default_max_concurrent_workers),
       heartbeat_interval_ms:
         Keyword.get(opts, :heartbeat_interval_ms, @default_heartbeat_interval_ms),
-      stall_timeout_ms: Keyword.get(opts, :stall_timeout_ms, @default_stall_timeout_ms),
-      next_poll_due_at_ms: now_ms,
       tick_timer_ref: nil,
       tick_token: nil,
       felt_stores: felt_stores,
@@ -447,7 +435,7 @@ defmodule Shuttle.Poller do
 
     Logger.info("configured felt stores: #{inspect(felt_stores)}")
 
-    # Daemon state is derived and disposable (slice 6: no runtime store). Rebuild
+    # Daemon state is derived and disposable. Rebuild
     # `running` from tmux by adopting any live shuttle sessions — a restart
     # re-scans tmux and is immediately correct, and running work survives because
     # tmux owns the worker process.
@@ -463,8 +451,7 @@ defmodule Shuttle.Poller do
       when is_reference(tick_token) do
     state = %{
       state
-      | next_poll_due_at_ms: nil,
-        tick_timer_ref: nil,
+      | tick_timer_ref: nil,
         tick_token: nil
     }
 
@@ -877,7 +864,7 @@ defmodule Shuttle.Poller do
       eligible: eligible,
       blocked: blocked,
       orphans: state.orphans,
-      # Retries collapsed into the poll loop (slice 6): a status:active fiber with
+      # Retries collapsed into the poll loop: a status:active fiber with
       # no live tmux session is simply eligible again on the next tick. The key
       # stays (empty) for snapshot-shape stability with API/kanban consumers.
       retrying: [],
@@ -887,7 +874,7 @@ defmodule Shuttle.Poller do
       document_cache: stringify_keys(state.document_cache_stats)
     }
 
-    # No separate per-fiber runtime index (slice 7). The runtime store and the
+    # No separate per-fiber runtime index. The runtime store and the
     # review overlay it fed are gone; liveness rides the `eligible`/`running`
     # rows (each carries uid, tmux_session, state), standing-role due-ness rides
     # `standing_roles`, and a viewer computes next_due from the document
@@ -1070,7 +1057,7 @@ defmodule Shuttle.Poller do
     # mark such roles awaiting (status:closed) so the armed document does not
     # re-fire. Oneshots need no analog: a status:active oneshot with no live
     # session is simply eligible again on the next tick — retries collapsed into
-    # the poll loop (slice 6).
+    # the poll loop.
     state = reconcile_dead_standing_roles(state, candidates)
 
     if available_slots(state) > 0 do
@@ -1092,8 +1079,7 @@ defmodule Shuttle.Poller do
   # ── Orphan Resurrection ──
 
   # Downtime recovery for perennial roles (standing + pinned), on the tmux-scan
-  # substrate (slice 6: replaces the runtime-store-keyed
-  # `reconcile_dispatched_dead_fibers` + `maybe_resurrect_orphan`). A perennial
+  # substrate. A perennial
   # role whose worker exited while the daemon was down never fired
   # `handle_worker_exit`, so its document stays `status:active` with no live
   # session. Scan tmux: an owned, active role with NO live session and NO live
@@ -1122,7 +1108,7 @@ defmodule Shuttle.Poller do
     fiber_id = Map.get(fiber, "id", "")
     shuttle = Map.get(fiber, "shuttle", %{})
     status = Map.get(fiber, "status", "")
-    kind = Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot"))
+    kind = role_kind(shuttle)
 
     cond do
       # Only the owning daemon writes a fiber's document. A fiber owned by
@@ -1155,9 +1141,8 @@ defmodule Shuttle.Poller do
       ) ->
         state
 
-      # The felt-history discriminator (slice 6 replaces slice 1's "stored
-      # session.id"): only a role that was actually DISPATCHED but never observed
-      # EXITING is a dead orphan. felt history records "worker dispatched ..." at
+      # The felt-history discriminator: only a role that was actually DISPATCHED
+      # but never observed EXITING is a dead orphan. felt history records "worker dispatched ..." at
       # spawn and "worker exited ..." at exit; a trailing dispatch with no exit
       # after it is the daemon-down-across-exit case. An armed role whose last run
       # already exited (the daily-practice "armed, not-yet-due, never-dispatched-
@@ -1192,10 +1177,9 @@ defmodule Shuttle.Poller do
   # True iff the fiber's most recent worker lifecycle event in felt history is a
   # "worker dispatched" with no "worker exited" after it — i.e., a run that began
   # but whose exit the daemon never observed (it was down across the exit). This
-  # is the felt-native marker that a worker actually ran this cycle, replacing
-  # slice 1's runtime-store session.id check. felt history is the durable
-  # substrate (slice 6); a never-dispatched-this-cycle armed role has a trailing
-  # "exited" (last cycle completed) and is left alone.
+  # is the felt-native marker that a worker actually ran this cycle. felt history
+  # is the durable substrate; a never-dispatched-this-cycle armed role has a
+  # trailing "exited" (last cycle completed) and is left alone.
   defp standing_role_dispatched_unexited?(fiber_id, state) do
     case host_for_fiber(fiber_id, state) do
       {:ok, felt_store} ->
@@ -1699,7 +1683,7 @@ defmodule Shuttle.Poller do
   defp pinned_role?(fiber) do
     case Map.get(fiber, "shuttle") do
       shuttle when is_map(shuttle) ->
-        Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot")) == "pinned"
+        role_kind(shuttle) == "pinned"
 
       _ ->
         false
@@ -1717,7 +1701,7 @@ defmodule Shuttle.Poller do
         # is doing the work themselves; the kanban shows the card in
         # inFlight via status:active, but Shuttle never tries to spawn
         # anything. This is the sole gate that keeps human-worker fibers out
-        # of dispatch (slice 5: no enabled flag).
+        # of dispatch.
         human_worker?(fiber) ->
           false
 
@@ -1732,8 +1716,8 @@ defmodule Shuttle.Poller do
         not project_dir_available?(shuttle) ->
           false
 
-        # `status: active` is the SOLE dispatch gate (slice 5: enabled/review
-        # dropped). A fiber is shuttle-managed iff it carries a shuttle: block;
+        # `status: active` is the SOLE dispatch gate. A fiber is shuttle-managed
+        # iff it carries a shuttle: block;
         # it dispatches iff status is active. `open` is a draft/paused (not
         # dispatched); `closed` is the awaiting-review / anti-oscillation gate —
         # a oneshot terminus, or a standing role that ran this cycle and is
@@ -1759,12 +1743,11 @@ defmodule Shuttle.Poller do
         # that exclusion lives in `filter_eligible/2` (the tick's only caller),
         # not here. A pinned `active` role with no live session therefore sits
         # idle until the human re-attaches, instead of re-dispatching every
-        # poll. (Supersedes Option D's "active pinned = looping" model, which
-        # burned tokens re-surveying idle interfaces.)
+        # poll.
 
         # Standing roles have additional preconditions; oneshots go to dep check.
         # Support both new-format (kind:) and old-format (mode:) shuttle blocks.
-        Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot")) == "standing" ->
+        role_kind(shuttle) == "standing" ->
           standing_role_due?(fiber, state)
 
         # Dependencies must be satisfied
@@ -1855,7 +1838,7 @@ defmodule Shuttle.Poller do
         {:not_eligible, {:project_dir_missing, Map.get(shuttle, "project_dir")}}
 
       # The remaining cases only gate a NON-forced dispatch (force overrides
-      # status). status is the sole gate (slice 5: no enabled flag): a draft
+      # status). status is the sole gate: a draft
       # (status: open) or a closed/awaiting fiber is reported so a plain
       # dispatch failure is legible.
       not forced? and status == "closed" ->
@@ -1871,7 +1854,7 @@ defmodule Shuttle.Poller do
 
   # Ad-hoc dispatch (`ad_hoc: true`, no `force`) bypasses the cron schedule but
   # still requires the role to be otherwise dispatchable. The gate is the felt
-  # document (slice 5: no review.state): an armed standing role is `status:
+  # document: an armed standing role is `status:
   # active` (a closed/awaiting role is NOT ad-hoc dispatchable — its run is
   # pending a verdict).
   defp force_dispatchable_standing_role?(fiber, state) do
@@ -1891,7 +1874,7 @@ defmodule Shuttle.Poller do
     end
   end
 
-  # Awaiting review is felt-native (slice 5): `status: closed` + untempered. A
+  # Awaiting review is felt-native: `status: closed` + untempered. A
   # NON-forced ad-hoc dispatch against a standing role in that state is refused
   # with the awaiting marker so the caller surfaces "pending a verdict" rather
   # than a flat not-eligible.
@@ -1926,15 +1909,8 @@ defmodule Shuttle.Poller do
   # every daemon — loud (the fiber simply never dispatches and the absence is
   # visible in its frontmatter), never silently mis-dispatched on the wrong
   # machine. Every dispatch path (poll, force, standing, orphan-resurrection)
-  # routes through this one function.
-  #
-  # Three pre-cutover failure modes this collapses:
-  #   - `(block.host || "local")` default → host-less fibers matched the
-  #     literal "local" daemon (which no real daemon advertised) → ineligible
-  #     everywhere, silently.
-  #   - `nil`-pin-as-wildcard → host-less fibers matched *every* daemon → the
-  #     wrong machine grabbed single-host work.
-  # Strict equality removes both: a block is owned by exactly one named host.
+  # routes through this one function. Strict equality: a block is owned by
+  # exactly one named host — no `"local"` default, no `nil`-pin wildcard.
   defp host_owned?(shuttle, own_host_id) when is_map(shuttle) do
     case Map.get(shuttle, "host") do
       host when is_binary(host) and host != "" -> host == own_host_id
@@ -1990,16 +1966,11 @@ defmodule Shuttle.Poller do
     3. `:inet.gethostname()` — short OS hostname. Two separately-deployed
        daemons get distinct ids automatically; no per-machine config needed.
 
-  No `Application.get_env(:shuttle, :host)` step. An earlier iteration
-  pinned `host: "local"` in `config/test.exs` so tests had a predictable
-  identity, but the pin leaked into escripts built with `MIX_ENV=test` and
-  stamped `"local"` onto production daemons — every fiber without an
-  explicit `host:` then silently failed the dispatch filter (which used to
-  default to `"local"` too). The whole `"local"` magic is gone.
+  No `Application.get_env(:shuttle, :host)` step and no `"local"` default:
+  an absent `host:` is unowned everywhere, never silently grabbed.
 
-  Raises if `:inet.gethostname/0` truly fails. That's a system-level
-  problem and silently degrading into a no-op filter (what the previous
-  `"local"` fallback did) made the failure invisible.
+  Raises if `:inet.gethostname/0` truly fails — a system-level problem;
+  silently degrading into a no-op filter would make the failure invisible.
   """
   @spec own_host_id() :: String.t()
   def own_host_id do
@@ -2061,8 +2032,8 @@ defmodule Shuttle.Poller do
   # init/handle_call code.
   defp resolve_own_host_id, do: own_host_id()
 
-  # Parse the standing roles straight from the candidate documents (slice 6: no
-  # runtime lifecycle row to persist). The role's display next_due is computed
+  # Parse the standing roles straight from the candidate documents. The role's
+  # display next_due is computed
   # from cron in `standing_role_snapshots`, and awaiting/accepted are document
   # facts (status + tempered), so nothing daemon-owned is written.
   defp standing_roles_from_candidates(candidates, state) do
@@ -2079,8 +2050,8 @@ defmodule Shuttle.Poller do
     |> Enum.reverse()
   end
 
-  # Standing roles are parsed straight from the felt document's `shuttle:` block
-  # (slice 4: no runtime lifecycle overlay). The document is the truth — status,
+  # Standing roles are parsed straight from the felt document's `shuttle:` block.
+  # The document is the truth — status,
   # tempered, and the cron schedule — and the StandingRole reads exactly that.
   defp standing_role_from_fiber(fiber, _state) do
     fiber_id = Map.get(fiber, "id", "")
@@ -2310,8 +2281,8 @@ defmodule Shuttle.Poller do
 
         case start_watcher(state, fiber_id, running_meta) do
           {:ok, running_meta} ->
-            # `running` is an in-memory watcher registry, not persisted (slice 6:
-            # tmux is the source of truth; a restart re-adopts live sessions).
+            # `running` is an in-memory watcher registry, not persisted: tmux is
+            # the source of truth; a restart re-adopts live sessions.
             running = Map.put(state.running, runtime_key, running_meta)
 
             state = %{
@@ -2672,14 +2643,18 @@ defmodule Shuttle.Poller do
   # shapes. Only standing roles need the dead-orphan awaiting mark: an armed
   # standing document (`status: active`) would re-fire on the next cron tick if
   # its worker died unobserved, so it must be closed. A PINNED role is
-  # oneshot-shaped (Option D): a dead pinned worker correctly leaves the document
+  # oneshot-shaped: a dead pinned worker correctly leaves the document
   # at `status: active`, and the next poll re-dispatches it (the loop) just like
   # an orphaned oneshot — there is nothing to close.
   defp standing_block?(shuttle) when is_map(shuttle) do
-    Map.get(shuttle, "kind", Map.get(shuttle, "mode")) == "standing"
+    role_kind(shuttle) == "standing"
   end
 
   defp standing_block?(_), do: false
+
+  # The role's dispatch kind, reading the new `kind:` shape and falling back to
+  # the legacy `mode:` field, defaulting to "oneshot".
+  defp role_kind(shuttle), do: Map.get(shuttle, "kind", Map.get(shuttle, "mode", "oneshot"))
 
   defp adopt_orphans(%State{} = state) do
     {:ok, sessions} = list_shuttle_sessions(state)
@@ -2814,7 +2789,7 @@ defmodule Shuttle.Poller do
                     # A still-active ONESHOT continuation: the next poll re-picks
                     # it and starts a fresh session (status:active + no live
                     # session → eligible; no resume_mode:previous on file —
-                    # retries collapsed into the poll loop, slice 6).
+                    # retries collapsed into the poll loop).
                     release_claim(state, fiber_id)
                 end
 
@@ -2969,7 +2944,7 @@ defmodule Shuttle.Poller do
   # boundary the dispatcher reads (`last_worker_exit_at`/`run_window_start`): a
   # resume directive filed after it falls inside the next run's window. The
   # session UUID lives in the separate "worker dispatched" event the dispatcher
-  # writes at spawn (slice 6: felt history is the only durable session-id home),
+  # writes at spawn (felt history is the only durable session-id home),
   # which `latest_history_session_id` scans for resume — so the exit event no
   # longer needs to carry the UUID. Best-effort: a felt failure must not block
   # the exit-handling state machine.
@@ -3106,7 +3081,7 @@ defmodule Shuttle.Poller do
   # Does this role's worker exit close it to awaiting-review? Only STANDING
   # (cron-driven) roles do. Marking a role awaiting on exit is an anti-re-fire
   # gate — `status: closed` is what stops the cron from re-dispatching the role
-  # again this cycle. A PINNED role does NOT come here (Option D: pinned is not
+  # again this cycle. A PINNED role does NOT come here (pinned is not
   # cyclical, just a oneshot-shaped looper): on exit-while-active it stays
   # `status: active` and re-dispatches next poll (the loop); a human stops the
   # loop by parking it (`active → open`). A pinned worker that's genuinely done
@@ -3121,7 +3096,7 @@ defmodule Shuttle.Poller do
   end
 
   # Standing dispatch is gated entirely by the FELT DOCUMENT — not a runtime
-  # review overlay (deleted in slice 4) and not a stored `next_due_at` (slice 2).
+  # review overlay and not a stored `next_due_at`.
   # A role dispatches iff its document says `status: active` with no verdict
   # (`tempered` unset) AND the cron schedule fired a tick inside the poll window
   # ending at now. `status: closed` (untempered) is the awaiting-review /
@@ -3418,8 +3393,7 @@ defmodule Shuttle.Poller do
     %{
       state
       | tick_timer_ref: timer_ref,
-        tick_token: tick_token,
-        next_poll_due_at_ms: System.monotonic_time(:millisecond) + delay_ms
+        tick_token: tick_token
     }
   end
 
