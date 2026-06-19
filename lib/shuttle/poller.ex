@@ -37,6 +37,8 @@ defmodule Shuttle.Poller do
     WorkerWatcher
   }
 
+  alias Shuttle.Poller.Snapshot
+
   @default_poll_interval_ms 30_000
   @default_max_concurrent_workers 10
   @default_heartbeat_interval_ms 5_000
@@ -504,7 +506,7 @@ defmodule Shuttle.Poller do
 
   @impl true
   def handle_call(:snapshot, _from, state) do
-    {:reply, build_snapshot(state), state}
+    {:reply, Snapshot.build_snapshot(state), state}
   end
 
   def handle_call({:cached_fiber_documents, opts}, _from, state) do
@@ -684,7 +686,7 @@ defmodule Shuttle.Poller do
 
   def handle_call(:orchestrator_state, _from, state) do
     state = clean_expired_reservations(state)
-    {:reply, build_full_state(state), state}
+    {:reply, Snapshot.build_full_state(state), state}
   end
 
   def handle_call({:resolve_fiber_host, fiber_id}, _from, state) do
@@ -733,71 +735,8 @@ defmodule Shuttle.Poller do
 
   # ── Snapshot ──
 
-  @spec build_snapshot(State.t()) :: map()
-  defp build_snapshot(state) do
-    now = DateTime.utc_now()
-    now_ms = DateTime.to_unix(now, :millisecond)
-
-    eligible =
-      Enum.map(state.running, fn {_runtime_key, meta} ->
-        fiber_id = fiber_address(meta)
-
-        %{
-          fiber_id: fiber_id,
-          uid: uid_for_fiber(state, fiber_id, meta),
-          felt_store: Map.get(state.fiber_host_cache, fiber_id),
-          tmux_session: meta.session,
-          agent: meta.agent_id,
-          state: Map.get(meta, :state, "running"),
-          run_id: Map.get(meta, :run_id),
-          started_at: DateTime.to_unix(meta.started_at, :millisecond),
-          last_activity_at: DateTime.to_unix(meta.last_activity_at, :millisecond),
-          runtime_seconds: runtime_seconds(meta.started_at, now)
-        }
-      end)
-
-    blocked =
-      Enum.map(state.dispatch_failures, fn {fiber_id, entry} ->
-        %{
-          fiber_id: fiber_id,
-          uid: uid_for_fiber(state, fiber_id),
-          reason: format_block_reason(entry.reason),
-          attempts: entry.attempts,
-          attempted_at: DateTime.to_unix(entry.attempted_at, :millisecond),
-          first_attempted_at: DateTime.to_unix(entry.first_attempted_at, :millisecond)
-        }
-      end)
-
-    snap = %{
-      poll_at: now_ms,
-      # Reflect the dispatch-filter identity, not just :inet.gethostname().
-      # When SHUTTLE_HOST is set this matches the host operators read in logs
-      # and use to author `shuttle.host:` pins on fibers.
-      host: state.own_host_id,
-      felt_stores: state.felt_stores,
-      eligible: eligible,
-      blocked: blocked,
-      orphans: state.orphans,
-      # Retries collapsed into the poll loop: a status:active fiber with
-      # no live tmux session is simply eligible again on the next tick. The key
-      # stays (empty) for snapshot-shape stability with API/kanban consumers.
-      retrying: [],
-      standing_roles: standing_role_snapshots(state.standing_roles, state.running, now, state),
-      claimed_count: MapSet.size(state.claimed),
-      max_concurrent: state.max_concurrent_workers,
-      document_cache: stringify_keys(state.document_cache_stats)
-    }
-
-    # No separate per-fiber runtime index. The runtime store and the
-    # review overlay it fed are gone; liveness rides the `eligible`/`running`
-    # rows (each carries uid, tmux_session, state), standing-role due-ness rides
-    # `standing_roles`, and a viewer computes next_due from the document
-    # `schedule` it already reads off the owner-only feed. There is nothing left
-    # for a `:runtime` overlay to add.
-    snap
-  end
-
-  defp uid_for_fiber(%State{} = state, fiber_id, metadata \\ %{}) do
+  @doc false
+  def uid_for_fiber(%State{} = state, fiber_id, metadata \\ %{}) do
     case metadata_uid(metadata) || Map.get(state.fiber_uid_cache, fiber_id) do
       uid when is_binary(uid) and uid != "" -> uid
       _ -> nil
@@ -846,7 +785,8 @@ defmodule Shuttle.Poller do
     end
   end
 
-  defp fiber_address(metadata) when is_map(metadata) do
+  @doc false
+  def fiber_address(metadata) when is_map(metadata) do
     case Map.get(metadata, :fiber_id) || Map.get(metadata, "fiber_id") ||
            Map.get(metadata, "id") || Map.get(metadata, :id) do
       fiber_id when is_binary(fiber_id) and fiber_id != "" -> fiber_id
@@ -878,7 +818,8 @@ defmodule Shuttle.Poller do
     end
   end
 
-  defp metadata_uid(metadata) when is_map(metadata) do
+  @doc false
+  def metadata_uid(metadata) when is_map(metadata) do
     case {Map.get(metadata, :uid), Map.get(metadata, "uid")} do
       {uid, _} when is_binary(uid) and uid != "" -> uid
       {_, uid} when is_binary(uid) and uid != "" -> uid
@@ -886,14 +827,7 @@ defmodule Shuttle.Poller do
     end
   end
 
-  defp metadata_uid(_), do: nil
-
-  # Stringifies dispatch-failure reasons for the snapshot. Atoms become their
-  # name (':missing_session_id' is more useful in the UI than the raw atom);
-  # strings pass through; everything else falls back to inspect/1.
-  defp format_block_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
-  defp format_block_reason(reason) when is_binary(reason), do: reason
-  defp format_block_reason(reason), do: inspect(reason)
+  def metadata_uid(_), do: nil
 
   # ── Dispatch ──
 
@@ -1257,8 +1191,8 @@ defmodule Shuttle.Poller do
     # Only running workers get stamped, so a session that signals and then dies
     # never leaves a stale runtime — it's already gone from `running`.
     activity = session_activity()
-    index = runtime_index(running, activity)
-    Enum.map(entries, &put_runtime(&1, index))
+    index = Snapshot.runtime_index(running, activity)
+    Enum.map(entries, &Snapshot.put_runtime(&1, index))
   end
 
   # The activity source. Defaults to the host-local WaitingTracker; overridable
@@ -1268,57 +1202,6 @@ defmodule Shuttle.Poller do
     case Application.get_env(:shuttle, :waiting_phases_source) do
       fun when is_function(fun, 0) -> fun.()
       _ -> Shuttle.WaitingTracker.session_activity()
-    end
-  end
-
-  defp runtime_index(running, activity) do
-    Enum.reduce(running, %{}, fn {runtime_key, meta}, acc ->
-      payload = runtime_payload(meta, activity)
-
-      [runtime_key, metadata_uid(meta), fiber_address(meta)]
-      |> Enum.filter(&(is_binary(&1) and &1 != ""))
-      |> Enum.reduce(acc, fn key, a -> Map.put_new(a, key, payload) end)
-    end)
-  end
-
-  defp put_runtime(%{fiber: fiber} = entry, index) do
-    [Map.get(fiber, "uid"), Map.get(fiber, "slug"), Map.get(fiber, "id")]
-    |> Enum.find_value(fn k -> is_binary(k) and k != "" and Map.get(index, k) end)
-    |> case do
-      nil -> entry
-      payload -> Map.put(entry, :runtime, payload)
-    end
-  end
-
-  # The eligible-row subset of a worker's meta, as a wire payload. Mirrors the
-  # `eligible` snapshot row so the feed's `runtime` and the snapshot agree on
-  # shape; the viewer reads `tmux_session` for liveness and may surface the rest.
-  #
-  # `last_activity_at` + `phase` come from the activity tracker keyed by this
-  # worker's tmux session: the REAL timestamp of its most recent hook event and
-  # the event's phase category ("attention" / "waiting" / "working"). This is
-  # what lets the in-flight column rank by idle duration. The old served
-  # `last_activity_at` was `meta.last_activity_at`, which equals `started_at`
-  # (only the tmux liveness heartbeat ever bumps it) — useless for ranking.
-  #
-  # Fallback: a just-dispatched worker with no hook event yet has no tracker
-  # record, so we fall back to `meta.last_activity_at` (≈ `started_at`) and omit
-  # `phase` — correct, since a brand-new worker shouldn't outrank an idle review.
-  defp runtime_payload(meta, activity) do
-    base = %{
-      tmux_session: meta.session,
-      agent: Map.get(meta, :agent_id),
-      state: Map.get(meta, :state, "running"),
-      run_id: Map.get(meta, :run_id),
-      started_at: DateTime.to_unix(meta.started_at, :millisecond)
-    }
-
-    case is_binary(meta.session) and Map.get(activity, meta.session) do
-      %{last_event_at: at, phase: phase} ->
-        base |> Map.put(:last_activity_at, at) |> Map.put(:phase, phase)
-
-      _ ->
-        Map.put(base, :last_activity_at, DateTime.to_unix(meta.last_activity_at, :millisecond))
     end
   end
 
@@ -2962,13 +2845,8 @@ defmodule Shuttle.Poller do
     end
   end
 
-  defp stringify_keys(value) when is_map(value) do
-    Map.new(value, fn {key, value} -> {to_string(key), value} end)
-  end
-
-  defp stringify_keys(_), do: %{}
-
-  defp standing_role_snapshots(roles, running, now, state) do
+  @doc false
+  def standing_role_snapshots(roles, running, now, state) do
     state = %{state | running: running}
 
     Enum.map(roles, fn role ->
@@ -3132,13 +3010,14 @@ defmodule Shuttle.Poller do
     :ok
   end
 
-  defp runtime_seconds(nil, _), do: 0
+  @doc false
+  def runtime_seconds(nil, _), do: 0
 
-  defp runtime_seconds(%DateTime{} = started_at, %DateTime{} = now) do
+  def runtime_seconds(%DateTime{} = started_at, %DateTime{} = now) do
     max(0, DateTime.diff(now, started_at, :second))
   end
 
-  defp runtime_seconds(_, _), do: 0
+  def runtime_seconds(_, _), do: 0
 
   # Returns the configured felt stores list.
   #
@@ -3169,40 +3048,4 @@ defmodule Shuttle.Poller do
     end
   end
 
-  defp build_full_state(state) do
-    snap = build_snapshot(state)
-
-    running_detail =
-      Enum.map(state.running, fn {runtime_key, meta} ->
-        fiber_id = fiber_address(meta)
-
-        %{
-          runtime_key: runtime_key,
-          fiber_id: fiber_id,
-          pid: inspect(meta.pid),
-          session: meta.session,
-          agent_id: meta.agent_id,
-          started_at: DateTime.to_unix(meta.started_at, :millisecond),
-          last_activity_at: DateTime.to_unix(meta.last_activity_at, :millisecond)
-        }
-      end)
-
-    reservations =
-      Enum.map(state.reservations, fn {{resource, host}, res} ->
-        %{
-          resource: resource,
-          host: host,
-          fiber_id: res.fiber_id,
-          expires_in_ms: max(0, res.expires_at_ms - System.monotonic_time(:millisecond))
-        }
-      end)
-
-    Map.merge(snap, %{
-      running_detail: running_detail,
-      reservations: reservations,
-      # No waiters: the Channel transport (the only producer) was removed; the
-      # key stays for payload-shape stability and is always empty.
-      waiters: []
-    })
-  end
 end
