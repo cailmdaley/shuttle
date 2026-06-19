@@ -30,19 +30,6 @@ and Shuttle as one thing rather than two that shell to each other.
 Live runtime couplings (these silently break or no-op without Portolan, and are
 the real severing work):
 
-- **`lib/shuttle/waiting_tracker.ex`** (and `sent_files.ex`, which delegates to
-  its `default_events_file/0`) — read the Claude Code hook-event stream to derive
-  per-session activity / "waiting" phase and the sent-files trail. **Shuttle now
-  owns its own stream:** the readers prefer the Shuttle-owned path
-  (`SHUTTLE_EVENTS_FILE`, else `$SHUTTLE_DATA_DIR/events.jsonl`, default
-  `~/.shuttle/events.jsonl`, written by `~/loom/hooks/shuttle-hook.sh`) and **fall back**
-  to the legacy Portolan path (`PORTOLAN_EVENTS_FILE` /
-  `~/.portolan/data/events.jsonl`, written by `~/loom/hooks/portolan-hook.sh`)
-  only when the Shuttle file is absent or empty. So behavior is unchanged until
-  the Shuttle hook is installed (see "Owning the event stream" below), then it
-  transparently switches. The event shape is identical, so the parsers are
-  unchanged. Fully severing means dropping the Portolan fallback once the hook is
-  installed everywhere.
 - **UI `:4004` backend (`ui/src/board/FiberDetailModal.ts`, `FileViewerPanel.ts`)** —
   `portolanBase` defaults to `http://localhost:4004` and the standalone
   `KanbanModal` never overrides it, so **Sent-files**, **Save-to-downloads**, and
@@ -145,25 +132,22 @@ fragile and per-binary; relocating out of Documents is the supported fix.
 ### Owning the event stream — `~/loom/hooks/shuttle-hook.sh`
 
 Shuttle derives per-session activity (`WaitingTracker`) and the sent-files trail
-(`SentFiles`) from a Claude Code hook-event stream. `~/loom/hooks/shuttle-hook.sh`
+(`SentFiles`) from its OWN Claude Code hook-event stream. `~/loom/hooks/shuttle-hook.sh`
 appends one JSON line per hook event to `$SHUTTLE_EVENTS_FILE` (default
-`~/.shuttle/events.jsonl`, dir `$SHUTTLE_DATA_DIR`), in the same shape the legacy
-`portolan-hook.sh` writes, so the daemon no longer depends on Portolan's hook.
-Until the hook is registered on a machine, the readers fall back to Portolan's
-`~/.portolan/data/events.jsonl` there, so nothing breaks in the meantime.
+`~/.shuttle/events.jsonl`, dir `$SHUTTLE_DATA_DIR`). The readers read ONLY this
+path — the Portolan fallback was dropped once the hook was live on all three
+hosts; Portolan is fully severed here.
 
-**The hook lives in loom, registered by `loom/setup.sh` — exactly like
-portolan-hook.** The reason it can't live in this repo: `~/loom` is the same
-absolute path on every machine, but the shuttle checkout is not (`~/dev/shuttle`
-here, `~/Documents/projects/shuttle` on the clusters), and `~/.claude/settings.json`
-needs a stable absolute `command` path. `loom/setup.sh`'s Python block registers
-`~/loom/hooks/shuttle-hook.sh` into `~/.claude/settings.json` across the tracked
-events (UserPromptSubmit, PreToolUse, Stop, Notification, SessionStart, SessionEnd),
-*alongside* portolan-hook for now (both fire, write their own files; drop the
-portolan entries once Portolan is fully retired). To install on a machine: sync
-loom there, then run `~/loom/setup.sh`. The hook needs `jq` on PATH; without it it
-exits silently and the readers keep using the Portolan fallback. Each host's
-daemon tails its own host's `~/.shuttle/events.jsonl`.
+**The hook lives in loom, registered by `loom/setup.sh`.** It can't live in this
+repo: `~/loom` is the same absolute path on every machine, but the shuttle
+checkout is not (`~/dev/shuttle` here, `~/Documents/projects/shuttle` on the
+clusters), and `~/.claude/settings.json` needs a stable absolute `command` path.
+`loom/setup.sh`'s Python block registers `~/loom/hooks/shuttle-hook.sh` into
+`~/.claude/settings.json` across the tracked events (UserPromptSubmit, PreToolUse,
+Stop, Notification, SessionStart, SessionEnd). To install on a machine: sync loom
+there, then run `~/loom/setup.sh`. The hook needs `jq` on PATH; without it it
+exits silently (no events → no activity ranking, but the board still serves).
+Each host's daemon tails its own host's `~/.shuttle/events.jsonl`.
 
 **Connecting to candide and cineca (SSH auth — read this first).** The two
 remotes authenticate differently, and getting it wrong looks like "the host is
