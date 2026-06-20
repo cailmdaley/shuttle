@@ -131,13 +131,6 @@ defmodule Shuttle.DispatchIntegrationTest do
     File.write!(path, Jason.encode!(%{at: DateTime.to_iso8601(at)}))
   end
 
-  # Mirror the lifecycle re-arm marker: `~/.shuttle/rearm/<key>.json` `{at}`.
-  defp write_rearm_marker(id, at \\ DateTime.utc_now()) do
-    path = Shuttle.Markers.rearm_path(id)
-    File.mkdir_p!(Path.dirname(path))
-    File.write!(path, Jason.encode!(%{at: DateTime.to_iso8601(at)}))
-  end
-
   # Start a Poller under ExUnit's per-test supervisor so it is torn down at test
   # end rather than leaking as a zombie ticker (Poller.start_link links to the
   # test process, but a :normal test exit doesn't kill linked processes). Returns
@@ -958,13 +951,13 @@ defmodule Shuttle.DispatchIntegrationTest do
   end
 
   # A standing role whose worker died without a clean handoff but which a human
-  # then ACCEPTED must be left armed — the human's accept (a durable re-arm marker
-  # newer than the dispatch) supersedes the dead-orphan inference. Regression for
-  # the real morning-post / weekly-arxiv oscillation: interactive/ad-hoc runs the
-  # daemon didn't observe exiting left a dispatch marker with no handoff, so the
-  # dead-orphan reconciler re-closed the role to awaiting on every
-  # restart/reconcile, undoing each accept. The re-arm marker is durable across a
-  # restart (the in-memory rearmed_at map is not), which is why it carries this.
+  # then ACCEPTED must be left armed — the human's accept stamps a handoff marker
+  # (the accept concludes the run) newer than the dispatch, which supersedes the
+  # dead-orphan inference. Regression for the real morning-post / weekly-arxiv
+  # oscillation: interactive/ad-hoc runs the daemon didn't observe exiting left a
+  # dispatch marker with no handoff, so the dead-orphan reconciler re-closed the
+  # role to awaiting on every restart/reconcile, undoing each accept. The handoff
+  # marker is durable across a restart (the in-memory rearmed_at map is not).
   #
   # The CONTROL role (dispatch, no handoff, NO accept) flips to awaiting in the
   # same poll — proving the reconciler actually ran this cycle, so the accepted
@@ -995,9 +988,9 @@ defmodule Shuttle.DispatchIntegrationTest do
         DateTime.add(DateTime.utc_now(), -60, :second)
       )
 
-      # Only the fix-target role gets the human accept (a durable re-arm marker,
-      # newer than the dispatch) after the death.
-      if accept?, do: write_rearm_marker("tests/#{slug}")
+      # Only the fix-target role gets the human accept (which stamps a handoff
+      # marker, newer than the dispatch) after the death.
+      if accept?, do: write_handoff_marker("tests/#{slug}")
     end
 
     prev_loom = System.get_env("LOOM_HOMES")

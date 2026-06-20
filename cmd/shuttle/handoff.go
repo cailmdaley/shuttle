@@ -4,11 +4,36 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 )
+
+// endOwnTmuxSession tears down the tmux session this process is running in — the
+// worker's `shuttle-<id>` session. Folded into `handoff` so the worker's exit is
+// ONE command (write the clean-exit marker, then end the session) instead of a
+// marker-write followed by a separate `kill $PPID`. Best-effort and a no-op
+// outside tmux (e.g. a manual/test invocation), so it never kills a stray shell:
+// it asks tmux for the *current* session name and kills exactly that.
+func endOwnTmuxSession() {
+	if os.Getenv("TMUX") == "" {
+		return
+	}
+	name, err := exec.Command("tmux", "display-message", "-p", "#S").Output()
+	if err != nil {
+		return
+	}
+	session := strings.TrimSpace(string(name))
+	if session == "" {
+		return
+	}
+	// This kills our own pane mid-call; the marker is already durably on disk
+	// (os.Rename completed before we got here), so nothing is lost.
+	_ = exec.Command("tmux", "kill-session", "-t", session).Run()
+}
 
 // shuttleDataDir resolves the per-host Shuttle data directory, mirroring the
 // Elixir side (Shuttle.Markers.data_dir/0, WaitingTracker.default_events_file/0):
@@ -92,8 +117,9 @@ func newHandoffCmd() *cobra.Command {
 {"at": <now>}) that tells the daemon this worker exited CLEANLY — so the next
 dispatch starts fresh instead of resuming a dead transcript.
 
-A worker calls this as its SECOND-to-last action (the last is 'kill $PPID'),
-after rewriting the constitution's '## Status' block. The runtime key comes from
+A worker calls this as its FINAL action, after rewriting the constitution's
+'## Status' block: it writes the marker and then ends its own tmux session — so
+the exit is one command, no separate 'kill $PPID'. The runtime key comes from
 SHUTTLE_FIBER_KEY, which the daemon exports at dispatch so the worker's marker and
 the daemon's dispatch marker line up byte-for-byte; this command fails loudly when
 that env is unset (the worker was not launched by the daemon).
@@ -112,6 +138,9 @@ never recomputed from the fiber ref — so the two writers can never diverge.`,
 				return err
 			}
 			fmt.Printf("handoff marker written: %s\n", path)
+			// Final act: end our own tmux session (no-op outside tmux). The
+			// marker is already durably on disk, so the kill loses nothing.
+			endOwnTmuxSession()
 			return nil
 		},
 	}

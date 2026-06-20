@@ -12,8 +12,9 @@ defmodule Shuttle.LifecycleService do
   Awaiting is `status: closed` + untempered in the document itself (there is no
   review axis); re-arm writes `status: active` and `next_due` is recomputed from
   the cron schedule on the next poll (there is no runtime store). The durable
-  re-arm signal the standing-role dead-orphan detector reads is the
-  `~/.shuttle/rearm/<key>` marker `LifecycleStore` stamps on each re-arm write —
+  signal the standing-role dead-orphan detector reads is the `~/.shuttle/handoff/<key>`
+  marker `LifecycleStore` stamps on each re-arm write (`Markers.resolve/1`) — a
+  human re-arm concludes the run, the same handoff a clean worker exit leaves —
   not a felt-history event.
   """
 
