@@ -234,10 +234,11 @@ export class FiberDetailModal {
    *  Disconnected on close so a re-opened panel never leaks observers. */
   private embedObservers: ResizeObserver[] = []
   /** Shuttle daemon base (`:4000`). Every verb routes here — transition,
-   *  dispatch, felt-edit, felt-history, lifecycle, felt-nest — owner-routed
-   *  by the card's `originId` carried as `origin` in the body. Reads (agent
-   *  registry, parent-picker fiber index) hit the daemon's GET routes.
-   *  Portolan's `:4004` no longer serves the kanban at all. */
+   *  dispatch (carrying user_message + resume_mode inline), felt-edit,
+   *  lifecycle, felt-nest — owner-routed by the card's `originId` carried as
+   *  `origin` in the body. Reads (agent registry, parent-picker fiber index)
+   *  hit the daemon's GET routes. Portolan's `:4004` no longer serves the
+   *  kanban at all. */
   private readonly shuttleBase: string
   /** Map a card's `cityId` to the city's project directory — the
    *  `project_dir` a shuttle install needs (worker cwd). Wired from the
@@ -948,9 +949,9 @@ export class FiberDetailModal {
   ): void {
     // ── Next dispatch (message + action buttons) ──────────────────────────
     // One canonical surface for "what happens when this fiber dispatches
-    // next." The message textarea is the optional payload; "talk to me
-    // first" intent rides the directive text as a felt review-comment,
-    // prepended via the one-click "Wait for me" affordance.
+    // next." The message textarea is the optional payload, carried inline on
+    // the dispatch call (`user_message`); "talk to me first" intent rides the
+    // directive text, prepended via the one-click "Wait for me" affordance.
     const actionsSec = this.buildSection(shuttleManaged ? 'Next dispatch' : 'Actions')
     const actionsErr = document.createElement('div')
     actionsErr.className = 'kbn-detail-error'
@@ -994,16 +995,15 @@ export class FiberDetailModal {
       const resumeBtn = this.buildActionBtn('Resume ▸', 'primary')
       resumeBtn.title = 'Resume the previous worker session (claude --resume); outcome preserved'
       // Resume is always offered for a shuttle-managed card — never gated on a
-      // card-visible session id. The Claude session id lives only in felt
-      // history now: shuttle retired the `shuttle.session.id` frontmatter write
-      // (slice 6), so `card.sessionId` is always absent and the frontend cannot
-      // see what to resume. Shuttle resolves the real session from felt history
-      // at dispatch time (force + ad_hoc overrides the run-window filter) and
-      // surfaces a precise error if there is genuinely nothing to resume.
-      // Gating on `card.sessionId` is exactly what grayed Resume out for EVERY
-      // card once that frontmatter write went away — it had already grayed
-      // standing roles, which never persisted one.
-      // See gotcha-standing-role-resume-button-grayed.
+      // card-visible session id. The Claude session id lives in the per-host
+      // dispatch marker (`~/.shuttle/dispatch/<uid>.json`), written by the
+      // daemon at dispatch; `card.sessionId` is always absent and the frontend
+      // cannot see what to resume. The daemon resolves continuation from its
+      // markers at dispatch time (resume_mode='previous' reads the marker's
+      // session_uuid) and surfaces a precise error if there is genuinely
+      // nothing to resume. Gating on `card.sessionId` is exactly what grayed
+      // Resume out for EVERY card — it had already grayed standing roles, which
+      // never persisted one. See gotcha-standing-role-resume-button-grayed.
 
       actionsRow.append(requeueBtn, resumeBtn, temperBtn, compostBtn)
 
@@ -2066,22 +2066,17 @@ export class FiberDetailModal {
   }
 
   /**
-   * Unified manual requeue, orchestrated client-side against the Shuttle
-   * daemon (the old single `/kanban/requeue` Portolan endpoint did this
-   * server-side):
+   * Unified manual requeue: a single owner-routed `/api/v1/dispatch` carrying
+   * the user's message and resume intent inline. `user_message` is the
+   * directive text (the daemon inlines it into the prompt at launch);
+   * `resume_mode` is `'fresh'` → start a new session, `'previous'` → resume the
+   * prior session. The daemon resolves the session to resume from its per-host
+   * dispatch marker (`~/.shuttle/dispatch/<uid>.json`), falling back to fresh
+   * when there's nothing to resume. `force`/`ad_hoc` launch the worker on the
+   * owning host regardless of poll eligibility.
    *
-   *   1. File a `review-comment` felt-history event carrying the user's
-   *      directive (event summary) + resume intent (`resume_mode` field).
-   *      The dispatcher reads the latest review-comment at dispatch time and
-   *      honors its `resume_mode` — so `previous` resumes the prior session,
-   *      `fresh` starts clean. The comment is filed even when the directive
-   *      is empty, so the latest `resume_mode` stays aligned with the click.
-   *   2. POST `/api/v1/dispatch` with `force: true, ad_hoc: true` to launch
-   *      the worker on the owning host.
-   *
-   * Both steps are owner-routed by `card.originId` (`origin`). `mode='previous'`
-   * only actually resumes when a previous session is resolvable; the daemon
-   * falls back to fresh otherwise (oneshot with no `session.id`).
+   * Owner-routed by `card.originId` (`origin`), which carries the message and
+   * resume_mode to the owning daemon intact cross-host.
    */
   private async runRequeue(
     card: KanbanCard,
@@ -2096,32 +2091,7 @@ export class FiberDetailModal {
     btn.textContent = mode === 'fresh' ? 'Starting…' : 'Resuming…'
     errorEl.style.display = 'none'
 
-    // Step 1: file the review-comment (directive + resume_mode). Plain-text
-    // body on !ok. Empty directive still files so `resume_mode` advances.
-    try {
-      const histRes = await fetch(`${this.shuttleBase}/api/v1/felt-history`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          fiber_id: card.id,
-          origin: card.originId,
-          kind: 'review-comment',
-          summary: directive,
-          fields: { resume_mode: mode },
-        }),
-      })
-      if (!histRes.ok) {
-        const detail = await histRes.text().catch(() => `${histRes.status}`)
-        this.showDispatchError(errorEl, btn, original, `Couldn't file directive: ${detail}`)
-        return
-      }
-    } catch (err: unknown) {
-      const detail = (err as { message?: string })?.message ?? String(err)
-      this.showDispatchError(errorEl, btn, original, `Couldn't reach Shuttle: ${detail}`)
-      return
-    }
-
-    // Step 2: force/ad-hoc dispatch.
+    // Single force/ad-hoc dispatch carrying the message + resume_mode inline.
     let res: Response
     try {
       res = await fetch(this.dispatchUrl(), {
@@ -2132,6 +2102,8 @@ export class FiberDetailModal {
           origin: card.originId,
           force: true,
           ad_hoc: true,
+          user_message: directive,
+          resume_mode: mode,
         }),
       })
     } catch (err: unknown) {
