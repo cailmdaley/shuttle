@@ -1382,17 +1382,20 @@ defmodule Shuttle.Dispatcher do
     headless = Keyword.get(opts, :headless, false)
     display_fiber_id = Keyword.get(opts, :display_fiber_id, fiber_id)
 
-    # The runtime key the worker's `shuttle-ctl handoff` stamps the handoff
-    # marker under — exported so the Go writer and this Elixir reader key
-    # identically (dispatch/<key> and handoff/<key> line up byte-for-byte).
+    # Marker env for the worker's `shuttle-ctl handoff`: the data dir AND the
+    # runtime key, both exported so the Go writer and this Elixir reader resolve
+    # the same `$SHUTTLE_DATA_DIR/handoff/<key>` byte-for-byte — independent of
+    # whatever the worker's login profile happens to set (a non-default
+    # SHUTTLE_DATA_DIR on the daemon must reach the worker, or they diverge).
     fiber_key_block =
-      case Keyword.get(opts, :marker_key) do
-        key when is_binary(key) and key != "" ->
-          "export SHUTTLE_FIBER_KEY=#{shell_single_quote(key)}\n"
+      "export SHUTTLE_DATA_DIR=#{shell_single_quote(Shuttle.Markers.data_dir())}\n" <>
+        case Keyword.get(opts, :marker_key) do
+          key when is_binary(key) and key != "" ->
+            "export SHUTTLE_FIBER_KEY=#{shell_single_quote(key)}\n"
 
-        _ ->
-          ""
-      end
+          _ ->
+            ""
+        end
 
     # When resuming claude, schedule a backgrounded tmux send-keys to
     # dismiss the interactive warning page. Runs *inside* the same tmux
