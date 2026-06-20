@@ -48,7 +48,7 @@ The Elixir daemon and Go CLI are in this repo. The Claude Code skill ships separ
 - [felt](https://github.com/LightconeResearch/felt) CLI on `PATH`
 - tmux
 
-Shuttle depends on felt entirely through the felt CLI — no in-process parsing, no library import. `felt ls --json`, `felt show -j`, `felt edit`, and `felt history append` are the seams.
+Shuttle depends on felt entirely through the felt CLI — no in-process parsing, no library import. `felt ls --json`, `felt show -j`, and `felt edit` are the seams. (Continuation state — `session_uuid` / `dispatched_at` / `handed_off_at` — rides in the fiber's `shuttle:` frontmatter block, written surgically; there is no separate history store.)
 
 ## Installation
 
@@ -173,7 +173,7 @@ Stage 7 (BEAM distribution / SSH-tunnel multi-host) is in progress. The `--all` 
 
 ## Skills
 
-The Claude Code skill ships as a separate plugin. It documents the worker protocol: how agents survey the constitution, carry the work forward, write the editorial handoff, and exit cleanly. Install it as a Claude Code extension to make it available in worker sessions.
+The Claude Code skill ships as a separate plugin. It documents the worker protocol: how agents survey the constitution, carry the work forward, rewrite the `## Status` handoff block, and exit cleanly via `shuttle-ctl handoff` (which stamps `shuttle.handed_off_at` and ends the worker's own tmux session). Install it as a Claude Code extension to make it available in worker sessions.
 
 A `Shuttle.WorkSource` behaviour (for non-felt adapters like Linear) is planned but out of scope for v0; follow the tracking issue for progress.
 

@@ -17,7 +17,7 @@ defmodule Shuttle.LifecycleStore do
   at open, so it has no accept/awaiting cycle here — only the `rearm` open.
   """
 
-  alias Shuttle.{Cron, FeltStores, FrontmatterEdit}
+  alias Shuttle.{Cron, FiberDoc}
 
   # Legacy + daemon-owned shuttle keys wiped from the block on every accept /
   # resume / mark-awaiting rewrite: `enabled` and `review` no longer exist;
@@ -27,7 +27,7 @@ defmodule Shuttle.LifecycleStore do
 
   @spec accept(String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
   def accept(fiber_id, _opts \\ []) when is_binary(fiber_id) do
-    with {:ok, path, raw_fm, frontmatter, body} <- read_fiber(fiber_id),
+    with {:ok, path, raw_fm, frontmatter, body} <- FiberDoc.read(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
          :ok <- require_standing(shuttle),
          :ok <- require_doc_acceptable(frontmatter) do
@@ -47,9 +47,10 @@ defmodule Shuttle.LifecycleStore do
     with {:ok, schedule} <- require_schedule(shuttle),
          {:ok, next_due_at} <- Cron.next_occurrence(schedule, DateTime.utc_now()) do
       # The document carries the entire lifecycle: writing `status: active` re-arms
-      # the role, and `next_due` is recomputed from the cron schedule on the next
-      # poll. There is no runtime row to upsert.
-      write_fiber!(path, raw_fm, body, rearm_ops() ++ evict_runtime_ops())
+      # the role, `handed_off_at` concludes the prior run (one atomic write), and
+      # `next_due` is recomputed from the cron schedule on the next poll. There is
+      # no runtime row to upsert.
+      FiberDoc.write!(path, raw_fm, body, rearm_ops() ++ [conclude_run_op()] ++ evict_runtime_ops())
 
       {:ok, "accepted run for #{fiber_id}\n  next due: #{DateTime.to_iso8601(next_due_at)}\n"}
     end
@@ -57,7 +58,7 @@ defmodule Shuttle.LifecycleStore do
 
   @spec resume(String.t()) :: {:ok, String.t()} | {:error, String.t()}
   def resume(fiber_id) when is_binary(fiber_id) do
-    with {:ok, path, raw_fm, frontmatter, body} <- read_fiber(fiber_id),
+    with {:ok, path, raw_fm, frontmatter, body} <- FiberDoc.read(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
          :ok <- require_standing(shuttle),
          :ok <- require_doc_awaiting(frontmatter) do
@@ -69,8 +70,9 @@ defmodule Shuttle.LifecycleStore do
     now = DateTime.utc_now()
 
     # Re-arm by writing `status: active`; the next poll's cron window picks the
-    # role up immediately (the active document IS the re-queue). No runtime row.
-    write_fiber!(path, raw_fm, body, rearm_ops() ++ evict_runtime_ops())
+    # role up immediately (the active document IS the re-queue). `handed_off_at`
+    # concludes the prior run in the same atomic write. No runtime row.
+    FiberDoc.write!(path, raw_fm, body, rearm_ops() ++ [conclude_run_op()] ++ evict_runtime_ops())
 
     {:ok,
      "resumed #{fiber_id} (standing role; re-queued for immediate dispatch)\n" <>
@@ -95,7 +97,7 @@ defmodule Shuttle.LifecycleStore do
   """
   @spec mark_awaiting(String.t()) :: {:ok, String.t()} | {:error, String.t()}
   def mark_awaiting(fiber_id) when is_binary(fiber_id) do
-    with {:ok, path, raw_fm, frontmatter, body} <- read_fiber(fiber_id),
+    with {:ok, path, raw_fm, frontmatter, body} <- FiberDoc.read(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
          :ok <- require_standing(shuttle) do
       ops =
@@ -105,7 +107,7 @@ defmodule Shuttle.LifecycleStore do
           {:delete, "tempered"}
         ] ++ evict_runtime_ops()
 
-      write_fiber!(path, raw_fm, body, ops)
+      FiberDoc.write!(path, raw_fm, body, ops)
 
       {:ok, "marked #{fiber_id} awaiting review (status: closed, untempered)\n"}
     end
@@ -130,23 +132,18 @@ defmodule Shuttle.LifecycleStore do
   """
   @spec rearm(String.t()) :: {:ok, String.t()} | {:error, String.t()}
   def rearm(fiber_id) when is_binary(fiber_id) do
-    with {:ok, path, raw_fm, frontmatter, body} <- read_fiber(fiber_id),
+    with {:ok, path, raw_fm, frontmatter, body} <- FiberDoc.read(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
          :ok <- require_perennial(shuttle) do
       if Map.get(frontmatter, "status") == "active" do
         {:ok, "#{fiber_id} already active\n"}
       else
-        write_fiber!(path, raw_fm, body, rearm_ops() ++ evict_runtime_ops())
+        FiberDoc.write!(path, raw_fm, body, rearm_ops() ++ [conclude_run_op()] ++ evict_runtime_ops())
         {:ok, "re-armed #{fiber_id} (status: active) for force-dispatch\n"}
       end
     end
   end
 
-  # Returns BOTH the raw frontmatter text (for surgical, byte-stable writes) and
-  # the parsed map (for the lifecycle gates: require_standing, doc_awaiting?,
-  # …). The write path edits the raw text directly and never round-trips the map
-  # through an emitter — that round-trip used to reorder keys and collapse block
-  # scalars, breaking felt indexing (see Shuttle.FrontmatterEdit).
   @doc """
   Pinned-worker exit writer: park an interactive role back to its rest state by
   writing `status: open` straight to the felt document — the strip resting state.
@@ -165,48 +162,18 @@ defmodule Shuttle.LifecycleStore do
   """
   @spec park(String.t()) :: {:ok, String.t()} | {:error, String.t()}
   def park(fiber_id) when is_binary(fiber_id) do
-    with {:ok, path, raw_fm, frontmatter, body} <- read_fiber(fiber_id),
+    with {:ok, path, raw_fm, frontmatter, body} <- FiberDoc.read(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
          :ok <- require_pinned(shuttle) do
       if Map.get(frontmatter, "status") == "open" do
         {:ok, "#{fiber_id} already parked\n"}
       else
         ops = [{:put, "status", "open"}, {:delete, "closed-at"}] ++ evict_runtime_ops()
-        write_fiber!(path, raw_fm, body, ops)
+        FiberDoc.write!(path, raw_fm, body, ops)
         {:ok, "parked #{fiber_id} (status: open) on session end\n"}
       end
     end
   end
-
-  defp read_fiber(fiber_id) do
-    with {:ok, path} <- resolve_fiber_path(fiber_id),
-         {:ok, text} <- File.read(path),
-         {:ok, frontmatter_yaml, body} <- split_frontmatter(text),
-         {:ok, frontmatter} <- YamlElixir.read_from_string(frontmatter_yaml) do
-      {:ok, path, frontmatter_yaml, stringify_keys(frontmatter || %{}), body}
-    else
-      {:error, :not_found} -> {:error, "fiber not found: #{fiber_id}"}
-      {:error, reason} when is_atom(reason) -> {:error, to_string(reason)}
-      {:error, reason} when is_binary(reason) -> {:error, reason}
-      {:error, reason} -> {:error, inspect(reason)}
-    end
-  end
-
-  defp resolve_fiber_path(fiber_id) do
-    case FeltStores.resolve_fiber(fiber_id) do
-      {:ok, %{path: path}} -> {:ok, path}
-      {:error, :not_found} -> {:error, :not_found}
-    end
-  end
-
-  defp split_frontmatter("---\n" <> rest) do
-    case :binary.split(rest, "\n---", []) do
-      [frontmatter, body] -> {:ok, frontmatter, body}
-      _ -> {:error, "missing closing frontmatter delimiter"}
-    end
-  end
-
-  defp split_frontmatter(_), do: {:error, "missing opening frontmatter delimiter"}
 
   defp shuttle_block(%{"shuttle" => shuttle}) when is_map(shuttle), do: {:ok, shuttle}
   defp shuttle_block(_), do: {:error, "fiber has no shuttle: block"}
@@ -305,36 +272,14 @@ defmodule Shuttle.LifecycleStore do
     Enum.map(@runtime_keys, &{:delete_nested, "shuttle", &1})
   end
 
-  # Atomic (tmp + rename), surgical write: apply the edit ops to the raw
-  # frontmatter text and reconstruct the file. Only the targeted frontmatter
-  # lines change; the `body` is re-emitted verbatim.
-  #
-  # Byte-stability of the fences: `split_frontmatter` splits on "\n---", so the
-  # newline that terminated the last frontmatter line is consumed by the split,
-  # and `body` begins with the "\n" that terminates the closing "---" fence
-  # line. We therefore normalize the frontmatter to exactly one trailing newline
-  # and write the closing fence as bare "---" (no newline) — `body`'s leading
-  # "\n" completes it. Writing "---\n" here instead would double the newline and
-  # grow a blank line after the fence on every write.
-  defp write_fiber!(path, raw_fm, body, ops) do
-    new_fm = raw_fm |> FrontmatterEdit.apply(ops) |> ensure_single_trailing_newline()
-    tmp = path <> ".tmp"
-    File.write!(tmp, ["---\n", new_fm, "---", body, ensure_trailing_newline(body)])
-    File.rename!(tmp, path)
-    :ok
-  end
-
-  defp ensure_single_trailing_newline(text) do
-    String.trim_trailing(text, "\n") <> "\n"
-  end
-
-  defp stringify_keys(map),
-    do: Map.new(map, fn {key, value} -> {to_string(key), stringify_value(value)} end)
-
-  defp stringify_value(value) when is_map(value), do: stringify_keys(value)
-  defp stringify_value(value) when is_list(value), do: Enum.map(value, &stringify_value/1)
-  defp stringify_value(value), do: value
-
-  defp ensure_trailing_newline(""), do: ""
-  defp ensure_trailing_newline(body), do: if(String.ends_with?(body, "\n"), do: "", else: "\n")
+  # Conclude the in-flight run by stamping `shuttle.handed_off_at = now` into the
+  # block — folded into the SAME atomic re-arm write as `status: active`. A human
+  # accept/resume/rearm declares the run concluded, which is exactly the signal a
+  # clean worker exit leaves (`Shuttle.Continuation` reads `handed_off_at`), so
+  # the standing-role dead-orphan detector sees a clean exit
+  # (`handed_off_at >= dispatched_at`) and the cron lookback baseline advances.
+  # This stops the temper oscillation with no separate re-arm field — the same
+  # `handed_off_at` covers both the worker's clean exit and the human re-arm.
+  defp conclude_run_op,
+    do: {:put_nested, "shuttle", "handed_off_at", DateTime.to_iso8601(DateTime.utc_now())}
 end

@@ -139,13 +139,12 @@ defmodule Shuttle.Poller do
       # %{runtime_key => unix_ms} — the instant a standing role was re-armed by
       # accept/resume, keyed by runtime key (uid when present, else slug) so a
       # rename mid-cycle can't strand the stamp. One of the "last serviced"
-      # signals the due rule anchors on
-      # (alongside felt-history worker events and the role's creation): it marks
-      # the just-served occurrence so the role isn't immediately re-served when
-      # accept flips closed→active. Belt-and-suspenders to the durable history
-      # signal — it covers the window where a transient felt read fails right after
-      # accept. NOT persisted; a restart loses nothing the history signal doesn't
-      # already carry.
+      # signals the due rule anchors on (alongside the fiber's
+      # dispatched_at/handed_off_at and its creation): it marks the just-served
+      # occurrence so the role isn't immediately re-served when accept flips
+      # closed→active. The within-lifetime fast path; the durable backstop is the
+      # `shuttle.handed_off_at` the re-arm stamps (`LifecycleStore`). NOT
+      # persisted; a restart loses nothing that field doesn't already carry.
       rearmed_at: %{},
       # %{runtime_key => %{count: pos_integer, opened_at: DateTime.t | nil,
       # fiber_id: slug, uid: String.t | nil}} — the resume-loop circuit breaker's
@@ -247,12 +246,12 @@ defmodule Shuttle.Poller do
   Validates the fiber (exists, not closed, no live worker) and the tmux
   session, renames the session to the canonical `<leaf>-<uid>-shuttle` name
   (so restart re-adoption, dual-recognition liveness, and the kanban treat it
-  identically to a dispatched worker), starts a watcher, and appends the same
-  `session=<uuid>` history event shape the dispatcher writes at spawn (when
-  `:session_uuid` is provided) so resume works.
+  identically to a dispatched worker), starts a watcher, and writes the same
+  per-host dispatch marker the dispatcher writes at spawn (when `:session_uuid`
+  is provided) so resume works.
 
   Options: `:agent` (registry name; defaults to the fiber's shuttle.agent),
-  `:session_uuid` (the harness transcript UUID, for the history event).
+  `:session_uuid` (the harness transcript UUID, for the dispatch marker).
   """
   @spec claim_session(String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def claim_session(fiber_id, tmux_session, opts \\ []),
@@ -1835,7 +1834,12 @@ defmodule Shuttle.Poller do
            prompt_context: prompt_context,
            felt_store: felt_store,
            force_fresh: Keyword.get(opts, :force_fresh, false),
-           force: Keyword.get(opts, :force, false)
+           force: Keyword.get(opts, :force, false),
+           # STORE 3: the user's directive + continuation mode ride the dispatch
+           # call (no persisted review-comment). The dispatcher inlines the
+           # message into the prompt at launch and honors resume_mode.
+           user_message: Keyword.get(opts, :user_message),
+           resume_mode: Keyword.get(opts, :resume_mode)
          ) do
       {:ok, :human_no_op} ->
         # Human-worker fibers don't need a watcher or running-state entry —
@@ -2027,7 +2031,7 @@ defmodule Shuttle.Poller do
             dispatch_failures: Map.delete(state.dispatch_failures, runtime_key)
         }
 
-        log_worker_claim(fiber_id, agent.id, Keyword.get(opts, :session_uuid), state)
+        log_worker_claim(fiber, Keyword.get(opts, :session_uuid))
         state = refresh_document_entry(state, fiber_id)
         Logger.info("Claimed session #{session} for #{fiber_id} (agent=#{agent.id})")
         {state, {:ok, %{session: session, agent_id: agent.id}}}
@@ -2038,42 +2042,22 @@ defmodule Shuttle.Poller do
     end
   end
 
-  # The claim-time analog of the dispatcher's "worker dispatched" event, with
-  # the same `session=<uuid>` token so `latest_history_session_id` recovers it
-  # for resume. Best-effort, like every felt-history write on this path.
-  defp log_worker_claim(fiber_id, agent_id, session_uuid, state) do
-    summary =
-      case session_uuid do
-        uuid when is_binary(uuid) and uuid != "" ->
-          "worker claimed (agent=#{agent_id}) session=#{uuid}"
+  # The claim-time analog of the dispatcher's dispatch write: a self-claimed /
+  # chat-captured session stamps (refreshes) the fiber's `shuttle:` dispatch
+  # fields so the continuation heuristic and "Resume previous" can recover its
+  # session UUID. Best-effort, keyed by the fiber's `.md` path. A claim with no
+  # captured session_uuid still stamps `dispatched_at` (the run-window anchor) so
+  # a clean handoff can later be compared against it. A path-less fiber (rare)
+  # skips the write — it then reads as a fresh dispatch, the safe default.
+  defp log_worker_claim(fiber, session_uuid) do
+    case Map.get(fiber, "path") do
+      path when is_binary(path) and path != "" ->
+        Shuttle.Continuation.write_dispatch(path, %{
+          session_uuid: if(is_binary(session_uuid) and session_uuid != "", do: session_uuid)
+        })
 
-        _ ->
-          "worker claimed (agent=#{agent_id})"
-      end
-
-    case host_for_fiber(fiber_id, state) do
-      {:ok, felt_store} ->
-        args = ["-C", felt_store, "history", "append", fiber_id, "--summary", summary]
-
-        try do
-          case System.cmd("felt", args, stderr_to_stdout: true) do
-            {_, 0} ->
-              :ok
-
-            {output, code} ->
-              Logger.warning(
-                "log_worker_claim: felt history append exited #{code} for #{fiber_id}: #{String.trim(output)}"
-              )
-          end
-        rescue
-          e ->
-            Logger.warning(
-              "log_worker_claim: felt history append raised for #{fiber_id}: #{inspect(e)}"
-            )
-        end
-
-      {:error, _} ->
-        Logger.debug("log_worker_claim: no felt store found for #{fiber_id}; skipping")
+      _ ->
+        :ok
     end
   end
 
@@ -2235,7 +2219,7 @@ defmodule Shuttle.Poller do
 
   # ── Worker Exit Handling ──
 
-  defp handle_worker_exit(%State{} = state, fiber_id, reason, _session_alive?) do
+  defp handle_worker_exit(%State{} = state, fiber_id, _reason, _session_alive?) do
     case running_key(state, fiber_id) do
       nil ->
         state
@@ -2252,14 +2236,13 @@ defmodule Shuttle.Poller do
             # Re-read fiber to determine next action
             case fetch_fiber_full(fiber_id, state) do
               {:ok, fiber} ->
-                # Auto-log the worker exit to felt history with the session UUID,
-                # so users can browse history and find sessions to reattach or
-                # diagnose. Best-effort: failure to write history doesn't block
-                # the exit-handling state machine. Captured every exit path
-                # (clean kill, crash, abort, ghost cleanup) since we always
-                # come through here when the daemon notices the session ended.
-                log_worker_exit(fiber_id, fiber, meta, reason, state)
-
+                # The daemon does NOT write the handoff marker — the WORKER does,
+                # via `shuttle-ctl handoff`, as its second-to-last act. A worker
+                # that dies without handing off leaves no handoff marker, so the
+                # next dispatch reads dirty-death → resume. The clean/dirty-death
+                # distinction lives entirely in the presence (and timestamp) of
+                # the worker-written handoff marker; this exit path only drives
+                # the document state machine below.
                 status = Map.get(fiber, "status", "")
 
                 cond do
@@ -2493,51 +2476,6 @@ defmodule Shuttle.Poller do
     end
   end
 
-  # Append a "worker exited" felt history event. This event is the run-window
-  # boundary the dispatcher reads (`last_worker_exit_at`/`run_window_start`): a
-  # resume directive filed after it falls inside the next run's window. The
-  # session UUID lives in the separate "worker dispatched" event the dispatcher
-  # writes at spawn (felt history is the only durable session-id home),
-  # which `latest_history_session_id` scans for resume — so the exit event no
-  # longer needs to carry the UUID. Best-effort: a felt failure must not block
-  # the exit-handling state machine.
-  #
-  # Surface for the user: `felt history <fiber-id>` lists every run's dispatch
-  # (with session UUID + agent) and exit (with reason). From there they can
-  # reattach (`claude --resume <uuid>`) or shape a refinement via `shuttle-ctl
-  # resume`.
-  defp log_worker_exit(fiber_id, _fiber, meta, reason, state) do
-    agent_id = Map.get(meta, :agent_id, "unknown")
-    summary = "worker exited (#{inspect(reason)}); agent=#{agent_id}"
-
-    case host_for_fiber(fiber_id, state) do
-      {:ok, felt_store} ->
-        args = ["-C", felt_store, "history", "append", fiber_id, "--summary", summary]
-
-        try do
-          case System.cmd("felt", args, stderr_to_stdout: true) do
-            {_, 0} ->
-              :ok
-
-            {output, code} ->
-              Logger.warning(
-                "log_worker_exit: felt history append exited #{code} for #{fiber_id}: #{String.trim(output)}"
-              )
-          end
-        rescue
-          e ->
-            Logger.warning(
-              "log_worker_exit: felt history append raised for #{fiber_id}: #{inspect(e)}"
-            )
-        end
-
-      {:error, _} ->
-        Logger.debug(
-          "log_worker_exit: no felt store found for #{fiber_id}; skipping history event"
-        )
-    end
-  end
-
   defp clean_expired_reservations(%State{} = state) do
     now_ms = System.monotonic_time(:millisecond)
     remaining = Enum.filter(state.reservations, fn {_key, res} -> res.expires_at_ms > now_ms end)
@@ -2592,8 +2530,8 @@ defmodule Shuttle.Poller do
   # `status: active` and re-dispatches next poll (the loop); a human stops the
   # loop by parking it (`active → open`). A pinned worker that's genuinely done
   # self-closes to `status: closed` — handled by the `status == "closed"` branch
-  # before this gate is reached. The "it ran" record lives in felt history
-  # either way (log_worker_exit), not in the status field.
+  # before this gate is reached. The "it ran" record lives in the per-host
+  # dispatch/handoff markers, not in the status field.
   defp standing_role?(fiber, state) do
     case StandingRoles.fetch_standing_role(Map.get(fiber, "id", ""), state) do
       {:ok, role} -> StandingRole.standing?(role)
@@ -2622,9 +2560,9 @@ defmodule Shuttle.Poller do
           if Keyword.get(opts, :ad_hoc, false) do
             {:standing_run, StandingRole.ad_hoc_run_id(now), :ad_hoc}
           else
-            # A resumed run keeps the awaiting run's id so the review-comment
-            # window covers the just-filed resume directive; only a fresh
-            # scheduled run mints a new id. See StandingRole.dispatch_run_id.
+            # A resumed run keeps the awaiting run's id; only a fresh scheduled
+            # run mints a new id. The run id flows into the STORE-1 dispatch
+            # marker. See StandingRole.dispatch_run_id.
             {:standing_run, StandingRole.dispatch_run_id(role, now)}
           end
         else

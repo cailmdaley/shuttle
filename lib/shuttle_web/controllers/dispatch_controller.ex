@@ -11,6 +11,12 @@ defmodule ShuttleWeb.DispatchController do
       the `origin` the composite board stamped, so `Shuttle.OriginRouter`
       forwards to the owning daemon's identical `/dispatch` (origin stripped),
       where the worker must run, and relays the response verbatim.
+
+  STORE 3 — the kanban requeue carries the user's directive (`user_message`) and
+  continuation mode (`resume_mode ∈ {"previous", "fresh"}` or absent) inline in
+  the body, replacing the prior file-a-review-comment-then-dispatch two-step.
+  Both ride the dispatch call into the prompt at launch; the remote forward
+  passes `conn.body_params` verbatim, so they survive owner-routing intact.
   """
 
   use Phoenix.Controller, formats: [:json]
@@ -43,7 +49,10 @@ defmodule ShuttleWeb.DispatchController do
       case Shuttle.Poller.dispatch_fiber(fiber_id,
              notify_on_exit: notify_on_exit,
              force: force or ad_hoc,
-             ad_hoc: ad_hoc
+             ad_hoc: ad_hoc,
+             # STORE 3: the directive + continuation mode ride the dispatch.
+             user_message: normalize_message(Map.get(params, "user_message")),
+             resume_mode: normalize_resume_mode(Map.get(params, "resume_mode"))
            ) do
         {:ok, session} ->
           # A forced dispatch may have re-armed the doc (status:active). Re-read it
@@ -105,6 +114,23 @@ defmodule ShuttleWeb.DispatchController do
 
   defp truthy?(value) when value in [true, "true", "1", 1], do: true
   defp truthy?(_), do: false
+
+  # A blank message is no message — the From User block renders only for real
+  # content. Non-strings collapse to nil.
+  defp normalize_message(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      _ -> value
+    end
+  end
+
+  defp normalize_message(_), do: nil
+
+  # resume_mode ∈ {"previous", "fresh"} or absent (→ marker-decided). Anything
+  # else is ignored (treated as absent) so a malformed param degrades to the
+  # autonomous heuristic rather than a hard error.
+  defp normalize_resume_mode(mode) when mode in ["previous", "fresh"], do: mode
+  defp normalize_resume_mode(_), do: nil
 
   # Turns a structured ineligibility detail into a stable `detail` code plus a
   # human `message`. The kanban renders `detail` to accurate copy and falls

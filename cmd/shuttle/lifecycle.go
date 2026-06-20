@@ -142,14 +142,15 @@ no enabled flag) — so the daemon dispatches the fiber on its next poll.
 For a standing role awaiting review (status: closed + untempered), resume
 re-arms it for immediate dispatch and routes to the owning daemon (which clears
 the awaiting marker and recomputes due-ness from the schedule). The previous
-run's session id, recorded in felt history, lets the next worker resume that
+run's session id lives in the fiber's shuttle.session_uuid frontmatter field
+(stamped by the daemon at dispatch), so the next worker can resume that
 transcript; this is distinct from accept, which advances the recurrence.
 
 A draft (status: open) is armed straight to status: active. Refuses on a
 tempered/composted close — use 'shuttle reopen' to requeue a finished fiber.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			path, fiberID, host := resolveFiber(args[0])
+			path, fiberID, _ := resolveFiber(args[0])
 			f := readFiber(path)
 			if f.Block == nil {
 				return fmt.Errorf("fiber %s has no shuttle: block", args[0])
@@ -177,7 +178,6 @@ tempered/composted close — use 'shuttle reopen' to requeue a finished fiber.`,
 				if err := f.WriteBlock(f.Block); err != nil {
 					return fmt.Errorf("writing fiber: %w", err)
 				}
-				_ = appendFeltHistory(host, fiberID, "resumed; re-queued for immediate dispatch")
 				fmt.Printf("resumed %s (standing role; re-queued for immediate dispatch)\n", args[0])
 				return nil
 			}
@@ -199,30 +199,12 @@ tempered/composted close — use 'shuttle reopen' to requeue a finished fiber.`,
 				}
 			}
 
-			// File a review-comment so the dispatcher's check_resume_intent/3
-			// can detect resume intent. The summary is intentionally empty:
-			// render_user_message_block/2 in the dispatcher suppresses the
-			// "From User" prompt block when the latest review-comment has empty
-			// text, so we keep the resume_mode in the payload without surfacing
-			// meaningless machinery as a directive.
-			//
-			// Request `previous` only when felt history actually holds a
-			// resumable session id (a "worker dispatched … session=<uuid>"
-			// event). Arming a never-run fiber has no such session, so a
-			// `previous` directive would resolve to {:error, :missing_session_id}
-			// in check_resume_intent/3 and re-fail on every poll, forever (the
-			// permanent-block failure mode that left morning-post stuck 5 days).
-			// File `fresh` there so arming a never-run fiber dispatches fresh.
-			resumeMode := "fresh"
-			if latestResumableSessionID(host, fiberID) != "" {
-				resumeMode = "previous"
-			}
-			_ = appendFeltHistoryReviewComment(host, fiberID, "", resumeMode)
-			if resumeMode == "previous" {
-				fmt.Println("  resume_mode: previous (session read from felt history)")
-			} else {
-				fmt.Println("  resume_mode: fresh (no prior session in felt history)")
-			}
+			// Resume arms status:active and stops. The daemon decides
+			// fresh-vs-resume from the per-host markers at the next dispatch
+			// (handoff/<key> vs dispatch/<key>.json) — there is no resume_mode to
+			// persist here. When the user means "start over" vs "continue," that
+			// intent rides the dispatch call as the resume_mode parameter, not a
+			// felt event.
 			return nil
 		},
 	}
@@ -433,11 +415,11 @@ a non-empty outcome as "prior runs unaccepted, append below." Pass
 a run whose digest the next worker should still see).
 
 Routes to the owning daemon when reachable (a single in-process re-arm);
-falls back to a local document write when the daemon is down. Appends a felt
-history event recording the acceptance.`,
+falls back to a local document write when the daemon is down. next_due is
+recomputed from the schedule by the daemon on its next poll.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			path, fiberID, host := resolveFiber(args[0])
+			path, fiberID, _ := resolveFiber(args[0])
 			f := readFiber(path)
 			if f.Block == nil {
 				return fmt.Errorf("fiber %s has no shuttle: block", args[0])
@@ -480,16 +462,15 @@ history event recording the acceptance.`,
 			f.SetStatus("active")
 			f.SetTempered(nil)
 			f.ClearClosedAt()
-			// No session block to clear: resume reads felt history, not a
-			// doc-resident block (slice 6). A WriteBlock still wipes any legacy
-			// `session:` key via knownShuttleKeys (clean cutover).
+			// No session block to clear: resume reads the daemon's dispatch
+			// marker, not a doc-resident block. A WriteBlock still wipes any
+			// legacy `session:` key via knownShuttleKeys (clean cutover).
 			if !keepOutcome {
 				f.SetOutcome("")
 			}
 			if err := f.WriteBlock(f.Block); err != nil {
 				return fmt.Errorf("writing fiber: %w", err)
 			}
-			_ = appendFeltHistory(host, fiberID, fmt.Sprintf("accepted run; next due %s", computedNext.Format(time.RFC3339)))
 			fmt.Printf("accepted run for %s\n  next due: %s\n", args[0], computedNext.Format(time.RFC3339))
 			return nil
 		},
@@ -629,7 +610,7 @@ var setInteractiveCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf(`set-interactive is retired: interactivity is no longer a dispatch mode.
   - Per-dispatch "talk to me first" intent goes in the From User directive
-    (the kanban requeue/resume box, or a felt review-comment event).
+    (the kanban requeue/resume box — it rides the dispatch call as a parameter).
   - Structural human-gates (2FA, send-in-his-voice) belong in the constitution
     text — the worker reads Desired State / Context and waits there.
   - To talk to any worker, finished or not, resume it from the kanban.`)

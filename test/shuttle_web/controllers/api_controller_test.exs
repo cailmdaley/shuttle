@@ -686,12 +686,12 @@ defmodule ShuttleWeb.APIControllerTest do
 
   # ── Owner-routing for the non-drag write verbs (Shuttle.OriginRouter) ──
   #
-  # The kanban posts tag/horizon edits, promote/requeue lifecycle, and
-  # review-comment history directly to Shuttle, carrying the `origin` the
-  # composite board stamped. A remote-owned card forwards to the owning daemon's
-  # IDENTICAL endpoint over the tunnel (origin stripped, so the owner runs its
-  # own local branch) and relays the response verbatim — the same one-hop shape
-  # /transition uses, via the shared forwarder.
+  # The kanban posts tag/horizon edits, promote/requeue lifecycle, and the
+  # dispatch directive (user_message + resume_mode, STORE 3) directly to Shuttle,
+  # carrying the `origin` the composite board stamped. A remote-owned card
+  # forwards to the owning daemon's IDENTICAL endpoint over the tunnel (origin
+  # stripped, so the owner runs its own local branch) and relays the response
+  # verbatim — the same one-hop shape /transition uses, via the shared forwarder.
 
   defp stub_forward(remote_name, remote_url, response) do
     start_supervised!(StubPostClient)
@@ -745,34 +745,6 @@ defmodule ShuttleWeb.APIControllerTest do
     assert Jason.decode!(last.body) == %{"action" => "pause", "fiber" => "tests/remote-card"}
   end
 
-  test "felt-history forwards a remote-owned card to the owning daemon" do
-    stub_forward("cineca", "http://localhost:4002", {:ok, 200, "appended"})
-
-    conn =
-      post(
-        api_conn(),
-        "/api/v1/felt-history",
-        Jason.encode!(%{
-          fiber_id: "tests/remote-card",
-          kind: "review-comment",
-          summary: "do the thing",
-          origin: "cineca"
-        })
-      )
-
-    assert conn.status == 200
-    assert conn.resp_body == "appended"
-
-    last = StubPostClient.last()
-    assert last.url == "http://localhost:4002/api/v1/felt-history"
-
-    assert Jason.decode!(last.body) == %{
-             "fiber_id" => "tests/remote-card",
-             "kind" => "review-comment",
-             "summary" => "do the thing"
-           }
-  end
-
   test "dispatch forwards a remote-owned card and relays its JSON" do
     stub_forward(
       "candide",
@@ -793,6 +765,42 @@ defmodule ShuttleWeb.APIControllerTest do
     last = StubPostClient.last()
     assert last.url == "http://localhost:4001/api/v1/dispatch"
     assert Jason.decode!(last.body) == %{"fiber_id" => "tests/remote-card"}
+  end
+
+  test "dispatch owner-routes the STORE-3 user_message + resume_mode intact" do
+    # STORE 3: the user's directive + continuation mode ride the dispatch call
+    # (replacing the old file-a-review-comment-then-dispatch two-step). For a
+    # remote-owned card they must owner-route to the owning daemon's /dispatch
+    # with origin stripped — the body otherwise verbatim.
+    stub_forward(
+      "cineca",
+      "http://localhost:4002",
+      {:ok, 200, Jason.encode!(%{"dispatched" => true, "fiber_id" => "tests/remote-card"})}
+    )
+
+    conn =
+      post(
+        api_conn(),
+        "/api/v1/dispatch",
+        Jason.encode!(%{
+          fiber_id: "tests/remote-card",
+          origin: "cineca",
+          user_message: "talk to me first",
+          resume_mode: "previous"
+        })
+      )
+
+    assert conn.status == 200
+    assert Jason.decode!(conn.resp_body)["dispatched"] == true
+
+    last = StubPostClient.last()
+    assert last.url == "http://localhost:4002/api/v1/dispatch"
+    # origin stripped; user_message + resume_mode survive the hop.
+    assert Jason.decode!(last.body) == %{
+             "fiber_id" => "tests/remote-card",
+             "user_message" => "talk to me first",
+             "resume_mode" => "previous"
+           }
   end
 
   test "felt-edit relays a tunnel failure as 502" do
