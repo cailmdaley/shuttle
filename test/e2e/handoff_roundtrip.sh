@@ -87,9 +87,15 @@ J=$("$FELT" -C "$STORE" show demo/worker-fiber -j)
 
 HOFF=$(sh_field "$J" handed_off_at)
 python3 - "$DISPATCHED_AT" "$HOFF" <<'PY' && pass "handed_off_at >= dispatched_at → decision FRESH" || fail "handoff not after dispatch"
-import sys; from datetime import datetime
-p=lambda s: datetime.fromisoformat(s.replace('Z','+00:00'))
-sys.exit(0 if p(sys.argv[2])>=p(sys.argv[1]) else 1)
+import sys, re
+from datetime import datetime
+# The Go writer emits RFC3339Nano (variable-precision fractional seconds, trailing
+# zeros trimmed); normalize to 6 digits so older datetime.fromisoformat accepts it.
+def p(s):
+    s = s.strip().replace('Z', '+00:00')
+    s = re.sub(r'\.(\d+)', lambda m: '.' + (m.group(1) + '000000')[:6], s)
+    return datetime.fromisoformat(s)
+sys.exit(0 if p(sys.argv[2]) >= p(sys.argv[1]) else 1)
 PY
 
 echo "== CASE 2: idempotent — repeated handoff does not accrete whitespace =="
