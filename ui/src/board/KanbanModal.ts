@@ -101,8 +101,8 @@ interface KanbanModalOptions {
   onNewIdeaClick?: () => void
   /** Override the Shuttle daemon base — the kanban's data + write plane. Reads
    *  `GET /api/v1/fibers/composite`; writes POST the daemon transition/felt-edit/
-   *  dispatch/felt-history endpoints, owner-routed by `origin`. Defaults to
-   *  `http://${hostname}:4000`. */
+   *  dispatch endpoints (dispatch carries user_message + resume_mode inline),
+   *  owner-routed by `origin`. Defaults to `http://${hostname}:4000`. */
   shuttleBase?: string
   /** Pinned cities' `.felt` realpaths, read FRESH per fetch (cities update on WS
    *  pushes) to build the browser `CityResolver` that attributes composite-feed
@@ -380,13 +380,13 @@ export class KanbanModal {
    *
    * Drag-to-inFlight is the launch verb. It routes through the unified
    * force-dispatch path (the same one FiberDetailModal's "New session ▸"
-   * uses): file a review-comment carrying resume_mode='fresh', then POST
-   * /api/v1/dispatch with `force: true`. force bypasses status / enabled /
-   * review_state / schedule / validity gates, so closed (tempered or
+   * uses): a single fresh POST /api/v1/dispatch with `force: true, ad_hoc:
+   * true` and no message — drag carries no directive (resume-previous and
+   * "talk first" intent live behind the detail modal). force bypasses status /
+   * enabled / review_state / schedule / validity gates, so closed (tempered or
    * composted), paused, awaiting-review, and dormant-standing cards all
-   * fire a worker immediately — no waiting on the 15s poller. The
-   * separate /kanban/transition write still runs first so the file state
-   * (enabled, reopen, accept) settles before the worker boots.
+   * fire a worker immediately — no waiting on the 15s poller; the dispatch
+   * reopens a closed lifecycle itself, so no separate transition write runs.
    *
    * Drag-from-timeline-or-stash composes the surface horizon write
    * (setSurface(card, 'now')) with the lifecycle verb. Previously the
@@ -522,8 +522,8 @@ export class KanbanModal {
    * both redundant (requeue already reopens-if-closed) and harmful: for an
    * enabled fiber the transition resolved to dispatch-ad-hoc and SPAWNED the
    * worker immediately, racing requeue's own force-dispatch into a 409
-   * already_running. Collapsing to one call writes the directive BEFORE the
-   * single dispatch. (overnight-audit C6, regression from 5973cdc.)
+   * already_running. Collapsing to one call removed the race; the drag
+   * carries no directive. (overnight-audit C6, regression from 5973cdc.)
    */
   private async launchFromDrag(card: KanbanCard): Promise<void> {
     // Drag launch always starts fresh. Resume-previous and "talk first" intent
