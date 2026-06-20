@@ -2429,13 +2429,13 @@ defmodule Shuttle.Poller do
 
   # ── Helpers ──
 
+  # Is a worker present in this tmux session? `present?` treats an inconclusive
+  # `has-session` as present, so reconcile won't drop a live worker's running
+  # entry (nor free its name for a resume) on a transient tmux failure — only a
+  # confirmed `:gone` does. The reconcile/liveness twin of dispatch's
+  # check_not_running.
   defp already_running_session?(%State{} = state, session) do
-    case state.runner.cmd("tmux", ["has-session", "-t", exact_tmux_target(session)],
-           stderr_to_stdout: true
-         ) do
-      {_, 0} -> true
-      {_, _} -> false
-    end
+    Shuttle.Tmux.present?(state.runner, session)
   end
 
   # Dual-recognition liveness: a fiber is running if a live tmux session exists
@@ -2455,8 +2455,6 @@ defmodule Shuttle.Poller do
     |> Dispatcher.session_names(uid || running_uid(state, fiber_id))
     |> Enum.find(&already_running_session?(state, &1))
   end
-
-  defp exact_tmux_target(session), do: "=" <> session
 
   defp available_slots(%State{} = state) do
     max(state.max_concurrent_workers - map_size(state.running), 0)
