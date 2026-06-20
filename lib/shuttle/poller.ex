@@ -124,12 +124,12 @@ defmodule Shuttle.Poller do
       # %{runtime_key => unix_ms} — the instant a standing role was re-armed by
       # accept/resume, keyed by runtime key (uid when present, else slug) so a
       # rename mid-cycle can't strand the stamp. One of the "last serviced"
-      # signals the due rule anchors on (alongside the dispatch/handoff/re-arm
-      # markers and the role's creation): it marks the just-served occurrence so
-      # the role isn't immediately re-served when accept flips closed→active. The
-      # within-lifetime fast path; the durable `~/.shuttle/rearm/<key>` marker is
-      # the restart-proof backstop. NOT persisted; a restart loses nothing the
-      # re-arm marker doesn't already carry.
+      # signals the due rule anchors on (alongside the dispatch/handoff markers
+      # and the role's creation): it marks the just-served occurrence so the role
+      # isn't immediately re-served when accept flips closed→active. The
+      # within-lifetime fast path; the durable backstop is the handoff marker the
+      # re-arm stamps (`Markers.resolve/1`). NOT persisted; a restart loses
+      # nothing the handoff marker doesn't already carry.
       rearmed_at: %{}
     ]
   end

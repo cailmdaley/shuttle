@@ -89,11 +89,11 @@ defmodule Shuttle.Poller.StandingRoles do
         state
 
       # The marker discriminator: only a role that was actually DISPATCHED but
-      # never cleanly handed off (and was not re-armed since) is a dead orphan.
-      # The dispatch marker records `dispatched_at`; the worker's handoff marker
-      # records a clean exit; the re-arm marker records a human accept/resume. A
-      # dispatch with no newer handoff and no newer re-arm is the
-      # daemon-down-across-exit case. An armed role whose last run already handed
+      # never cleanly handed off is a dead orphan. The dispatch marker records
+      # `dispatched_at`; the handoff marker records a clean exit — written by the
+      # worker on a clean exit OR by a human accept/resume (which concludes the
+      # run). A dispatch with no newer handoff is the daemon-down-across-exit
+      # case. An armed role whose last run already handed
       # off (the "armed, not-yet-due" shape) is left alone so its next cron tick
       # fires.
       not standing_role_dispatched_unexited?(fiber) ->
@@ -123,23 +123,23 @@ defmodule Shuttle.Poller.StandingRoles do
     end
   end
 
-  # True iff the role was DISPATCHED but never cleanly handed off and was not
-  # re-armed since — i.e., a run that began but whose exit the daemon never
-  # observed (it was down across the exit). Read from the per-host markers
-  # (`Shuttle.Markers`), keyed by the fiber's intrinsic runtime key:
+  # True iff the role was DISPATCHED but never cleanly handed off — a run that
+  # began but whose exit the daemon never observed (it was down across the exit).
+  # Read from the per-host markers (`Shuttle.Markers`), keyed by the fiber's
+  # intrinsic runtime key:
   #
-  #   • no dispatch marker        → never ran           → not an orphan (false).
-  #   • handoff.at >= dispatch.at → clean exit observed  → not an orphan (false).
-  #   • rearm.at  >= dispatch.at  → human re-armed since → not an orphan (false).
-  #     A human accept / resume / force-dispatch re-arm SUPERSEDES the dead-orphan
-  #     inference: the human declared the run done and re-armed the role, so it
-  #     is not an un-exited orphan no matter how the worker died. Without this,
-  #     a role whose worker died without handing off gets re-closed to awaiting
-  #     on every reconcile — the standing-role temper oscillation Cail hit on his
-  #     real morning-post / weekly-arxiv roles. The marker is durable across a
-  #     daemon restart (the in-memory `rearmed_at` map was wiped on every boot,
-  #     which is exactly why this signal had to leave memory).
-  #   • otherwise (dispatched, no newer handoff, no newer re-arm) → orphan (true).
+  #   • no dispatch marker        → never ran (or a human resolved it) → not an orphan.
+  #   • handoff.at >= dispatch.at → clean exit observed                → not an orphan.
+  #   • otherwise (dispatched, no newer handoff)                       → orphan (true).
+  #
+  # A human accept / resume / force-rearm SUPERSEDES the dead-orphan inference by
+  # *concluding the run* — `Markers.resolve/1` stamps the handoff marker
+  # (`handoff.at >= dispatch.at`), the same signal a clean worker exit leaves,
+  # since a human accepting the run IS concluding it. This is what stops the
+  # standing-role temper oscillation Cail hit on his morning-post / weekly-arxiv
+  # roles (a worker that died without handing off was re-closed to awaiting on
+  # every reconcile). Durable across a daemon restart, and needs no third
+  # (re-arm) marker racing the dispatch/handoff pair.
   def standing_role_dispatched_unexited?(fiber) do
     key = Poller.runtime_key_for_fiber(fiber)
 
@@ -148,8 +148,7 @@ defmodule Shuttle.Poller.StandingRoles do
         false
 
       dispatch_dt ->
-        not (at_or_after?(Shuttle.Markers.handoff_at(key), dispatch_dt) or
-               at_or_after?(Shuttle.Markers.rearmed_at(key), dispatch_dt))
+        not at_or_after?(Shuttle.Markers.handoff_at(key), dispatch_dt)
     end
   rescue
     _ -> false
@@ -245,9 +244,10 @@ defmodule Shuttle.Poller.StandingRoles do
   # document transition is the per-cycle "already ran this cycle" gate.
   # The one standing-role dispatch rule: an active role is due when a scheduled
   # occurrence has elapsed since it was last serviced. "Last serviced" is the most
-  # recent of — the latest dispatch/handoff/re-arm marker timestamp (durable
-  # across restarts), the in-memory re-arm stamp, or the role's creation if it has
-  # never run. Expressed against the cron primitive as the lookback `now -
+  # recent of — the latest dispatch/handoff marker timestamp (durable across
+  # restarts; a human re-arm stamps the handoff marker too), the in-memory re-arm
+  # stamp, or the role's creation if it has never run. Expressed against the cron
+  # primitive as the lookback `now -
   # last_serviced`: `due_by_cron?` then asks "did a tick fire after the last
   # service, at or before now?" — i.e. is there an unrun occurrence. (A
   # non-positive lookback ⇒ nothing elapsed since service ⇒ not due, handled by
@@ -287,8 +287,8 @@ defmodule Shuttle.Poller.StandingRoles do
       last_service_event_ms(fiber),
       # `rearmed_at` is keyed by runtime key (uid when present), so look it up by
       # the candidate's runtime key — matching how `lifecycle_transition` stamps.
-      # It is the within-lifetime fast path; the durable re-arm marker
-      # (in `last_service_event_ms`) is the restart-proof backstop.
+      # It is the within-lifetime fast path; the durable handoff marker the
+      # re-arm stamps (in `last_service_event_ms`) is the restart-proof backstop.
       Map.get(state.rearmed_at, Poller.runtime_key_for_fiber(fiber)),
       created_at_ms(fiber)
     ]
@@ -300,18 +300,19 @@ defmodule Shuttle.Poller.StandingRoles do
   end
 
   # Unix-ms of the most recent durable service marker — the max of the dispatch
-  # marker's `dispatched_at`, the handoff marker's `at`, and the re-arm marker's
-  # `at` (`Shuttle.Markers`, keyed by the fiber's runtime key). nil when no marker
-  # exists (never run / never re-armed). The cron self-catching invariant hinges
-  # on this advancing each run: a fresh dispatch writes a newer `dispatched_at`,
-  # so the next poll sees only the next FUTURE occurrence.
+  # marker's `dispatched_at` and the handoff marker's `at` (`Shuttle.Markers`,
+  # keyed by the fiber's runtime key). A human re-arm stamps the handoff marker
+  # too (it concludes the run), so `handoff_at` covers re-arms as well — no
+  # separate re-arm marker. nil when no marker exists (never run). The cron
+  # self-catching invariant hinges on this advancing each run: a fresh dispatch
+  # writes a newer `dispatched_at`, so the next poll sees only the next FUTURE
+  # occurrence.
   def last_service_event_ms(fiber) do
     key = Poller.runtime_key_for_fiber(fiber)
 
     [
       Shuttle.Markers.dispatched_at(key),
-      Shuttle.Markers.handoff_at(key),
-      Shuttle.Markers.rearmed_at(key)
+      Shuttle.Markers.handoff_at(key)
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.map(&DateTime.to_unix(&1, :millisecond))

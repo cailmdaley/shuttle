@@ -202,9 +202,12 @@ defmodule Shuttle.DispatcherTest do
     # The autonomous kill-on-exit instruction must be absent for pinned.
     refute pinned =~ "your final action must be `kill $PPID`"
 
-    # Oneshot (the default) keeps the kill-on-exit contract.
+    # Oneshot (the default) keeps the autonomous exit-on-completion contract:
+    # the final action is `shuttle-ctl handoff`, which writes the marker and ends
+    # the session (it folds in the old `kill $PPID`).
     oneshot = Dispatcher.render_prompt("tests/haiku")
-    assert oneshot =~ "your final action must be `kill $PPID`"
+    assert oneshot =~ "your FINAL action is `shuttle-ctl handoff"
+    refute oneshot =~ "stay alive and wait"
     refute oneshot =~ "pinned interactive role"
   end
 

@@ -62,12 +62,6 @@ defmodule Shuttle.Markers do
   def handoff_path(key), do: Path.join([data_dir(), "handoff", key])
 
   @doc """
-  Absolute path of the standing-role re-arm marker for `key` (`rearm/<key>.json`).
-  """
-  @spec rearm_path(String.t()) :: String.t()
-  def rearm_path(key), do: Path.join([data_dir(), "rearm", "#{key}.json"])
-
-  @doc """
   Write the dispatch marker for `key`: `{session_uuid, dispatched_at, run_id}`.
 
   `dispatched_at` is stamped now (RFC3339 UTC). `run_id` is whatever the caller
@@ -114,32 +108,25 @@ defmodule Shuttle.Markers do
   def read_handoff(_), do: nil
 
   @doc """
-  Write the standing-role re-arm marker for `key`: `{at}` (RFC3339 UTC, now).
+  Resolve `key`'s in-flight run by stamping its handoff marker (`{at}`, now).
 
-  Written by the accept/resume/rearm lifecycle verbs — the durable, restart-proof
-  "the human re-armed this role" fact the standing-role dead-orphan detector
-  compares against the dispatch marker's `dispatched_at` (a re-arm newer than the
-  dispatch supersedes the orphan inference). The in-memory `rearmed_at` map this
-  replaces was wiped on every daemon restart, which is exactly why the signal had
-  to move to durable storage.
+  Called by the accept/resume/rearm lifecycle verbs. A human servicing the role
+  *declares the run concluded* — which is exactly what a handoff marker means — so
+  reusing the handoff marker (rather than a third, re-arm marker) keeps the model
+  at two markers and makes both standing-role signals fall out for free:
+    • the dead-orphan detector sees a clean exit (`handoff.at >= dispatch.at`), so
+      a worker that died without handing off stops being re-marked awaiting on
+      every reconcile (the temper oscillation), and
+    • the cron lookback baseline advances (`last_service_event_ms` maxes over the
+      handoff `at`), so the role isn't seen as due for a past occurrence.
+  Both durable across a daemon restart. Best-effort: a write failure is logged.
   """
-  @spec write_rearm(String.t()) :: :ok | {:error, term()}
-  def write_rearm(key) when is_binary(key) and key != "" do
-    write_json(rearm_path(key), %{at: iso_now()})
+  @spec resolve(String.t()) :: :ok | {:error, term()}
+  def resolve(key) when is_binary(key) and key != "" do
+    write_json(handoff_path(key), %{at: iso_now()})
   end
 
-  def write_rearm(_), do: {:error, :no_key}
-
-  @doc "Read the re-arm marker for `key`, or `nil` when absent/unparseable."
-  @spec read_rearm(String.t()) :: map() | nil
-  def read_rearm(key) when is_binary(key) and key != "", do: read_json(rearm_path(key))
-  def read_rearm(_), do: nil
-
-  @doc "The `at` of the re-arm marker for `key` as a `DateTime`, or `nil`."
-  @spec rearmed_at(String.t()) :: DateTime.t() | nil
-  def rearmed_at(key) do
-    with %{"at" => iso} <- read_rearm(key), do: parse_iso(iso)
-  end
+  def resolve(_), do: :ok
 
   @doc """
   The `dispatched_at` of the dispatch marker for `key` as a `DateTime`, or `nil`.

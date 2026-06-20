@@ -50,7 +50,7 @@ defmodule Shuttle.LifecycleStore do
       # the role, and `next_due` is recomputed from the cron schedule on the next
       # poll. There is no runtime row to upsert.
       write_fiber!(path, raw_fm, body, rearm_ops() ++ evict_runtime_ops())
-      write_rearm_marker(marker_key)
+      resolve_run_markers(marker_key)
 
       {:ok, "accepted run for #{fiber_id}\n  next due: #{DateTime.to_iso8601(next_due_at)}\n"}
     end
@@ -72,7 +72,7 @@ defmodule Shuttle.LifecycleStore do
     # Re-arm by writing `status: active`; the next poll's cron window picks the
     # role up immediately (the active document IS the re-queue). No runtime row.
     write_fiber!(path, raw_fm, body, rearm_ops() ++ evict_runtime_ops())
-    write_rearm_marker(marker_key)
+    resolve_run_markers(marker_key)
 
     {:ok,
      "resumed #{fiber_id} (standing role; re-queued for immediate dispatch)\n" <>
@@ -139,7 +139,7 @@ defmodule Shuttle.LifecycleStore do
         {:ok, "#{fiber_id} already active\n"}
       else
         write_fiber!(path, raw_fm, body, rearm_ops() ++ evict_runtime_ops())
-        write_rearm_marker(marker_key(frontmatter, fiber_id))
+        resolve_run_markers(marker_key(frontmatter, fiber_id))
         {:ok, "re-armed #{fiber_id} (status: active) for force-dispatch\n"}
       end
     end
@@ -310,8 +310,8 @@ defmodule Shuttle.LifecycleStore do
 
   # The runtime key the per-host markers are keyed by: the document's `uid` when
   # present, else the fiber's slug `id`. Mirrors `Poller.runtime_key_for_fiber/1`
-  # so the re-arm marker the lifecycle verb stamps lines up byte-for-byte with
-  # the dispatch/handoff markers the standing-role detector compares it against.
+  # so the handoff marker the lifecycle verb stamps on re-arm lines up byte-for-byte
+  # with the dispatch/handoff markers the standing-role detector compares it against.
   defp marker_key(frontmatter, fiber_id) do
     case Map.get(frontmatter, "uid") do
       uid when is_binary(uid) and uid != "" -> uid
@@ -319,14 +319,14 @@ defmodule Shuttle.LifecycleStore do
     end
   end
 
-  # Write the durable re-arm marker (`~/.shuttle/rearm/<key>`). This is the
-  # restart-proof "a human re-armed this role" fact that replaced the in-memory
-  # `rearmed_at` map (wiped on every daemon restart): the standing-role
-  # dead-orphan detector compares it against the dispatch marker's
-  # `dispatched_at` — a re-arm newer than the last dispatch supersedes the orphan
-  # inference. Best-effort: a marker-write failure must not crash the lifecycle
-  # write (the document re-arm already landed; `Markers` logs and continues).
-  defp write_rearm_marker(marker_key), do: Shuttle.Markers.write_rearm(marker_key)
+  # Resolve the role's in-flight run by stamping its handoff marker
+  # (`~/.shuttle/handoff/<key>`). A human accept/resume/rearm declares the run
+  # concluded — which is what a handoff marker means — so the standing-role
+  # dead-orphan detector sees a clean exit (`handoff.at >= dispatch.at`) and the
+  # cron lookback baseline advances. This stops the temper oscillation with no
+  # third (re-arm) marker racing the dispatch/handoff pair. Best-effort: the
+  # document re-arm already landed; `Markers.resolve/1` swallows fs errors.
+  defp resolve_run_markers(marker_key), do: Shuttle.Markers.resolve(marker_key)
 
   # Atomic (tmp + rename), surgical write: apply the edit ops to the raw
   # frontmatter text and reconstruct the file. Only the targeted frontmatter
