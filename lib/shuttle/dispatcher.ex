@@ -1162,25 +1162,19 @@ defmodule Shuttle.Dispatcher do
   end
 
   # Dual-recognition: a live worker under either the uid-keyed name or the
-  # legacy leaf-only name blocks a fresh dispatch.
+  # legacy leaf-only name blocks a fresh dispatch OR a resume. `present?` treats
+  # an inconclusive `has-session` as present, so a transient tmux failure can
+  # never let a dispatch (especially a resume) spawn over a still-live worker —
+  # the daemon refuses with :already_running and the caller adopts instead.
   defp check_not_running(fiber_id, uid, runner) do
     fiber_id
     |> session_names(uid)
-    |> Enum.any?(fn session ->
-      case runner.cmd("tmux", ["has-session", "-t", exact_tmux_target(session)],
-             stderr_to_stdout: true
-           ) do
-        {_, 0} -> true
-        {_, _} -> false
-      end
-    end)
+    |> Enum.any?(&Shuttle.Tmux.present?(runner, &1))
     |> case do
       true -> {:error, :already_running}
       false -> :ok
     end
   end
-
-  defp exact_tmux_target(session), do: "=" <> session
 
   defp resolve_agent(fiber) do
     # Prefer the post-migration shuttle.agent field when present; fall back

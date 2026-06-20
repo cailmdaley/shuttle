@@ -60,11 +60,7 @@ defmodule Shuttle.ActionQueries do
 
   defp session_live?(session, opts) do
     runner = Keyword.get(opts, :runner, default_runner())
-
-    case runner.cmd("tmux", ["has-session", "-t", "=" <> session], stderr_to_stdout: true) do
-      {_, 0} -> true
-      {_, _} -> false
-    end
+    Shuttle.Tmux.present?(runner, session)
   end
 
   defp fiber_uid(fiber) do

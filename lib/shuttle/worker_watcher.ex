@@ -80,15 +80,18 @@ defmodule Shuttle.WorkerWatcher do
       token_budget: token_budget
     }
 
-    # On init, check if the session exists. If not, exit immediately.
+    # On init, check if the session exists. `:gone` (confirmed absent) is the
+    # only result that exits immediately; `:unknown` (an inconclusive tmux error)
+    # starts the heartbeat and re-checks rather than killing a possibly-live
+    # worker on a single flaky read.
     case check_session(state) do
-      :alive ->
-        ref = Process.send_after(self(), :heartbeat, heartbeat_interval)
-        {:ok, %{state | heartbeat_timer_ref: ref}}
-
-      :dead ->
+      :gone ->
         notify_poller(state, :session_not_found)
         {:stop, :normal}
+
+      _alive_or_unknown ->
+        ref = Process.send_after(self(), :heartbeat, heartbeat_interval)
+        {:ok, %{state | heartbeat_timer_ref: ref}}
     end
   end
 
@@ -106,7 +109,9 @@ defmodule Shuttle.WorkerWatcher do
              consecutive_failures: 0
          }}
 
-      :dead ->
+      # Confirmed absent — count toward death. `max_consecutive_failures` strikes
+      # of `:gone` in a row (a real, persistent absence) declares the worker dead.
+      :gone ->
         failures = state.consecutive_failures + 1
 
         if failures >= state.max_consecutive_failures do
@@ -115,13 +120,27 @@ defmodule Shuttle.WorkerWatcher do
           {:stop, :normal, state}
         else
           Logger.debug(
-            "Heartbeat: transient tmux check failure #{failures}/#{state.max_consecutive_failures} " <>
+            "Heartbeat: session absent #{failures}/#{state.max_consecutive_failures} " <>
               "for #{state.fiber_id} — will retry"
           )
 
           ref = Process.send_after(self(), :heartbeat, state.heartbeat_interval_ms)
           {:noreply, %{state | heartbeat_timer_ref: ref, consecutive_failures: failures}}
         end
+
+      # Inconclusive (tmux errored for a non-absence reason — server hiccup, PATH,
+      # fork-under-load). NOT a death signal: hold the strike count where it is
+      # (don't advance toward death, don't reset genuine progress) and re-check.
+      # This is the load-bearing change against the false-kill-then-resume storm:
+      # a live worker is never declared dead on a flaky `has-session`.
+      :unknown ->
+        Logger.debug(
+          "Heartbeat: inconclusive tmux check for #{state.fiber_id} " <>
+            "(#{state.consecutive_failures}/#{state.max_consecutive_failures} absences held) — will retry"
+        )
+
+        ref = Process.send_after(self(), :heartbeat, state.heartbeat_interval_ms)
+        {:noreply, %{state | heartbeat_timer_ref: ref}}
     end
   end
 
@@ -136,14 +155,7 @@ defmodule Shuttle.WorkerWatcher do
 
   # ── Internal ──
 
-  defp check_session(state) do
-    case state.runner.cmd("tmux", ["has-session", "-t", exact_tmux_target(state.session)],
-           stderr_to_stdout: true
-         ) do
-      {_, 0} -> :alive
-      {_, _} -> :dead
-    end
-  end
+  defp check_session(state), do: Shuttle.Tmux.session_status(state.runner, state.session)
 
   defp notify_poller(state, reason) do
     # state.poller is the Poller's registered name (atom) in production —
@@ -164,14 +176,9 @@ defmodule Shuttle.WorkerWatcher do
     end
   end
 
-  defp session_alive?(state) do
-    case state.runner.cmd("tmux", ["has-session", "-t", exact_tmux_target(state.session)],
-           stderr_to_stdout: true
-         ) do
-      {_, 0} -> true
-      {_, _} -> false
-    end
-  end
-
-  defp exact_tmux_target(session), do: "=" <> session
+  # Reported alongside the exit so the poller knows whether the tmux session is
+  # still up (a genuine death vs an in-flight teardown). `:unknown` counts as
+  # present here — the same uncertainty-is-presence rule the rest of the system
+  # uses, so a flaky check doesn't report a live worker as gone.
+  defp session_alive?(state), do: Shuttle.Tmux.present?(state.runner, state.session)
 end

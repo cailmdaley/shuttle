@@ -198,11 +198,13 @@ defmodule Shuttle.WorkerWatcherTest do
   end
 
   # ── Flake robustness tests ─────────────────────────────────────────────────
-  # Suspect 4 in finding-ghost-workers-stuck-running: a transient non-zero exit
-  # from `tmux has-session` currently terminates the watcher prematurely, leaving
-  # the fiber orphaned in the daemon's running set with no future cleanup.
-  # The desired behaviour: tolerate up to max_consecutive_failures transient
-  # failures before declaring the worker dead.
+  # Liveness is classified three ways by Shuttle.Tmux (see tmux_test.exs): exit 0
+  # is :alive, tmux's own absence message ("can't find session") is :gone, and any
+  # OTHER non-zero is :unknown. Only :gone counts toward death; :unknown is an
+  # inconclusive read (server hiccup, PATH, fork-under-load) that must NEVER kill
+  # a live worker — the false-kill that re-dispatches a healthy fiber and drives
+  # the resume storm. FlakeyRunner's injected "transient tmux error" is :unknown;
+  # removing the session yields "can't find session" → :gone.
 
   test "watcher survives transient tmux failures without declaring worker dead" do
     session = Dispatcher.session_name("tests/flaky")
@@ -238,6 +240,37 @@ defmodule Shuttle.WorkerWatcherTest do
 
     # Now the watcher should declare the worker dead.
     assert_receive {:worker_exited, "tests/flaky", :normal_exit, false}, 1000
+    assert wait_until(fn -> not Process.alive?(watcher) end)
+  end
+
+  test "inconclusive (:unknown) checks never declare death, even well past the threshold" do
+    # The stronger guarantee: an inconclusive read is not a death signal AT ALL,
+    # so far more than max_consecutive_failures of them in a row still can't kill
+    # a live worker. Reverting Shuttle.Tmux's :unknown carve-out (treating any
+    # non-zero as death) re-arms the false-kill-then-resume storm.
+    session = Dispatcher.session_name("tests/inconclusive")
+    FlakeyRunner.add_session(session)
+
+    {:ok, watcher} =
+      WorkerWatcher.start_link(
+        fiber_id: "tests/inconclusive",
+        session: session,
+        poller: self(),
+        runner: FlakeyRunner,
+        heartbeat_interval_ms: 20,
+        max_consecutive_failures: 3
+      )
+
+    # 12 inconclusive checks in a row — 4× the death threshold.
+    FlakeyRunner.inject_failures(12)
+    Process.sleep(400)
+
+    refute_receive {:worker_exited, _, _, _}, 50
+    assert Process.alive?(watcher)
+
+    # A confirmed absence still kills it, proving death detection is intact.
+    FlakeyRunner.remove_session(session)
+    assert_receive {:worker_exited, "tests/inconclusive", :normal_exit, false}, 1000
     assert wait_until(fn -> not Process.alive?(watcher) end)
   end
 
