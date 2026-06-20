@@ -862,6 +862,30 @@ defmodule Shuttle.DispatcherTest do
       assert :fresh = Dispatcher.check_resume_intent("task", fiber, felt_store: ctx.store)
     end
 
+    test "an explicit resume_mode=fresh directive overrides the dirty-death resume", ctx do
+      # The setup leaves a "worker dispatched" event with no handoff after it —
+      # the dirty-death state that decide_continuation reads as "resume". But the
+      # human clicked "New session", which stamps a review-comment carrying
+      # resume_mode=fresh. That explicit directive must win over the autonomous
+      # heuristic: "New session" always means a new session, never resume. This is
+      # the remote-machine bug — workers there die without a handoff, so every
+      # "New session" silently resumed the dead transcript.
+      ctx.felt.([
+        "history",
+        "append",
+        "task",
+        "--kind",
+        "review-comment",
+        "--summary",
+        "start fresh",
+        "--field",
+        "resume_mode=fresh"
+      ])
+
+      fiber = %{"shuttle" => %{"kind" => "oneshot"}}
+      assert :fresh = Dispatcher.check_resume_intent("task", fiber, felt_store: ctx.store)
+    end
+
     test "starts fresh when the handoff is in the work_dir store, not the felt_store", ctx do
       # Split-brain reality: the daemon writes dispatch events to the configured
       # felt_store (loom aggregate), but the worker writes its handoff from its
