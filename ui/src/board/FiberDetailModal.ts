@@ -200,10 +200,11 @@ interface AgentRecord {
  * `NarrativeView`/PretextProse stack — the body is rendered by the lean
  * `marked` renderer (`utils.renderMarkdown`) and styled to read like a
  * vellum page (`.kbn-detail-prose` in FiberDetailModal.css). The markdown
- * comes from the daemon's `GET /api/v1/fibers/<id>?body=true`; a fiber whose
- * body the local daemon can't read (remote origin — owner-routed body is a
- * later slice) degrades to its outcome, which the composite feed always
- * carries. `:::{embed}` artifacts and relative images render through the
+ * comes from the daemon's `GET /api/v1/fibers/<id>?body=true`, which reads the
+ * daemon's stores including the git-synced `~/loom` mirror — so remote-host
+ * fibers normally render here too; a fiber the local daemon can't read (not
+ * synced to its mirror, or bodyless) degrades to its outcome, which the
+ * composite feed always carries. `:::{embed}` artifacts and relative images render through the
  * daemon's owner-routed `/file` route, anchored on the fiber's own dir.
  *
  * Every card action lives in one dropdown directly under the title,
@@ -536,11 +537,14 @@ export class FiberDetailModal {
   /**
    * Fetch the fiber's markdown body from the daemon and render it into the
    * page pane, styled to read like a vellum page. The body endpoint
-   * (`GET /api/v1/fibers/<id>?body=true`) is local-only — a remote fiber's
-   * body can't be read from here, so it degrades to the outcome, which the
-   * composite feed always carries. `:::{embed}` artifacts and relative images
-   * resolve through the daemon's `/file` route, anchored on the fiber's dir
-   * (`card.fiberDir`); an unresolvable path falls back to a placeholder.
+   * (`GET /api/v1/fibers/<id>?body=true`) reads from THIS daemon's configured
+   * felt stores — which include the git-synced `~/loom` mirror, so a remote
+   * host's fibers normally resolve here too (the mirror carries every synced
+   * project's body). It degrades to the outcome only when the fiber isn't in
+   * this daemon's mirror (e.g. not synced yet) or genuinely has no body.
+   * `:::{embed}` artifacts and relative images resolve through the daemon's
+   * `/file` route, anchored on the fiber's dir (`card.fiberDir`); an
+   * unresolvable path falls back to a placeholder.
    */
   private async renderFiberBody(
     prose: HTMLElement,
@@ -558,6 +562,7 @@ export class FiberDetailModal {
     prose.innerHTML = lede + '<p class="kbn-detail-body-status">loading body…</p>'
 
     let body = ''
+    let found = false
     let reached = false
     try {
       const idPath = card.id.split('/').map(encodeURIComponent).join('/')
@@ -571,6 +576,9 @@ export class FiberDetailModal {
         const data = (await res.json()) as {
           fibers?: Array<{ fiber?: { body?: string } }>
         }
+        // An empty `fibers` array means the daemon answered but the id isn't in
+        // its mirror (vs. found-but-bodyless); the note below distinguishes them.
+        found = (data.fibers?.length ?? 0) > 0
         body = (data.fibers?.[0]?.fiber?.body ?? '').trim()
         reached = true
       }
@@ -590,19 +598,24 @@ export class FiberDetailModal {
       this.autosizeEmbeds(prose)
       return
     }
-    if (!outcome && reached) {
+    if (!outcome && reached && found) {
       prose.classList.add('kbn-detail-prose-empty')
       prose.textContent = 'No body or outcome yet.'
       return
     }
-    // No body: either the daemon answered but had nothing local (remote-origin
-    // fiber) or the read failed/timed out. Keep the outcome; explain + (on
-    // failure) offer a retry.
-    const note = reached
-      ? 'Body lives on the owning host — cross-host body rendering is a later slice; the outcome above is the headline.'
-      : 'Couldn’t load the body — the daemon was slow to respond. <button type="button" class="kbn-detail-body-retry">retry</button>'
+    // No body. Three honest cases — remote bodies normally resolve here via the
+    // synced loom mirror, so this is "nothing to show" or "not synced", never a
+    // cross-host rendering gap:
+    //   reached + found      → the fiber simply has no markdown body.
+    //   reached + not found  → not in this daemon's mirror (e.g. not synced yet).
+    //   not reached          → the read failed/timed out; offer a retry.
+    const note = !reached
+      ? 'Couldn’t load the body — the daemon was slow to respond. <button type="button" class="kbn-detail-body-retry">retry</button>'
+      : found
+        ? 'No body yet — the outcome above is the headline.'
+        : 'This fiber isn’t in the local mirror yet (not synced here) — the outcome above is the headline. <button type="button" class="kbn-detail-body-retry">retry</button>'
     prose.innerHTML = lede + `<p class="kbn-detail-prose-note">${note}</p>`
-    if (!reached) {
+    if (note.includes('kbn-detail-body-retry')) {
       prose.querySelector('.kbn-detail-body-retry')?.addEventListener('click', () => {
         void this.renderFiberBody(prose, card, overlay)
       })
