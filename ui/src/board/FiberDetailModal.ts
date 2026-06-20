@@ -995,13 +995,13 @@ export class FiberDetailModal {
       const resumeBtn = this.buildActionBtn('Resume ▸', 'primary')
       resumeBtn.title = 'Resume the previous worker session (claude --resume); outcome preserved'
       // Resume is always offered for a shuttle-managed card — never gated on a
-      // card-visible session id. The Claude session id lives in the per-host
-      // dispatch marker (`~/.shuttle/dispatch/<uid>.json`), written by the
-      // daemon at dispatch; `card.sessionId` is always absent and the frontend
-      // cannot see what to resume. The daemon resolves continuation from its
-      // markers at dispatch time (resume_mode='previous' reads the marker's
-      // session_uuid) and surfaces a precise error if there is genuinely
-      // nothing to resume. Gating on `card.sessionId` is exactly what grayed
+      // card-visible session id. The Claude session id lives in the fiber's
+      // `shuttle.session_uuid` frontmatter field, stamped by the daemon at
+      // dispatch; `card.sessionId` is always absent and the frontend cannot
+      // see what to resume. The daemon resolves continuation from the
+      // `shuttle:` block at dispatch time (resume_mode='previous' reads
+      // `shuttle.session_uuid`) and surfaces a precise error if there is
+      // genuinely nothing to resume. Gating on `card.sessionId` is exactly what grayed
       // Resume out for EVERY card — it had already grayed standing roles, which
       // never persisted one. See gotcha-standing-role-resume-button-grayed.
 
@@ -2070,8 +2070,8 @@ export class FiberDetailModal {
    * the user's message and resume intent inline. `user_message` is the
    * directive text (the daemon inlines it into the prompt at launch);
    * `resume_mode` is `'fresh'` → start a new session, `'previous'` → resume the
-   * prior session. The daemon resolves the session to resume from its per-host
-   * dispatch marker (`~/.shuttle/dispatch/<uid>.json`), falling back to fresh
+   * prior session. The daemon resolves the session to resume from the fiber's
+   * `shuttle.session_uuid` frontmatter field, falling back to fresh
    * when there's nothing to resume. `force`/`ad_hoc` launch the worker on the
    * owning host regardless of poll eligibility.
    *
