@@ -629,38 +629,69 @@ export class FiberDetailModal {
   }
 
   /**
-   * Grow full-length HTML embeds (`iframe[data-autosize]`, emitted by
-   * utils.embedHtml for a `:::{embed} report.html` with no pinned `:height:`)
-   * to their own content height, so the artifact reads as part of the page —
-   * one scroll column, no nested scrollbar. The iframe is served from the same
-   * origin (the daemon's `/file` route on :4000), so its document is readable:
-   * on load we size to the content's scrollHeight, and a ResizeObserver on its
-   * body re-fits whenever a panel resize reflows the content. A cross-origin or
-   * unreadable doc silently keeps the CSS min-height.
+   * Size full-length HTML embeds (`iframe[data-autosize]`, emitted by
+   * utils.embedHtml for an HTML `:::{embed}` with no pinned `:height:`) so they
+   * read as part of the page — one scroll column, no nested scrollbar. The
+   * iframe is same-origin (the daemon's `/file` route), so its document is
+   * readable. Two regimes:
+   *
+   *   - **reveal.js deck** (a `slides.html` from the slides skill) — a deck has
+   *     fixed NATIVE slide dimensions and scales to fill whatever box it's given,
+   *     so content-height measurement collapses it to a stub. Instead size by the
+   *     deck's own aspect ratio (`Reveal.getConfig()` width/height): height =
+   *     container-width × (slideH / slideW). The deck then shows at native
+   *     proportions and grows taller as the panel widens.
+   *   - **ordinary HTML** (report.html and friends) — grow to the content's
+   *     scrollHeight so the whole document reads inline.
+   *
+   * A ResizeObserver on both the container (width-driven, for the deck) and the
+   * body (content-driven, for ordinary HTML) re-fits on any panel resize. A
+   * cross-origin or unreadable doc silently keeps the CSS min-height.
    */
   private autosizeEmbeds(prose: HTMLElement): void {
     const frames = prose.querySelectorAll<HTMLIFrameElement>('iframe[data-autosize]')
     frames.forEach((iframe) => {
+      // reveal.js deck → size by native slide aspect ratio. Returns false when
+      // the frame isn't a (ready) reveal deck, so `fit` falls back to content
+      // height. `getConfig` may not exist until the deck's async init runs —
+      // hence the retries scheduled on load.
+      const fitReveal = (): boolean => {
+        const win = iframe.contentWindow as unknown as {
+          Reveal?: { getConfig?: () => { width?: number; height?: number } }
+        } | null
+        const cfg = win?.Reveal?.getConfig?.()
+        const sw = Number(cfg?.width)
+        const sh = Number(cfg?.height)
+        if (!(sw > 0) || !(sh > 0)) return false
+        const w = (iframe.parentElement ?? iframe).clientWidth
+        if (!(w > 0)) return false
+        iframe.style.height = `${Math.round((w * sh) / sw)}px`
+        return true
+      }
+      const fitContent = () => {
+        const doc = iframe.contentDocument
+        if (!doc) return
+        const h = Math.max(doc.documentElement?.scrollHeight ?? 0, doc.body?.scrollHeight ?? 0)
+        if (h > 0) iframe.style.height = `${h}px`
+      }
       const fit = () => {
         try {
-          const doc = iframe.contentDocument
-          if (!doc) return
-          const h = Math.max(
-            doc.documentElement?.scrollHeight ?? 0,
-            doc.body?.scrollHeight ?? 0,
-          )
-          if (h > 0) iframe.style.height = `${h}px`
+          if (!fitReveal()) fitContent()
         } catch {
           /* cross-origin / unreadable — leave the CSS min-height in place */
         }
       }
       iframe.addEventListener('load', () => {
         fit()
+        // Late reveal init: getConfig can lag the load event; re-fit a few times.
+        ;[120, 400, 1200].forEach((ms) => window.setTimeout(fit, ms))
         try {
-          const doc = iframe.contentDocument
-          if (doc?.body && typeof ResizeObserver !== 'undefined') {
+          if (typeof ResizeObserver !== 'undefined') {
             const ro = new ResizeObserver(() => fit())
-            ro.observe(doc.body)
+            // Container width drives the deck; body size drives ordinary HTML.
+            if (iframe.parentElement) ro.observe(iframe.parentElement)
+            const body = iframe.contentDocument?.body
+            if (body) ro.observe(body)
             this.embedObservers.push(ro)
           }
         } catch {

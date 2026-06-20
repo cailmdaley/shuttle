@@ -6,7 +6,9 @@ defmodule Shuttle.SentFiles do
   The standalone Shuttle board shows the artifacts a worker pushed with
   `SendUserFile` on each card. Those sends are recorded — always fresh, server
   independent — by `portolan-hook.sh` as `pre_tool_use` events with
-  `tool == "SendUserFile"`, carrying `toolInput.files` (absolute paths),
+  `tool == "SendUserFile"`, carrying `toolInput.files` (absolute, or relative to
+  the event's `cwd` — resolved to absolute here so the `/file` route can serve
+  them),
   `tmuxSession` (e.g. `morning-post-<ULID>-shuttle`, the embedded 26-char
   Crockford ULID being the fiber id = card `uid`), `sessionId`, and `timestamp`.
   (Portolan's derived `sent-files.json` is stale the moment its server stops —
@@ -67,11 +69,14 @@ defmodule Shuttle.SentFiles do
          files when is_list(files) <- get_in(event, ["toolInput", "files"]) do
       session_id = event["sessionId"]
       timestamp = event["timestamp"]
+      cwd = event["cwd"]
 
       for full_path <- files, is_binary(full_path) do
+        abs = absolutize(full_path, cwd)
+
         %{
-          fullPath: full_path,
-          basename: Path.basename(full_path),
+          fullPath: abs,
+          basename: Path.basename(abs),
           timestamp: timestamp,
           sessionId: session_id
         }
@@ -79,6 +84,20 @@ defmodule Shuttle.SentFiles do
     else
       _ -> []
     end
+  end
+
+  # SendUserFile records the path as the worker passed it — which is often
+  # RELATIVE to the worker's cwd (e.g. `results/scratch/frame.png`). The `/file`
+  # route serves only ABSOLUTE paths — a relative one is a 400, so the card's
+  # thumbnail renders as a broken-image icon. Resolve against the event's `cwd`
+  # here, in `SentFiles`, which runs on the OWNING host (owner-routed): that cwd
+  # is a path on the same host where the file actually lives. An already-absolute
+  # path passes through verbatim; a relative path with no recorded cwd is left
+  # as-is (nothing to resolve against — the pre-cwd-capture behavior).
+  defp absolutize(path, cwd) do
+    if Path.type(path) == :relative and is_binary(cwd) and cwd != "",
+      do: Path.expand(path, cwd),
+      else: path
   end
 
   # The fiber id an event belongs to: the ULID embedded in the tmux session

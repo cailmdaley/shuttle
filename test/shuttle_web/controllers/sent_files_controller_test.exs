@@ -85,6 +85,37 @@ defmodule ShuttleWeb.SentFilesControllerTest do
       assert Enum.find(files, &(&1.fullPath == "/tmp/two.png")).basename == "two.png"
     end
 
+    test "resolves a relative file path against the event's cwd to absolute" do
+      # SendUserFile often records a path relative to the worker's cwd; /file
+      # serves only absolute paths (a relative one 400s → broken-image icon on
+      # the card). The reader absolutizes against the event's cwd. (Real case:
+      # spt-talk-push sent `results/scratch/footprints/frames/frame3_act.png`.)
+      # An already-absolute path in the same event passes through verbatim.
+      path =
+        write_fixture([
+          event(%{
+            "cwd" => "/leonardo_work/cmbx",
+            "toolInput" => %{"files" => ["results/scratch/frame3_act.png", "/abs/already.png"]}
+          })
+        ])
+
+      files = Shuttle.SentFiles.for_uid(@match_ulid, events_file: path)
+
+      assert Enum.map(files, & &1.fullPath) |> Enum.sort() ==
+               ["/abs/already.png", "/leonardo_work/cmbx/results/scratch/frame3_act.png"]
+
+      assert Enum.find(files, &(&1.fullPath =~ "frame3_act")).basename == "frame3_act.png"
+    end
+
+    test "leaves a relative path as-is when the event carries no cwd" do
+      # The default fixture event has no `cwd`; nothing to resolve against, so
+      # the path is preserved (pre-cwd-capture behavior, not a crash).
+      path = write_fixture([event(%{"toolInput" => %{"files" => ["rel/no-cwd.png"]}})])
+
+      files = Shuttle.SentFiles.for_uid(@match_ulid, events_file: path)
+      assert Enum.map(files, & &1.fullPath) == ["rel/no-cwd.png"]
+    end
+
     test "matches by sessionId when the tmux name has no embedded ULID" do
       path =
         write_fixture([
