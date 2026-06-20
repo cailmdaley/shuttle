@@ -41,7 +41,7 @@ defmodule Shuttle.Poller.Snapshot do
         }
       end)
 
-    blocked =
+    dispatch_blocked =
       Enum.map(state.dispatch_failures, fn {_runtime_key, entry} ->
         %{
           # `dispatch_failures` is keyed by runtime key (uid); the entry carries
@@ -54,6 +54,25 @@ defmodule Shuttle.Poller.Snapshot do
           first_attempted_at: DateTime.to_unix(entry.first_attempted_at, :millisecond)
         }
       end)
+
+    # Open resume-loop breakers surface as blocked rows too, so the board shows a
+    # fiber paused by the breaker (and why) instead of it silently going idle.
+    loop_blocked =
+      state.resume_loop
+      |> Map.values()
+      |> Enum.filter(&match?(%DateTime{}, &1.opened_at))
+      |> Enum.map(fn entry ->
+        %{
+          fiber_id: entry.fiber_id,
+          uid: Map.get(entry, :uid),
+          reason: "resume_loop (#{entry.count} rapid exits)",
+          attempts: entry.count,
+          attempted_at: DateTime.to_unix(entry.opened_at, :millisecond),
+          first_attempted_at: DateTime.to_unix(entry.opened_at, :millisecond)
+        }
+      end)
+
+    blocked = dispatch_blocked ++ loop_blocked
 
     snap = %{
       poll_at: now_ms,
