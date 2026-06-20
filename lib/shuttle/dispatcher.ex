@@ -259,8 +259,19 @@ defmodule Shuttle.Dispatcher do
           do: {:previous, session_id},
           else: {:error, :missing_session_id}
 
-      # No human directive: decide fresh-vs-resume by whether the previous
-      # worker handed off cleanly. This is the autonomous-loop path.
+      # A human explicitly asked for a new session ("New session" / "Requeue
+      # fresh" stamps resume_mode:fresh). This directive is unconditional — it
+      # wins over the autonomous dirty-death heuristic below. Without this short
+      # circuit, a oneshot whose prior worker died WITHOUT a clean handoff
+      # (routine on remote machines, where SSH drops and kills cut workers off
+      # mid-thought) falls through to decide_continuation and gets resumed —
+      # so "New session" silently reopened the dead transcript. "New session"
+      # means a new session, always.
+      resume_mode == "fresh" ->
+        :fresh
+
+      # No human directive (resume_mode absent): decide fresh-vs-resume by
+      # whether the previous worker handed off cleanly. The autonomous-loop path.
       true ->
         decide_continuation(fiber_id, fiber, session_id, felt_store,
           work_dir: Keyword.get(opts, :work_dir)
