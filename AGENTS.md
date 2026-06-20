@@ -25,6 +25,19 @@ daemon/CLI/UI spread. When weighing a change, prefer the design that moves
 toward that convergence: fewer moving parts, fewer cross-process contracts, felt
 and Shuttle as one thing rather than two that shell to each other.
 
+The **named shape** for the merge: **keep the Elixir code for the networked
+daemon** — dispatch, the per-worker watcher, the `:4000` API — that's where
+OTP earns its keep. But **formalize the `shuttle:` frontmatter block into felt's
+main schema**, so the contract that today lives on *both* sides (validated by the
+Go `pkg/schema` *and* parsed by the Elixir daemon) lives in one place. Felt owns
+the data model; Shuttle owns the network and the surface. Tracked in felt as
+[[ai-futures/shuttle/unify-with-felt]]. The **gating first step** before merge
+work starts in earnest is deciding the fate of felt's synced SQLite index + the
+history log built on it (the cross-machine SQLite-sync cost Cail wants gone) —
+that decision reshapes wikilink resolution, how the daemon detects clean worker
+exits (the `--kind handoff` marker), and what the merged schema must carry.
+Investigation: [[ai-futures/felt/shed-sqlite-history]].
+
 ### Where Shuttle still depends on / references Portolan
 
 Live runtime couplings (these silently break or no-op without Portolan, and are
