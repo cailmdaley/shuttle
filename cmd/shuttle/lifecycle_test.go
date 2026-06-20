@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -860,90 +859,45 @@ Body.
 	}
 }
 
-// lastReviewCommentResumeMode reads the resume_mode of the most recent
-// review-comment event in a fiber's felt history. Returns "" when no
-// review-comment is on file (felt errors or empty result).
-func lastReviewCommentResumeMode(t *testing.T, host, fiberID string) string {
-	t.Helper()
-	out, err := exec.Command("felt", "-C", host, "history", fiberID,
-		"--kind", "review-comment", "--last", "1", "--json").Output()
+// TestResumeCmd_ArmsActiveWithoutPersistingResumeMode verifies the post-history
+// resume contract: resume only arms status:active and writes nothing that
+// encodes a resume directive. The "previous vs fresh" intent now rides the
+// dispatch call (the resume_mode parameter); the daemon decides continuation
+// from the per-host markers at dispatch, so resume never persists a resume_mode.
+func TestResumeCmd_ArmsActiveWithoutPersistingResumeMode(t *testing.T) {
+	host, cleanup := withTempHost(t)
+	defer cleanup()
+
+	path := writeFiber(t, host, "arm-no-resume-mode", `---
+name: Arm without resume mode
+status: open
+shuttle:
+  kind: oneshot
+  agent: claude-sonnet
+---
+
+Body.
+`)
+
+	cmd := newResumeCmd()
+	cmd.SetArgs([]string{"arm-no-resume-mode"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("felt history read: %v", err)
+		t.Fatalf("read fiber: %v", err)
 	}
-	var events []struct {
-		Payload struct {
-			ResumeMode string `json:"resume_mode"`
-		} `json:"payload"`
+	text := string(raw)
+	if !strings.Contains(text, "status: active") {
+		t.Fatalf("resume should arm to status: active:\n%s", text)
 	}
-	if err := json.Unmarshal(out, &events); err != nil {
-		t.Fatalf("decode review-comment json: %v\n%s", err, out)
+	if strings.Contains(text, "resume_mode") {
+		t.Fatalf("resume must not persist a resume_mode directive:\n%s", text)
 	}
-	if len(events) == 0 {
-		return ""
-	}
-	return events[0].Payload.ResumeMode
-}
-
-// TestResumeCmd_NeverRunFilesFreshResumeMode verifies the arm path does not
-// manufacture a permanent block: arming a fiber with no prior session in felt
-// history files `resume_mode: fresh`, so the dispatcher starts fresh rather than
-// returning {:error, :missing_session_id} on every poll.
-func TestResumeCmd_NeverRunFilesFreshResumeMode(t *testing.T) {
-	host, cleanup := withTempHost(t)
-	defer cleanup()
-
-	writeFiber(t, host, "never-run-resume", `---
-name: Never run resume
-status: open
-shuttle:
-  kind: oneshot
-  agent: claude-sonnet
----
-
-Body.
-`)
-
-	cmd := newResumeCmd()
-	cmd.SetArgs([]string{"never-run-resume"})
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-
-	if got := lastReviewCommentResumeMode(t, host, "never-run-resume"); got != "fresh" {
-		t.Fatalf("never-run resume should file resume_mode: fresh, got %q", got)
-	}
-}
-
-// TestResumeCmd_PriorSessionFilesPreviousResumeMode verifies the arm path still
-// requests transcript continuation when there is one: a dispatch event with a
-// session id on file makes resume file `resume_mode: previous`.
-func TestResumeCmd_PriorSessionFilesPreviousResumeMode(t *testing.T) {
-	host, cleanup := withTempHost(t)
-	defer cleanup()
-
-	writeFiber(t, host, "ran-before-resume", `---
-name: Ran before resume
-status: open
-shuttle:
-  kind: oneshot
-  agent: claude-sonnet
----
-
-Body.
-`)
-	if err := appendFeltHistory(host, "ran-before-resume",
-		"worker dispatched (agent=claude-sonnet) session=1111-2222-3333-4444"); err != nil {
-		t.Fatalf("seed dispatch event: %v", err)
-	}
-
-	cmd := newResumeCmd()
-	cmd.SetArgs([]string{"ran-before-resume"})
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-
-	if got := lastReviewCommentResumeMode(t, host, "ran-before-resume"); got != "previous" {
-		t.Fatalf("resume with a prior session should file resume_mode: previous, got %q", got)
+	if strings.Contains(text, "review-comment") {
+		t.Fatalf("resume must not write a review-comment:\n%s", text)
 	}
 }
 
