@@ -88,13 +88,15 @@ defmodule Shuttle.Poller.StandingRoles do
       ) ->
         state
 
-      # The felt-history discriminator: only a role that was actually DISPATCHED
-      # but never observed EXITING is a dead orphan. felt history records "worker dispatched ..." at
-      # spawn and "worker exited ..." at exit; a trailing dispatch with no exit
-      # after it is the daemon-down-across-exit case. An armed role whose last run
-      # already exited (the daily-practice "armed, not-yet-due, never-dispatched-
-      # this-cycle" shape) is left alone so its next cron tick fires.
-      not standing_role_dispatched_unexited?(fiber_id, state) ->
+      # The marker discriminator: only a role that was actually DISPATCHED but
+      # never cleanly handed off is a dead orphan. The dispatch marker records
+      # `dispatched_at`; the handoff marker records a clean exit — written by the
+      # worker on a clean exit OR by a human accept/resume (which concludes the
+      # run). A dispatch with no newer handoff is the daemon-down-across-exit
+      # case. An armed role whose last run already handed
+      # off (the "armed, not-yet-due" shape) is left alone so its next cron tick
+      # fires.
+      not standing_role_dispatched_unexited?(fiber) ->
         state
 
       # Daemon-down analog of handle_worker_exit, split by kind:
@@ -121,71 +123,43 @@ defmodule Shuttle.Poller.StandingRoles do
     end
   end
 
-  # True iff the fiber's most recent worker lifecycle event in felt history is a
-  # "worker dispatched" with no "worker exited" after it — i.e., a run that began
-  # but whose exit the daemon never observed (it was down across the exit). This
-  # is the felt-native marker that a worker actually ran this cycle. felt history
-  # is the durable substrate; a never-dispatched-this-cycle armed role has a
-  # trailing "exited" (last cycle completed) and is left alone.
-  def standing_role_dispatched_unexited?(fiber_id, state) do
-    case Poller.host_for_fiber(fiber_id, state) do
-      {:ok, felt_store} ->
-        # Read felt history directly (System.cmd, like log_worker_exit) rather
-        # than through the injected runner — history is real-felt substrate, not a
-        # mocked dispatch surface.
-        args = ["-C", felt_store, "history", fiber_id, "--last", "20", "--json"]
-
-        case System.cmd("felt", args, stderr_to_stdout: true) do
-          {output, 0} ->
-            with {:ok, events} when is_list(events) <- Jason.decode(output) do
-              events
-              |> Enum.find_value(fn event ->
-                text = get_in(event, ["payload", "text"]) || ""
-
-                cond do
-                  String.contains?(text, "worker exited") -> :exited
-                  # A human re-arm (accept / resume / force-dispatch re-arm) more
-                  # recent than the last dispatch SUPERSEDES the dead-orphan
-                  # inference: the human has declared the run done and re-armed
-                  # the role, so it is not an un-exited orphan no matter what the
-                  # worker's free-form exit text said (or whether the daemon ever
-                  # wrote a canonical "worker exited" — interactive/ad-hoc/claimed
-                  # exits, and exits the daemon missed across a restart, often
-                  # don't). Without this, a role whose exit produced only a
-                  # free-form summary gets re-closed to awaiting on every reconcile
-                  # — the standing-role temper oscillation Cail hit on his real
-                  # morning-post / weekly-arxiv roles.
-                  String.contains?(text, "accepted run") -> :rearmed
-                  String.contains?(text, "resumed ") -> :rearmed
-                  String.contains?(text, "re-armed ") -> :rearmed
-                  String.contains?(text, "worker dispatched") -> :dispatched
-                  # The claim verb's spawn-equivalent event — a claimed
-                  # standing worker's unobserved death must mark awaiting too.
-                  String.contains?(text, "worker claimed") -> :dispatched
-                  true -> nil
-                end
-              end)
-              |> Kernel.==(:dispatched)
-            else
-              _ -> false
-            end
-
-          _ ->
-            false
-        end
-
-      {:error, _} ->
+  # True iff the role was DISPATCHED but never cleanly handed off — a run that
+  # began but whose exit the daemon never observed (it was down across the exit).
+  # Read straight off the fiber's `shuttle:` block (`Shuttle.Continuation`):
+  #
+  #   • no dispatched_at             → never ran (or a human resolved it) → not an orphan.
+  #   • handed_off_at >= dispatched  → clean exit observed                → not an orphan.
+  #   • otherwise (dispatched, no newer handoff)                          → orphan (true).
+  #
+  # A human accept / resume / force-rearm SUPERSEDES the dead-orphan inference by
+  # *concluding the run* — `LifecycleStore` folds `handed_off_at = now` into the
+  # re-arm write, the same signal a clean worker exit leaves, since a human
+  # accepting the run IS concluding it. This is what stops the standing-role
+  # temper oscillation Cail hit on his morning-post / weekly-arxiv roles (a worker
+  # that died without handing off was re-closed to awaiting on every reconcile).
+  # Git-native, durable across a daemon restart, and needs no separate re-arm
+  # field — the same `handed_off_at` covers both worker exit and human re-arm.
+  def standing_role_dispatched_unexited?(fiber) do
+    case Shuttle.Continuation.dispatched_at(fiber) do
+      nil ->
         false
+
+      dispatch_dt ->
+        not at_or_after?(Shuttle.Continuation.handed_off_at(fiber), dispatch_dt)
     end
   rescue
     _ -> false
   end
 
+  # True iff `dt` is non-nil and at or after `reference`.
+  defp at_or_after?(nil, _reference), do: false
+  defp at_or_after?(%DateTime{} = dt, reference), do: DateTime.compare(dt, reference) != :lt
+
   # Mark a standing role awaiting (`status: closed`, untempered) by writing its
   # felt document on worker exit. Best-effort: a failed felt write must not crash
   # the exit-handling state machine (the worker is already gone; the dead-orphan
-  # reconciler is the backstop), so we log and continue. The felt-history exit
-  # event is written separately by `log_worker_exit`.
+  # reconciler is the backstop), so we log and continue. No exit event is written
+  # to any log — clean-exit is signalled by the worker's handoff marker.
   def mark_standing_awaiting(fiber_id) do
     case LifecycleStore.mark_awaiting(fiber_id) do
       {:ok, _} ->
@@ -200,8 +174,7 @@ defmodule Shuttle.Poller.StandingRoles do
   # Park a pinned interactive role back to the strip (`status: open`) on session
   # end. Best-effort, same contract as mark_standing_awaiting: a failed felt
   # write must not crash the exit-handling state machine (the worker is already
-  # gone), so we log and continue. The felt-history exit event is written
-  # separately by `log_worker_exit`.
+  # gone), so we log and continue. No exit event is written to any log.
   def mark_pinned_parked(fiber_id) do
     case LifecycleStore.park(fiber_id) do
       {:ok, _} ->
@@ -268,18 +241,20 @@ defmodule Shuttle.Poller.StandingRoles do
   # document transition is the per-cycle "already ran this cycle" gate.
   # The one standing-role dispatch rule: an active role is due when a scheduled
   # occurrence has elapsed since it was last serviced. "Last serviced" is the most
-  # recent of — the latest worker dispatch/exit in felt history (durable across
-  # restarts), the in-memory re-arm stamp, or the role's creation if it has never
-  # run. Expressed against the cron primitive as the lookback `now - last_serviced`:
-  # `due_by_cron?` then asks "did a tick fire after the last service, at or before
-  # now?" — i.e. is there an unrun occurrence. (A non-positive lookback ⇒ nothing
-  # elapsed since service ⇒ not due, handled by `due_by_cron?`'s guard.)
+  # recent of — the latest dispatch/handoff marker timestamp (durable across
+  # restarts; a human re-arm stamps the handoff marker too), the in-memory re-arm
+  # stamp, or the role's creation if it has never run. Expressed against the cron
+  # primitive as the lookback `now -
+  # last_serviced`: `due_by_cron?` then asks "did a tick fire after the last
+  # service, at or before now?" — i.e. is there an unrun occurrence. (A
+  # non-positive lookback ⇒ nothing elapsed since service ⇒ not due, handled by
+  # `due_by_cron?`'s guard.)
   #
   # This makes the schedule SELF-CATCHING: a fire missed because the daemon was
   # down or the laptop asleep at the cron instant runs on the next poll instead —
   # however late. One catch-up fires, not a backlog: the run writes a fresh
-  # "worker dispatched" event, advancing the anchor to ~now, so the next poll sees
-  # only the next FUTURE occurrence.
+  # dispatch marker, advancing the anchor to ~now, so the next poll sees only the
+  # next FUTURE occurrence.
   #
   # Awaiting review can't relaunch: a role that ran is `status: closed` until a
   # human tempers (accepts) it back to `active`, and `eligible?`'s status gate
@@ -301,14 +276,16 @@ defmodule Shuttle.Poller.StandingRoles do
     end
   end
 
-  # Unix-ms the role was last serviced — the most recent of its worker lifecycle
-  # events, its re-arm stamp, and its creation. Defaults to `now_ms` (⇒ zero
-  # lookback ⇒ not due) only in the impossible case that none are known.
-  def last_serviced_at_ms(fiber, fiber_id, state, now_ms) do
+  # Unix-ms the role was last serviced — the most recent of its marker
+  # timestamps, its in-memory re-arm stamp, and its creation. Defaults to `now_ms`
+  # (⇒ zero lookback ⇒ not due) only in the impossible case that none are known.
+  def last_serviced_at_ms(fiber, _fiber_id, state, now_ms) do
     [
-      last_service_event_ms(fiber_id, state),
+      last_service_event_ms(fiber),
       # `rearmed_at` is keyed by runtime key (uid when present), so look it up by
       # the candidate's runtime key — matching how `lifecycle_transition` stamps.
+      # It is the within-lifetime fast path; the durable handoff marker the
+      # re-arm stamps (in `last_service_event_ms`) is the restart-proof backstop.
       Map.get(state.rearmed_at, Poller.runtime_key_for_fiber(fiber)),
       created_at_ms(fiber)
     ]
@@ -319,29 +296,23 @@ defmodule Shuttle.Poller.StandingRoles do
     end
   end
 
-  # Unix-ms of the most recent worker lifecycle event ("worker dispatched" /
-  # "worker exited") in felt history. nil when there are none (never run) or felt
-  # is unreadable.
-  def last_service_event_ms(fiber_id, state) do
-    with {:ok, felt_store} <- Poller.host_for_fiber(fiber_id, state),
-         {output, 0} <-
-           System.cmd("felt", ["-C", felt_store, "history", fiber_id, "--last", "20", "--json"],
-             stderr_to_stdout: true
-           ),
-         {:ok, events} when is_list(events) <- Jason.decode(output) do
-      events
-      |> Enum.filter(fn event ->
-        text = get_in(event, ["payload", "text"]) || ""
-        String.contains?(text, "worker dispatched") or String.contains?(text, "worker exited")
-      end)
-      |> Enum.map(&Poller.iso_to_unix_ms(Map.get(&1, "occurred_at")))
-      |> Enum.reject(&is_nil/1)
-      |> case do
-        [] -> nil
-        list -> Enum.max(list)
-      end
-    else
-      _ -> nil
+  # Unix-ms of the most recent durable service event — the max of the fiber's
+  # `shuttle.dispatched_at` and `shuttle.handed_off_at` (`Shuttle.Continuation`).
+  # A human re-arm stamps `handed_off_at` too (it concludes the run), so it covers
+  # re-arms as well — no separate re-arm field. nil when neither is set (never
+  # run). The cron self-catching invariant hinges on this advancing each run: a
+  # fresh dispatch writes a newer `dispatched_at`, so the next poll sees only the
+  # next FUTURE occurrence.
+  def last_service_event_ms(fiber) do
+    [
+      Shuttle.Continuation.dispatched_at(fiber),
+      Shuttle.Continuation.handed_off_at(fiber)
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map(&DateTime.to_unix(&1, :millisecond))
+    |> case do
+      [] -> nil
+      list -> Enum.max(list)
     end
   end
 

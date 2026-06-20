@@ -180,10 +180,9 @@ defmodule Shuttle.StandingRole do
   Run id for a *scheduled* (non-ad-hoc) standing dispatch — a display label for
   the prompt's `Run:` line, minted from `now`.
 
-  It is not load-bearing for resume continuity: `Dispatcher.run_window_start`
-  derives the resume window from felt history (the last worker-exit event's
-  timestamp), not from this id. The id is therefore free to be a fresh
-  timestamp every dispatch.
+  It is not load-bearing for resume continuity: continuation is decided from the
+  fiber's `shuttle.dispatched_at`/`handed_off_at` (`Shuttle.Continuation`), not
+  from this id. The id is therefore free to be a fresh timestamp every dispatch.
   """
   @spec dispatch_run_id(t(), DateTime.t()) :: String.t()
   def dispatch_run_id(%__MODULE__{} = role, now) do

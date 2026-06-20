@@ -7,10 +7,11 @@ defmodule Shuttle.OriginRouter do
   composite board (`GET /api/v1/fibers/composite`) stamps each fiber with its
   owning `origin`; a write carries that origin back so the local daemon can
   either act (origin is itself) or forward to the owning remote over the SSH
-  tunnel. `/transition`, `/felt-edit`, `/lifecycle`, `/felt-history`, and
-  `/dispatch` all route through here, so owner-routing has ONE implementation
-  that cannot drift per-verb (the same discipline `Shuttle.Transition` keeps for
-  `invoke/2` + `http_error/1`).
+  tunnel. `/transition`, `/felt-edit`, `/lifecycle`, and `/dispatch` all route
+  through here, so owner-routing has ONE implementation that cannot drift
+  per-verb (the same discipline `Shuttle.Transition` keeps for `invoke/2` +
+  `http_error/1`). `/dispatch` carries the STORE-3 `user_message` + `resume_mode`
+  in its forwarded body, so a remote-owned card's directive owner-routes intact.
 
     * `route/2` decides local vs remote from the carried origin.
     * `forward/4` relays a POST to the owning remote's identical path with

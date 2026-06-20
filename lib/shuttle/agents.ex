@@ -297,9 +297,10 @@ defmodule Shuttle.Agents do
 
     * `:session_id` — for Claude agents only: pre-specifies the session UUID via
       `--session-id <uuid>`. Ignored for other harnesses. Allows the Shuttle
-      daemon to know the session UUID before the worker runs, so it can record it
-      in felt history at dispatch (the durable resume handle; slice 6 dropped the
-      doc-resident `shuttle.session` block) rather than via post-hoc capture.
+      daemon to know the session UUID before the worker runs, so it can stamp it
+      into the fiber's `shuttle:` block at dispatch (`shuttle.session_uuid`, the
+      durable resume handle read by `Shuttle.Continuation`) rather than via
+      post-hoc capture.
   """
   @spec build_command(agent_record(), String.t(), keyword()) :: String.t()
   def build_command(agent, prompt, opts \\ []) do
@@ -338,12 +339,12 @@ defmodule Shuttle.Agents do
   next user turn in the resumed session — mirroring the fresh-dispatch
   pattern (claude reads it via `<<<` here-string; codex takes it as a
   positional arg). Without it, resume would land the worker in a session
-  with no signal that it was deliberately woken — Cail's directive would
-  sit silently in `felt history` instead of surfacing.
+  with no signal that it was deliberately woken, and the user's directive
+  (the transient `user_message` dispatch parameter) would never reach it.
 
   Pi has no inline-prompt arg on `pi --session`, so the directive is
-  dropped on resume for pi today; the worker can still query
-  `felt history` to surface it.
+  dropped on pi resume today — and since `user_message` is transient (not
+  persisted), it is simply lost on that path (a known, accepted gap for pi).
 
   Extra flags (provider, model, extra_flags) are threaded through so the
   harness wrapper runs with the same configuration as the original session.
