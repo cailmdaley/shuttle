@@ -104,7 +104,9 @@ defmodule ShuttleWeb.FiberDocumentsController do
   # here" reads as that, not a tunnel error.
   defp relay_show(conn, {:forwarded, status, content_type, body}) do
     conn
-    |> put_resp_content_type(content_type)
+    # `nil` charset → relay verbatim; avoids doubling the remote's own charset
+    # (see FileController.relay/2 — a doubled charset breaks image rendering).
+    |> put_resp_content_type(content_type, nil)
     |> send_resp(status, body)
   end
 

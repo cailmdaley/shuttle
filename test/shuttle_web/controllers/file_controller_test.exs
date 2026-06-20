@@ -106,6 +106,24 @@ defmodule ShuttleWeb.FileControllerTest do
                "http://localhost:4001/api/v1/file?path=%2Fabs%2Fon%2Fcandide.png"
     end
 
+    test "relays the remote content-type VERBATIM — no doubled charset" do
+      # The owner serves through Phoenix, so its content-type already carries
+      # `; charset=utf-8`. Relaying must not append a SECOND charset, or the
+      # header becomes `image/png; charset=utf-8; charset=utf-8` and browsers
+      # reject the image (the broken-image / blue-question-mark bug on a
+      # remote-owned sent file).
+      stub_forward(
+        "candide",
+        "http://localhost:4001",
+        {:ok, 200, "image/png; charset=utf-8", <<137, 80, 78, 71>>}
+      )
+
+      conn =
+        get(api_conn(), "/api/v1/file?path=#{URI.encode_www_form("/abs/on/candide.png")}&origin=candide")
+
+      assert get_resp_header(conn, "content-type") == ["image/png; charset=utf-8"]
+    end
+
     test "relays the remote's status verbatim (a remote 404 stays a 404)" do
       stub_forward("candide", "http://localhost:4001", {:ok, 404, "application/json", ~s({"error":"x"})})
 

@@ -62,7 +62,12 @@ defmodule ShuttleWeb.FileController do
   # 404 reads as a remote 404, not a tunnel 502.
   defp relay(conn, {:forwarded, status, content_type, body}) do
     conn
-    |> put_resp_content_type(content_type)
+    # `nil` charset → relay the content-type AS-IS. The remote already served it
+    # through Phoenix, so it carries `; charset=utf-8`; the default 2-arg form
+    # would append a SECOND charset (`image/png; charset=utf-8; charset=utf-8`),
+    # which browsers reject — a remote-owned image then renders as a broken-image
+    # icon. (Local serve_local's single charset is tolerated; the double is not.)
+    |> put_resp_content_type(content_type, nil)
     |> send_resp(status, body)
   end
 
