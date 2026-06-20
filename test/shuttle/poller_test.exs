@@ -121,6 +121,23 @@ defmodule Shuttle.PollerTest do
       end)
     end
 
+    # Merge scalar continuation fields into a fiber's parsed `shuttle:` block —
+    # the in-memory analog of the daemon stamping `dispatched_at`/`session_uuid`
+    # (or the worker stamping `handed_off_at`) into the fiber's frontmatter. The
+    # poller reads these straight off the `felt show -j` map, so updating the map
+    # is what the continuation/orphan readers see on the next poll.
+    def put_shuttle_fields(id, fields) do
+      Agent.update(__MODULE__, fn state ->
+        fiber = Map.get(state.fibers, id) || %{"id" => id, "shuttle" => %{}}
+        shuttle = Map.merge(Map.get(fiber, "shuttle") || %{}, fields)
+        put_in(state.fibers[id], Map.put(fiber, "shuttle", shuttle))
+      end)
+    end
+
+    # The full fiber map for `id` (carries `path`), for tests that read back what
+    # a write path (e.g. the claim's frontmatter stamp) wrote to the real file.
+    def fiber(id), do: Agent.get(__MODULE__, &Map.get(&1.fibers, id))
+
     # Absolute, symlink-resolved path of a written fiber file. macOS resolves
     # `/tmp` and `/var` to `/private/...`; mirror that so the carried path
     # matches the store realpath the poller computes for ownership.
@@ -377,24 +394,20 @@ defmodule Shuttle.PollerTest do
     |> Enum.map(fn {_cmd, args} -> List.last(args) end)
   end
 
-  # Mirror the dispatcher's at-spawn dispatch-marker write: `{session_uuid,
-  # dispatched_at, run_id}` keyed by the fiber's runtime key (the slug `id` for
-  # these uid-less test fibers). The optional `at` lets a test back-date the
-  # dispatch so a later handoff can be ordered relative to it.
+  # Mirror the dispatcher's at-spawn dispatch stamp: `session_uuid` +
+  # `dispatched_at` into the fiber's `shuttle:` block. The optional `at` lets a
+  # test back-date the dispatch so a later handoff can be ordered relative to it.
   defp write_dispatch_marker(id, session_id, at \\ DateTime.utc_now()) do
-    :ok =
-      Shuttle.Markers.write_dispatch(id, %{
-        session_uuid: session_id,
-        dispatched_at: DateTime.to_iso8601(at)
-      })
+    MockRunner.put_shuttle_fields(id, %{
+      "session_uuid" => session_id,
+      "dispatched_at" => DateTime.to_iso8601(at)
+    })
   end
 
-  # Mirror the worker's `shuttle-ctl handoff`: write `~/.shuttle/handoff/<key>`
-  # (extensionless) with `{at}` in RFC3339 UTC — the clean-exit signal.
+  # Mirror the worker's `shuttle-ctl handoff`: stamp `shuttle.handed_off_at` in
+  # RFC3339 UTC — the clean-exit signal the daemon compares against dispatched_at.
   defp write_handoff_marker(id, at \\ DateTime.utc_now()) do
-    path = Shuttle.Markers.handoff_path(id)
-    File.mkdir_p!(Path.dirname(path))
-    File.write!(path, Jason.encode!(%{at: DateTime.to_iso8601(at)}))
+    MockRunner.put_shuttle_fields(id, %{"handed_off_at" => DateTime.to_iso8601(at)})
   end
 
   # ── Tests ──
@@ -3458,9 +3471,10 @@ defmodule Shuttle.PollerTest do
     snap = Poller.snapshot(poller)
     assert Enum.any?(snap.eligible, &(&1.fiber_id == id))
 
-    # The claim wrote the dispatch marker (keyed by the fiber's uid runtime key)
-    # carrying the session uuid, so resume / continuation can recover it.
-    assert %{"session_uuid" => "uuid-claim-1"} = Shuttle.Markers.read_dispatch("01CLAIMUID")
+    # The claim stamped the session uuid into the fiber's `shuttle:` block (the
+    # real .md at the carried path), so resume / continuation can recover it.
+    {:ok, _p, _raw, claimed_fm, _body} = Shuttle.FiberDoc.read_path(MockRunner.fiber(id)["path"])
+    assert claimed_fm["shuttle"]["session_uuid"] == "uuid-claim-1"
 
     new_sessions_before =
       Enum.count(MockRunner.commands(), fn {cmd, args} ->

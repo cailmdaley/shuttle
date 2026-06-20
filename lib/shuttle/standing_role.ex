@@ -181,8 +181,8 @@ defmodule Shuttle.StandingRole do
   the prompt's `Run:` line, minted from `now`.
 
   It is not load-bearing for resume continuity: continuation is decided from the
-  per-host dispatch/handoff markers (`Shuttle.Markers`), not from this id. The id
-  is therefore free to be a fresh timestamp every dispatch.
+  fiber's `shuttle.dispatched_at`/`handed_off_at` (`Shuttle.Continuation`), not
+  from this id. The id is therefore free to be a fresh timestamp every dispatch.
   """
   @spec dispatch_run_id(t(), DateTime.t()) :: String.t()
   def dispatch_run_id(%__MODULE__{} = role, now) do

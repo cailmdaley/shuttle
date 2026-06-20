@@ -125,30 +125,27 @@ defmodule Shuttle.Poller.StandingRoles do
 
   # True iff the role was DISPATCHED but never cleanly handed off — a run that
   # began but whose exit the daemon never observed (it was down across the exit).
-  # Read from the per-host markers (`Shuttle.Markers`), keyed by the fiber's
-  # intrinsic runtime key:
+  # Read straight off the fiber's `shuttle:` block (`Shuttle.Continuation`):
   #
-  #   • no dispatch marker        → never ran (or a human resolved it) → not an orphan.
-  #   • handoff.at >= dispatch.at → clean exit observed                → not an orphan.
-  #   • otherwise (dispatched, no newer handoff)                       → orphan (true).
+  #   • no dispatched_at             → never ran (or a human resolved it) → not an orphan.
+  #   • handed_off_at >= dispatched  → clean exit observed                → not an orphan.
+  #   • otherwise (dispatched, no newer handoff)                          → orphan (true).
   #
   # A human accept / resume / force-rearm SUPERSEDES the dead-orphan inference by
-  # *concluding the run* — `Markers.resolve/1` stamps the handoff marker
-  # (`handoff.at >= dispatch.at`), the same signal a clean worker exit leaves,
-  # since a human accepting the run IS concluding it. This is what stops the
-  # standing-role temper oscillation Cail hit on his morning-post / weekly-arxiv
-  # roles (a worker that died without handing off was re-closed to awaiting on
-  # every reconcile). Durable across a daemon restart, and needs no third
-  # (re-arm) marker racing the dispatch/handoff pair.
+  # *concluding the run* — `LifecycleStore` folds `handed_off_at = now` into the
+  # re-arm write, the same signal a clean worker exit leaves, since a human
+  # accepting the run IS concluding it. This is what stops the standing-role
+  # temper oscillation Cail hit on his morning-post / weekly-arxiv roles (a worker
+  # that died without handing off was re-closed to awaiting on every reconcile).
+  # Git-native, durable across a daemon restart, and needs no separate re-arm
+  # field — the same `handed_off_at` covers both worker exit and human re-arm.
   def standing_role_dispatched_unexited?(fiber) do
-    key = Poller.runtime_key_for_fiber(fiber)
-
-    case Shuttle.Markers.dispatched_at(key) do
+    case Shuttle.Continuation.dispatched_at(fiber) do
       nil ->
         false
 
       dispatch_dt ->
-        not at_or_after?(Shuttle.Markers.handoff_at(key), dispatch_dt)
+        not at_or_after?(Shuttle.Continuation.handed_off_at(fiber), dispatch_dt)
     end
   rescue
     _ -> false
@@ -299,20 +296,17 @@ defmodule Shuttle.Poller.StandingRoles do
     end
   end
 
-  # Unix-ms of the most recent durable service marker — the max of the dispatch
-  # marker's `dispatched_at` and the handoff marker's `at` (`Shuttle.Markers`,
-  # keyed by the fiber's runtime key). A human re-arm stamps the handoff marker
-  # too (it concludes the run), so `handoff_at` covers re-arms as well — no
-  # separate re-arm marker. nil when no marker exists (never run). The cron
-  # self-catching invariant hinges on this advancing each run: a fresh dispatch
-  # writes a newer `dispatched_at`, so the next poll sees only the next FUTURE
-  # occurrence.
+  # Unix-ms of the most recent durable service event — the max of the fiber's
+  # `shuttle.dispatched_at` and `shuttle.handed_off_at` (`Shuttle.Continuation`).
+  # A human re-arm stamps `handed_off_at` too (it concludes the run), so it covers
+  # re-arms as well — no separate re-arm field. nil when neither is set (never
+  # run). The cron self-catching invariant hinges on this advancing each run: a
+  # fresh dispatch writes a newer `dispatched_at`, so the next poll sees only the
+  # next FUTURE occurrence.
   def last_service_event_ms(fiber) do
-    key = Poller.runtime_key_for_fiber(fiber)
-
     [
-      Shuttle.Markers.dispatched_at(key),
-      Shuttle.Markers.handoff_at(key)
+      Shuttle.Continuation.dispatched_at(fiber),
+      Shuttle.Continuation.handed_off_at(fiber)
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.map(&DateTime.to_unix(&1, :millisecond))

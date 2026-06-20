@@ -797,143 +797,116 @@ defmodule Shuttle.DispatcherTest do
     assert prompt =~ "Run:   adhoc-1770000000000"
   end
 
-  test "resolve_resume_intent forces :fresh for ad-hoc dispatch even with a dispatch marker" do
+  test "resolve_resume_intent forces :fresh for ad-hoc dispatch even with a resumable session" do
     # An ad-hoc run is "do this responsibility right now" work. The prior
     # session's transcript may have wrapped on a "Run accepted. Exiting"
     # turn — resuming there leads to an idle worker that says "nothing new
     # on the fiber" instead of running the responsibility afresh. The
-    # ad-hoc branch must short-circuit to :fresh regardless of any dispatch
-    # marker the fiber carries.
-    data_dir = marker_data_dir()
-    System.put_env("SHUTTLE_DATA_DIR", data_dir)
-    on_exit(fn -> System.delete_env("SHUTTLE_DATA_DIR"); File.rm_rf!(data_dir) end)
-
-    Shuttle.Markers.write_dispatch("tests/haiku", %{session_uuid: "11111111-2222-3333-4444-555555555555"})
-    fiber = %{"shuttle" => %{"kind" => "standing"}}
+    # ad-hoc branch must short-circuit to :fresh regardless of any
+    # `session_uuid`/`dispatched_at` the fiber's shuttle: block carries.
+    fiber =
+      %{
+        "shuttle" => %{
+          "kind" => "standing",
+          "session_uuid" => "11111111-2222-3333-4444-555555555555",
+          "dispatched_at" => iso_now()
+        }
+      }
 
     assert Dispatcher.resolve_resume_intent(
              {:standing_run, "adhoc-1770000000000", :ad_hoc},
              "tests/haiku",
-             fiber,
-             marker_key: "tests/haiku"
+             fiber
            ) == :fresh
   end
 
   test "resolve_resume_intent defers to check_resume_intent for non-ad-hoc dispatches" do
     # The delegation boundary: anything other than {:standing_run, _, :ad_hoc}
-    # takes the marker-driven path. With no markers there's nothing to resume and
-    # the deterministic result is :fresh — but it's the path taken that matters.
+    # takes the continuation-decision path. With no shuttle fields there's nothing
+    # to resume and the deterministic result is :fresh — but it's the path taken
+    # that matters.
     fiber = %{}
 
     # Scheduled standing run: defer
     assert Dispatcher.resolve_resume_intent(
              {:standing_run, "20260508T070000+0000"},
              "tests/haiku",
-             fiber,
-             marker_key: "tests/no-markers-#{System.unique_integer([:positive])}"
+             fiber
            ) == :fresh
 
     # Plain constitution dispatch: defer
-    assert Dispatcher.resolve_resume_intent(:constitution, "tests/haiku", fiber,
-             marker_key: "tests/no-markers-#{System.unique_integer([:positive])}"
-           ) == :fresh
+    assert Dispatcher.resolve_resume_intent(:constitution, "tests/haiku", fiber) == :fresh
   end
 
-  describe "check_resume_intent — oneshot resume-on-no-handoff discriminator (markers)" do
+  describe "check_resume_intent — oneshot resume-on-no-handoff discriminator (frontmatter)" do
+    # The continuation state lives in the fiber's `shuttle:` block (the substrate
+    # that replaced the per-host marker files): `dispatched_at`/`session_uuid` the
+    # daemon stamps at dispatch, `handed_off_at` the worker stamps at clean exit.
+    # The decision is a pure read off the polled fiber map — no SHUTTLE_DATA_DIR,
+    # no marker files.
     setup do
-      # Isolate marker state per-test under a throwaway SHUTTLE_DATA_DIR. The
-      # dispatch marker carries the daemon's session uuid; the worker's handoff
-      # marker (when present) signals a clean exit.
-      data_dir = marker_data_dir()
-      System.put_env("SHUTTLE_DATA_DIR", data_dir)
-      key = "task-#{System.unique_integer([:positive])}"
-
-      # A dispatch marker the daemon wrote at spawn — the resumable session id.
-      Shuttle.Markers.write_dispatch(key, %{session_uuid: "aaaa-bbbb-cccc-dddd"})
-
-      on_exit(fn ->
-        System.delete_env("SHUTTLE_DATA_DIR")
-        File.rm_rf!(data_dir)
-      end)
-
-      %{key: key, data_dir: data_dir}
+      # A fiber dispatched at a fixed past instant, carrying the resumable session
+      # id — the daemon-at-spawn state. Clean-exit tests add a newer
+      # `handed_off_at`; dirty-death tests leave it absent.
+      dispatched_at = "2026-06-20T18:00:00.000000Z"
+      %{dispatched_at: dispatched_at, session_uuid: "aaaa-bbbb-cccc-dddd"}
     end
 
     test "resumes the prior session when the worker died without a handoff", ctx do
-      # Only a dispatch marker on file (the daemon writes it at spawn); the
-      # session vanished with no worker-authored handoff marker after it →
-      # died mid-thought → resume the transcript rather than loop a fresh worker.
-      fiber = %{"shuttle" => %{"kind" => "oneshot"}}
-
+      # A dispatch stamp but no `handed_off_at` after it → died mid-thought →
+      # resume the transcript rather than loop a fresh worker.
       assert {:previous, "aaaa-bbbb-cccc-dddd"} =
-               Dispatcher.check_resume_intent("task", fiber, marker_key: ctx.key)
+               Dispatcher.check_resume_intent("task", dispatched_fiber(ctx))
     end
 
-    test "starts fresh when the worker left a clean handoff marker", ctx do
-      # The worker wrote ~/.shuttle/handoff/<key> at or after the dispatch → clean
-      # close → next worker starts fresh.
-      write_handoff(ctx.key, DateTime.utc_now())
-      fiber = %{"shuttle" => %{"kind" => "oneshot"}}
-      assert :fresh = Dispatcher.check_resume_intent("task", fiber, marker_key: ctx.key)
+    test "starts fresh when the worker left a clean handoff (handed_off_at >= dispatched_at)", ctx do
+      # The worker stamped `handed_off_at` at or after the dispatch → clean close →
+      # next worker starts fresh.
+      fiber = dispatched_fiber(ctx, %{"handed_off_at" => "2026-06-20T18:05:00.000000Z"})
+      assert :fresh = Dispatcher.check_resume_intent("task", fiber)
     end
 
     test "an explicit resume_mode=fresh directive overrides the dirty-death resume", ctx do
-      # The setup leaves a dispatch marker with no handoff after it — the
-      # dirty-death state decide_continuation reads as "resume". But the human
-      # clicked "New session", carrying resume_mode=fresh as a dispatch parameter.
-      # That explicit directive must win over the autonomous heuristic: "New
-      # session" always means a new session, never resume. This is the
-      # remote-machine bug — workers there die without a handoff, so every "New
-      # session" silently resumed the dead transcript.
-      fiber = %{"shuttle" => %{"kind" => "oneshot"}}
-
+      # A dispatch stamp with no handoff after it — the dirty-death state
+      # decide_continuation reads as "resume". But the human clicked "New
+      # session", carrying resume_mode=fresh as a dispatch parameter. That
+      # explicit directive must win over the autonomous heuristic: "New session"
+      # always means a new session, never resume. This is the remote-machine bug —
+      # workers there die without a handoff, so every "New session" silently
+      # resumed the dead transcript.
       assert :fresh =
-               Dispatcher.check_resume_intent("task", fiber,
-                 marker_key: ctx.key,
-                 resume_mode: "fresh"
-               )
+               Dispatcher.check_resume_intent("task", dispatched_fiber(ctx), resume_mode: "fresh")
     end
 
-    test "resume_mode=previous resumes the dispatch marker's session", ctx do
-      # The human clicked "Resume previous". The session id comes from the
-      # dispatch marker the daemon holds (the worker never knew its own UUID).
-      fiber = %{"shuttle" => %{"kind" => "oneshot"}}
-
+    test "resume_mode=previous resumes the shuttle block's session", ctx do
+      # The human clicked "Resume previous". The session id comes from
+      # `shuttle.session_uuid` the daemon stamped (the worker never knew its UUID).
       assert {:previous, "aaaa-bbbb-cccc-dddd"} =
-               Dispatcher.check_resume_intent("task", fiber,
-                 marker_key: ctx.key,
-                 resume_mode: "previous"
-               )
+               Dispatcher.check_resume_intent("task", dispatched_fiber(ctx), resume_mode: "previous")
     end
 
-    test "resume_mode=previous with no dispatch marker surfaces the missing-id error", _ctx do
-      # "Resume previous" but no dispatch marker on this host → there is no
+    test "resume_mode=previous with no session_uuid surfaces the missing-id error", _ctx do
+      # "Resume previous" but the fiber carries no `session_uuid` → there is no
       # session to resume. Surface :missing_session_id rather than silently
       # starting fresh ("New session" is the explicit fresh path).
       fiber = %{"shuttle" => %{"kind" => "oneshot"}}
 
       assert {:error, :missing_session_id} =
-               Dispatcher.check_resume_intent("task", fiber,
-                 marker_key: "absent-#{System.unique_integer([:positive])}",
-                 resume_mode: "previous"
-               )
+               Dispatcher.check_resume_intent("task", fiber, resume_mode: "previous")
     end
 
     test "a standing role is never auto-resumed (fresh even with no handoff)", ctx do
       # Scope guard: only oneshots use this mechanism. A standing role dispatches
       # discrete scheduled occurrences — always fresh.
-      fiber = %{"shuttle" => %{"kind" => "standing"}}
-      assert :fresh = Dispatcher.check_resume_intent("task", fiber, marker_key: ctx.key)
+      fiber = dispatched_fiber(ctx, %{"kind" => "standing"})
+      assert :fresh = Dispatcher.check_resume_intent("task", fiber)
     end
 
     test "no prior session (first run) starts fresh", _ctx do
-      # No dispatch marker for this key → no session id to resume → fresh.
+      # No `session_uuid`/`dispatched_at` on the fiber → no session id to resume →
+      # fresh.
       fiber = %{"shuttle" => %{"kind" => "oneshot"}}
-
-      assert :fresh =
-               Dispatcher.check_resume_intent("fresh-task", fiber,
-                 marker_key: "fresh-#{System.unique_integer([:positive])}"
-               )
+      assert :fresh = Dispatcher.check_resume_intent("fresh-task", fiber)
     end
   end
 
@@ -1160,21 +1133,26 @@ defmodule Shuttle.DispatcherTest do
     assert reason2 =~ "effort bogus not allowed"
   end
 
-  # ── Marker test helpers ──
+  # ── Continuation test helpers ──
 
-  # A throwaway SHUTTLE_DATA_DIR for marker isolation. The caller is responsible
-  # for setting/unsetting the env and cleaning up (the describe setup does both).
-  defp marker_data_dir do
-    dir = Path.join(System.tmp_dir!(), "shuttle-markers-#{System.unique_integer([:positive])}")
-    File.mkdir_p!(dir)
-    dir
-  end
+  # An RFC3339 UTC timestamp for `now` — the format the daemon stamps into
+  # `shuttle.dispatched_at` / `handed_off_at`.
+  defp iso_now, do: DateTime.to_iso8601(DateTime.utc_now())
 
-  # Write the handoff marker the worker would write via `shuttle-ctl handoff`:
-  # `~/.shuttle/handoff/<key>` (extensionless) with `{at}` in RFC3339 UTC.
-  defp write_handoff(key, %DateTime{} = at) do
-    path = Shuttle.Markers.handoff_path(key)
-    File.mkdir_p!(Path.dirname(path))
-    File.write!(path, Jason.encode!(%{at: DateTime.to_iso8601(at)}))
+  # A oneshot fiber map carrying the daemon-at-dispatch shuttle fields (session
+  # uuid + dispatched_at from the test context), with `extra` merged over them
+  # (e.g. a `handed_off_at`, or `kind: standing`).
+  defp dispatched_fiber(ctx, extra \\ %{}) do
+    %{
+      "shuttle" =>
+        Map.merge(
+          %{
+            "kind" => "oneshot",
+            "session_uuid" => ctx.session_uuid,
+            "dispatched_at" => ctx.dispatched_at
+          },
+          extra
+        )
+    }
   end
 end

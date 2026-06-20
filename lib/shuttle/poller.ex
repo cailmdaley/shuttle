@@ -124,12 +124,12 @@ defmodule Shuttle.Poller do
       # %{runtime_key => unix_ms} — the instant a standing role was re-armed by
       # accept/resume, keyed by runtime key (uid when present, else slug) so a
       # rename mid-cycle can't strand the stamp. One of the "last serviced"
-      # signals the due rule anchors on (alongside the dispatch/handoff markers
-      # and the role's creation): it marks the just-served occurrence so the role
-      # isn't immediately re-served when accept flips closed→active. The
-      # within-lifetime fast path; the durable backstop is the handoff marker the
-      # re-arm stamps (`Markers.resolve/1`). NOT persisted; a restart loses
-      # nothing the handoff marker doesn't already carry.
+      # signals the due rule anchors on (alongside the fiber's
+      # dispatched_at/handed_off_at and its creation): it marks the just-served
+      # occurrence so the role isn't immediately re-served when accept flips
+      # closed→active. The within-lifetime fast path; the durable backstop is the
+      # `shuttle.handed_off_at` the re-arm stamps (`LifecycleStore`). NOT
+      # persisted; a restart loses nothing that field doesn't already carry.
       rearmed_at: %{}
     ]
   end
@@ -2002,20 +2002,23 @@ defmodule Shuttle.Poller do
     end
   end
 
-  # The claim-time analog of the dispatcher's dispatch-marker write: a
-  # self-claimed / chat-captured session writes (refreshes) the per-host dispatch
-  # marker so the continuation heuristic and "Resume previous" can recover its
-  # session UUID, keyed by the fiber's runtime key (uid when present, else slug).
-  # Best-effort, like every runtime-marker write on this path. A claim with no
-  # captured session_uuid still stamps `dispatched_at` (the run-window anchor)
-  # so a clean handoff can later be compared against it.
+  # The claim-time analog of the dispatcher's dispatch write: a self-claimed /
+  # chat-captured session stamps (refreshes) the fiber's `shuttle:` dispatch
+  # fields so the continuation heuristic and "Resume previous" can recover its
+  # session UUID. Best-effort, keyed by the fiber's `.md` path. A claim with no
+  # captured session_uuid still stamps `dispatched_at` (the run-window anchor) so
+  # a clean handoff can later be compared against it. A path-less fiber (rare)
+  # skips the write — it then reads as a fresh dispatch, the safe default.
   defp log_worker_claim(fiber, session_uuid) do
-    key = runtime_key_for_fiber(fiber)
+    case Map.get(fiber, "path") do
+      path when is_binary(path) and path != "" ->
+        Shuttle.Continuation.write_dispatch(path, %{
+          session_uuid: if(is_binary(session_uuid) and session_uuid != "", do: session_uuid)
+        })
 
-    Shuttle.Markers.write_dispatch(key, %{
-      session_uuid: if(is_binary(session_uuid) and session_uuid != "", do: session_uuid),
-      run_id: nil
-    })
+      _ ->
+        :ok
+    end
   end
 
   # Records (or refreshes the attempt count on) a dispatch failure. The map

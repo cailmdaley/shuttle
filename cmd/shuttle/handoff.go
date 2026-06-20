@@ -1,23 +1,23 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/cailmdaley/shuttle/pkg/schema"
 )
 
 // endOwnTmuxSession tears down the tmux session this process is running in — the
 // worker's `shuttle-<id>` session. Folded into `handoff` so the worker's exit is
-// ONE command (write the clean-exit marker, then end the session) instead of a
-// marker-write followed by a separate `kill $PPID`. Best-effort and a no-op
-// outside tmux (e.g. a manual/test invocation), so it never kills a stray shell:
-// it asks tmux for the *current* session name and kills exactly that.
+// ONE command (stamp the clean-exit field, then end the session) instead of a
+// write followed by a separate `kill $PPID`. Best-effort and a no-op outside
+// tmux (e.g. a manual/test invocation), so it never kills a stray shell: it asks
+// tmux for the *current* session name and kills exactly that.
 func endOwnTmuxSession() {
 	if os.Getenv("TMUX") == "" {
 		return
@@ -30,116 +30,77 @@ func endOwnTmuxSession() {
 	if session == "" {
 		return
 	}
-	// This kills our own pane mid-call; the marker is already durably on disk
+	// This kills our own pane mid-call; the field is already durably on disk
 	// (os.Rename completed before we got here), so nothing is lost.
 	_ = exec.Command("tmux", "kill-session", "-t", session).Run()
 }
 
-// shuttleDataDir resolves the per-host Shuttle data directory, mirroring the
-// Elixir side (Shuttle.Markers.data_dir/0, WaitingTracker.default_events_file/0):
-// $SHUTTLE_DATA_DIR, else ~/.shuttle. This is the FIRST SHUTTLE_DATA_DIR resolver
-// on the Go side — the CLI had none — so it must agree byte-for-byte with the
-// daemon's resolution, or the dispatch and handoff markers land in different
-// trees and continuation silently breaks.
-func shuttleDataDir() (string, error) {
-	if dir := os.Getenv("SHUTTLE_DATA_DIR"); dir != "" {
-		return dir, nil
+// resolveHandoffPath returns the fiber `.md` the worker should stamp. The daemon
+// exports SHUTTLE_FIBER_PATH at dispatch — the path it already resolved — so the
+// worker writes the same file the daemon reads on the next poll, with no
+// felt-store resolution and no ambiguity. Falls back to resolving the <fiber>
+// argument (a manual/test invocation outside a daemon-launched worker).
+func resolveHandoffPath(fiber string) (string, error) {
+	if path := os.Getenv("SHUTTLE_FIBER_PATH"); path != "" {
+		return path, nil
 	}
-	home, err := os.UserHomeDir()
+	path, err := schema.ResolveFiberPath(fiber)
 	if err != nil {
-		return "", fmt.Errorf("resolving home directory: %w", err)
-	}
-	return filepath.Join(home, ".shuttle"), nil
-}
-
-// handoffMarkerPath is the extensionless handoff marker for the given runtime
-// key: $SHUTTLE_DATA_DIR/handoff/<key>. The Elixir reader (Markers.handoff_path/1)
-// resolves the identical path; the key is the daemon-supplied SHUTTLE_FIBER_KEY,
-// never recomputed here.
-func handoffMarkerPath(key string) (string, error) {
-	dir, err := shuttleDataDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "handoff", key), nil
-}
-
-// writeHandoffMarker atomically writes {"at": <RFC3339 UTC now>} to the handoff
-// marker for key. Atomic (temp file + os.Rename), matching the Elixir writer, so
-// a reader never sees a half-written marker. The marker carries NO session_uuid:
-// the worker doesn't know its own UUID (the daemon captured it into the dispatch
-// marker); the handoff is a pure clean-exit signal whose `at` the daemon compares
-// against dispatch.dispatched_at to decide fresh-vs-resume.
-func writeHandoffMarker(key string) (string, error) {
-	path, err := handoffMarkerPath(key)
-	if err != nil {
-		return "", err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return "", fmt.Errorf("creating handoff dir: %w", err)
-	}
-
-	// RFC3339Nano with a trailing Z (UTC). The Elixir reader parses this via
-	// DateTime.from_iso8601; both no-fractional and fractional forms parse, and
-	// DateTime comparison is on the wire value, so >= microsecond precision is
-	// exact.
-	at := time.Now().UTC().Format(time.RFC3339Nano)
-	payload, err := json.Marshal(map[string]string{"at": at})
-	if err != nil {
-		return "", fmt.Errorf("encoding handoff marker: %w", err)
-	}
-
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".handoff-*.tmp")
-	if err != nil {
-		return "", fmt.Errorf("creating temp marker: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op once the rename succeeds
-
-	if _, err := tmp.Write(payload); err != nil {
-		tmp.Close()
-		return "", fmt.Errorf("writing temp marker: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return "", fmt.Errorf("closing temp marker: %w", err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return "", fmt.Errorf("renaming marker into place: %w", err)
+		return "", fmt.Errorf("resolving fiber %q (SHUTTLE_FIBER_PATH unset): %w", fiber, err)
 	}
 	return path, nil
+}
+
+// stampHandedOff sets `shuttle.handed_off_at = <now RFC3339 UTC>` in the fiber's
+// frontmatter, surgically (SetShuttleField preserves the daemon-written
+// session_uuid / dispatched_at), and writes atomically. This is the clean-exit
+// signal: the daemon compares `handed_off_at` against `dispatched_at` to decide
+// fresh-vs-resume at the next dispatch. RFC3339Nano with a trailing Z (UTC) —
+// the Elixir reader parses it via DateTime.from_iso8601, and the comparison is
+// on the wire value, so sub-second precision is exact.
+func stampHandedOff(path string) (string, error) {
+	f, err := schema.ReadFiber(path)
+	if err != nil {
+		return "", err
+	}
+	at := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := f.SetShuttleField("handed_off_at", at); err != nil {
+		return "", err
+	}
+	if err := f.Write(); err != nil {
+		return "", err
+	}
+	return at, nil
 }
 
 func newHandoffCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "handoff <fiber>",
-		Short: "Write the clean-exit handoff marker for a worker",
-		Long: `Writes the per-host handoff marker ($SHUTTLE_DATA_DIR/handoff/<key> =
-{"at": <now>}) that tells the daemon this worker exited CLEANLY — so the next
-dispatch starts fresh instead of resuming a dead transcript.
+		Short: "Stamp the clean-exit handoff signal for a worker",
+		Long: `Stamps shuttle.handed_off_at = now into the fiber's frontmatter — the
+signal that tells the daemon this worker exited CLEANLY, so the next dispatch
+starts fresh (and reads the rewritten '## Status' block) instead of resuming a
+dead transcript.
 
 A worker calls this as its FINAL action, after rewriting the constitution's
-'## Status' block: it writes the marker and then ends its own tmux session — so
-the exit is one command, no separate 'kill $PPID'. The runtime key comes from
-SHUTTLE_FIBER_KEY, which the daemon exports at dispatch so the worker's marker and
-the daemon's dispatch marker line up byte-for-byte; this command fails loudly when
-that env is unset (the worker was not launched by the daemon).
-
-The <fiber> argument is accepted for symmetry with the other verbs and to make
-the call self-documenting, but the marker is keyed strictly by SHUTTLE_FIBER_KEY —
-never recomputed from the fiber ref — so the two writers can never diverge.`,
+'## Status' block: it stamps the field and then ends its own tmux session — so
+the exit is one command, no separate 'kill $PPID'. The target fiber is the file
+at SHUTTLE_FIBER_PATH, which the daemon exports at dispatch (the path it already
+resolved); outside a daemon-launched worker the <fiber> argument is resolved
+instead.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			key := os.Getenv("SHUTTLE_FIBER_KEY")
-			if key == "" {
-				return fmt.Errorf("SHUTTLE_FIBER_KEY is unset — handoff is only valid inside a daemon-launched worker")
-			}
-			path, err := writeHandoffMarker(key)
+			path, err := resolveHandoffPath(args[0])
 			if err != nil {
 				return err
 			}
-			fmt.Printf("handoff marker written: %s\n", path)
+			at, err := stampHandedOff(path)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("handed off: %s (handed_off_at=%s)\n", path, at)
 			// Final act: end our own tmux session (no-op outside tmux). The
-			// marker is already durably on disk, so the kill loses nothing.
+			// field is already durably on disk, so the kill loses nothing.
 			endOwnTmuxSession()
 			return nil
 		},
