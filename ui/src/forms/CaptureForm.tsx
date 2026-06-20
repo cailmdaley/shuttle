@@ -31,11 +31,20 @@ import { shuttleOrigin } from './projectModel'
  * effort/chrome stay disabled on the fallback (no metadata to gate them).
  */
 const FALLBACK_AGENTS: AgentEntry[] = [
-  { id: 'claude-fable', default: true },
-  { id: 'claude-opus', default: false },
+  { id: 'claude-opus', default: true },
   { id: 'claude-sonnet', default: false },
+  { id: 'claude-fable', default: false },
   { id: 'codex', default: false },
 ]
+
+// Capture's default worker: claude-opus at xhigh reasoning. A captured yap is
+// often a real piece of thinking to crystallize, not throwaway — worth the
+// strong model. Effort is seeded here rather than taking opus's registry
+// default_effort so the global opus default (used by kanban/CLI dispatch) is
+// untouched; switching the agent in the form falls back to that agent's own
+// default_effort.
+const CAPTURE_DEFAULT_AGENT = 'claude-opus'
+const CAPTURE_DEFAULT_EFFORT = 'xhigh'
 
 export interface CaptureFormProps {
   /** Default destination: a project path (matched against `availableCities` by
@@ -76,15 +85,14 @@ export function CaptureForm({
   shuttleBase = '',
 }: CaptureFormProps): JSX.Element {
   const [prompt, setPrompt] = useState('')
-  // Capture's default is claude-fable (the daemon's capture default), not the
-  // registry's dispatch default — a background crystallize session is fable
-  // territory regardless of what ordinary dispatch defaults to.
-  const [agent, setAgent] = useState<string>('claude-fable')
+  const [agent, setAgent] = useState<string>(CAPTURE_DEFAULT_AGENT)
   const [agents, setAgents] = useState<AgentEntry[]>(FALLBACK_AGENTS)
   // Axes come from the selected agent's registry constraint metadata — no
   // hardcoded lists. The effective effort is always a concrete token when
-  // the selected agent supports reasoning levels.
-  const [effort, setEffort] = useState<string>('')
+  // the selected agent supports reasoning levels. Seeded to the capture default
+  // (xhigh) for the initial opus selection; `handleAgentChange` re-derives from
+  // the chosen agent's own default_effort thereafter.
+  const [effort, setEffort] = useState<string>(CAPTURE_DEFAULT_EFFORT)
   const [chrome, setChrome] = useState<boolean>(false)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -254,7 +262,7 @@ export function CaptureForm({
             >
               {agents.map((a) => (
                 <option key={a.id} value={a.id}>
-                  {a.id}{a.id === 'claude-fable' ? ' (default)' : ''}
+                  {a.id}{a.id === CAPTURE_DEFAULT_AGENT ? ' (default)' : ''}
                 </option>
               ))}
             </select>
