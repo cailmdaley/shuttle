@@ -101,7 +101,9 @@ defmodule ShuttleWeb.AstraController do
   # Relay the owning remote's JSON + status verbatim, so a remote 404/502 reads
   # as itself, not a tunnel error.
   defp relay(conn, {:forwarded, status, content_type, body}) do
-    conn |> put_resp_content_type(content_type) |> send_resp(status, body)
+    # `nil` charset → relay verbatim; avoids doubling the remote's own charset
+    # (see FileController.relay/2 — a doubled charset breaks image rendering).
+    conn |> put_resp_content_type(content_type, nil) |> send_resp(status, body)
   end
 
   defp relay(conn, {:error, {:forward_failed, name, reason}}) do
