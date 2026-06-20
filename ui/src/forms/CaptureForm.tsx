@@ -39,10 +39,10 @@ const FALLBACK_AGENTS: AgentEntry[] = [
 
 // Capture's default worker: claude-opus at xhigh reasoning. A captured yap is
 // often a real piece of thinking to crystallize, not throwaway — worth the
-// strong model. Effort is seeded here rather than taking opus's registry
-// default_effort so the global opus default (used by kanban/CLI dispatch) is
-// untouched; switching the agent in the form falls back to that agent's own
-// default_effort.
+// strong model. opus's registry default_effort is now xhigh too, so the live
+// agents list yields the same; this seed just keeps the dialog correct before
+// the registry loads (offline fallback). Switching the agent re-derives effort
+// from that agent's own default_effort.
 const CAPTURE_DEFAULT_AGENT = 'claude-opus'
 const CAPTURE_DEFAULT_EFFORT = 'xhigh'
 

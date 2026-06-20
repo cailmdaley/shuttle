@@ -584,9 +584,10 @@ defmodule Shuttle.DispatcherTest do
   end
 
   test "claude with no declared effort renders the registry default" do
+    # claude-opus's registry default_effort is xhigh.
     {:ok, agent} = Agents.resolve_with_axes("claude-opus", nil, false)
     cmd = Agents.build_command(agent, "hi")
-    assert cmd =~ "--effort 'low'"
+    assert cmd =~ "--effort 'xhigh'"
     refute cmd =~ "--chrome"
   end
 
