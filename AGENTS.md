@@ -32,11 +32,15 @@ main schema**, so the contract that today lives on *both* sides (validated by th
 Go `pkg/schema` *and* parsed by the Elixir daemon) lives in one place. Felt owns
 the data model; Shuttle owns the network and the surface. Tracked in felt as
 [[ai-futures/shuttle/unify-with-felt]]. The **gating first step** before merge
-work starts in earnest is deciding the fate of felt's synced SQLite index + the
-history log built on it (the cross-machine SQLite-sync cost Cail wants gone) —
-that decision reshapes wikilink resolution, how the daemon detects clean worker
-exits (the `--kind handoff` marker), and what the merged schema must carry.
-Investigation: [[ai-futures/felt/shed-sqlite-history]].
+work could start in earnest was deciding the fate of felt's synced SQLite index +
+the history log built on it (the cross-machine SQLite-sync cost Cail wants gone).
+That decision is made and, on the shed-history branches, largely implemented:
+**felt history is gone**, and the daemon now detects clean worker exits via the
+`shuttle.handed_off_at` frontmatter field — not a `--kind handoff` felt-history
+event. Continuation state (`session_uuid` / `dispatched_at` / `handed_off_at`)
+lives entirely in the `shuttle:` block, which is exactly the merge end-state
+(felt owns the data model). The index-as-throwaway-cache slice is deferred to a
+follow-on cycle. Investigation: [[ai-futures/felt/shed-sqlite-history]].
 
 ### Where Shuttle still depends on / references Portolan
 
@@ -307,6 +311,10 @@ shuttle-ctl pause <fiber>                       # disable + kill live worker; --
 shuttle-ctl resume / accept <fiber>
 shuttle-ctl set-model <fiber> <agent-id>
 shuttle-ctl dispatch <fiber>
+shuttle-ctl handoff <fiber>                     # worker's clean-exit ritual: stamp
+                                                #   shuttle.handed_off_at (→ next dispatch
+                                                #   is fresh) + end own tmux session. The
+                                                #   single final action; folds in kill $PPID.
 shuttle-ctl snapshot
 shuttle-ctl abort / attach <fiber>
 shuttle-ctl validate-identity                # UID migration/cross-city validation
@@ -392,12 +400,18 @@ All prompt variants share this shape (`compose_prompt/3` in dispatcher.ex):
    `prompt_fiber_id`'s work_dir-local translation safe-fails, the id above
    is global and doesn't resolve from cwd; the store line makes the
    fallback mechanical (`felt -C <felt-store> show <id>`).
-4. **`From User · <relative time>`** — the most recent `--kind
-   review-comment` event, if any. Pulled fresh at dispatch.
+4. **`From User`** — the user's directive, when one rides this dispatch. It
+   is the `user_message` dispatch *parameter* (inlined into the prompt at
+   launch and discarded), not a persisted felt event. The since-window
+   "which comment is current?" computation is gone: the directive arrives
+   *with* the dispatch.
 
-The fiber's outcome and last editorial event are not inlined — they're
-already in scope after `felt show <id>` and `felt history <id>`, which
-the shuttle skill prescribes the worker calls on arrival.
+The fiber's outcome and handoff prose are not inlined — they're already in
+scope after `felt show <id>`, which renders the body's `## Status` block (the
+worker's last-writer-wins handoff) along with the rest of the constitution. The
+shuttle skill prescribes the worker reads it on arrival. (`felt history` no
+longer exists; the editorial chain it used to carry now lives in `## Status` +
+the git log of the constitution.)
 
 ## Inspecting state
 
