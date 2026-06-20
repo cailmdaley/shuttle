@@ -861,6 +861,35 @@ defmodule Shuttle.DispatcherTest do
       assert :fresh = Dispatcher.check_resume_intent("task", fiber, felt_store: ctx.store)
     end
 
+    test "starts fresh when the handoff is in the work_dir store, not the felt_store", ctx do
+      # Split-brain reality: the daemon writes dispatch events to the configured
+      # felt_store (loom aggregate), but the worker writes its handoff from its
+      # work_dir, whose .felt resolves to the project substore — and a typed
+      # `--kind` query against the aggregate root does NOT surface substore events.
+      # So the handoff lives ONLY in the work_dir store. Without threading work_dir
+      # the daemon would never see it and resume forever (the glass-delta-recovery
+      # loop, 2026-06-20). With it, the handoff is found → fresh.
+      work_dir = Path.join(System.tmp_dir!(), "shuttle-workdir-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(work_dir)
+      on_exit(fn -> File.rm_rf!(work_dir) end)
+      wfelt = fn args -> {_, 0} = System.cmd("felt", ["-C", work_dir | args], cd: work_dir, stderr_to_stdout: true) end
+      {_, 0} = System.cmd("felt", ["init"], cd: work_dir, stderr_to_stdout: true)
+      wfelt.(["add", "task", "A oneshot task"])
+      wfelt.(["history", "append", "task", "--kind", "handoff", "--summary", "did X; next: Y"])
+
+      fiber = %{"shuttle" => %{"kind" => "oneshot"}}
+
+      # felt_store (ctx.store) carries the dispatch event but NO handoff.
+      assert {:previous, _} = Dispatcher.check_resume_intent("task", fiber, felt_store: ctx.store)
+
+      # With work_dir threaded, the worker's handoff is found → fresh.
+      assert :fresh =
+               Dispatcher.check_resume_intent("task", fiber,
+                 felt_store: ctx.store,
+                 work_dir: work_dir
+               )
+    end
+
     test "a standing role is never auto-resumed (fresh even with no handoff)", ctx do
       # Scope guard: only oneshots use this mechanism. A standing role dispatches
       # discrete scheduled occurrences — always fresh.
