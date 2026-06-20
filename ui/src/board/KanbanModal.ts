@@ -540,6 +540,10 @@ export class KanbanModal {
           origin: card.originId,
           force: true,
           ad_hoc: true,
+          // "Drag launch always starts fresh" is unconditional — stamp it as an
+          // explicit fresh directive, NOT the marker auto-decide (which would
+          // resume a dirty-dead transcript; see dispatcher commit 3bdb776).
+          resume_mode: 'fresh',
         }),
       })
     } catch (err: unknown) {
