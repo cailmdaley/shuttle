@@ -82,6 +82,10 @@ defmodule Shuttle.Poller do
       # adopting live shuttle sessions (`adopt_orphans`) and every poll
       # reconciles entries whose tmux session has died.
       running: %{},
+      # MapSet of runtime keys (uid when the fiber carries one, else slug —
+      # identical to a `running` key) for fibers with a live or queued worker.
+      # Re-keyed off slug in the identity cutover so it shares `running`'s key:
+      # the only slug consumer left is felt I/O.
       claimed: MapSet.new(),
       reservations: %{},
       standing_roles: [],
@@ -90,12 +94,16 @@ defmodule Shuttle.Poller do
       # poll cycle and by host_for_fiber/2 on demand. Entries are never evicted
       # automatically; call bust_fiber_host_cache/1 when a fiber moves hosts.
       fiber_host_cache: %{},
-      # %{fiber_id => uid} — intrinsic frontmatter identity from felt's JSON
-      # projection. The poller still addresses fibers by slug-shaped
-      # fiber_id until the full dispatcher/session cutover carries path
-      # resolution everywhere; uid is exposed on runtime surfaces as the join
-      # key for document cards.
-      fiber_uid_cache: %{},
+      # %{uid => slug} — boundary uid→slug RESOLUTION index, rebuilt each poll
+      # from the candidate rows (every row carries both `id` and `uid`). It lets
+      # a uid-shaped public call (the kanban action-menu hot path — the UI posts
+      # uid, and most cards aren't running) resolve to felt's slug address with
+      # an O(1) map hit instead of a synchronous cross-store `felt ls` walk
+      # inside the GenServer. This serves felt I/O ONLY; runtime state stays
+      # keyed by uid. It is NOT the deleted `fiber_uid_cache`/`address_*`
+      # runtime-keying bridge and carries none of its semantics — a cold miss
+      # falls through to felt, never to a uid→slug runtime translation.
+      uid_slug_index: %{},
       # %{uid_or_fiber_id => %{modified_at: String.t() | nil, entry: map()}} —
       # daemon-local document cache for the Portolan kanban feed. The poll task
       # diffs the cheap shuttle projection's modified_at against this cache and
@@ -103,16 +111,20 @@ defmodule Shuttle.Poller do
       document_cache: %{},
       document_cache_stats: %{hits: 0, misses: 0, evictions: 0, entries: 0},
       document_cache_ready: false,
-      # %{fiber_id => %{reason: term, attempted_at: DateTime.t, attempts:
-      # pos_integer}} — fibers the dispatcher rejected with an error other
-      # than :already_running. Surfaced in the snapshot's `blocked` list so
-      # the kanban shows *why* a fiber isn't progressing instead of leaving
-      # the poll-cycle warning to scroll unread in the daemon log. Entries
-      # clear on successful dispatch or when the fiber's eligibility changes
-      # (frontmatter edit, pause, close).
+      # %{runtime_key => %{reason: term, attempted_at: DateTime.t, attempts:
+      # pos_integer, fiber_id: slug, uid: String.t() | nil}} — fibers the
+      # dispatcher rejected with an error other than :already_running. Keyed by
+      # runtime key (uid when present, else slug), matching `running`; the entry
+      # carries the slug + uid so the snapshot's `blocked` rows expose both.
+      # Surfaced in the snapshot's `blocked` list so the kanban shows *why* a
+      # fiber isn't progressing instead of leaving the poll-cycle warning to
+      # scroll unread in the daemon log. Entries clear on successful dispatch or
+      # when the fiber's eligibility changes (frontmatter edit, pause, close).
       dispatch_failures: %{},
-      # %{fiber_id => unix_ms} — the instant a standing role was re-armed by
-      # accept/resume. One of the "last serviced" signals the due rule anchors on
+      # %{runtime_key => unix_ms} — the instant a standing role was re-armed by
+      # accept/resume, keyed by runtime key (uid when present, else slug) so a
+      # rename mid-cycle can't strand the stamp. One of the "last serviced"
+      # signals the due rule anchors on
       # (alongside felt-history worker events and the role's creation): it marks
       # the just-served occurrence so the role isn't immediately re-served when
       # accept flips closed→active. Belt-and-suspenders to the durable history
@@ -545,13 +557,15 @@ defmodule Shuttle.Poller do
   end
 
   def handle_call({:worker_status, fiber_id}, _from, state) do
-    fiber_id = address_for_identifier(state, fiber_id)
+    # `running_worker` resolves a uid or slug input through `running_key`'s scan,
+    # so no separate uid→slug bridge is needed at this boundary.
     {:reply, running_worker(state, fiber_id), state}
   end
 
   def handle_call({:claim_session, fiber_id, tmux_session, opts}, _from, state) do
-    fiber_id = address_for_identifier(state, fiber_id)
-    {state, reply} = do_claim_session(state, fiber_id, tmux_session, opts)
+    {runtime_key, slug} = resolve_identity(state, fiber_id)
+    uid = running_uid(state, slug) || if(Shuttle.ULID.valid?(runtime_key), do: runtime_key)
+    {state, reply} = do_claim_session(state, slug, uid, tmux_session, opts)
     {:reply, reply, state}
   end
 
@@ -588,15 +602,16 @@ defmodule Shuttle.Poller do
   end
 
   def handle_call({:dispatch, fiber_id, opts}, _from, state) do
-    fiber_id = address_for_identifier(state, fiber_id)
+    {runtime_key, fiber_id} = resolve_identity(state, fiber_id)
     state = reconcile_running_fiber(state, fiber_id)
-    session = Dispatcher.session_name(fiber_id, uid_for_fiber(state, fiber_id))
+    uid = running_uid(state, fiber_id) || if(Shuttle.ULID.valid?(runtime_key), do: runtime_key)
+    session = Dispatcher.session_name(fiber_id, uid)
 
     cond do
-      running_key(state, fiber_id) != nil or MapSet.member?(state.claimed, fiber_id) ->
+      running_key(state, fiber_id) != nil or MapSet.member?(state.claimed, runtime_key) ->
         {:reply, {:error, :already_running}, state}
 
-      fiber_session_live?(state, fiber_id) ->
+      fiber_session_live?(state, fiber_id, uid) ->
         {:reply, {:error, :already_running}, state}
 
       true ->
@@ -629,37 +644,39 @@ defmodule Shuttle.Poller do
   end
 
   def handle_call({:actions, fiber_id, opts}, _from, state) do
-    fiber_id = address_for_identifier(state, fiber_id)
+    {_runtime_key, slug} = resolve_identity(state, fiber_id)
 
     opts = Keyword.merge([felt_stores: state.felt_stores, runner: state.runner], opts)
-    {:reply, ActionQueries.actions_for(fiber_id, opts), state}
+    {:reply, ActionQueries.actions_for(slug, opts), state}
   end
 
   def handle_call({:resolve_action, fiber_id, target, opts}, _from, state) do
-    fiber_id = address_for_identifier(state, fiber_id)
+    {_runtime_key, slug} = resolve_identity(state, fiber_id)
 
     opts = Keyword.merge([felt_stores: state.felt_stores, runner: state.runner], opts)
-    {:reply, ActionQueries.resolve_action(fiber_id, target, opts), state}
+    {:reply, ActionQueries.resolve_action(slug, target, opts), state}
   end
 
   def handle_call({:lifecycle_transition, verb, fiber_id, opts}, _from, state) do
-    fiber_id = address_for_identifier(state, fiber_id)
+    {runtime_key, slug} = resolve_identity(state, fiber_id)
 
     result =
       case verb do
-        :accept -> LifecycleStore.accept(fiber_id, opts)
-        :resume -> LifecycleStore.resume(fiber_id)
+        :accept -> LifecycleStore.accept(slug, opts)
+        :resume -> LifecycleStore.resume(slug)
         other -> {:error, "unknown lifecycle transition #{inspect(other)}"}
       end
 
     # On a successful re-arm, stamp the instant so the due-window clamp in
     # `standing_role_due?` won't re-serve the occurrence that just ran (the
     # standing-role temper oscillation). accept/resume both flip closed→active.
+    # Keyed by runtime key so the poll's `last_serviced_at_ms` (which reads the
+    # candidate's runtime key) finds it.
     state =
       case result do
         {:ok, _} when verb in [:accept, :resume] ->
           now_ms = DateTime.utc_now() |> DateTime.to_unix(:millisecond)
-          %{state | rearmed_at: Map.put(state.rearmed_at, fiber_id, now_ms)}
+          %{state | rearmed_at: Map.put(state.rearmed_at, runtime_key, now_ms)}
 
         _ ->
           state
@@ -737,12 +754,15 @@ defmodule Shuttle.Poller do
 
   # ── Snapshot ──
 
-  @doc false
-  def uid_for_fiber(%State{} = state, fiber_id, metadata \\ %{}) do
-    case metadata_uid(metadata) || Map.get(state.fiber_uid_cache, fiber_id) do
-      uid when is_binary(uid) and uid != "" -> uid
-      _ -> nil
-    end
+  # The uid carried by a running entry matching `identifier` (by runtime key,
+  # slug address, or uid), or nil when no running entry matches. Used to build
+  # the uid-keyed session name for a fiber addressed by slug — the runtime
+  # registry, not a cache, is the uid source now that the bridge is gone.
+  defp running_uid(%State{} = state, identifier) do
+    Enum.find_value(state.running, fn {key, metadata} ->
+      if identifier in [key, fiber_address(metadata), metadata_uid(metadata)],
+        do: metadata_uid(metadata)
+    end)
   end
 
   @doc false
@@ -751,41 +771,55 @@ defmodule Shuttle.Poller do
     metadata_uid(fiber) || fiber_id
   end
 
-  defp address_for_identifier(%State{} = state, identifier) when is_binary(identifier) do
-    cond do
-      Map.has_key?(state.fiber_uid_cache, identifier) ->
-        identifier
+  # Resolve any public identifier (a uid from the UI, a slug from the CLI) to
+  # `{runtime_key, slug}`: the runtime key is what `running`/`claimed`/
+  # `dispatch_failures`/`rearmed_at` are keyed by (uid when the fiber has one,
+  # else slug), and the slug is felt's address for I/O. Resolution order, each
+  # step cheaper than a felt shell-out before it:
+  #   1. the running registry (`running_key`'s scan) — a live fiber answers from
+  #      its own metadata;
+  #   2. the poll-refreshed `uid_slug_index` — a uid-shaped input maps to its
+  #      slug with an O(1) hit (the kanban hot path), no felt walk;
+  #   3. `FeltStores.resolve_fiber/2` — the cold-miss fallback only (a uid not
+  #      seen since the last poll, or a slug input), matching the old
+  #      cache-miss behavior. Falls back to `{identifier, identifier}` when felt
+  #      can't resolve (preserving the prior "use the input as-is" behavior).
+  # This is the single uid↔slug seam that replaced the deleted
+  # `address_for_identifier` bridge — felt stays slug-addressed throughout.
+  defp resolve_identity(%State{} = state, identifier) when is_binary(identifier) do
+    case running_key(state, identifier) do
+      nil ->
+        case Map.get(state.uid_slug_index, identifier) do
+          slug when is_binary(slug) ->
+            {identifier, slug}
 
-      true ->
-        address_from_runtime_maps(state, identifier) ||
-          address_from_uid_cache(state, identifier) ||
-          address_from_felt_stores(identifier) ||
-          identifier
+          _ ->
+            case Shuttle.FeltStores.resolve_fiber(identifier, state.felt_stores) do
+              {:ok, %{uid: uid, fiber_id: slug}} when is_binary(uid) and uid != "" -> {uid, slug}
+              {:ok, %{fiber_id: slug}} -> {slug, slug}
+              _ -> {identifier, identifier}
+            end
+        end
+
+      runtime_key ->
+        {runtime_key, fiber_address(Map.get(state.running, runtime_key))}
     end
   end
 
-  defp address_for_identifier(_state, identifier), do: identifier
+  # Builds the boundary uid→slug resolution index from the poll's candidates.
+  # Every candidate row carries both its slug `id` and intrinsic `uid`. A
+  # felt-I/O resolution aid ONLY — runtime state stays keyed by uid; this is
+  # NOT the deleted uid↔slug runtime-keying bridge.
+  defp build_uid_slug_index(candidates) do
+    Enum.reduce(candidates, %{}, fn fiber, acc ->
+      case {Map.get(fiber, "uid"), Map.get(fiber, "id")} do
+        {uid, slug} when is_binary(uid) and uid != "" and is_binary(slug) and slug != "" ->
+          Map.put(acc, uid, slug)
 
-  defp address_from_uid_cache(%State{} = state, uid) do
-    Enum.find_value(state.fiber_uid_cache, fn {fiber_id, cached_uid} ->
-      if cached_uid == uid, do: fiber_id
+        _ ->
+          acc
+      end
     end)
-  end
-
-  defp address_from_runtime_maps(%State{} = state, identifier) do
-    Enum.find_value(state.running, fn {_key, metadata} ->
-      address = fiber_address(metadata)
-      uid = metadata_uid(metadata)
-
-      if identifier in [address, uid], do: address
-    end)
-  end
-
-  defp address_from_felt_stores(identifier) do
-    case Shuttle.FeltStores.resolve_fiber(identifier) do
-      {:ok, %{fiber_id: fiber_id}} -> fiber_id
-      {:error, :not_found} -> nil
-    end
   end
 
   @doc false
@@ -844,7 +878,7 @@ defmodule Shuttle.Poller do
   # down with the Task.
   defp poll_reads(%State{} = state) do
     state = refresh_felt_stores(state)
-    {:ok, candidates, host_map, uid_map} = discover_candidates(state)
+    {:ok, candidates, host_map} = discover_candidates(state)
     {document_cache, document_cache_stats} = refresh_document_cache(state, candidates, host_map)
 
     {:ok,
@@ -852,7 +886,6 @@ defmodule Shuttle.Poller do
        felt_stores: state.felt_stores,
        candidates: candidates,
        host_map: host_map,
-       uid_map: uid_map,
        document_cache: document_cache,
        document_cache_stats: document_cache_stats
      }}
@@ -875,7 +908,6 @@ defmodule Shuttle.Poller do
          felt_stores: felt_stores,
          candidates: candidates,
          host_map: new_host_map,
-         uid_map: new_uid_map,
          document_cache: document_cache,
          document_cache_stats: document_cache_stats
        }) do
@@ -889,7 +921,9 @@ defmodule Shuttle.Poller do
     state = %{
       state
       | fiber_host_cache: Map.merge(new_host_map, state.fiber_host_cache),
-        fiber_uid_cache: Map.merge(new_uid_map, state.fiber_uid_cache),
+        # Rebuilt (not merged) each poll so a rename or delete can't leave a
+        # stale uid→slug entry; an as-yet-unseen uid falls through to felt.
+        uid_slug_index: build_uid_slug_index(candidates),
         document_cache: document_cache,
         document_cache_stats: document_cache_stats,
         document_cache_ready: true,
@@ -937,7 +971,11 @@ defmodule Shuttle.Poller do
       |> Enum.map(&Map.get(&1, "id", ""))
       |> MapSet.new()
 
-    Map.filter(failures, fn {fiber_id, _entry} -> MapSet.member?(active_ids, fiber_id) end)
+    # Keyed by runtime key now; match the carried slug (`entry.fiber_id`)
+    # against the active candidate slugs.
+    Map.filter(failures, fn {_key, entry} ->
+      MapSet.member?(active_ids, Map.get(entry, :fiber_id))
+    end)
   end
 
   # Discovers candidate fibers by asking felt for a narrow shuttle projection
@@ -945,10 +983,12 @@ defmodule Shuttle.Poller do
   # No tag predicate — the shuttle: block is the source of truth, matching the
   # same contract every other surface reads.
   #
-  # Returns {:ok, fibers, host_map, uid_map} where:
+  # Returns {:ok, fibers, host_map} where:
   #   fibers   — [%{"id" => id, "uid" => uid, "status" => status, "path" => …}] across all hosts
   #   host_map — %{fiber_id => felt_store} for host resolution
-  #   uid_map  — %{fiber_id => uid} for the intrinsic identity read surface
+  #
+  # Each fiber row carries its own "uid", so callers that need the intrinsic
+  # identity read it off the candidate directly — no separate uid map.
   #
   # ## Symlink discipline
   #
@@ -977,8 +1017,8 @@ defmodule Shuttle.Poller do
   # enumerates it. Ownership is read from felt's path, never reverse-derived.
   @doc false
   def discover_candidates(state) do
-    {all_fibers, host_map, uid_map} =
-      Enum.reduce(state.felt_stores, {[], %{}, %{}}, fn host, {acc_fibers, acc_map, acc_uids} ->
+    {all_fibers, host_map} =
+      Enum.reduce(state.felt_stores, {[], %{}}, fn host, {acc_fibers, acc_map} ->
         case list_shuttle_fibers(host, state) do
           {:ok, fibers} ->
             new_map =
@@ -987,27 +1027,15 @@ defmodule Shuttle.Poller do
                 Map.put(hm, id, host)
               end)
 
-            new_uids =
-              Enum.reduce(fibers, %{}, fn fiber, uids ->
-                case {Map.get(fiber, "id"), Map.get(fiber, "uid")} do
-                  {id, uid} when is_binary(id) and id != "" and is_binary(uid) and uid != "" ->
-                    Map.put(uids, id, uid)
-
-                  _ ->
-                    uids
-                end
-              end)
-
             merged_map = Map.merge(new_map, acc_map)
-            merged_uids = Map.merge(new_uids, acc_uids)
-            {acc_fibers ++ fibers, merged_map, merged_uids}
+            {acc_fibers ++ fibers, merged_map}
 
           {:error, _} ->
-            {acc_fibers, acc_map, acc_uids}
+            {acc_fibers, acc_map}
         end
       end)
 
-    {:ok, all_fibers, host_map, uid_map}
+    {:ok, all_fibers, host_map}
   end
 
   # Owner-only feed gate for a cached document entry: keep it iff its
@@ -1270,8 +1298,9 @@ defmodule Shuttle.Poller do
         running_key(state, fiber_id) != nil ->
           false
 
-        # Must not be claimed (retry queued)
-        MapSet.member?(state.claimed, fiber_id) ->
+        # Must not be claimed (retry queued). `claimed` is keyed by runtime key
+        # (uid when present), so match the candidate's runtime key, not its slug.
+        MapSet.member?(state.claimed, runtime_key_for_fiber(fiber)) ->
           false
 
         # Pinned roles need no bespoke branch HERE: this predicate also serves
@@ -1746,6 +1775,11 @@ defmodule Shuttle.Poller do
     # No-op for active roles, oneshots, and non-forced dispatch.
     fiber = maybe_force_rearm(fiber, opts)
 
+    # The runtime key (uid when the fiber carries one, else slug) keys every
+    # runtime map — running, claimed, dispatch_failures. felt I/O below stays
+    # addressed by the slug `fiber_id`.
+    runtime_key = runtime_key_for_fiber(fiber)
+
     felt_store =
       case host_for_fiber(fiber_id, state) do
         {:ok, h} -> h
@@ -1776,7 +1810,6 @@ defmodule Shuttle.Poller do
         {:ok, agent} = Shuttle.Agents.resolve_by_name(agent_name)
 
         now = DateTime.utc_now()
-        runtime_key = runtime_key_for_fiber(fiber)
 
         running_meta =
           %{
@@ -1798,8 +1831,8 @@ defmodule Shuttle.Poller do
             state = %{
               state
               | running: running,
-                claimed: MapSet.put(state.claimed, fiber_id),
-                dispatch_failures: Map.delete(state.dispatch_failures, fiber_id)
+                claimed: MapSet.put(state.claimed, runtime_key),
+                dispatch_failures: Map.delete(state.dispatch_failures, runtime_key)
             }
 
             {state, {:ok, session}}
@@ -1809,20 +1842,20 @@ defmodule Shuttle.Poller do
             # failure for the `blocked` snapshot; the next poll re-evaluates the
             # fiber (status:active + no watcher → eligible / adopted again).
             Logger.error("Failed to start watcher for #{fiber_id}: #{inspect(reason)}")
-            state = release_claim(state, fiber_id)
-            state = record_dispatch_failure(state, fiber_id, :watcher_start_failed)
+            state = release_claim(state, runtime_key)
+            state = record_dispatch_failure(state, fiber, :watcher_start_failed)
             {state, {:error, :watcher_start_failed}}
         end
 
       {:error, :already_running} ->
         # Session exists but we don't have a watcher — adopt it
         state = SessionReconciliation.adopt_session(state, fiber_id)
-        state = %{state | dispatch_failures: Map.delete(state.dispatch_failures, fiber_id)}
+        state = %{state | dispatch_failures: Map.delete(state.dispatch_failures, runtime_key)}
         {state, {:error, :already_running}}
 
       {:error, reason} ->
         Logger.warning("Dispatch failed for #{fiber_id}: #{inspect(reason)}")
-        state = record_dispatch_failure(state, fiber_id, reason)
+        state = record_dispatch_failure(state, fiber, reason)
         {state, {:error, reason}}
     end
   end
@@ -1831,7 +1864,7 @@ defmodule Shuttle.Poller do
   # session to the canonical worker name, register it in `running` with a
   # watcher, log the dispatch-shaped history event, and refresh the document
   # cache so the board reflects the claim immediately.
-  defp do_claim_session(%State{} = state, fiber_id, tmux_session, opts) do
+  defp do_claim_session(%State{} = state, fiber_id, uid, tmux_session, opts) do
     state = reconcile_running_fiber(state, fiber_id)
 
     running =
@@ -1840,7 +1873,11 @@ defmodule Shuttle.Poller do
         key -> Map.get(state.running, key)
       end
 
-    live_session = live_session_for_fiber(state, fiber_id)
+    # Pass the resolved uid so the pre-check sees the canonical
+    # `<leaf>-<uid>-shuttle` name, not just the legacy leaf-only one — a live
+    # canonical session of a not-yet-running fiber is then refused with
+    # :already_running instead of degrading to a rename collision.
+    live_session = live_session_for_fiber(state, fiber_id, uid)
 
     cond do
       # Idempotent retry: the fiber's running worker is this very session —
@@ -1946,8 +1983,8 @@ defmodule Shuttle.Poller do
         state = %{
           state
           | running: Map.put(state.running, runtime_key, running_meta),
-            claimed: MapSet.put(state.claimed, fiber_id),
-            dispatch_failures: Map.delete(state.dispatch_failures, fiber_id)
+            claimed: MapSet.put(state.claimed, runtime_key),
+            dispatch_failures: Map.delete(state.dispatch_failures, runtime_key)
         }
 
         log_worker_claim(fiber_id, agent.id, Keyword.get(opts, :session_uuid), state)
@@ -2004,19 +2041,29 @@ defmodule Shuttle.Poller do
   # entry is surfaced in `build_snapshot/1` under `blocked` so the kanban can
   # show why a fiber is stuck — replacing the silent-warning-log failure mode
   # where a `:missing_session_id` block could persist for days unnoticed.
-  defp record_dispatch_failure(%State{} = state, fiber_id, reason) do
+  defp record_dispatch_failure(%State{} = state, fiber, reason) do
     now = DateTime.utc_now()
+    runtime_key = runtime_key_for_fiber(fiber)
+    slug = fiber_address(fiber)
+    uid = metadata_uid(fiber)
 
     entry =
-      case Map.get(state.dispatch_failures, fiber_id) do
+      case Map.get(state.dispatch_failures, runtime_key) do
         %{reason: ^reason, attempts: n} = e ->
           %{e | attempts: n + 1, attempted_at: now}
 
         _ ->
-          %{reason: reason, attempts: 1, attempted_at: now, first_attempted_at: now}
+          %{
+            reason: reason,
+            attempts: 1,
+            attempted_at: now,
+            first_attempted_at: now,
+            fiber_id: slug,
+            uid: uid
+          }
       end
 
-    %{state | dispatch_failures: Map.put(state.dispatch_failures, fiber_id, entry)}
+    %{state | dispatch_failures: Map.put(state.dispatch_failures, runtime_key, entry)}
   end
 
   # ── Reconciliation ──
@@ -2178,7 +2225,7 @@ defmodule Shuttle.Poller do
                 cond do
                   status == "closed" ->
                     # Work complete or blocked — release claim
-                    release_claim(state, fiber_id)
+                    release_claim(state, runtime_key)
 
                   standing_role?(fiber, state) ->
                     # A STANDING (cron) worker's exit makes the role awaiting
@@ -2190,7 +2237,7 @@ defmodule Shuttle.Poller do
                     # skips re-dispatch).
                     StandingRoles.mark_standing_awaiting(fiber_id)
 
-                    release_claim(state, fiber_id)
+                    release_claim(state, runtime_key)
 
                   pinned_role?(fiber) ->
                     # A PINNED interactive role's session ended — the human killed
@@ -2204,19 +2251,19 @@ defmodule Shuttle.Poller do
                     # document reflects the parked state before the claim frees.
                     StandingRoles.mark_pinned_parked(fiber_id)
 
-                    release_claim(state, fiber_id)
+                    release_claim(state, runtime_key)
 
                   true ->
                     # A still-active ONESHOT continuation: the next poll re-picks
                     # it and starts a fresh session (status:active + no live
                     # session → eligible; no resume_mode:previous on file —
                     # retries collapsed into the poll loop).
-                    release_claim(state, fiber_id)
+                    release_claim(state, runtime_key)
                 end
 
               {:error, _} ->
                 # Can't read fiber — release the claim; the next poll re-reads it.
-                release_claim(state, fiber_id)
+                release_claim(state, runtime_key)
             end
         end
     end
@@ -2259,16 +2306,18 @@ defmodule Shuttle.Poller do
   # Dual-recognition liveness: a fiber is running if a live tmux session exists
   # under either its uid-keyed name or the legacy leaf-only name. Used wherever
   # the caller has the fiber identity but not a stored session name.
-  defp fiber_session_live?(%State{} = state, fiber_id) do
-    live_session_for_fiber(state, fiber_id) != nil
+  defp fiber_session_live?(%State{} = state, fiber_id, uid) do
+    live_session_for_fiber(state, fiber_id, uid) != nil
   end
 
   # The fiber's *live* tmux session name (either form), preferring the uid-keyed
   # canonical name when both happen to exist. Returns nil when neither is live.
+  # `uid` may be supplied by a caller that already resolved it (the dispatch and
+  # adopt paths); otherwise it's read off a matching running entry.
   @doc false
-  def live_session_for_fiber(%State{} = state, fiber_id) do
+  def live_session_for_fiber(%State{} = state, fiber_id, uid \\ nil) do
     fiber_id
-    |> Dispatcher.session_names(uid_for_fiber(state, fiber_id))
+    |> Dispatcher.session_names(uid || running_uid(state, fiber_id))
     |> Enum.find(&already_running_session?(state, &1))
   end
 
@@ -2278,18 +2327,17 @@ defmodule Shuttle.Poller do
     max(state.max_concurrent_workers - map_size(state.running), 0)
   end
 
-  defp release_claim(%State{} = state, fiber_id) do
-    %{state | claimed: MapSet.delete(state.claimed, fiber_id)}
+  defp release_claim(%State{} = state, runtime_key) do
+    %{state | claimed: MapSet.delete(state.claimed, runtime_key)}
   end
 
-  defp remove_running(%State{} = state, fiber_id) do
-    metadata = Map.get(state.running, fiber_id, %{})
-    address = fiber_address(metadata)
-
+  # Both `running` and `claimed` are keyed by the same runtime key now, so a
+  # single delete on each clears the fiber's runtime footprint.
+  defp remove_running(%State{} = state, runtime_key) do
     %{
       state
-      | running: Map.delete(state.running, fiber_id),
-        claimed: state.claimed |> MapSet.delete(fiber_id) |> MapSet.delete(address)
+      | running: Map.delete(state.running, runtime_key),
+        claimed: MapSet.delete(state.claimed, runtime_key)
     }
   end
 

@@ -16,7 +16,7 @@ defmodule Shuttle.Poller.StandingRoles do
   inside `Shuttle.Poller`. Truly shared helpers (`role_kind/1`,
   `host_for_fiber/2`, `host_owned?/2`, `running_key/2`, `iso_to_unix_ms/1`,
   `fetch_shuttle_block/2`, `dependencies_satisfied?/2`, `list_shuttle_sessions/1`,
-  `uid_for_fiber/3`) stay in `Shuttle.Poller` and are called from here.
+  `runtime_key_for_fiber/1`) stay in `Shuttle.Poller` and are called from here.
   """
 
   require Logger
@@ -239,7 +239,9 @@ defmodule Shuttle.Poller.StandingRoles do
 
     case Map.get(fiber, "shuttle") do
       shuttle when is_map(shuttle) ->
-        StandingRole.from_map(fiber_id, shuttle)
+        # Carry the candidate's uid onto the role so the snapshot's `:uid` join
+        # key survives without the deleted uid cache.
+        StandingRole.from_map(fiber_id, shuttle, Map.get(fiber, "uid"))
 
       _ ->
         {:error, :no_shuttle_block}
@@ -305,7 +307,9 @@ defmodule Shuttle.Poller.StandingRoles do
   def last_serviced_at_ms(fiber, fiber_id, state, now_ms) do
     [
       last_service_event_ms(fiber_id, state),
-      Map.get(state.rearmed_at, fiber_id),
+      # `rearmed_at` is keyed by runtime key (uid when present), so look it up by
+      # the candidate's runtime key — matching how `lifecycle_transition` stamps.
+      Map.get(state.rearmed_at, Poller.runtime_key_for_fiber(fiber)),
       created_at_ms(fiber)
     ]
     |> Enum.reject(&is_nil/1)
@@ -356,7 +360,7 @@ defmodule Shuttle.Poller.StandingRoles do
       # tick, not a stored timestamp (the slice-2 cutover). Falls back to the
       # snapshot's stored value when the schedule won't parse.
       |> put_computed_next_due(role, now)
-      |> Map.put(:uid, Poller.uid_for_fiber(state, role.fiber_id))
+      |> Map.put(:uid, role.uid)
     end)
   end
 

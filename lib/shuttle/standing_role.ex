@@ -12,6 +12,10 @@ defmodule Shuttle.StandingRole do
 
   defstruct [
     :fiber_id,
+    # Intrinsic uid (ULID) carried from the candidate document, for the
+    # snapshot's runtime join key. nil when the caller didn't supply it (the
+    # parser/cron paths that don't need it) or the fiber has no uid.
+    :uid,
     :mode,
     :schedule,
     :next_due_at,
@@ -22,6 +26,7 @@ defmodule Shuttle.StandingRole do
 
   @type t :: %__MODULE__{
           fiber_id: String.t(),
+          uid: String.t() | nil,
           mode: String.t() | nil,
           schedule: map(),
           next_due_at: DateTime.t() | nil,
@@ -30,10 +35,11 @@ defmodule Shuttle.StandingRole do
           validation_errors: [String.t()]
         }
 
-  @spec from_map(String.t(), map()) :: {:ok, t()} | {:error, term()}
-  def from_map(fiber_id, data) when is_map(data) do
+  @spec from_map(String.t(), map(), String.t() | nil) :: {:ok, t()} | {:error, term()}
+  def from_map(fiber_id, data, uid \\ nil) when is_map(data) do
     role = %__MODULE__{
       fiber_id: fiber_id,
+      uid: uid,
       mode: string(data["kind"] || data["mode"]),
       schedule: map(data["schedule"]),
       next_due_at: parse_datetime(data["next_due_at"]),
