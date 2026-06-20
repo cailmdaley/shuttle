@@ -1190,6 +1190,109 @@ defmodule Shuttle.PollerTest do
     assert doc =~ ~r/status:\s*closed/
   end
 
+  # Inject a running entry with a chosen start time, then deliver a worker exit —
+  # the precise input the breaker keys on (a oneshot exit and its lifetime),
+  # without the dispatch/watcher/resume machinery that makes a full
+  # spawn→kill→resume loop nondeterministic under the mock runner.
+  defp simulate_exit(poller, fiber_id, lifetime_seconds) do
+    started = DateTime.add(DateTime.utc_now(), -lifetime_seconds, :second)
+
+    :sys.replace_state(poller, fn state ->
+      meta = %{
+        fiber_id: fiber_id,
+        session: Dispatcher.session_name(fiber_id),
+        agent_id: "claude-sonnet",
+        uid: nil,
+        started_at: started,
+        last_activity_at: started
+      }
+
+      %{
+        state
+        | running: Map.put(state.running, fiber_id, meta),
+          claimed: MapSet.put(state.claimed, fiber_id)
+      }
+    end)
+
+    send(poller, {:worker_exited, fiber_id, :normal_exit, false})
+    # Synchronous call flushes the exit message (mailbox order) before we read.
+    _ = Poller.snapshot(poller)
+  end
+
+  defp loop_blocked?(poller, fiber_id) do
+    Enum.any?(Poller.snapshot(poller).blocked, fn b ->
+      b.fiber_id == fiber_id and b.reason =~ "resume_loop"
+    end)
+  end
+
+  test "resume-loop breaker pauses a oneshot whose workers keep dying instantly, and force-dispatch overrides it" do
+    # The kill-and-resume churn: a still-active oneshot whose worker dies almost
+    # immediately (stale/unresumable session, wrong project_dir, TCC-blocked cwd)
+    # is re-dispatched every poll, dying again each time — observed as 125 resumes
+    # of one fiber in a day. After @resume_loop_max_rapid_exits consecutive rapid
+    # exits the breaker opens: the fiber goes ineligible (surfaced as `blocked`)
+    # until a cooldown or a human force-dispatch. Reverting the eligible? guard or
+    # note_worker_lifetime re-arms the infinite loop.
+    fiber_id = "tests/resume-loop-breaker"
+    MockRunner.set_fiber(fiber_id, make_fiber(fiber_id, %{"status" => "active"}))
+    MockRunner.set_shuttle(fiber_id, "kind: oneshot\nagent: claude-sonnet\n", "active")
+
+    # max_concurrent_workers: 0 disables the autonomous tick's dispatch (the
+    # first poll fires at 0ms and would otherwise spawn a real worker mid-test);
+    # explicit Poller.dispatch_fiber/3 is not slot-gated, so the breaker path is
+    # still fully exercised.
+    {:ok, poller} =
+      start_poller!(
+        name: :test_poller_resume_loop_breaker,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        max_concurrent_workers: 0,
+        felt_stores: ["/tmp"]
+      )
+
+    # Four rapid (0s-lifetime) exits — one short of tripping; breaker stays closed.
+    for _ <- 1..4, do: simulate_exit(poller, fiber_id, 0)
+    refute loop_blocked?(poller, fiber_id)
+
+    # The fifth rapid exit opens the breaker: now blocked, and an autonomous
+    # (non-force) dispatch is refused.
+    simulate_exit(poller, fiber_id, 0)
+    assert loop_blocked?(poller, fiber_id)
+    assert {:error, _} = Poller.dispatch_fiber(poller, fiber_id, [])
+
+    # A human force-dispatch is an explicit "go": it clears the breaker and spawns.
+    assert {:ok, _} = Poller.dispatch_fiber(poller, fiber_id, force: true)
+    refute loop_blocked?(poller, fiber_id)
+  end
+
+  test "a healthy worker run resets the resume-loop breaker count" do
+    # A long-lived run (≥ the rapid-exit threshold) is the system working: it must
+    # zero the consecutive-rapid-exit count so a fiber that occasionally has a fast
+    # exit between real work never trips.
+    fiber_id = "tests/resume-loop-reset"
+    MockRunner.set_fiber(fiber_id, make_fiber(fiber_id, %{"status" => "active"}))
+    MockRunner.set_shuttle(fiber_id, "kind: oneshot\nagent: claude-sonnet\n", "active")
+
+    {:ok, poller} =
+      start_poller!(
+        name: :test_poller_resume_loop_reset,
+        runner: MockRunner,
+        poll_interval_ms: 60_000,
+        max_concurrent_workers: 0,
+        felt_stores: ["/tmp"]
+      )
+
+    # 4 rapid exits — one short of tripping.
+    for _ <- 1..4, do: simulate_exit(poller, fiber_id, 0)
+
+    # A healthy run lands (lived well past the threshold): clears the count.
+    simulate_exit(poller, fiber_id, 3600)
+
+    # 4 more rapid exits still don't trip (the reset means it would take 5 fresh).
+    for _ <- 1..4, do: simulate_exit(poller, fiber_id, 0)
+    refute loop_blocked?(poller, fiber_id)
+  end
+
   test "poller does not dispatch a scheduled standing role before it is due" do
     fiber = make_fiber("tests/standing-sleeping", %{"tags" => ["constitution", "standing"]})
     MockRunner.set_fiber("tests/standing-sleeping", fiber)

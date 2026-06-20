@@ -47,6 +47,21 @@ defmodule Shuttle.Poller do
   @dispatch_call_timeout_ms 30_000
   @orchestrator_state_call_timeout_ms 30_000
 
+  # Resume-loop circuit breaker. A still-active oneshot whose worker exits is
+  # re-dispatched on the next poll (resuming the prior transcript on a dirty
+  # death). When a worker dies almost immediately — a stale/unresumable session,
+  # a wrong project_dir, a TCC-blocked cwd — that re-dispatch produces another
+  # near-instant death, and the fiber churns ~every poll forever (observed: one
+  # fiber resumed 125× in a day). The breaker counts CONSECUTIVE rapid exits
+  # (worker lived < threshold) per fiber; after `max` it pauses autonomous
+  # dispatch for a cooldown and surfaces the fiber as `blocked` so a human looks.
+  # A healthy run (lived ≥ threshold) or a human force-dispatch clears the count.
+  # Lifetime-based on purpose: it needs no felt-history handoff signal, so it
+  # survives the history-shed rework intact.
+  @resume_loop_rapid_exit_threshold_ms 90_000
+  @resume_loop_max_rapid_exits 5
+  @resume_loop_cooldown_ms 600_000
+
   defmodule State do
     @moduledoc false
     defstruct [
@@ -131,7 +146,16 @@ defmodule Shuttle.Poller do
       # signal — it covers the window where a transient felt read fails right after
       # accept. NOT persisted; a restart loses nothing the history signal doesn't
       # already carry.
-      rearmed_at: %{}
+      rearmed_at: %{},
+      # %{runtime_key => %{count: pos_integer, opened_at: DateTime.t | nil,
+      # fiber_id: slug, uid: String.t | nil}} — the resume-loop circuit breaker's
+      # per-fiber state. `count` is consecutive rapid worker exits (lived <
+      # @resume_loop_rapid_exit_threshold_ms); `opened_at` is set once count
+      # crosses @resume_loop_max_rapid_exits, pausing autonomous dispatch for
+      # @resume_loop_cooldown_ms. Cleared by a healthy run, a force-dispatch, or
+      # the fiber leaving the active candidate set. NOT persisted — a restart is a
+      # clean slate (and re-adopts live workers rather than re-dispatching).
+      resume_loop: %{}
     ]
   end
 
@@ -928,7 +952,8 @@ defmodule Shuttle.Poller do
         document_cache_stats: document_cache_stats,
         document_cache_ready: true,
         standing_roles: standing_roles,
-        dispatch_failures: evict_stale_dispatch_failures(state.dispatch_failures, candidates)
+        dispatch_failures: evict_stale_dispatch_failures(state.dispatch_failures, candidates),
+        resume_loop: evict_stale_resume_loop(state.resume_loop, candidates)
     }
 
     # Downtime recovery: a standing role whose tmux session is gone but whose
@@ -1301,6 +1326,13 @@ defmodule Shuttle.Poller do
         # Must not be claimed (retry queued). `claimed` is keyed by runtime key
         # (uid when present), so match the candidate's runtime key, not its slug.
         MapSet.member?(state.claimed, runtime_key_for_fiber(fiber)) ->
+          false
+
+        # Resume-loop circuit breaker is open: this fiber's workers keep dying
+        # almost immediately, so autonomous re-dispatch is paused for a cooldown
+        # (it surfaces as `blocked`). A human force-dispatch bypasses eligible?
+        # entirely and clears the breaker; a healthy run clears it on exit.
+        resume_loop_open?(state, runtime_key_for_fiber(fiber)) ->
           false
 
         # Pinned roles need no bespoke branch HERE: this predicate also serves
@@ -1780,6 +1812,14 @@ defmodule Shuttle.Poller do
     # addressed by the slug `fiber_id`.
     runtime_key = runtime_key_for_fiber(fiber)
 
+    # A human force-dispatch ("New session" / "Resume" / drag-to-inFlight) is an
+    # explicit "go" — clear any open resume-loop breaker so the worker spawns now
+    # rather than sitting out the cooldown.
+    state =
+      if Keyword.get(opts, :force, false),
+        do: clear_resume_loop(state, runtime_key),
+        else: state
+
     felt_store =
       case host_for_fiber(fiber_id, state) do
         {:ok, h} -> h
@@ -2257,8 +2297,13 @@ defmodule Shuttle.Poller do
                     # A still-active ONESHOT continuation: the next poll re-picks
                     # it and starts a fresh session (status:active + no live
                     # session → eligible; no resume_mode:previous on file —
-                    # retries collapsed into the poll loop).
-                    release_claim(state, runtime_key)
+                    # retries collapsed into the poll loop). Feed the worker's
+                    # lifetime to the resume-loop breaker: a rapid death (lived <
+                    # threshold) increments the count and may open the circuit; a
+                    # healthy run clears it.
+                    state
+                    |> note_worker_lifetime(runtime_key, fiber, meta)
+                    |> release_claim(runtime_key)
                 end
 
               {:error, _} ->
@@ -2267,6 +2312,96 @@ defmodule Shuttle.Poller do
             end
         end
     end
+  end
+
+  # ── Resume-loop circuit breaker ──
+
+  # Record a finished worker's lifetime against the breaker. A healthy run
+  # (lived ≥ threshold) clears the fiber's loop count; a rapid death increments
+  # it and may open the circuit. Scoped to the still-active-oneshot exit branch
+  # — the only path that auto-re-dispatches, hence the only one that can loop.
+  defp note_worker_lifetime(%State{} = state, runtime_key, fiber, meta) do
+    if worker_lifetime_ms(meta) >= @resume_loop_rapid_exit_threshold_ms do
+      %{state | resume_loop: Map.delete(state.resume_loop, runtime_key)}
+    else
+      bump_resume_loop(state, runtime_key, fiber)
+    end
+  end
+
+  # Wall-clock lifetime of a worker from its running metadata. Clamped to ≥ 0 so
+  # a backward clock step (observed on this host) can't read as a huge lifetime
+  # and mask a loop — a non-positive diff counts as a rapid exit. An absent
+  # started_at is treated as healthy (don't trip on missing data).
+  defp worker_lifetime_ms(meta) do
+    case Map.get(meta, :started_at) do
+      %DateTime{} = started -> max(0, DateTime.diff(DateTime.utc_now(), started, :millisecond))
+      _ -> @resume_loop_rapid_exit_threshold_ms
+    end
+  end
+
+  defp bump_resume_loop(%State{} = state, runtime_key, fiber) do
+    now = DateTime.utc_now()
+
+    entry =
+      Map.get(state.resume_loop, runtime_key, %{
+        count: 0,
+        opened_at: nil,
+        fiber_id: fiber_address(fiber),
+        uid: metadata_uid(fiber)
+      })
+
+    count = entry.count + 1
+    tripping? = count >= @resume_loop_max_rapid_exits
+
+    if tripping? do
+      Logger.warning(
+        "Resume-loop breaker open for #{fiber_address(fiber)}: #{count} consecutive rapid " <>
+          "worker exits (each < #{div(@resume_loop_rapid_exit_threshold_ms, 1000)}s) — pausing " <>
+          "autonomous dispatch for #{div(@resume_loop_cooldown_ms, 60_000)}m (force-dispatch to override)"
+      )
+    end
+
+    opened_at = if tripping?, do: now, else: entry.opened_at
+    %{state | resume_loop: Map.put(state.resume_loop, runtime_key, %{entry | count: count, opened_at: opened_at})}
+  end
+
+  # True while the breaker is open AND inside its cooldown window. After the
+  # cooldown elapses the fiber is eligible again (one retry); a healthy run then
+  # clears the entry, while another rapid death re-opens it immediately (count is
+  # already past the threshold), so a persistent loop is bounded to one attempt
+  # per cooldown instead of one per poll.
+  @doc false
+  def resume_loop_open?(%State{} = state, runtime_key) do
+    case Map.get(state.resume_loop, runtime_key) do
+      %{opened_at: %DateTime{} = opened} ->
+        DateTime.diff(DateTime.utc_now(), opened, :millisecond) < @resume_loop_cooldown_ms
+
+      _ ->
+        false
+    end
+  end
+
+  # Clear the breaker for a fiber — a human force-dispatch is an explicit "go",
+  # overriding any paused loop, and the next poll's eviction also drops entries
+  # for fibers that left the active candidate set.
+  defp clear_resume_loop(%State{} = state, runtime_key) do
+    %{state | resume_loop: Map.delete(state.resume_loop, runtime_key)}
+  end
+
+  # Drops resume_loop entries for fibers shuttle no longer auto-dispatches —
+  # paused, closed, shuttle block removed, or gone — so a config fix or pause
+  # clears the paused state without waiting out the cooldown. Mirrors
+  # evict_stale_dispatch_failures; keyed by runtime key, matched on carried slug.
+  defp evict_stale_resume_loop(resume_loop, candidates) do
+    active_ids =
+      candidates
+      |> Enum.filter(fn fiber -> Map.get(fiber, "status") in ["open", "active"] end)
+      |> Enum.map(&Map.get(&1, "id", ""))
+      |> MapSet.new()
+
+    Map.filter(resume_loop, fn {_key, entry} ->
+      MapSet.member?(active_ids, Map.get(entry, :fiber_id))
+    end)
   end
 
   # ── Retry ──
