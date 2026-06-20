@@ -91,8 +91,51 @@ defmodule Shuttle.DispatchIntegrationTest do
     start_supervised!(IntegrationRunner)
     host = mk_tmp_felt_store()
     IntegrationRunner.reset(host)
-    on_exit(fn -> File.rm_rf!(host) end)
+
+    # Isolate the per-host runtime markers (dispatch / handoff / re-arm) under a
+    # throwaway SHUTTLE_DATA_DIR — the substrate that replaced felt history. The
+    # dispatcher writes the dispatch marker keyed by the fiber's runtime key (the
+    # slug for these uid-less test fibers); resume reads it back.
+    prev_data_dir = System.get_env("SHUTTLE_DATA_DIR")
+    data_dir = Path.join(System.tmp_dir!(), "shuttle-int-markers-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(data_dir)
+    System.put_env("SHUTTLE_DATA_DIR", data_dir)
+
+    on_exit(fn ->
+      File.rm_rf!(host)
+      if prev_data_dir, do: System.put_env("SHUTTLE_DATA_DIR", prev_data_dir), else: System.delete_env("SHUTTLE_DATA_DIR")
+      File.rm_rf!(data_dir)
+    end)
+
     {:ok, host: host}
+  end
+
+  # ── Marker helpers (the felt-history replacement) ──
+
+  # Mirror the dispatcher's at-spawn dispatch marker: `{session_uuid,
+  # dispatched_at, run_id}` keyed by the fiber's runtime key (the slug `id` for
+  # these uid-less test fibers). `at` lets a test order a later handoff against it.
+  defp write_dispatch_marker(id, session_id, at \\ DateTime.utc_now()) do
+    :ok =
+      Shuttle.Markers.write_dispatch(id, %{
+        session_uuid: session_id,
+        dispatched_at: DateTime.to_iso8601(at)
+      })
+  end
+
+  # Mirror the worker's `shuttle-ctl handoff`: `~/.shuttle/handoff/<key>`
+  # (extensionless) with `{at}` in RFC3339 UTC — the clean-exit signal.
+  defp write_handoff_marker(id, at \\ DateTime.utc_now()) do
+    path = Shuttle.Markers.handoff_path(id)
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, Jason.encode!(%{at: DateTime.to_iso8601(at)}))
+  end
+
+  # Mirror the lifecycle re-arm marker: `~/.shuttle/rearm/<key>.json` `{at}`.
+  defp write_rearm_marker(id, at \\ DateTime.utc_now()) do
+    path = Shuttle.Markers.rearm_path(id)
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, Jason.encode!(%{at: DateTime.to_iso8601(at)}))
   end
 
   # Start a Poller under ExUnit's per-test supervisor so it is torn down at test
@@ -213,16 +256,10 @@ defmodule Shuttle.DispatchIntegrationTest do
 
   # ── Resume path tests ──────────────────────────────────────────────────────
 
-  # Hypothesis #1 confirmed: shuttle-ctl resume flips enabled=true but does NOT
-  # file a `--kind review-comment` event. check_resume_intent reads only review-
-  # comment events; without one, it returns :fresh, so even a fiber with a stored
-  # shuttle.session.id gets a fresh worker.
-  #
-  # This test documents the current behavior *before* the lifecycle.go fix that
-  # makes shuttle-ctl resume file the review-comment. After that fix lands,
-  # test "CLI resume after fix: review-comment filed → --resume in run-script" below
-  # should cover the green path.
-  test "CLI resume: no review-comment → dispatcher takes fresh path despite session.id",
+  # A clean handoff marker after the dispatch → the prior session closed cleanly →
+  # the next dispatch starts FRESH (no --resume), even though a dispatch marker
+  # with a session id is on file. This is the autonomous loop's fresh half.
+  test "clean handoff → dispatcher takes fresh path despite a stored session",
        %{host: host} do
     write_fiber(host, "tests/cli-resume-no-event", """
     ---
@@ -234,16 +271,18 @@ defmodule Shuttle.DispatchIntegrationTest do
       enabled: true
       kind: oneshot
       agent: claude-sonnet
-      session:
-        agent: claude-sonnet
-        dispatched_at: "2026-05-01T09:00:00Z"
-        id: test-session-uuid-abcd
     ---
-    A fiber with a prior session but no review-comment filed by shuttle-ctl resume.
+    A fiber whose prior session closed cleanly.
     """)
 
-    # No review-comment event filed — this is what shuttle-ctl resume does today
-    # (before the fix). The dispatcher has no resume signal.
+    # Dispatch marker (the session id), then a handoff marker after it → clean
+    # close → the dispatcher takes the fresh path.
+    write_dispatch_marker("tests/cli-resume-no-event", "test-session-uuid-abcd",
+      DateTime.add(DateTime.utc_now(), -60, :second)
+    )
+
+    write_handoff_marker("tests/cli-resume-no-event")
+
     assert {:ok, _} =
              Dispatcher.dispatch("tests/cli-resume-no-event",
                runner: IntegrationRunner,
@@ -256,9 +295,9 @@ defmodule Shuttle.DispatchIntegrationTest do
     refute script =~ "send-keys"
   end
 
-  # After the lifecycle.go fix: shuttle-ctl resume files a review-comment with
-  # resume_mode=previous, so the dispatcher takes the resume path.
-  test "CLI resume after fix: review-comment filed → --resume in run-script", %{host: host} do
+  # The autonomous resume half: a dispatch marker with NO handoff after it (the
+  # worker died mid-thought) → the dispatcher resumes the marker's session.
+  test "dirty death (no handoff marker) → --resume in run-script", %{host: host} do
     write_fiber(host, "tests/cli-resume-fixed", """
     ---
     name: CLI resume fixed
@@ -269,22 +308,12 @@ defmodule Shuttle.DispatchIntegrationTest do
       kind: oneshot
       agent: claude-sonnet
     ---
-    A fiber where shuttle-ctl resume has filed the review-comment.
+    A fiber whose worker died without a clean handoff.
     """)
 
-    # The prior session id lives in felt history (slice 6: no doc-resident
-    # session block); the dispatcher parses it back via extract_session_id.
-    append_worker_exit(host, "tests/cli-resume-fixed",
-      agent: "claude-sonnet",
-      session: "cli-resume-session-uuid"
-    )
-
-    # Simulate what shuttle-ctl resume does after the fix: file a review-comment
-    # with resume_mode=previous so the dispatcher knows to invoke --resume.
-    append_review_comment(host, "tests/cli-resume-fixed",
-      summary: "resumed via shuttle-ctl; session cli-resume-session-uuid available for reattach",
-      resume_mode: "previous"
-    )
+    # The prior session id lives ONLY in the dispatch marker (the daemon wrote it
+    # at spawn; the worker never knew its own UUID). No handoff after it → resume.
+    write_dispatch_marker("tests/cli-resume-fixed", "cli-resume-session-uuid")
 
     assert {:ok, _} =
              Dispatcher.dispatch("tests/cli-resume-fixed",
@@ -299,9 +328,9 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert script =~ "sleep 2"
   end
 
-  # Kanban resume: review-comment with resume_mode=previous triggers claude --resume.
-  # This path works today (kanban writes the review-comment correctly).
-  test "kanban resume: review-comment with resume_mode=previous triggers --resume", %{host: host} do
+  # Kanban resume: resume_mode=previous (a dispatch parameter, STORE 3) triggers
+  # claude --resume against the dispatch marker's session.
+  test "kanban resume: resume_mode=previous param triggers --resume", %{host: host} do
     write_fiber(host, "tests/kanban-resume", """
     ---
     name: Kanban resume fiber
@@ -315,22 +344,15 @@ defmodule Shuttle.DispatchIntegrationTest do
     A fiber that the kanban resumes.
     """)
 
-    # The prior session id lives in felt history (slice 6).
-    append_worker_exit(host, "tests/kanban-resume",
-      agent: "claude-sonnet",
-      session: "kanban-session-uuid-5678"
-    )
+    # The prior session id lives in the dispatch marker.
+    write_dispatch_marker("tests/kanban-resume", "kanban-session-uuid-5678")
 
-    # Kanban writes a review-comment on "Resume previous" click.
-    append_review_comment(host, "tests/kanban-resume",
-      summary: "Continue from where we left off",
-      resume_mode: "previous"
-    )
-
+    # Kanban passes resume_mode: "previous" on the dispatch call (no felt event).
     assert {:ok, _} =
              Dispatcher.dispatch("tests/kanban-resume",
                runner: IntegrationRunner,
-               felt_store: host
+               felt_store: host,
+               resume_mode: "previous"
              )
 
     script = read_run_script()
@@ -366,20 +388,13 @@ defmodule Shuttle.DispatchIntegrationTest do
     A fiber whose stored resume session may no longer be resumable.
     """)
 
-    append_worker_exit(host, "tests/resume-fallback",
-      agent: "claude-sonnet",
-      session: "gone-session-uuid-9999"
-    )
-
-    append_review_comment(host, "tests/resume-fallback",
-      summary: "Resume previous",
-      resume_mode: "previous"
-    )
+    write_dispatch_marker("tests/resume-fallback", "gone-session-uuid-9999")
 
     assert {:ok, _} =
              Dispatcher.dispatch("tests/resume-fallback",
                runner: IntegrationRunner,
-               felt_store: host
+               felt_store: host,
+               resume_mode: "previous"
              )
 
     script = read_run_script()
@@ -396,7 +411,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert resume_idx < fresh_idx
   end
 
-  test "kanban resume uses worker-exit history session when frontmatter session was cleared", %{
+  test "kanban resume uses the dispatch marker's session for a codex worker", %{
     host: host
   } do
     write_fiber(host, "tests/kanban-history-resume", """
@@ -410,23 +425,16 @@ defmodule Shuttle.DispatchIntegrationTest do
       kind: oneshot
       agent: codex
     ---
-    A codex fiber whose live session block has been cleared.
+    A codex fiber resumed from its dispatch marker.
     """)
 
-    append_worker_exit(host, "tests/kanban-history-resume",
-      agent: "codex",
-      session: "40740310-2345-4e33-a1e4-7950db41ce10"
-    )
-
-    append_review_comment(host, "tests/kanban-history-resume",
-      summary: "Continue from history",
-      resume_mode: "previous"
-    )
+    write_dispatch_marker("tests/kanban-history-resume", "40740310-2345-4e33-a1e4-7950db41ce10")
 
     assert {:ok, _} =
              Dispatcher.dispatch("tests/kanban-history-resume",
                runner: IntegrationRunner,
-               felt_store: host
+               felt_store: host,
+               resume_mode: "previous"
              )
 
     script = read_run_script()
@@ -435,7 +443,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert script =~ "Shuttle resumed your previous session"
   end
 
-  test "poller resume recovers the session id from felt history", %{
+  test "poller continuation resumes the dispatch marker's session on a dirty death", %{
     host: host
   } do
     write_fiber(host, "tests/poller-history-resume", """
@@ -449,18 +457,12 @@ defmodule Shuttle.DispatchIntegrationTest do
       agent: claude-sonnet
       host: test-host
     ---
-    A fiber whose resume handle lives only in felt history (slice 6).
+    A fiber whose resume handle lives in the per-host dispatch marker.
     """)
 
-    append_worker_exit(host, "tests/poller-history-resume",
-      agent: "claude-sonnet",
-      session: "history-resume-session-uuid"
-    )
-
-    append_review_comment(host, "tests/poller-history-resume",
-      summary: "Continue from the history handle",
-      resume_mode: "previous"
-    )
+    # Dispatch marker on file with no handoff after it (dirty death) — the
+    # autonomous continuation resumes the marker's session, no directive needed.
+    write_dispatch_marker("tests/poller-history-resume", "history-resume-session-uuid")
 
     {:ok, poller} =
       start_poller!(
@@ -476,61 +478,6 @@ defmodule Shuttle.DispatchIntegrationTest do
     script = read_run_script()
     assert script =~ "--resume 'history-resume-session-uuid'"
     assert script =~ "Shuttle resumed your previous session"
-  end
-
-  test "session id is recovered when a redispatch storm buries the dispatch event", %{
-    host: host
-  } do
-    # Regression: a human-led oneshot left `status: active` gets redispatched
-    # every poll; each worker exits :normal_exit and `log_worker_exit` appends a
-    # SESSION-LESS "worker exited" event. The session id lives only in the rare
-    # "worker dispatched ... session=<uuid>" event, which a fixed `--last N`
-    # history window buries once enough exit events pile up — the resume lookup
-    # then returns nil → :missing_session_id → the fiber blocks indefinitely
-    # ("in-flight but never aloft"). The lookup must scan all of history.
-    write_fiber(host, "tests/storm-buried-session", """
-    ---
-    name: Storm-buried session fiber
-    status: active
-    tags:
-      - constitution
-    shuttle:
-      kind: oneshot
-      agent: claude-opus
-      host: test-host
-    ---
-    A human-led oneshot whose one dispatch event is buried under an exit storm.
-    """)
-
-    append_dispatch_event(host, "tests/storm-buried-session",
-      agent: "claude-opus",
-      session: "buried-session-uuid"
-    )
-
-    # The storm: production-shaped, session-less exit events (mirrors
-    # `log_worker_exit`, which logs agent= only). Far more than any fixed window.
-    for _ <- 1..30 do
-      append_freeform_exit(
-        host,
-        "tests/storm-buried-session",
-        "worker exited (:normal_exit); agent=claude-opus"
-      )
-    end
-
-    append_review_comment(host, "tests/storm-buried-session",
-      summary: "Resume previous",
-      resume_mode: "previous"
-    )
-
-    assert {:ok, _} =
-             Dispatcher.dispatch("tests/storm-buried-session",
-               runner: IntegrationRunner,
-               felt_store: host
-             )
-
-    script = read_run_script()
-    assert script =~ "--resume 'buried-session-uuid'"
-    refute script =~ "missing_session_id"
   end
 
   test "resume previous dispatch reaches each harness-specific resume command", %{host: host} do
@@ -550,18 +497,14 @@ defmodule Shuttle.DispatchIntegrationTest do
 
       write_resume_fiber(host, id,
         agent: agent,
-        history_session: session_id
-      )
-
-      append_review_comment(host, id,
-        summary: "Resume the previous #{agent} worker",
-        resume_mode: "previous"
+        session: session_id
       )
 
       assert {:ok, _} =
                Dispatcher.dispatch(id,
                  runner: IntegrationRunner,
-                 felt_store: host
+                 felt_store: host,
+                 resume_mode: "previous"
                )
 
       script = read_run_script()
@@ -570,7 +513,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     end
   end
 
-  test "resume previous can recover the session id from worker-exit history for every harness", %{
+  test "resume previous recovers the session id from the dispatch marker for every harness", %{
     host: host
   } do
     matrix = [
@@ -583,18 +526,13 @@ defmodule Shuttle.DispatchIntegrationTest do
       IntegrationRunner.reset(host)
       id = "tests/history-resume-matrix/#{agent}"
 
-      write_resume_fiber(host, id, agent: agent)
-      append_worker_exit(host, id, agent: agent, session: session_id)
-
-      append_review_comment(host, id,
-        summary: "Resume from history for #{agent}",
-        resume_mode: "previous"
-      )
+      write_resume_fiber(host, id, agent: agent, session: session_id)
 
       assert {:ok, _} =
                Dispatcher.dispatch(id,
                  runner: IntegrationRunner,
-                 felt_store: host
+                 felt_store: host,
+                 resume_mode: "previous"
                )
 
       assert read_run_script() =~ resume_fragment
@@ -657,11 +595,15 @@ defmodule Shuttle.DispatchIntegrationTest do
                work_dir: work_dir
              )
 
-    # The captured worker session id is recorded in felt history (slice 6:
-    # the only durable session-id home), carrying the `session=<uuid>` token the
-    # dispatcher parses back at resume. The wrong (human) session is ignored.
-    assert eventually(fn -> history_text(host, "tests/codex-capture") =~ "session=right-worker-session" end)
-    refute history_text(host, "tests/codex-capture") =~ "wrong-human-session"
+    # The captured worker session id is recorded in the per-host dispatch marker
+    # (the only structured session-id home) so resume can recover it. The wrong
+    # (human) session is ignored.
+    assert eventually(fn ->
+             match?(
+               %{"session_uuid" => "right-worker-session"},
+               Shuttle.Markers.read_dispatch("tests/codex-capture")
+             )
+           end)
   end
 
   # Interactivity is retired as a dispatch mode: the prompt never renders an
@@ -713,14 +655,11 @@ defmodule Shuttle.DispatchIntegrationTest do
     A fiber whose dispatch should wait for the human.
     """)
 
-    append_review_comment(host, "tests/talk-first",
-      summary: "Wait for me before doing anything heavy — let's talk first."
-    )
-
     assert {:ok, _} =
              Dispatcher.dispatch("tests/talk-first",
                runner: IntegrationRunner,
-               felt_store: host
+               felt_store: host,
+               user_message: "Wait for me before doing anything heavy — let's talk first."
              )
 
     script = read_run_script()
@@ -747,28 +686,22 @@ defmodule Shuttle.DispatchIntegrationTest do
     No session UUID in shuttle block.
     """)
 
-    # review-comment says resume, but there's no UUID stored.
-    append_review_comment(host, "tests/resume-no-uuid",
-      summary: "Please resume",
-      resume_mode: "previous"
-    )
-
+    # resume_mode: "previous" requested, but no dispatch marker on this host → no
+    # session id to resume.
     assert {:error, :missing_session_id} =
              Dispatcher.dispatch("tests/resume-no-uuid",
                runner: IntegrationRunner,
-               felt_store: host
+               felt_store: host,
+               resume_mode: "previous"
              )
   end
 
-  # Scheduled standing-run dispatches scope the review-comment lookup to the
-  # current run window — the window opens at the LAST worker-exit event in felt
-  # history (slice 4: not parsed from the prompt's run_id). A resume directive
-  # filed BEFORE that exit is from a prior run cycle and is ignored. Without
-  # this, a stale `resume_mode: "previous"` from days ago blocks every
-  # subsequent scheduled run with :missing_session_id. (Real-world example:
-  # loom/email/morning-post stuck 2026-05-09 → 2026-05-14 with no surfaced
-  # signal; the warning log fired every 30s for 5 days.)
-  test "scheduled standing-run ignores a resume directive older than the last worker exit",
+  # The since-window machinery is GONE — resume_mode is now a transient dispatch
+  # parameter, not a persisted directive that could go stale and block every
+  # future scheduled run (the "morning-post stuck for 5 days" pathology cannot
+  # recur). A scheduled standing run with NO resume_mode carried is always fresh,
+  # even when a dispatch marker (a prior run's session) is on file.
+  test "scheduled standing-run with no resume directive is always fresh",
        %{host: host} do
     write_fiber(host, "tests/standing-stale-resume", """
     ---
@@ -784,23 +717,12 @@ defmodule Shuttle.DispatchIntegrationTest do
         expr: 0 9 * * 1-5
         tz: Europe/Paris
     ---
-    Standing role with a stale resume directive.
+    Standing role with a prior run's dispatch marker.
     """)
 
-    # A resume directive from a PRIOR run cycle (resume_mode: previous, no
-    # session id) ...
-    append_review_comment(host, "tests/standing-stale-resume",
-      summary: "Resume previous",
-      resume_mode: "previous"
-    )
-
-    # ... followed by a later worker-exit, which opens the current run window
-    # AFTER the directive. The directive is therefore outside the window and is
-    # ignored → :fresh.
-    append_worker_exit(host, "tests/standing-stale-resume",
-      agent: "claude-sonnet",
-      session: "11111111-2222-3333-4444-555555555555"
-    )
+    # A prior run's dispatch marker (session on file) — but no resume directive is
+    # carried on THIS dispatch, and standing roles never auto-resume → fresh.
+    write_dispatch_marker("tests/standing-stale-resume", "11111111-2222-3333-4444-555555555555")
 
     assert {:ok, _} =
              Dispatcher.dispatch("tests/standing-stale-resume",
@@ -815,10 +737,11 @@ defmodule Shuttle.DispatchIntegrationTest do
     refute script =~ "send-keys"
   end
 
-  # Inverse of the above: when the review-comment is filed AFTER the last
-  # worker-exit, it falls inside the current run window and the existing
-  # fail-loud-on-missing-session contract still holds.
-  test "scheduled standing-run honors a resume directive filed after the last worker exit",
+  # When resume_mode: "previous" IS carried but no dispatch marker holds a session
+  # id, the fail-loud-on-missing-session contract holds (for standing as for
+  # oneshot): "New session" is the explicit fresh path, Resume must never silently
+  # start fresh.
+  test "scheduled standing-run with resume_mode=previous but no marker fails loud",
        %{host: host} do
     write_fiber(host, "tests/standing-fresh-resume", """
     ---
@@ -834,26 +757,14 @@ defmodule Shuttle.DispatchIntegrationTest do
         expr: 0 9 * * 1-5
         tz: Europe/Paris
     ---
-    Standing role with an in-window resume directive but no session id.
+    Standing role asked to resume with no session on file.
     """)
-
-    # The window opens at this worker-exit ...
-    append_worker_exit(host, "tests/standing-fresh-resume",
-      agent: "claude-sonnet",
-      session: "<unknown>"
-    )
-
-    # ... and the resume directive is filed after it, so it applies. No usable
-    # session id → fail loud per the existing contract.
-    append_review_comment(host, "tests/standing-fresh-resume",
-      summary: "Resume previous",
-      resume_mode: "previous"
-    )
 
     assert {:error, :missing_session_id} =
              Dispatcher.dispatch("tests/standing-fresh-resume",
                runner: IntegrationRunner,
                felt_store: host,
+               resume_mode: "previous",
                prompt_context: {:standing_run, "20200101T090000+0000"}
              )
   end
@@ -874,11 +785,6 @@ defmodule Shuttle.DispatchIntegrationTest do
     No session UUID in shuttle block.
     """)
 
-    append_review_comment(host, "tests/poller-resume-no-uuid",
-      summary: "Please resume",
-      resume_mode: "previous"
-    )
-
     {:ok, poller} =
       start_poller!(
         name: :test_poller_resume_no_uuid,
@@ -888,7 +794,7 @@ defmodule Shuttle.DispatchIntegrationTest do
       )
 
     assert {:error, :missing_session_id} =
-             Poller.dispatch_fiber(poller, "tests/poller-resume-no-uuid", [])
+             Poller.dispatch_fiber(poller, "tests/poller-resume-no-uuid", resume_mode: "previous")
 
     refute Enum.any?(IntegrationRunner.commands(), fn {cmd, args} ->
              cmd == "tmux" and Enum.at(args, 0) == "new-session"
@@ -927,11 +833,6 @@ defmodule Shuttle.DispatchIntegrationTest do
     No session UUID; dispatch will block.
     """)
 
-    append_review_comment(host, "tests/blocked-then-closed",
-      summary: "Please resume",
-      resume_mode: "previous"
-    )
-
     {:ok, poller} =
       start_poller!(
         name: :test_poller_blocked_then_closed,
@@ -941,7 +842,7 @@ defmodule Shuttle.DispatchIntegrationTest do
       )
 
     assert {:error, :missing_session_id} =
-             Poller.dispatch_fiber(poller, "tests/blocked-then-closed", [])
+             Poller.dispatch_fiber(poller, "tests/blocked-then-closed", resume_mode: "previous")
 
     assert [%{fiber_id: "tests/blocked-then-closed"}] = Poller.snapshot(poller).blocked
 
@@ -964,19 +865,18 @@ defmodule Shuttle.DispatchIntegrationTest do
            "expected blocked entry to evict after fiber closed"
   end
 
-  # Slice-6 standing dead-orphan reconciler on the tmux-scan substrate. A standing
-  # worker that exits while the daemon is DOWN never fires handle_worker_exit, so
-  # the armed document would re-fire. On poll, the daemon scans tmux: an armed
-  # standing role with no live session whose felt history shows a trailing "worker
-  # dispatched" with no "worker exited" after it (the daemon-down-across-exit
-  # case) is marked awaiting (status:closed). The felt-history discriminator
-  # replaces slice 1's runtime-store session.id check (slice 6: no runtime store).
-  # A role whose last run already exited (the daily-practice "armed, not-yet-due,
-  # never-dispatched-this-cycle" shape) is left armed, proven by the sibling.
-  test "a standing role with an un-exited dispatch is marked awaiting; one whose run exited is left armed",
+  # Standing dead-orphan reconciler on the tmux-scan substrate. A standing worker
+  # that exits while the daemon is DOWN never fires handle_worker_exit, so the
+  # armed document would re-fire. On poll, the daemon scans tmux: an armed
+  # standing role with no live session whose dispatch marker has NO handoff (and
+  # no re-arm) after it (the daemon-down-across-exit case) is marked awaiting
+  # (status:closed). The marker discriminator replaces the felt-history one. A
+  # role whose last run already handed off (the daily-practice "armed,
+  # not-yet-due" shape) is left armed, proven by the sibling.
+  test "a standing role with an un-exited dispatch is marked awaiting; one whose run handed off is left armed",
        %{host: host} do
-    # The dead worker's role — armed, no live session, with a trailing un-exited
-    # "worker dispatched" event in history (the daemon-down case).
+    # The dead worker's role — armed, no live session, with a dispatch marker and
+    # NO handoff after it (the daemon-down case).
     write_fiber(host, "tests/standing-dead", """
     ---
     name: Standing dead-orphan
@@ -995,17 +895,14 @@ defmodule Shuttle.DispatchIntegrationTest do
     A standing role whose worker died while the daemon was down.
     """)
 
-    append_dispatch_event(host, "tests/standing-dead",
-      agent: "claude-sonnet",
-      session: "dead-session-uuid"
-    )
+    write_dispatch_marker("tests/standing-dead", "dead-session-uuid")
 
-    # The control — armed, whose last run already exited (its dispatch is
-    # followed by an exit). Must be left untouched: the run completed, this is the
-    # next cycle's armed-and-waiting shape.
+    # The control — armed, whose last run already handed off cleanly (a handoff
+    # marker after its dispatch). Must be left untouched: the run completed, this
+    # is the next cycle's armed-and-waiting shape.
     write_fiber(host, "tests/standing-armed", """
     ---
-    name: Standing armed (last run exited)
+    name: Standing armed (last run handed off)
     status: active
     tags:
       - constitution
@@ -1021,15 +918,11 @@ defmodule Shuttle.DispatchIntegrationTest do
     A standing role whose previous run completed; armed for the next tick.
     """)
 
-    append_dispatch_event(host, "tests/standing-armed",
-      agent: "claude-sonnet",
-      session: "completed-session-uuid"
+    write_dispatch_marker("tests/standing-armed", "completed-session-uuid",
+      DateTime.add(DateTime.utc_now(), -60, :second)
     )
 
-    append_worker_exit(host, "tests/standing-armed",
-      agent: "claude-sonnet",
-      session: "completed-session-uuid"
-    )
+    write_handoff_marker("tests/standing-armed")
 
     # mark_awaiting resolves the fiber through FeltStores (LOOM_HOMES), not the
     # injected runner — point it at the temp store for the duration.
@@ -1064,20 +957,19 @@ defmodule Shuttle.DispatchIntegrationTest do
     end
   end
 
-  # A standing role whose last dispatch was followed by a free-form worker exit
-  # summary (no canonical "worker exited" marker) AND a human accept must be left
-  # armed — the human's accept supersedes the dead-orphan inference. Regression
-  # for the real morning-post / weekly-arxiv oscillation: interactive/ad-hoc runs
-  # the daemon didn't observe exiting wrote only a free-form summary, so the
-  # dead-orphan reconciler walked past it to the "worker dispatched" event and
-  # re-closed the role to awaiting on every restart/reconcile, undoing each
-  # accept.
+  # A standing role whose worker died without a clean handoff but which a human
+  # then ACCEPTED must be left armed — the human's accept (a durable re-arm marker
+  # newer than the dispatch) supersedes the dead-orphan inference. Regression for
+  # the real morning-post / weekly-arxiv oscillation: interactive/ad-hoc runs the
+  # daemon didn't observe exiting left a dispatch marker with no handoff, so the
+  # dead-orphan reconciler re-closed the role to awaiting on every
+  # restart/reconcile, undoing each accept. The re-arm marker is durable across a
+  # restart (the in-memory rearmed_at map is not), which is why it carries this.
   #
-  # The CONTROL role (dispatch + free-form exit, NO accept) flips to awaiting in
-  # the same poll — proving the reconciler actually ran this cycle, so the
-  # accepted role staying active is the fix at work, not a reconcile that never
-  # fired.
-  test "an accepted standing role is left armed despite a non-canonical exit summary",
+  # The CONTROL role (dispatch, no handoff, NO accept) flips to awaiting in the
+  # same poll — proving the reconciler actually ran this cycle, so the accepted
+  # role staying active is the fix at work, not a reconcile that never fired.
+  test "an accepted standing role is left armed despite a dirty death",
        %{host: host} do
     for {slug, accept?} <- [{"standing-accepted-freeform", true}, {"standing-dead-freeform", false}] do
       write_fiber(host, "tests/#{slug}", """
@@ -1095,18 +987,17 @@ defmodule Shuttle.DispatchIntegrationTest do
           expr: "0 8 * * *"
           tz: Europe/Paris
       ---
-      A standing role with a free-form (non-canonical) exit summary.
+      A standing role whose worker died without a clean handoff.
       """)
 
-      # Dispatch, then a FREE-FORM exit summary (no "worker exited").
-      append_dispatch_event(host, "tests/#{slug}", agent: "claude-fable", session: "#{slug}-uuid")
-
-      append_freeform_exit(host, "tests/#{slug}",
-        "Ad-hoc interactive run adhoc-123 complete; inbox at intended residue."
+      # Dispatch with NO handoff after it (dirty death).
+      write_dispatch_marker("tests/#{slug}", "#{slug}-uuid",
+        DateTime.add(DateTime.utc_now(), -60, :second)
       )
 
-      # Only the fix-target role gets the human accept after the exit.
-      if accept?, do: append_accept_event(host, "tests/#{slug}")
+      # Only the fix-target role gets the human accept (a durable re-arm marker,
+      # newer than the dispatch) after the death.
+      if accept?, do: write_rearm_marker("tests/#{slug}")
     end
 
     prev_loom = System.get_env("LOOM_HOMES")
@@ -1365,9 +1256,10 @@ defmodule Shuttle.DispatchIntegrationTest do
     refute Enum.any?(body.fibers, &(get_in(&1, [:fiber, "id"]) == "tests/refresh-seam"))
   end
 
-  # review-comment with resume_mode=fresh explicitly requests a new session
-  # even when a prior session UUID is stored.
-  test "resume_mode=fresh takes fresh path even with stored session.id", %{host: host} do
+  # resume_mode=fresh explicitly requests a new session — UNCONDITIONALLY, winning
+  # over the dirty-death marker heuristic (a dispatch marker with no handoff would
+  # otherwise resume). "New session" always means a new session.
+  test "resume_mode=fresh takes fresh path even with a resumable dispatch marker", %{host: host} do
     write_fiber(host, "tests/resume-mode-fresh", """
     ---
     name: Resume mode fresh
@@ -1378,23 +1270,19 @@ defmodule Shuttle.DispatchIntegrationTest do
       enabled: true
       kind: oneshot
       agent: claude-sonnet
-      session:
-        agent: claude-sonnet
-        dispatched_at: "2026-05-01T09:00:00Z"
-        id: should-not-be-resumed-uuid
     ---
-    Session exists but resume_mode explicitly says fresh.
+    A dispatch marker exists, but resume_mode explicitly says fresh.
     """)
 
-    append_review_comment(host, "tests/resume-mode-fresh",
-      summary: "Start fresh please",
-      resume_mode: "fresh"
-    )
+    # Dispatch marker with no handoff after it → dirty-death state the heuristic
+    # would resume; resume_mode: "fresh" must override it.
+    write_dispatch_marker("tests/resume-mode-fresh", "should-not-be-resumed-uuid")
 
     assert {:ok, _} =
              Dispatcher.dispatch("tests/resume-mode-fresh",
                runner: IntegrationRunner,
-               felt_store: host
+               felt_store: host,
+               resume_mode: "fresh"
              )
 
     script = read_run_script()
@@ -1446,9 +1334,11 @@ defmodule Shuttle.DispatchIntegrationTest do
 
   # ── User message block ─────────────────────────────────────────────────────
 
-  # A review-comment with a non-empty summary surfaces as the "From User" block
-  # in the dispatch prompt, so the worker sees the directive at the top of context.
-  test "review-comment summary appears as From User block in fresh dispatch prompt",
+  # The user's directive rides the dispatch call as the `:user_message` parameter
+  # (STORE 3) and surfaces as the "From User" block in the prompt, so the worker
+  # sees it at the top of context. It is transient — inlined at launch, never
+  # persisted — so there is no "consumed by a prior run" suppression to compute.
+  test "the user_message dispatch parameter surfaces as a From User block",
        %{host: host} do
     write_fiber(host, "tests/user-message", """
     ---
@@ -1464,15 +1354,11 @@ defmodule Shuttle.DispatchIntegrationTest do
     A fiber with a user directive.
     """)
 
-    append_review_comment(host, "tests/user-message",
-      summary: "Focus on the authentication layer first",
-      resume_mode: "fresh"
-    )
-
     assert {:ok, _} =
              Dispatcher.dispatch("tests/user-message",
                runner: IntegrationRunner,
-               felt_store: host
+               felt_store: host,
+               user_message: "Focus on the authentication layer first"
              )
 
     script = read_run_script()
@@ -1480,90 +1366,9 @@ defmodule Shuttle.DispatchIntegrationTest do
     assert script =~ "Focus on the authentication layer first"
   end
 
-  # A review-comment already consumed by a prior run — i.e. followed by an
-  # editorial (worker handoff) event — is suppressed on re-dispatch, so a stale
-  # directive doesn't replay as a fresh task when the card is re-dispatched
-  # without a new comment. Regression for the round-4-comment-resurfaced bug.
-  test "review-comment older than the latest editorial event is suppressed", %{host: host} do
-    write_fiber(host, "tests/consumed-message", """
-    ---
-    name: Consumed message fiber
-    status: active
-    tags:
-      - constitution
-    shuttle:
-      enabled: true
-      kind: oneshot
-      agent: claude-sonnet
-    ---
-    A fiber whose directive was already implemented by a prior run.
-    """)
-
-    # User files a directive, a worker runs and hands off (editorial event),
-    # then the card is re-dispatched with no new comment.
-    append_review_comment(host, "tests/consumed-message",
-      summary: "Make the halo bigger",
-      resume_mode: "fresh"
-    )
-
-    append_worker_exit(host, "tests/consumed-message",
-      agent: "claude-sonnet",
-      session: "sess-consumed"
-    )
-
-    assert {:ok, _} =
-             Dispatcher.dispatch("tests/consumed-message",
-               runner: IntegrationRunner,
-               felt_store: host
-             )
-
-    script = read_run_script()
-    refute script =~ "From User"
-    refute script =~ "Make the halo bigger"
-  end
-
-  # The inverse: a review-comment filed *after* the last editorial event (the
-  # requeue-then-dispatch case) still renders — it hasn't been consumed yet.
-  test "review-comment newer than the latest editorial event still renders", %{host: host} do
-    write_fiber(host, "tests/fresh-after-handoff", """
-    ---
-    name: Fresh-after-handoff fiber
-    status: active
-    tags:
-      - constitution
-    shuttle:
-      enabled: true
-      kind: oneshot
-      agent: claude-sonnet
-    ---
-    A fiber with a prior run, then a brand-new directive.
-    """)
-
-    # A prior run handed off first, THEN the user filed a new directive.
-    append_worker_exit(host, "tests/fresh-after-handoff",
-      agent: "claude-sonnet",
-      session: "sess-prior"
-    )
-
-    append_review_comment(host, "tests/fresh-after-handoff",
-      summary: "Now restructure the talk order",
-      resume_mode: "fresh"
-    )
-
-    assert {:ok, _} =
-             Dispatcher.dispatch("tests/fresh-after-handoff",
-               runner: IntegrationRunner,
-               felt_store: host
-             )
-
-    script = read_run_script()
-    assert script =~ "From User"
-    assert script =~ "Now restructure the talk order"
-  end
-
-  # No review-comment at all suppresses the From User block. The common case
-  # for a fresh constitution that has never been requeued from the kanban.
-  test "no review-comment event suppresses From User block", %{host: host} do
+  # No `:user_message` carried suppresses the From User block. The common case
+  # for a fresh constitution dispatched with no directive.
+  test "no user_message suppresses the From User block", %{host: host} do
     write_fiber(host, "tests/no-review-comment", """
     ---
     name: No review comment fiber
@@ -1575,10 +1380,9 @@ defmodule Shuttle.DispatchIntegrationTest do
       kind: oneshot
       agent: claude-sonnet
     ---
-    A fresh fiber with no kanban interactions yet.
+    A fresh fiber with no directive.
     """)
 
-    # No append_review_comment call — fiber has no history events at all.
     assert {:ok, _} =
              Dispatcher.dispatch("tests/no-review-comment",
                runner: IntegrationRunner,
@@ -1623,7 +1427,7 @@ defmodule Shuttle.DispatchIntegrationTest do
 
   defp write_resume_fiber(host, id, opts) do
     agent = Keyword.fetch!(opts, :agent)
-    history_session = Keyword.get(opts, :history_session)
+    session = Keyword.get(opts, :session)
 
     write_fiber(host, id, """
     ---
@@ -1638,91 +1442,9 @@ defmodule Shuttle.DispatchIntegrationTest do
     A fiber used by the resume matrix.
     """)
 
-    # The session id lives in felt history (slice 6: no doc-resident session).
-    if history_session do
-      append_worker_exit(host, id, agent: agent, session: history_session)
-    end
-  end
-
-  # Appends a review-comment event to the fiber's felt history so that
-  # check_resume_intent/3 and render_user_message_block/2 can read it.
-  defp append_review_comment(host, id, opts) do
-    summary = Keyword.get(opts, :summary, "Requeued")
-    resume_mode = Keyword.get(opts, :resume_mode)
-
-    fields =
-      []
-      |> maybe_field("resume_mode", resume_mode)
-
-    args =
-      ["-C", host, "history", "append", id, "--kind", "review-comment", "-m", summary] ++
-        fields
-
-    {out, code} = System.cmd("felt", args, stderr_to_stdout: true)
-    if code != 0, do: raise("felt history append failed (#{code}): #{out}")
-  end
-
-  defp maybe_field(fields, _key, nil), do: fields
-  defp maybe_field(fields, key, value), do: fields ++ ["--field", "#{key}=#{value}"]
-
-  # Raw felt-history text for a fiber, used to assert the dispatcher recorded the
-  # session id (`session=<uuid>`) in history (slice 6: the durable session home).
-  defp history_text(host, id) do
-    case System.cmd("felt", ["-C", host, "history", id, "--last", "20"], stderr_to_stdout: true) do
-      {out, 0} -> out
-      _ -> ""
-    end
-  end
-
-  defp append_worker_exit(host, id, opts) do
-    agent = Keyword.fetch!(opts, :agent)
-    session = Keyword.fetch!(opts, :session)
-    summary = "worker exited (:normal_exit); agent=#{agent} session=#{session}"
-
-    {out, code} =
-      System.cmd("felt", ["-C", host, "history", "append", id, "-m", summary],
-        stderr_to_stdout: true
-      )
-
-    if code != 0, do: raise("felt history append failed (#{code}): #{out}")
-  end
-
-  # Mirror the dispatcher's at-spawn session record (slice 6): a "worker
-  # dispatched ... session=<uuid>" felt-history event, the durable session-id
-  # home and the dead-orphan discriminator's "dispatched" marker.
-  defp append_dispatch_event(host, id, opts) do
-    agent = Keyword.fetch!(opts, :agent)
-    session = Keyword.fetch!(opts, :session)
-    summary = "worker dispatched (agent=#{agent}) session=#{session}"
-
-    {out, code} =
-      System.cmd("felt", ["-C", host, "history", "append", id, "-m", summary],
-        stderr_to_stdout: true
-      )
-
-    if code != 0, do: raise("felt history append failed (#{code}): #{out}")
-  end
-
-  # A worker's own free-form exit summary (NOT the daemon's canonical "worker
-  # exited ..." marker) followed by the human's accept — the real morning-post /
-  # weekly-arxiv shape after an interactive/ad-hoc run the daemon didn't observe
-  # exiting.
-  defp append_freeform_exit(host, id, summary) do
-    {out, code} =
-      System.cmd("felt", ["-C", host, "history", "append", id, "-m", summary],
-        stderr_to_stdout: true
-      )
-
-    if code != 0, do: raise("felt history append failed (#{code}): #{out}")
-  end
-
-  defp append_accept_event(host, id) do
-    {out, code} =
-      System.cmd("felt", ["-C", host, "history", "append", id, "-m", "accepted run for #{id}"],
-        stderr_to_stdout: true
-      )
-
-    if code != 0, do: raise("felt history append failed (#{code}): #{out}")
+    # The session id lives in the per-host dispatch marker (the only structured
+    # session-id home). Keyed by the fiber's runtime key (slug for these fibers).
+    if session, do: write_dispatch_marker(id, session)
   end
 
   defp write_codex_session(session_dir, filename, uuid, cwd, timestamp, prompt) do

@@ -43,7 +43,6 @@ defmodule ShuttleWeb.Router do
     get("/fibers/composite", FiberDocumentsController, :composite)
     get("/fibers/*id", FiberDocumentsController, :show)
     post("/lifecycle", LifecycleController, :create)
-    post("/felt-history", FeltHistoryController, :create)
     post("/felt-edit", FeltEditController, :create)
     post("/felt-nest", FeltNestController, :create)
     get("/agents", AgentsController, :show)

@@ -129,9 +129,9 @@ defmodule Shuttle.StandingRoleTest do
     @resume_now ~U[2026-06-05 16:04:19Z]
 
     test "mints from now — the id is no longer load-bearing for resume continuity" do
-      # The resume window-start is now derived from felt history (the last
-      # worker-exit event), not parsed from this id. The id is therefore a fresh
-      # timestamp label every dispatch, regardless of any leftover review block.
+      # Continuation is decided from the per-host dispatch/handoff markers, not
+      # parsed from this id. The id is therefore a fresh timestamp label every
+      # dispatch, regardless of any leftover review block.
       role = role(%{})
 
       assert StandingRole.dispatch_run_id(role, @resume_now) ==

@@ -269,6 +269,20 @@ defmodule Shuttle.PollerTest do
   setup do
     start_supervised!(MockRunner)
     MockRunner.reset()
+
+    # Isolate the per-host runtime markers (dispatch / handoff / re-arm) under a
+    # throwaway SHUTTLE_DATA_DIR so continuation/orphan tests don't bleed across
+    # each other or into the developer's real ~/.shuttle.
+    prev_data_dir = System.get_env("SHUTTLE_DATA_DIR")
+    data_dir = Path.join(System.tmp_dir!(), "shuttle-poller-markers-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(data_dir)
+    System.put_env("SHUTTLE_DATA_DIR", data_dir)
+
+    on_exit(fn ->
+      restore_env("SHUTTLE_DATA_DIR", prev_data_dir)
+      File.rm_rf!(data_dir)
+    end)
+
     :ok
   end
 
@@ -363,62 +377,24 @@ defmodule Shuttle.PollerTest do
     |> Enum.map(fn {_cmd, args} -> List.last(args) end)
   end
 
-  defp append_review_comment(id, opts) do
-    resume_mode = Keyword.fetch!(opts, :resume_mode)
-
-    {out, code} =
-      System.cmd(
-        "felt",
-        [
-          "-C",
-          "/tmp",
-          "history",
-          "append",
-          id,
-          "--kind",
-          "review-comment",
-          "-m",
-          "",
-          "--field",
-          "resume_mode=#{resume_mode}"
-        ],
-        stderr_to_stdout: true
-      )
-
-    if code != 0, do: raise("felt history append failed (#{code}): #{out}")
+  # Mirror the dispatcher's at-spawn dispatch-marker write: `{session_uuid,
+  # dispatched_at, run_id}` keyed by the fiber's runtime key (the slug `id` for
+  # these uid-less test fibers). The optional `at` lets a test back-date the
+  # dispatch so a later handoff can be ordered relative to it.
+  defp write_dispatch_marker(id, session_id, at \\ DateTime.utc_now()) do
+    :ok =
+      Shuttle.Markers.write_dispatch(id, %{
+        session_uuid: session_id,
+        dispatched_at: DateTime.to_iso8601(at)
+      })
   end
 
-  # Mirror the dispatcher's at-spawn session record: a felt-history event whose
-  # summary carries `session=<uuid>` (slice 6: felt history is the durable
-  # session-id home, parsed back by extract_session_id at resume).
-  defp append_dispatch_session(id, session_id) do
-    {out, code} =
-      System.cmd(
-        "felt",
-        [
-          "-C",
-          "/tmp",
-          "history",
-          "append",
-          id,
-          "--summary",
-          "worker dispatched (agent=claude-sonnet) session=#{session_id}"
-        ],
-        stderr_to_stdout: true
-      )
-
-    if code != 0, do: raise("felt history append failed (#{code}): #{out}")
-  end
-
-  defp append_handoff(id, summary \\ "did the work; next picks up at the next step") do
-    {out, code} =
-      System.cmd(
-        "felt",
-        ["-C", "/tmp", "history", "append", id, "--kind", "handoff", "--summary", summary],
-        stderr_to_stdout: true
-      )
-
-    if code != 0, do: raise("felt handoff append failed (#{code}): #{out}")
+  # Mirror the worker's `shuttle-ctl handoff`: write `~/.shuttle/handoff/<key>`
+  # (extensionless) with `{at}` in RFC3339 UTC — the clean-exit signal.
+  defp write_handoff_marker(id, at \\ DateTime.utc_now()) do
+    path = Shuttle.Markers.handoff_path(id)
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, Jason.encode!(%{at: DateTime.to_iso8601(at)}))
   end
 
   # ── Tests ──
@@ -1217,7 +1193,7 @@ defmodule Shuttle.PollerTest do
     # Just serviced (a "worker dispatched" event at ~now): under the one due rule,
     # a role is due only once a scheduled occurrence elapses AFTER its last
     # service, so a freshly-serviced weekday-09:00 role is not due now.
-    append_dispatch_session("tests/standing-sleeping", "seed-recent")
+    write_dispatch_marker("tests/standing-sleeping", "seed-recent")
 
     {:ok, poller} =
       start_poller!(
@@ -1257,7 +1233,7 @@ defmodule Shuttle.PollerTest do
     )
 
     # Recently serviced ⇒ not due now (so it stays scheduled, not running).
-    append_dispatch_session(fiber_id, "seed-recent")
+    write_dispatch_marker(fiber_id, "seed-recent")
 
     {:ok, poller} =
       start_poller!(
@@ -1530,7 +1506,7 @@ defmodule Shuttle.PollerTest do
 
     # Recently serviced ⇒ the scheduler treats it as not-due, so a plain dispatch
     # is refused; only force/ad-hoc overrides (the point of this test).
-    append_dispatch_session(fiber_id, "seed-recent")
+    write_dispatch_marker(fiber_id, "seed-recent")
 
     {:ok, poller} =
       start_poller!(
@@ -1733,12 +1709,15 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
-    # The prior run's session id lives in felt history (slice 6); a forced resume
-    # parses it back via extract_session_id. The resume directive post-dates it.
-    append_dispatch_session(fiber_id, "stored-standing-session-id")
-    append_review_comment(fiber_id, resume_mode: "previous")
+    # The prior run's session id lives in the per-host dispatch marker; a forced
+    # resume reads it from there. The resume directive (`resume_mode: "previous"`)
+    # now rides the dispatch call as a transient parameter (STORE 3), not a
+    # persisted felt review-comment — so there is no since-window to scope and the
+    # "morning-post blocked for days" pathology cannot recur.
+    write_dispatch_marker(fiber_id, "stored-standing-session-id")
 
-    assert {:ok, _session} = Poller.dispatch_fiber(poller, fiber_id, force: true)
+    assert {:ok, _session} =
+             Poller.dispatch_fiber(poller, fiber_id, force: true, resume_mode: "previous")
 
     script_path = new_session_scripts() |> List.last()
     assert script_path, "expected at least one new-session script"
@@ -1958,7 +1937,7 @@ defmodule Shuttle.PollerTest do
 
     # Recently serviced ⇒ not due now (the stored next_due_at is ignored under the
     # one due rule; what gates is "has an occurrence elapsed since last service").
-    append_dispatch_session("tests/standing-stale", "seed-recent")
+    write_dispatch_marker("tests/standing-stale", "seed-recent")
 
     {:ok, poller} =
       start_poller!(
@@ -2010,7 +1989,7 @@ defmodule Shuttle.PollerTest do
     )
 
     # Recently serviced ⇒ not due ⇒ stays "scheduled" (not dispatched/"running").
-    append_dispatch_session("tests/standing-review", "seed-recent")
+    write_dispatch_marker("tests/standing-review", "seed-recent")
 
     # A draft role (status: open) still reads scheduled in the schedule-derived
     # snapshot — paused/draft is a document fact (status), surfaced by the kanban
@@ -2230,14 +2209,14 @@ defmodule Shuttle.PollerTest do
     assert [%{fiber_id: ^fiber_id, uid: ^uid, state: "running"}] = snap.eligible
   end
 
-  test "force-dispatch honors resume_mode: previous review-comment (unified resume path)" do
+  test "force-dispatch honors resume_mode: previous dispatch param (unified resume path)" do
     # The old kanban-modal flow had two separate paths: "New session"
     # (ad-hoc, force-fresh) and "Resume" (a special accept-then-dispatch
     # dance via shuttle-ctl resume). Under unified force semantics, BOTH
-    # buttons file a review-comment carrying resume_mode and dispatch with
-    # force: true. resolve_resume_intent honors the latest
-    # review-comment regardless of dispatch context (oneshot, standing
-    # scheduled, standing ad-hoc).
+    # buttons carry resume_mode on the dispatch call and dispatch with
+    # force: true. resolve_resume_intent honors the carried resume_mode
+    # regardless of dispatch context (oneshot, standing scheduled, standing
+    # ad-hoc).
     fiber_id = "tests/force-resume-unified"
     fiber = make_fiber(fiber_id)
     MockRunner.set_fiber(fiber_id, fiber)
@@ -2250,12 +2229,10 @@ defmodule Shuttle.PollerTest do
       """
     )
 
-    # Record the prior session id in felt history (the dispatcher writes a
-    # "worker dispatched ... session=<uuid>" event at spawn; slice 6: felt
-    # history is the only durable session-id home), and file the resume directive
-    # BEFORE the poller starts so its first poll dispatches the resume.
-    append_dispatch_session(fiber_id, "stored-session-id")
-    append_review_comment(fiber_id, resume_mode: "previous")
+    # The prior session id lives in the per-host dispatch marker the daemon wrote
+    # at spawn (the only structured session-id home). resume_mode rides the
+    # dispatch call (STORE 3), not a persisted review-comment.
+    write_dispatch_marker(fiber_id, "stored-session-id")
 
     {:ok, poller} =
       start_poller!(
@@ -2265,10 +2242,10 @@ defmodule Shuttle.PollerTest do
         felt_stores: ["/tmp"]
       )
 
-    # Whether the resume comes from the auto-poll or the explicit force-dispatch,
-    # the dispatch produces a --resume invocation against the history session id,
-    # not a fresh new-session.
-    _ = Poller.dispatch_fiber(poller, fiber_id, force: true)
+    # An explicit force-dispatch carrying resume_mode: "previous" produces a
+    # --resume invocation against the dispatch marker's session id, not a fresh
+    # new-session.
+    _ = Poller.dispatch_fiber(poller, fiber_id, force: true, resume_mode: "previous")
 
     assert wait_until(fn -> new_session_scripts() != [] end)
 
@@ -2280,16 +2257,16 @@ defmodule Shuttle.PollerTest do
 
   test "poller continuation RESUMES a oneshot that died without a handoff marker" do
     # The resume-on-no-handoff fix. A multi-session oneshot's autonomous
-    # continuation: a prior session id is on file but there is NO worker-authored
-    # `--kind handoff` after it — so the previous session died mid-thought (the
-    # remote-machine kill case), and the dispatch must RESUME the transcript
-    # rather than loop a fresh, context-less worker.
+    # continuation: a dispatch marker (with the session id) is on file but there
+    # is NO worker-authored handoff marker after it — so the previous session
+    # died mid-thought (the remote-machine kill case), and the dispatch must
+    # RESUME the transcript rather than loop a fresh, context-less worker.
     fiber_id = "tests/continuation-died"
 
     MockRunner.set_fiber(fiber_id, make_fiber(fiber_id))
     MockRunner.set_shuttle(fiber_id, "kind: oneshot\nagent: claude-sonnet\n")
 
-    append_dispatch_session(fiber_id, "old-session-id")
+    write_dispatch_marker(fiber_id, "old-session-id")
 
     {:ok, poller} =
       start_poller!(
@@ -2308,16 +2285,17 @@ defmodule Shuttle.PollerTest do
   end
 
   test "poller continuation re-dispatches FRESH when the worker left a clean handoff" do
-    # The clean-close half: a `--kind handoff` event filed after the last
-    # dispatch marks an intentional handoff, so the continuation starts fresh and
-    # the next worker reads the handoff (the intentional loop, unchanged).
+    # The clean-close half: a handoff marker written at or after the last dispatch
+    # marks an intentional handoff, so the continuation starts fresh and the next
+    # worker reads the `## Status` block (the intentional loop, unchanged).
     fiber_id = "tests/continuation-handoff"
 
     MockRunner.set_fiber(fiber_id, make_fiber(fiber_id))
     MockRunner.set_shuttle(fiber_id, "kind: oneshot\nagent: claude-sonnet\n")
 
-    append_dispatch_session(fiber_id, "old-session-id")
-    append_handoff(fiber_id)
+    # Back-date the dispatch so the handoff (now) is unambiguously >= dispatch.
+    write_dispatch_marker(fiber_id, "old-session-id", DateTime.add(DateTime.utc_now(), -60, :second))
+    write_handoff_marker(fiber_id)
 
     {:ok, poller} =
       start_poller!(
@@ -2481,8 +2459,8 @@ defmodule Shuttle.PollerTest do
     agent: claude-sonnet
     """)
 
-    # A prior dispatch is recorded in felt history but no tmux session is alive.
-    append_dispatch_session(fiber_id, "577af64b-644a-4733-9e6a-f60d86b6941f")
+    # A prior dispatch is recorded in the dispatch marker but no tmux session is alive.
+    write_dispatch_marker(fiber_id, "577af64b-644a-4733-9e6a-f60d86b6941f")
 
     {:ok, poller} =
       start_poller!(
@@ -2513,7 +2491,7 @@ defmodule Shuttle.PollerTest do
     host: some-other-machine
     """)
 
-    append_dispatch_session(fiber_id, "577af64b-644a-4733-9e6a-f60d86b6941f")
+    write_dispatch_marker(fiber_id, "577af64b-644a-4733-9e6a-f60d86b6941f")
 
     # own_host_id is the default "test-host", which does not equal
     # "some-other-machine".
@@ -2648,9 +2626,9 @@ defmodule Shuttle.PollerTest do
       tz: Europe/Paris
     """)
 
-    # The felt-history discriminator: a trailing "worker dispatched" event with no
-    # "worker exited" after it marks this as a daemon-down-across-exit dead orphan.
-    append_dispatch_session(fiber_id, "dead-session-uuid")
+    # The marker discriminator: a dispatch marker with no handoff (and no re-arm)
+    # after it marks this as a daemon-down-across-exit dead orphan.
+    write_dispatch_marker(fiber_id, "dead-session-uuid")
 
     doc_path = "/tmp/.felt/#{fiber_id}/standing-dead-orphan.md"
 
@@ -2684,7 +2662,7 @@ defmodule Shuttle.PollerTest do
       "closed"
     )
 
-    append_dispatch_session(fiber_id, "closed-uuid")
+    write_dispatch_marker(fiber_id, "closed-uuid")
 
     {:ok, poller} =
       start_poller!(
@@ -3480,14 +3458,9 @@ defmodule Shuttle.PollerTest do
     snap = Poller.snapshot(poller)
     assert Enum.any?(snap.eligible, &(&1.fiber_id == id))
 
-    # The dispatch-shaped history event landed with the session uuid token.
-    {out, 0} =
-      System.cmd("felt", ["-C", "/tmp", "history", id, "--last", "1", "--json"],
-        stderr_to_stdout: true
-      )
-
-    assert out =~ "worker claimed"
-    assert out =~ "session=uuid-claim-1"
+    # The claim wrote the dispatch marker (keyed by the fiber's uid runtime key)
+    # carrying the session uuid, so resume / continuation can recover it.
+    assert %{"session_uuid" => "uuid-claim-1"} = Shuttle.Markers.read_dispatch("01CLAIMUID")
 
     new_sessions_before =
       Enum.count(MockRunner.commands(), fn {cmd, args} ->
