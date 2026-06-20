@@ -15,9 +15,9 @@ defmodule Shuttle.Poller.SessionReconciliation do
   State-shaped helpers take the `Shuttle.Poller.State` struct and return updated
   state, mirroring the signatures they had inside `Shuttle.Poller`. Truly shared
   helpers stay in `Shuttle.Poller` and are called from here:
-  `running_key/2`, `fiber_address/1`, `uid_for_fiber/3`, `runtime_key_for_fiber/1`,
+  `running_key/2`, `fiber_address/1`, `runtime_key_for_fiber/1`,
   `list_shuttle_sessions/1`, `discover_candidates/1`, `fetch_fiber_full/2`,
-  `fetch_shuttle_agent_name/2`, `start_watcher/3`, `live_session_for_fiber/2`.
+  `fetch_shuttle_agent_name/2`, `start_watcher/3`, `live_session_for_fiber/3`.
   """
 
   require Logger
@@ -64,34 +64,39 @@ defmodule Shuttle.Poller.SessionReconciliation do
   # of the fiber's name forms is actually live (preferring the uid-keyed name),
   # for callers that only have the fiber identity.
   def adopt_session(state, fiber_id, session \\ nil) do
-    session =
-      session || Poller.live_session_for_fiber(state, fiber_id) ||
-        Dispatcher.session_name(fiber_id, Poller.uid_for_fiber(state, fiber_id))
-
+    # Fetch first so the uid for the canonical session name comes straight off
+    # the fiber (the uid↔slug bridge and its cache are gone). The runtime maps
+    # key by the fiber's runtime key; felt I/O stays slug-addressed.
     case Poller.fetch_fiber_full(fiber_id, state) do
       {:ok, fiber} ->
+        uid = Map.get(fiber, "uid")
+
+        session =
+          session || Poller.live_session_for_fiber(state, fiber_id, uid) ||
+            Dispatcher.session_name(fiber_id, uid)
+
         if Map.get(fiber, "status") != "closed" do
           agent_name = Poller.fetch_shuttle_agent_name(fiber_id, state)
           {:ok, agent} = Shuttle.Agents.resolve_by_name(agent_name)
 
           now = DateTime.utc_now()
+          runtime_key = Poller.runtime_key_for_fiber(fiber)
 
           running_meta = %{
             fiber_id: fiber_id,
             session: session,
             agent_id: agent.id,
-            uid: Map.get(fiber, "uid"),
+            uid: uid,
             started_at: now,
             last_activity_at: now
           }
 
           case Poller.start_watcher(state, fiber_id, running_meta) do
             {:ok, running_meta} ->
-              runtime_key = Poller.runtime_key_for_fiber(fiber)
               running = Map.put(state.running, runtime_key, running_meta)
 
               Logger.info("Adopted orphan session: #{session}")
-              %{state | running: running, claimed: MapSet.put(state.claimed, fiber_id)}
+              %{state | running: running, claimed: MapSet.put(state.claimed, runtime_key)}
 
             {:error, reason} ->
               Logger.warning("Failed to adopt session #{session}: #{inspect(reason)}")
@@ -106,7 +111,7 @@ defmodule Shuttle.Poller.SessionReconciliation do
 
       {:error, _} ->
         # Fiber not found — skip, don't kill (could be from another host or test)
-        Logger.debug("Skipping orphan session for unknown fiber: #{session}")
+        Logger.debug("Skipping orphan session for unknown fiber: #{inspect(session)}")
         state
     end
   end
@@ -118,7 +123,7 @@ defmodule Shuttle.Poller.SessionReconciliation do
   # entries keep the existing ambiguity guard (two fibers sharing a leaf resolve
   # to `:ambiguous` and are skipped rather than mis-adopted).
   def candidate_session_lookup(%State{} = state) do
-    {:ok, candidates, _host_map, _uid_map} = Poller.discover_candidates(state)
+    {:ok, candidates, _host_map} = Poller.discover_candidates(state)
 
     candidates
     |> Enum.reduce(%{}, fn fiber, acc ->

@@ -9,10 +9,9 @@ defmodule Shuttle.Poller.Snapshot do
   preserve it exactly.
 
   State-coupled helpers that the rest of the poller also relies on
-  (`fiber_address/1`, `uid_for_fiber/3`, `metadata_uid/1`, `runtime_seconds/2`)
-  stay in `Shuttle.Poller` as the single source of truth and are called back
-  into from here. `standing_role_snapshots/4` lives in
-  `Shuttle.Poller.StandingRoles`.
+  (`fiber_address/1`, `metadata_uid/1`, `runtime_seconds/2`) stay in
+  `Shuttle.Poller` as the single source of truth and are called back into from
+  here. `standing_role_snapshots/4` lives in `Shuttle.Poller.StandingRoles`.
   """
 
   alias Shuttle.Poller
@@ -30,7 +29,7 @@ defmodule Shuttle.Poller.Snapshot do
 
         %{
           fiber_id: fiber_id,
-          uid: Poller.uid_for_fiber(state, fiber_id, meta),
+          uid: Poller.metadata_uid(meta),
           felt_store: Map.get(state.fiber_host_cache, fiber_id),
           tmux_session: meta.session,
           agent: meta.agent_id,
@@ -43,10 +42,12 @@ defmodule Shuttle.Poller.Snapshot do
       end)
 
     blocked =
-      Enum.map(state.dispatch_failures, fn {fiber_id, entry} ->
+      Enum.map(state.dispatch_failures, fn {_runtime_key, entry} ->
         %{
-          fiber_id: fiber_id,
-          uid: Poller.uid_for_fiber(state, fiber_id),
+          # `dispatch_failures` is keyed by runtime key (uid); the entry carries
+          # the slug + uid so the row exposes both, unchanged in wire shape.
+          fiber_id: entry.fiber_id,
+          uid: Map.get(entry, :uid),
           reason: format_block_reason(entry.reason),
           attempts: entry.attempts,
           attempted_at: DateTime.to_unix(entry.attempted_at, :millisecond),
