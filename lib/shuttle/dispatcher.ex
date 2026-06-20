@@ -31,7 +31,7 @@ defmodule Shuttle.Dispatcher do
       Defaults to `Shuttle.Runner.Default`.
     * `:work_dir` — working directory for the tmux session. Defaults to `File.cwd!()`.
     * `:felt_store` — directory containing the `.felt/` index this dispatch
-      should read fibers and history from. Defaults to `default_felt_store/0`.
+      should read fibers from. Defaults to `default_felt_store/0`.
       The Poller passes its configured `state.felt_store` here so each shuttle
       instance is consistent within itself; running multiple shuttle instances
       against different felt stores (e.g. one for `~/loom`, another for a
@@ -44,12 +44,15 @@ defmodule Shuttle.Dispatcher do
     * `:force` — explicit manual dispatch override. When true, the dispatcher
       stops refusing closed fibers (the Poller already relaxes eligibility
       under force) and `resolve_resume_intent` ignores the ad-hoc
-      short-circuit so the most recent review-comment's `resume_mode` is
-      honored regardless of dispatch context.
-    * `:runtime_session_id` — prior session UUID the caller already resolved (a
-      live in-memory watcher record within the daemon's lifetime). Falls back to
-      felt history (`latest_history_session_id`) when absent, which is the
-      durable home (no runtime store, no doc-resident session).
+      short-circuit so the caller's `resume_mode` is honored regardless of
+      dispatch context.
+    * `:resume_mode` — the user's continuation directive, a transient dispatch
+      parameter carried with the dispatch call: `"previous"` resumes the
+      dispatch marker's session, `"fresh"` always starts new (unconditional —
+      wins over the marker heuristic), absent → marker-decided.
+    * `:user_message` — the user's free-text directive for this dispatch,
+      inlined into the prompt at launch (the "From User" block). Transient: it
+      rides the dispatch call, never a persisted felt event.
   """
   @spec dispatch(String.t(), keyword()) :: dispatch_result()
   def dispatch(fiber_id, opts \\ []) do
@@ -80,10 +83,10 @@ defmodule Shuttle.Dispatcher do
               :fresh
 
             true ->
-              resolve_resume_intent(prompt_context, fiber_id, fiber, felt_store,
+              resolve_resume_intent(prompt_context, fiber_id, fiber,
                 force: force,
-                work_dir: work_dir,
-                session_id: Keyword.get(opts, :runtime_session_id)
+                resume_mode: Keyword.get(opts, :resume_mode),
+                marker_key: marker_key(fiber, uid, fiber_id)
               )
           end
 
@@ -95,7 +98,10 @@ defmodule Shuttle.Dispatcher do
             create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent,
               felt_store: felt_store,
               uid: uid,
-              kind: fiber_kind(fiber)
+              kind: fiber_kind(fiber),
+              marker_key: marker_key(fiber, uid, fiber_id),
+              run_id: prompt_context_run_id(prompt_context),
+              user_message: Keyword.get(opts, :user_message)
             )
         end
       end
@@ -104,33 +110,29 @@ defmodule Shuttle.Dispatcher do
 
   @doc """
   Decides whether this dispatch should resume a prior worker session or start
-  fresh, based on the prompt context.
+  fresh, given the prompt context and the user's continuation directive.
 
   - Ad-hoc standing-role dispatches default to fresh. Resuming would land
     the worker in a transcript whose last assistant turn was "Run accepted.
     Exiting" — they'd idle ("nothing new on the fiber") instead of doing the
     new run. The kanban modal's manual "Resume" button overrides this by
     passing `force: true`, which routes back through `check_resume_intent`
-    so the freshly-filed review-comment's `resume_mode` is honored.
-  - Scheduled standing-role dispatches scope the review-comment lookup to the
-    current run window — events at or after the **last worker-exit event in
-    felt history** (`run_window_start/3`). A stale `resume_mode: "previous"`
-    from a prior run would otherwise gate every future scheduled dispatch with
-    `:missing_session_id` (see `loom/email/morning-post` blocked for 5 days,
-    2026-05-09 → 2026-05-14). The window start lives in felt history — the
-    chronological substrate — not in a `review.run_id` the document no longer
-    carries: a resume directive filed after the awaiting run exited
-    necessarily post-dates that exit, so it falls inside the window.
-  - All other contexts defer to `check_resume_intent/3`, which reads the
-    most recent review-comment from felt history and honors its `resume_mode`.
+    so the carried `resume_mode` is honored.
+  - All other contexts defer to `check_resume_intent/3`, which honors the
+    `resume_mode` dispatch parameter (`"previous"` / `"fresh"`), falling back
+    to the per-host marker heuristic when no directive is carried.
 
   Options:
-    * `:force` — when true, the ad-hoc short-circuit is skipped and the
-      latest review-comment's intent wins. Set by manual kanban dispatches.
+    * `:force` — when true, the ad-hoc short-circuit is skipped and the carried
+      `resume_mode` wins. Set by manual kanban dispatches.
+    * `:resume_mode` — the user's continuation directive (`"previous"` /
+      `"fresh"` / absent), carried with the dispatch call.
+    * `:marker_key` — the runtime key (uid when present, else slug) that keys
+      the per-host dispatch/handoff markers.
   """
-  @spec resolve_resume_intent(any(), String.t(), map(), String.t() | nil, keyword()) ::
+  @spec resolve_resume_intent(any(), String.t(), map(), keyword()) ::
           :fresh | {:previous, String.t()} | {:error, :missing_session_id}
-  def resolve_resume_intent(prompt_context, fiber_id, fiber, felt_store, opts \\ []) do
+  def resolve_resume_intent(prompt_context, fiber_id, fiber, opts \\ []) do
     force? = Keyword.get(opts, :force, false)
 
     case prompt_context do
@@ -138,121 +140,43 @@ defmodule Shuttle.Dispatcher do
         :fresh
 
       _ ->
-        since =
-          if force?, do: nil, else: run_window_start(prompt_context, fiber_id, felt_store)
-
-        check_opts =
-          [since: since, work_dir: Keyword.get(opts, :work_dir)]
-          |> then(fn o -> if is_nil(felt_store), do: o, else: [{:felt_store, felt_store} | o] end)
-          |> then(fn o ->
-            case Keyword.get(opts, :session_id) do
-              session_id when is_binary(session_id) and session_id != "" ->
-                [{:session_id, session_id} | o]
-
-              _ ->
-                o
-            end
-          end)
-
-        check_resume_intent(fiber_id, fiber, check_opts)
+        check_resume_intent(fiber_id, fiber,
+          resume_mode: Keyword.get(opts, :resume_mode),
+          marker_key: Keyword.get(opts, :marker_key)
+        )
     end
   end
-
-  # The lower bound for the review-comment lookup on a standing run: the
-  # timestamp of the most recent worker-exit event in felt history. felt history
-  # is the chronological substrate (the document no longer carries a
-  # `review.run_id`), so the run window starts where the awaiting run ended. A
-  # resume directive is filed AFTER the run exits, so it lands at or after this
-  # bound and `check_resume_intent --since` finds it; a stale directive from an
-  # older run (before the last exit) falls outside and can't silently gate the
-  # dispatcher. Non-standing contexts (oneshots, ad-hoc) impose no window.
-  defp run_window_start({:standing_run, _run_id}, fiber_id, felt_store),
-    do: last_worker_exit_at(fiber_id, felt_store: felt_store)
-
-  defp run_window_start({:standing_run, _run_id, _}, fiber_id, felt_store),
-    do: last_worker_exit_at(fiber_id, felt_store: felt_store)
-
-  defp run_window_start(_, _fiber_id, _felt_store), do: nil
-
-  # The `occurred_at` of the latest worker-exit event in felt history, parsed to
-  # a DateTime. Mirrors `latest_history_session_id` (same event, parsed for its
-  # timestamp instead of its session id). nil when no exit event is recorded
-  # (a never-run role) — then the lookup spans all of history.
-  defp last_worker_exit_at(fiber_id, opts) do
-    felt_store = Keyword.get(opts, :felt_store) || default_felt_store()
-
-    fiber_id
-    |> query_history(["--last", "20", "--json"], felt_store: felt_store)
-    |> Enum.find_value(fn event ->
-      text = get_in(event, ["payload", "text"])
-
-      if is_binary(text) and String.contains?(text, "worker exited") do
-        parse_occurred_at(Map.get(event, "occurred_at"))
-      end
-    end)
-  end
-
-  defp parse_occurred_at(value) when is_binary(value) do
-    case DateTime.from_iso8601(value) do
-      {:ok, dt, _offset} -> dt
-      _ -> nil
-    end
-  end
-
-  defp parse_occurred_at(_), do: nil
 
   @doc """
-  Checks whether the most recent review-comment requests resume of the previous
-  worker session and, if so, whether a stored session UUID is available.
+  Resolves the continuation intent from the carried `resume_mode` directive and,
+  when absent, the per-host markers.
 
   Returns one of:
   - `:fresh` — no resume requested, or a fresh run was explicitly requested.
-  - `{:previous, session_id}` — resume requested and session UUID available.
-    The dispatcher will invoke the harness-appropriate resume command.
-  - `{:error, :missing_session_id}` — previous-session resume was requested,
-    but neither the daemon runtime store, legacy `shuttle.session.id`, nor
-    worker-exit history contains a usable session id. The caller should surface
-    this instead of silently starting fresh; "New session" is the explicit fresh
-    path.
+  - `{:previous, session_id}` — resume requested and the dispatch marker holds a
+    session UUID. The dispatcher invokes the harness-appropriate resume command.
+  - `{:error, :missing_session_id}` — `resume_mode == "previous"` but the
+    dispatch marker has no usable session id. The caller surfaces this instead
+    of silently starting fresh; "New session" is the explicit fresh path.
 
-  Reads the latest `--kind review-comment` event from felt history. The
-  `resume_mode` field in the event payload is set at requeue time by the user
-  clicking "Requeue fresh" or "Resume previous" in the Kanban UI.
+  `resume_mode` is the user's directive (a transient dispatch parameter, no
+  longer a persisted felt event). The session id comes ONLY from the dispatch
+  marker (`Shuttle.Markers`) — the worker never knew its own UUID, the daemon
+  did.
 
   Options:
-    * `:since` — `DateTime` lower bound passed through to `felt history
-      --since`. Used by scheduled standing-run dispatches to ignore
-      directives that pre-date the current run window. When unset (oneshots,
-      ad-hoc dispatches), the latest review-comment of all time applies.
-    * `:session_id` — daemon-owned prior session UUID supplied by the Poller.
+    * `:resume_mode` — `"previous"` / `"fresh"` / absent.
+    * `:marker_key` — the runtime key the dispatch/handoff markers are keyed by.
   """
   @spec check_resume_intent(String.t(), map(), keyword()) ::
           :fresh | {:previous, String.t()} | {:error, :missing_session_id}
-  def check_resume_intent(fiber_id, fiber, opts \\ []) do
-    felt_store = Keyword.get(opts, :felt_store, default_felt_store())
-
-    since_args =
-      case Keyword.get(opts, :since) do
-        %DateTime{} = dt -> ["--since", DateTime.to_iso8601(dt)]
-        _ -> []
-      end
-
-    resume_mode =
-      case query_history(
-             fiber_id,
-             ["--kind", "review-comment", "--last", "1", "--json"] ++ since_args,
-             felt_store: felt_store
-           ) do
-        [event | _] -> get_in(event, ["payload", "resume_mode"])
-        _ -> nil
-      end
-
-    session_id =
-      Keyword.get(opts, :session_id) ||
-        latest_history_session_id(fiber_id, felt_store: felt_store)
+  def check_resume_intent(_fiber_id, fiber, opts \\ []) do
+    resume_mode = Keyword.get(opts, :resume_mode)
+    marker_key = Keyword.get(opts, :marker_key)
+    session_id = marker_key && Shuttle.Markers.resumable_session_id(marker_key)
 
     cond do
-      # A human explicitly asked to resume (kanban Resume button stamps
+      # A human explicitly asked to resume (kanban Resume button passes
       # resume_mode:previous). Honor it, or surface the missing-id error.
       resume_mode == "previous" ->
         if is_binary(session_id) and session_id != "",
@@ -260,119 +184,48 @@ defmodule Shuttle.Dispatcher do
           else: {:error, :missing_session_id}
 
       # A human explicitly asked for a new session ("New session" / "Requeue
-      # fresh" stamps resume_mode:fresh). This directive is unconditional — it
-      # wins over the autonomous dirty-death heuristic below. Without this short
-      # circuit, a oneshot whose prior worker died WITHOUT a clean handoff
-      # (routine on remote machines, where SSH drops and kills cut workers off
-      # mid-thought) falls through to decide_continuation and gets resumed —
-      # so "New session" silently reopened the dead transcript. "New session"
-      # means a new session, always.
+      # fresh" passes resume_mode:fresh). This directive is UNCONDITIONAL — it
+      # wins over the autonomous dirty-death heuristic below. Without it, a
+      # oneshot whose prior worker died WITHOUT a clean handoff (routine on
+      # remote machines, where SSH drops and kills cut workers off mid-thought)
+      # falls through to decide_continuation and gets resumed — so "New session"
+      # silently reopened the dead transcript. "New session" means new, always.
       resume_mode == "fresh" ->
         :fresh
 
-      # No human directive (resume_mode absent): decide fresh-vs-resume by
-      # whether the previous worker handed off cleanly. The autonomous-loop path.
+      # No directive (resume_mode absent): decide fresh-vs-resume by whether the
+      # previous worker handed off cleanly. The autonomous-loop path.
       true ->
-        decide_continuation(fiber_id, fiber, session_id, felt_store,
-          work_dir: Keyword.get(opts, :work_dir)
-        )
+        decide_continuation(fiber, session_id, marker_key)
     end
   end
 
   # The autonomous fresh-vs-resume decision when there is no human resume
   # directive. A long-running oneshot loops across sessions: a worker exits, the
   # next poll re-dispatches and continues. The question is whether the previous
-  # session ended CLEANLY (it filed a `--kind handoff` marker as its last act —
-  # then the next worker starts fresh and reads the handoff) or DIED mid-thought
-  # (no handoff — the process was killed, common on remote machines — then the
-  # fresh worker loses the in-flight reasoning and loops). On a dirty death we
-  # resume the prior transcript instead; the `resume || fresh-same-id` self-heal
-  # makes resume safe even if the transcript is gone.
+  # session ended CLEANLY (it wrote a handoff marker via `shuttle-ctl handoff` as
+  # its last act — then the next worker starts fresh and reads the `## Status`
+  # block) or DIED mid-thought (no handoff — the process was killed, common on
+  # remote machines — then the fresh worker loses the in-flight reasoning and
+  # loops). On a dirty death we resume the prior transcript instead; the
+  # `resume || fresh-same-id` self-heal makes resume safe even if the transcript
+  # is gone.
+  #
+  # The whole decision is now two per-host marker reads keyed by the intrinsic
+  # runtime key (`Shuttle.Markers`): `handoff` present AND `handoff.at >=
+  # dispatch.dispatched_at` → fresh, else resume the dispatch marker's
+  # session_uuid. Store-agnostic — no work_dir/aggregate federation, no
+  # `SQLITE_BUSY` append-drop that could make a clean exit look dirty.
   #
   # Scoped to oneshots: pinned roles park on session-end (human Resume handles
   # their resume), and standing roles dispatch discrete scheduled occurrences
   # (always fresh). First run / no prior session → fresh (nothing to resume).
-  defp decide_continuation(fiber_id, fiber, session_id, felt_store, opts \\ []) do
+  defp decide_continuation(fiber, session_id, marker_key) do
     cond do
       fiber_kind(fiber) != "oneshot" -> :fresh
       not (is_binary(session_id) and session_id != "") -> :fresh
-      clean_handoff_since_last_dispatch?(fiber_id, felt_store, opts) -> :fresh
+      Shuttle.Markers.clean_handoff_since_dispatch?(marker_key) -> :fresh
       true -> {:previous, session_id}
-    end
-  end
-
-  # True iff the previous session closed cleanly: a worker-authored `--kind
-  # handoff` event exists at or after the last "worker dispatched" event. felt's
-  # default history view shows only `editorial` events (the daemon's dispatch/exit
-  # logs), so typed handoff events must be queried separately by kind — exactly
-  # like review-comments. We therefore compare timestamps across the two queries.
-  #
-  # Two-store reality: the daemon writes dispatch/exit events to the configured
-  # `felt_store` (the loom aggregate), but the WORKER writes its handoff from its
-  # `work_dir` — whose `.felt` symlinks into the project's substore. A typed
-  # `--kind` query against the aggregate root does NOT federate substore-written
-  # events (default editorial does; typed does not), so the worker's handoff is
-  # invisible from `felt_store` and the loop never breaks. `latest_handoff_ts`
-  # therefore queries the work_dir store too. Timestamps are absolute UTC, so
-  # comparing a substore handoff against an aggregate dispatch is sound.
-  #
-  # Defaults to clean (fresh) when the last session start can't be located, so
-  # uncertainty never forces a surprising mid-transcript resume; but a located
-  # dispatch with no handoff after it → died mid-thought → resume.
-  defp clean_handoff_since_last_dispatch?(fiber_id, felt_store, opts) do
-    dispatch_ts = latest_dispatch_ts(fiber_id, felt_store)
-    handoff_ts = latest_handoff_ts(fiber_id, felt_store, opts)
-
-    cond do
-      is_nil(dispatch_ts) -> true
-      is_nil(handoff_ts) -> false
-      true -> DateTime.compare(handoff_ts, dispatch_ts) != :lt
-    end
-  end
-
-  # Timestamp of the most recent worker-authored clean-handoff marker, or nil.
-  # Queries both the configured store (with the global id) and — when known —
-  # the worker's work_dir store (with the work_dir-local id, the address the
-  # worker actually appended under), taking whichever handoff is newest. The
-  # work_dir query is the one that finds substore-written handoffs the aggregate
-  # root can't see; the felt_store query covers fibers whose work_dir IS the
-  # store root.
-  defp latest_handoff_ts(fiber_id, felt_store, opts \\ []) do
-    work_dir = Keyword.get(opts, :work_dir)
-
-    queries =
-      [{fiber_id, felt_store}]
-      |> then(fn qs ->
-        if is_binary(work_dir) and work_dir != "" and work_dir != felt_store,
-          do: [{prompt_fiber_id(fiber_id, work_dir, felt_store), work_dir} | qs],
-          else: qs
-      end)
-
-    queries
-    |> Enum.map(fn {id, store} ->
-      case query_history(id, ["--kind", "handoff", "--last", "1", "--json"], felt_store: store) do
-        [event | _] -> parse_occurred_at(Map.get(event, "occurred_at"))
-        _ -> nil
-      end
-    end)
-    |> Enum.reject(&is_nil/1)
-    |> case do
-      [] -> nil
-      tss -> Enum.max_by(tss, &DateTime.to_unix(&1, :microsecond))
-    end
-  end
-
-  # Timestamp of the most recent "worker dispatched" event (the last session
-  # start), or nil. These are plain editorial events the daemon writes at spawn;
-  # take the max occurred_at rather than trusting list order.
-  defp latest_dispatch_ts(fiber_id, felt_store) do
-    query_history(fiber_id, ["--last", "30", "--json"], felt_store: felt_store)
-    |> Enum.filter(&String.contains?(get_in(&1, ["payload", "text"]) || "", "worker dispatched"))
-    |> Enum.map(&parse_occurred_at(Map.get(&1, "occurred_at")))
-    |> Enum.reject(&is_nil/1)
-    |> case do
-      [] -> nil
-      tss -> Enum.max_by(tss, &DateTime.to_unix(&1, :microsecond))
     end
   end
 
@@ -396,23 +249,23 @@ defmodule Shuttle.Dispatcher do
   what the worker is here to do, and how the practice gets loaded — then
   inlines exactly one context block:
 
-    - **From User** — the most recent `review-comment` event, if any.
-      The user's intent for this dispatch. Persists across handoffs
-      until a newer one is filed.
+    - **From User** — the user's message for this dispatch, if any.
+      Carried as a transient dispatch parameter (`:user_message`),
+      inlined here and discarded — never persisted.
 
   We deliberately *don't* inline the fiber's outcome or the last
-  editorial event. Both are already in scope after the worker calls
-  `felt show <fiber-id>` (which renders outcome + the `Recent:` line)
-  and `felt history <fiber-id>` (which renders the full editorial
-  chain). The shuttle skill prescribes that read order; duplicating
-  either here just bloats the prompt and risks drift between the
-  inlined snapshot and felt's own view.
+  handoff prose. Both are already in scope after the worker calls
+  `felt show <fiber-id>` (which renders outcome and the body, including
+  the `## Status` handoff block the previous session rewrote). The
+  shuttle skill prescribes that read order; duplicating either here just
+  bloats the prompt and risks drift between the inlined snapshot and
+  felt's own view.
 
-  Why keep the From User block inlined? The user's directive isn't
-  recoverable from `felt show` in the same way — it's a typed event
-  among many in the history, and having it sit at the top of the
-  prompt where causal attention sees it first conditions the worker's
-  reading of everything that follows.
+  Why keep the From User block inlined? The user's directive arrives
+  *with* the dispatch — it isn't in the constitution the worker reads on
+  arrival, and having it sit at the top of the prompt where causal
+  attention sees it first conditions the worker's reading of everything
+  that follows.
 
   The exit contract appears directly in the prompt, even though the full
   practice lives in the `shuttle` skill. Resumed sessions otherwise arrive
@@ -453,13 +306,8 @@ defmodule Shuttle.Dispatcher do
   and the constitution are already in the resumed transcript, so repeating
   them is noise.
 
-  When the latest review-comment has an empty summary (the kanban writes
-  one on every requeue/resume click to keep `resume_mode` aligned with
-  user intent — see `render_user_message_block/2`), the From User block
+  When no `:user_message` is carried on the dispatch, the From User block
   is suppressed and the worker just gets the framing sentence.
-
-  Pass `felt_store:` to control which `.felt/` index is queried; defaults
-  to `default_felt_store/0`.
   """
   @spec render_resume_prompt(String.t(), keyword()) :: String.t()
   def render_resume_prompt(fiber_id, opts \\ []) do
@@ -475,77 +323,26 @@ defmodule Shuttle.Dispatcher do
   end
 
   @doc """
-  Reads the most recent `--kind review-comment` event for `fiber_id` and
-  renders it as a "From User · <relative time>" block for inclusion in
-  the dispatch prompt. Returns "" if there are no review-comment events,
-  the latest one has an empty summary, or the latest one has already been
-  consumed by a prior run (see below).
+  Renders the user's dispatch message (the `:user_message` parameter) as a
+  "From User" block for inclusion in the dispatch prompt. Returns "" when no
+  message is carried (or it is blank).
 
-  Persistence semantics: the latest user message is shown until a worker
-  run completes after it was filed. "Consumed" is derived from the existing
-  editorial chain rather than a stored flag: workers append an editorial
-  (`event_type: "editorial"`) handoff event at every session boundary, so
-  if the most recent editorial event post-dates the latest review-comment,
-  a prior run has already seen the directive and the block is suppressed.
-  This stops a re-dispatch with no *new* comment from re-surfacing a stale,
-  already-implemented directive as if it were a fresh task. A directive that
-  has not yet been followed by any editorial event (the requeue-then-dispatch
-  case) still renders. See `consumed_by_later_handoff?/3`.
-
-  Pass `felt_store:` to control which `.felt/` index is queried.
+  The message is a transient dispatch parameter — it rides the dispatch call,
+  is inlined here at launch, and is discarded. There is no persistence: a
+  directive arrives *with* its dispatch, so there is no "which comment is
+  current?" to compute, and no stale-directive-replay to guard against.
   """
-  @spec render_user_message_block(String.t(), keyword()) :: String.t()
-  def render_user_message_block(fiber_id, opts \\ []) do
-    case query_history(fiber_id, ["--kind", "review-comment", "--last", "1", "--json"], opts) do
-      [event | _] ->
-        # felt stores `--summary` text under `payload.text`. Read that key;
-        # `payload.summary` was a dispatcher-side misread, never written.
-        summary = (get_in(event, ["payload", "text"]) || "") |> String.trim()
-        when_iso = Map.get(event, "occurred_at", "")
-
-        cond do
-          # Empty-text events: the kanban may write a review-comment carrying
-          # only `resume_mode` (no user message) to keep the latest resume_mode
-          # current; those should not render a From User block.
-          summary == "" ->
-            ""
-
-          # Already consumed by a completed run — suppress so re-dispatch
-          # without a fresh comment doesn't replay an old directive.
-          consumed_by_later_handoff?(fiber_id, when_iso, opts) ->
-            ""
-
-          true ->
-            render_block("From User", relative_time(when_iso), summary)
+  @spec render_user_message_block(keyword()) :: String.t()
+  def render_user_message_block(opts \\ []) do
+    case Keyword.get(opts, :user_message) do
+      message when is_binary(message) ->
+        case String.trim(message) do
+          "" -> ""
+          trimmed -> render_block("From User", nil, trimmed)
         end
 
       _ ->
         ""
-    end
-  end
-
-  # True when the fiber has an editorial (worker handoff) event strictly newer
-  # than `comment_iso` — evidence the latest review-comment was already seen by
-  # a prior run. Editorial events are filed by workers at session boundaries
-  # (`felt history append` with no `--kind`), so one post-dating the directive
-  # means a worker has had its turn with it.
-  #
-  # Conservative on failure: a missing/blank/unparseable timestamp, or no
-  # editorial event at all, returns false (render) so a genuinely-fresh
-  # directive is never silently dropped.
-  defp consumed_by_later_handoff?(_fiber_id, comment_iso, _opts)
-       when not is_binary(comment_iso) or comment_iso == "",
-       do: false
-
-  defp consumed_by_later_handoff?(fiber_id, comment_iso, opts) do
-    with {:ok, comment_dt, _} <- DateTime.from_iso8601(comment_iso),
-         [event | _] <-
-           query_history(fiber_id, ["--kind", "editorial", "--last", "1", "--json"], opts),
-         editorial_iso when is_binary(editorial_iso) <- Map.get(event, "occurred_at"),
-         {:ok, editorial_dt, _} <- DateTime.from_iso8601(editorial_iso) do
-      DateTime.compare(editorial_dt, comment_dt) == :gt
-    else
-      _ -> false
     end
   end
 
@@ -572,90 +369,6 @@ defmodule Shuttle.Dispatcher do
 
     "#{top}\n#{body}\n#{bottom}"
   end
-
-  # Convert ISO 8601 timestamp to a relative-time phrase ("just now",
-  # "5 minutes ago", "2 days ago"). Granularity tops out at coarse units
-  # — we want the worker to feel the gap ("picked back up after 2 days"),
-  # not the precision. Falls back to the raw string on parse failure.
-  defp relative_time(""), do: ""
-
-  defp relative_time(iso) when is_binary(iso) do
-    case DateTime.from_iso8601(iso) do
-      {:ok, dt, _offset} ->
-        DateTime.utc_now()
-        |> DateTime.diff(dt)
-        |> max(0)
-        |> format_relative()
-
-      _ ->
-        iso
-    end
-  end
-
-  defp relative_time(_), do: ""
-
-  defp format_relative(s) when s < 60, do: "just now"
-  defp format_relative(s) when s < 3600, do: pluralize(div(s, 60), "minute")
-  defp format_relative(s) when s < 86_400, do: pluralize(div(s, 3600), "hour")
-  defp format_relative(s) when s < 2_592_000, do: pluralize(div(s, 86_400), "day")
-  defp format_relative(s) when s < 31_536_000, do: pluralize(div(s, 2_592_000), "month")
-  defp format_relative(s), do: pluralize(div(s, 31_536_000), "year")
-
-  defp pluralize(1, unit), do: "1 #{unit} ago"
-  defp pluralize(n, unit), do: "#{n} #{unit}s ago"
-
-  # Shared `felt history` JSON query with graceful fallback to []. Used by
-  # both the directive block (filters on --kind review-comment) and the
-  # handoff block (default editorial filter). `felt_store:` opt selects the
-  # `.felt/` index to query — defaults to `default_felt_store/0` so callers
-  # without a configured host (e.g. CLI smoke tests) still work.
-  defp query_history(fiber_id, extra_args, opts) do
-    felt_store = Keyword.get(opts, :felt_store, default_felt_store())
-    args = ["-C", felt_store, "history", fiber_id] ++ extra_args
-
-    case System.cmd("felt", args, stderr_to_stdout: true) do
-      {output, 0} ->
-        case Jason.decode(output) do
-          {:ok, events} when is_list(events) -> events
-          _ -> []
-        end
-
-      _ ->
-        []
-    end
-  end
-
-  # The most recent harness session UUID recoverable from felt history.
-  #
-  # Scans ALL of history (`--last 0`), not a fixed window. The session id lives
-  # in the rare "worker dispatched ... session=<uuid>" event, while every worker
-  # exit appends a "worker exited (...)" event that carries NO session id
-  # (`log_worker_exit` logs agent= only — `meta.session` is the tmux name, not
-  # the harness UUID). So a redispatch storm floods history with session-less
-  # exit events, and any fixed `--last N` window buries the dispatch event past
-  # the cap — the lookup returns nil and the resume path fails
-  # `:missing_session_id` even though the id is on record, blocking the fiber
-  # indefinitely (the "morning-post blocked for days" pathology). `find_value`
-  # returns the FIRST (newest-first) session-bearing event regardless of depth.
-  defp latest_history_session_id(fiber_id, opts) do
-    fiber_id
-    |> query_history(["--last", "0", "--json"], opts)
-    |> Enum.find_value(fn event ->
-      event
-      |> get_in(["payload", "text"])
-      |> extract_session_id()
-    end)
-  end
-
-  defp extract_session_id(text) when is_binary(text) do
-    case Regex.run(~r/(?:^|\s)session=([A-Za-z0-9._:-]+)/, text) do
-      [_, "<unknown>"] -> nil
-      [_, session_id] -> session_id
-      _ -> nil
-    end
-  end
-
-  defp extract_session_id(_), do: nil
 
   # Indent every line of `text` by `prefix`. Used to inset event summaries
   # under the box header so multi-line directives stay visually grouped.
@@ -685,7 +398,7 @@ defmodule Shuttle.Dispatcher do
 
     orientation =
       if ad_hoc? do
-        "The orchestration system Shuttle dispatched you for an ad-hoc run of this standing role. Standing roles are recurring responsibilities; this dispatch is right-now work and does not consume or advance the scheduled occurrence. Exit like any standing run: write the work product into outcome, append a felt history event carrying this run id, then kill $PPID — the daemon owns the awaiting transition. The `shuttle` and `felt` skills carry the practice — activate them next."
+        "The orchestration system Shuttle dispatched you for an ad-hoc run of this standing role. Standing roles are recurring responsibilities; this dispatch is right-now work and does not consume or advance the scheduled occurrence. Exit like any standing run: write the work product into outcome, rewrite the constitution's `## Status` section in prose, then kill $PPID — the daemon owns the awaiting transition. The `shuttle` and `felt` skills carry the practice — activate them next."
       else
         "The orchestration system Shuttle dispatched you for a scheduled run of this standing role. Standing roles are recurring responsibilities — this dispatch is one due occurrence, not a new fiber. The `shuttle` and `felt` skills carry the practice — activate them next; the skill's \"Standing Roles\" section covers the awaiting-review handoff at run completion."
       end
@@ -739,13 +452,11 @@ defmodule Shuttle.Dispatcher do
   # header, the mandatory exit contract, and optional context blocks. The
   # shape is documented in CLAUDE.md under "Dispatch prompt structure".
   # Outcome and last-session are deliberately not inlined — the shuttle
-  # skill prescribes that the worker reads them via `felt show` /
-  # `felt history` on arrival, and duplicating either here risks drift
-  # between the prompt's snapshot and felt's view.
-  defp compose_prompt(header, fiber_id, opts) do
+  # skill prescribes that the worker reads them via `felt show` (outcome +
+  # the body's `## Status` block) on arrival, and duplicating either here risks
+  # drift between the prompt's snapshot and felt's view.
+  defp compose_prompt(header, _fiber_id, opts) do
     felt_store = Keyword.get(opts, :felt_store, default_felt_store())
-
-    felt_opts = [felt_store: felt_store]
 
     # The store line is the worker's absolute anchor. `prompt_fiber_id`
     # translates the global id to the work_dir-local view when it can, but
@@ -766,13 +477,13 @@ defmodule Shuttle.Dispatcher do
 
     # Order: header, exit contract, user message block. The exit contract is
     # always present; the From User block carries the per-dispatch intent
-    # (including any "talk to me first" signal) and renders only when there's a
-    # fresh directive.
+    # (including any "talk to me first" signal) and renders only when a
+    # `:user_message` was carried on the dispatch.
     [
       header,
       render_exit_contract(Keyword.get(opts, :kind, "oneshot")),
       render_headless_notice(Keyword.get(opts, :headless, false)),
-      render_user_message_block(fiber_id, felt_opts)
+      render_user_message_block(user_message: Keyword.get(opts, :user_message))
     ]
     |> Enum.reject(&(&1 == ""))
     |> Enum.join("\n\n")
@@ -827,7 +538,7 @@ defmodule Shuttle.Dispatcher do
     render_block(
       "Exit Contract",
       nil,
-      "This is an autonomous Shuttle worker. After you update outcome/history, file findings, and commit at a clean checkpoint, file your handoff as the SECOND-to-last action — `felt history append <fiber-id> --kind handoff --summary \"<what you did; where the next session picks up>\"` — and then your final action must be `kill $PPID`. The handoff marker is load-bearing: it tells the daemon you closed cleanly, so the next dispatch starts fresh and reads your note. WITHOUT it, a session that simply died (the process was killed mid-thought — common on remote machines) is indistinguishable from a clean exit, so the daemon RESUMES your transcript instead of looping a fresh, context-less worker. Exception: if the dispatch directive or constitution explicitly asks you to wait for a human (a 2FA gate, a send-in-his-voice step, a \"talk to me first\" signal), drive to that checkpoint and stay alive there instead — no handoff, no kill. Do not substitute a normal chat final response for worker exit; the handoff belongs in the fiber."
+      "This is an autonomous Shuttle worker. After you update outcome, file findings, and commit at a clean checkpoint, rewrite the constitution's `## Status` section in prose — where the work stands, what's blocked, where the next session picks up (rewritten, never a session log) — then file your handoff as the SECOND-to-last action with `shuttle-ctl handoff <fiber-id>`, and your final action must be `kill $PPID`. The handoff marker is load-bearing: it tells the daemon you closed cleanly, so the next dispatch starts fresh and reads your `## Status` note. WITHOUT it, a session that simply died (the process was killed mid-thought — common on remote machines) is indistinguishable from a clean exit, so the daemon RESUMES your transcript instead of looping a fresh, context-less worker. Exception: if the dispatch directive or constitution explicitly asks you to wait for a human (a 2FA gate, a send-in-his-voice step, a \"talk to me first\" signal), drive to that checkpoint and stay alive there instead — no handoff, no kill. Do not substitute a normal chat final response for worker exit; the handoff belongs in the fiber."
     )
   end
 
@@ -1230,6 +941,26 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
+  # The runtime key the per-host markers are keyed by: the fiber's uid when
+  # present, else its slug. Mirrors `Poller.runtime_key_for_fiber/1` exactly so
+  # the dispatch marker the daemon writes and the handoff marker the worker
+  # writes (via `SHUTTLE_FIBER_KEY`) line up byte-for-byte. `uid` is read off the
+  # fiber by `dispatch/2`; `fiber_id` is the slug fallback.
+  @spec marker_key(map(), String.t() | nil, String.t()) :: String.t()
+  defp marker_key(fiber, uid, fiber_id) do
+    cond do
+      is_binary(uid) and uid != "" -> uid
+      is_binary(Map.get(fiber, "uid")) and Map.get(fiber, "uid") != "" -> Map.get(fiber, "uid")
+      true -> fiber_id
+    end
+  end
+
+  # The standing run id carried in the prompt context tuple, threaded into the
+  # dispatch marker. nil for a plain oneshot/constitution dispatch.
+  defp prompt_context_run_id({:standing_run, run_id}), do: run_id
+  defp prompt_context_run_id({:standing_run, run_id, _}), do: run_id
+  defp prompt_context_run_id(_), do: nil
+
   # Dispatch: fresh worker (new session) or resume previous.
   # `resume_intent` is `:fresh | {:previous, session_id}` from check_resume_intent/3.
   defp create_tmux_session(fiber_id, agent, work_dir, runner, prompt_context, resume_intent, opts) do
@@ -1287,7 +1018,8 @@ defmodule Shuttle.Dispatcher do
             dismiss_resume_warning: agent.cli == "claude" and not headless,
             session: session,
             headless: headless,
-            display_fiber_id: worker_fiber_id
+            display_fiber_id: worker_fiber_id,
+            marker_key: Keyword.get(opts, :marker_key)
           )
 
         spawn_tmux(session, work_dir, run_script, runner)
@@ -1300,13 +1032,20 @@ defmodule Shuttle.Dispatcher do
         Logger.info("Dispatching #{fiber_id} via #{agent.id} → tmux session #{session}")
 
         run_script =
-          build_run_script(fiber_id, command, agent.id, display_fiber_id: worker_fiber_id)
+          build_run_script(fiber_id, command, agent.id,
+            display_fiber_id: worker_fiber_id,
+            marker_key: Keyword.get(opts, :marker_key)
+          )
 
         case spawn_tmux(session, work_dir, run_script, runner) do
           {:ok, _} = result ->
-            # Store the session UUID so "Resume previous" is available next time.
+            # Store the session UUID in the dispatch marker so "Resume previous"
+            # and the autonomous continuation heuristic can recover it.
             if Keyword.get(opts, :store_session_id, true) do
-              store_session_id(fiber_id, agent.id, session_uuid, runner, felt_store)
+              store_session_id(fiber_id, session_uuid, runner,
+                marker_key: Keyword.get(opts, :marker_key),
+                run_id: Keyword.get(opts, :run_id)
+              )
             end
 
             result
@@ -1378,29 +1117,28 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
-  # Record the session UUID in felt history after a successful fresh dispatch, so
-  # "Resume previous" can recover it across a daemon restart. felt history is the
-  # chronological substrate and the only durable session-id home (no
-  # runtime store, no doc-resident `shuttle.session` block); `latest_history_
-  # session_id` parses the `session=<uuid>` token back out at the next dispatch,
-  # and the worker-exit event reads it the same way.
+  # Record the session UUID in the per-host dispatch marker after a successful
+  # fresh dispatch, so "Resume previous" and the autonomous continuation
+  # heuristic can recover it (the marker is the only structured session-id home —
+  # the worker never knows its own UUID, the daemon does). `opts` carries
+  # `:marker_key` (the runtime key the dispatch/handoff markers share) and
+  # `:run_id` (the standing run id, nil for a oneshot).
   # - Claude: UUID was pre-specified; write synchronously (fire-and-forget Task).
   # - Codex/Pi: capture UUID from session file asynchronously with backoff.
   # - None: agent doesn't support session IDs; skip.
-  defp store_session_id(fiber_id, agent_id, {:claude, uuid}, _runner, felt_store) do
+  defp store_session_id(fiber_id, {:claude, uuid}, _runner, opts) do
     # Fire-and-forget: recording the UUID is best-effort; blocking dispatch on a
-    # felt write would delay WorkerWatcher startup and cause flaky tests.
+    # marker write would delay WorkerWatcher startup and cause flaky tests.
     Task.start(fn ->
-      record_dispatch_session(fiber_id, agent_id, uuid, felt_store)
+      record_dispatch_session(fiber_id, uuid, opts)
     end)
   end
 
   defp store_session_id(
          fiber_id,
-         agent_id,
          {:capture, cli, work_dir, capture_fiber_id, dispatched_after},
          _runner,
-         felt_store
+         opts
        ) do
     # Fire-and-forget: capture the session UUID from the harness's JSONL file
     # in a background task. The race window (50 ms × 20 attempts = ~1 s) is
@@ -1409,7 +1147,7 @@ defmodule Shuttle.Dispatcher do
     Task.start(fn ->
       case capture_session_uuid(cli, work_dir, capture_fiber_id, dispatched_after, 100) do
         {:ok, uuid} ->
-          record_dispatch_session(fiber_id, agent_id, uuid, felt_store)
+          record_dispatch_session(fiber_id, uuid, opts)
 
         {:error, reason} ->
           Logger.warning(
@@ -1420,25 +1158,32 @@ defmodule Shuttle.Dispatcher do
     end)
   end
 
-  defp store_session_id(_fiber_id, _agent_id, :none, _runner, _felt_store), do: :ok
+  defp store_session_id(_fiber_id, :none, _runner, _opts), do: :ok
 
-  # Append a felt-history event carrying the dispatch session UUID. The summary
-  # uses the same `session=<uuid>` token the worker-exit event uses, so
-  # `latest_history_session_id`/`extract_session_id` recover it uniformly.
-  defp record_dispatch_session(fiber_id, agent_id, uuid, felt_store) do
-    store = felt_store || default_felt_store()
-    summary = "worker dispatched (agent=#{agent_id}) session=#{uuid}"
+  # Write the per-host dispatch marker carrying `{session_uuid, dispatched_at,
+  # run_id}`, keyed by the fiber's runtime key. The handoff marker the worker
+  # writes at clean exit is compared against this marker's `dispatched_at` to
+  # decide fresh-vs-resume at the next dispatch. A missing `:marker_key` (no uid
+  # and no slug threaded) skips the write — the fiber simply has no resumable
+  # session, which the heuristic treats as fresh.
+  defp record_dispatch_session(fiber_id, uuid, opts) do
+    case Keyword.get(opts, :marker_key) do
+      key when is_binary(key) and key != "" ->
+        case Shuttle.Markers.write_dispatch(key, %{
+               session_uuid: uuid,
+               run_id: Keyword.get(opts, :run_id)
+             }) do
+          :ok ->
+            Logger.info("Recorded session UUID #{uuid} for #{fiber_id} in dispatch marker #{key}")
 
-    case System.cmd("felt", ["-C", store, "history", "append", fiber_id, "--summary", summary],
-           stderr_to_stdout: true
-         ) do
-      {_, 0} ->
-        Logger.info("Recorded session UUID #{uuid} for #{fiber_id} in felt history")
+          {:error, reason} ->
+            Logger.warning(
+              "Could not record session UUID for #{fiber_id} (marker #{key}): #{inspect(reason)}"
+            )
+        end
 
-      {output, code} ->
-        Logger.warning(
-          "Could not record session UUID for #{fiber_id} (felt exit #{code}): #{String.trim(output)}"
-        )
+      _ ->
+        Logger.debug("record_dispatch_session: no marker key for #{fiber_id}; skipping")
     end
   rescue
     e -> Logger.warning("Could not record session UUID for #{fiber_id}: #{inspect(e)}")
@@ -1607,6 +1352,13 @@ defmodule Shuttle.Dispatcher do
     |> IO.chardata_to_string()
   end
 
+  # POSIX single-quote a value for safe interpolation into the run script's
+  # `export` line. Single-quoting suppresses every shell special char; an
+  # embedded `'` is closed, escaped (`'\''`), and reopened.
+  defp shell_single_quote(value) do
+    "'" <> String.replace(value, "'", "'\\''") <> "'"
+  end
+
   defp render_context_prompt(fiber_id, {:standing_run, run_id}, opts) do
     render_standing_run_prompt(fiber_id, run_id, opts)
   end
@@ -1629,6 +1381,18 @@ defmodule Shuttle.Dispatcher do
     # wait-for-client gate below would only burn its full timeout for nothing.
     headless = Keyword.get(opts, :headless, false)
     display_fiber_id = Keyword.get(opts, :display_fiber_id, fiber_id)
+
+    # The runtime key the worker's `shuttle-ctl handoff` stamps the handoff
+    # marker under — exported so the Go writer and this Elixir reader key
+    # identically (dispatch/<key> and handoff/<key> line up byte-for-byte).
+    fiber_key_block =
+      case Keyword.get(opts, :marker_key) do
+        key when is_binary(key) and key != "" ->
+          "export SHUTTLE_FIBER_KEY=#{shell_single_quote(key)}\n"
+
+        _ ->
+          ""
+      end
 
     # When resuming claude, schedule a backgrounded tmux send-keys to
     # dismiss the interactive warning page. Runs *inside* the same tmux
@@ -1687,7 +1451,7 @@ defmodule Shuttle.Dispatcher do
     set -e
     trap 'rm -f "$0"' EXIT
 
-    #{wait_for_client_block}
+    #{fiber_key_block}#{wait_for_client_block}
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "Shuttle worker — #{display_fiber_id} — agent=#{agent_id} — $(date '+%H:%M:%S')"

@@ -34,8 +34,8 @@ defmodule ShuttleWeb.RelayHelpers do
   @doc """
   Relay a plain-text forward verbatim, or render a 502 tunnel failure.
 
-  Identical across the felt-edit / felt-nest / felt-history / lifecycle
-  endpoints, whose owning daemon returns `text/plain`.
+  Identical across the felt-edit / felt-nest / lifecycle endpoints, whose
+  owning daemon returns `text/plain`.
   """
   def relay_text(conn, forward_result)
 

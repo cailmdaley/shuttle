@@ -3,7 +3,7 @@ defmodule Shuttle.Felt do
   Centralized `felt` CLI shell-out for the write endpoints.
 
   One implementation of the drifting `System.cmd("felt", …)` error mapping the
-  felt-edit / felt-nest / felt-history controllers each had inline:
+  felt-edit / felt-nest controllers each had inline:
 
     * `{output, 0}` → `{:ok, output}`
     * `{output, status}` (non-zero exit) → `{:command_error, status, output}`
