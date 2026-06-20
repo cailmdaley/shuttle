@@ -4,9 +4,11 @@ defmodule ShuttleWeb.FiberDocumentsController do
 
   `GET /api/v1/fibers` returns the fibers visible to this daemon's configured
   felt stores. `GET /api/v1/fibers/:id` resolves a SINGLE fiber by canonical id
-  — the per-fiber lookup Portolan uses to open a remote card without fetching
-  every fiber. The `fiber` payload is felt JSON, intentionally leaving document
-  parsing semantics with felt and Portolan's existing reader.
+  — the per-fiber lookup used to open a card without fetching every fiber — and
+  is OWNER-ROUTED: a remote-owned fiber's body is fetched from the owning daemon
+  over the SSH tunnel (see `show/2`), never assumed present in a local git
+  mirror. The `fiber` payload is felt JSON, intentionally leaving document
+  parsing semantics with felt and the reader.
 
   Query params (both actions):
     * `body=true`    — include each fiber's markdown body.
@@ -24,6 +26,8 @@ defmodule ShuttleWeb.FiberDocumentsController do
   """
 
   use Phoenix.Controller, formats: [:json]
+
+  alias Shuttle.OriginRouter
 
   def index(conn, params) do
     with_body? = Map.get(params, "body") in ["1", "true", true]
@@ -47,11 +51,33 @@ defmodule ShuttleWeb.FiberDocumentsController do
   zero or one fiber, so Portolan reuses the list-response parser. A missing
   fiber is a 200 with `fibers: []`, not a 404 — the caller treats an empty list
   as "not here", same as scanning the full list would.
+
+  **Owner-routed via `Shuttle.OriginRouter`, exactly like `/file`.** Only the
+  daemon that owns a fiber's host can read its body off that host's filesystem.
+  The composite board stamps each fiber with its `origin`; the detail panel
+  carries that origin back here. A local-owned fiber is read here; a remote-owned
+  fiber forwards to the owning daemon's identical `/api/v1/fibers/:id` (origin
+  stripped) over the SSH tunnel and relays the JSON verbatim. This is the ONLY
+  correct source for a remote constitution's body — git-mirror replication is
+  incidental and must never be relied on for availability.
   """
   def show(conn, %{"id" => id_segments} = params) do
     id = id_segments |> List.wrap() |> Enum.join("/")
     with_body? = Map.get(params, "body") in ["1", "true", true]
 
+    case OriginRouter.route(Map.get(params, "origin")) do
+      {:remote, remote} ->
+        relay_show(
+          conn,
+          OriginRouter.forward_get(remote, fibers_show_path(id), %{"body" => to_string(with_body?)})
+        )
+
+      :local ->
+        show_local(conn, id, with_body?)
+    end
+  end
+
+  defp show_local(conn, id, with_body?) do
     case Shuttle.FiberDocuments.get(id, with_body: with_body?) do
       {:ok, body} ->
         json(conn, body)
@@ -61,6 +87,31 @@ defmodule ShuttleWeb.FiberDocumentsController do
         |> put_status(:service_unavailable)
         |> json(%{error: "felt_show_failed", stores: errors})
     end
+  end
+
+  # Rebuild the owning daemon's `/api/v1/fibers/:id` path, encoding each id
+  # segment so the remote's wildcard splat reconstructs the same canonical id.
+  defp fibers_show_path(id) do
+    encoded =
+      id
+      |> String.split("/")
+      |> Enum.map_join("/", &URI.encode(&1, fn c -> URI.char_unreserved?(c) end))
+
+    "/api/v1/fibers/" <> encoded
+  end
+
+  # Relay the owning remote's JSON + status verbatim, so a remote "fiber not
+  # here" reads as that, not a tunnel error.
+  defp relay_show(conn, {:forwarded, status, content_type, body}) do
+    conn
+    |> put_resp_content_type(content_type)
+    |> send_resp(status, body)
+  end
+
+  defp relay_show(conn, {:error, {:forward_failed, name, reason}}) do
+    conn
+    |> put_status(:bad_gateway)
+    |> json(%{error: "forward to #{name} failed: #{inspect(reason)}"})
   end
 
   @doc """

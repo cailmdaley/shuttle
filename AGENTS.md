@@ -306,6 +306,21 @@ shuttle-ctl validate-identity                # UID migration/cross-city validati
   not workers.
 - **Felt is the data layer; Shuttle shells out to the felt CLI.** Don't
   import felt internals.
+- **Remote content comes from the owning daemon over the tunnel — NEVER from
+  git sync.** A fiber is owned by exactly one host; only that host's daemon can
+  read its body, files, and assets off its own filesystem. Every cross-host
+  READ (`/api/v1/fibers/:id?body=true`, `/file`, `/astra`) and every cross-host
+  WRITE is **owner-routed via `Shuttle.OriginRouter`**: the composite board
+  stamps each fiber's `origin`, the client carries it back, and the local daemon
+  forwards to the owner's identical endpoint over the SSH LocalForward
+  (candide→:4001, cineca→:4002). The `~/loom` git mirror replicating a remote
+  fiber's files locally is **incidental and must never be relied on** — if any
+  feature works only because a file happened to git-sync, that is a bug. The
+  symptom when this invariant is violated: a remote card shows its outcome (it
+  rides the composite feed) but the body reads empty / "not in the local
+  mirror", because the read was attempted locally instead of being owner-routed.
+  New endpoints that surface a fiber's host-local content MUST route through
+  `OriginRouter`, not assume the bytes are reachable on this host.
 - **Agent records live in one source of truth: `share/agents.json`.** Both
   runtimes (Elixir daemon, Go CLI) embed it at compile time — Elixir via
   `@external_resource` + `File.read!` in `lib/shuttle/agents.ex`, Go via

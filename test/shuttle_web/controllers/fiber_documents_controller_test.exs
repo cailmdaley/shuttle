@@ -21,6 +21,24 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
     def get(url, _timeout_ms), do: Agent.get(__MODULE__, &Map.get(&1, url, {:error, :not_set}))
   end
 
+  # GET transport stub for the owner-routed `show` forward (forward_get →
+  # get_file). Records the URL it was asked to fetch and replays a scripted
+  # response, so the cross-host body read runs without a real tunnel.
+  defmodule StubGetFileClient do
+    use Agent
+
+    def start_link(_ \\ []),
+      do: Agent.start_link(fn -> %{response: nil, last: nil} end, name: __MODULE__)
+
+    def set_response(response), do: Agent.update(__MODULE__, &Map.put(&1, :response, response))
+    def last, do: Agent.get(__MODULE__, & &1.last)
+
+    def get_file(url, _timeout_ms) do
+      Agent.update(__MODULE__, &Map.put(&1, :last, %{url: url}))
+      Agent.get(__MODULE__, & &1.response)
+    end
+  end
+
   setup do
     root =
       Path.join(
@@ -722,6 +740,62 @@ defmodule ShuttleWeb.FiberDocumentsControllerTest do
     System.put_env("PATH", bin_dir <> ":" <> (old_path || ""))
     on_exit(fn -> restore_env("PATH", old_path) end)
   end
+
+  describe "GET /api/v1/fibers/:id owner-routing" do
+    test "a remote-owned fiber's body is fetched FROM the owning daemon, not locally" do
+      # The fiber does NOT exist in this daemon's local store; only owner-routing
+      # over the tunnel can produce its body. This is the analysis-advance bug:
+      # without forwarding, the read came back empty and blamed "not in the local
+      # mirror" — relying on git sync that must never be load-bearing.
+      stub_forward(
+        "cineca",
+        "http://localhost:4002",
+        {:ok, 200, "application/json; charset=utf-8",
+         ~s({"fibers":[{"fiber":{"id":"science/cmbx/explorations/analysis-advance","body":"REMOTE BODY"}}]})}
+      )
+
+      conn =
+        get(
+          api_conn(),
+          "/api/v1/fibers/science%2Fcmbx%2Fexplorations%2Fanalysis-advance?body=true&origin=cineca"
+        )
+
+      assert conn.status == 200
+      assert %{"fibers" => [%{"fiber" => %{"body" => "REMOTE BODY"}}]} = json_response(conn, 200)
+
+      # origin stripped; id re-encoded onto the owner's identical path; body=true preserved.
+      assert StubGetFileClient.last().url ==
+               "http://localhost:4002/api/v1/fibers/science/cmbx/explorations/analysis-advance?body=true"
+    end
+
+    test "relays the remote status verbatim and 502s on tunnel failure" do
+      stub_forward("cineca", "http://localhost:4002", {:error, :econnrefused})
+
+      conn =
+        get(api_conn(), "/api/v1/fibers/science%2Fcmbx%2Fx?body=true&origin=cineca")
+
+      assert conn.status == 502
+      assert %{"error" => _} = json_response(conn, 502)
+    end
+  end
+
+  defp stub_forward(remote_name, remote_url, response) do
+    start_supervised!(StubGetFileClient)
+    StubGetFileClient.set_response(response)
+
+    previous_remotes = Application.get_env(:shuttle, :remotes)
+    previous_client = Application.get_env(:shuttle, :write_forward_client)
+    Application.put_env(:shuttle, :remotes, [%{name: remote_name, url: remote_url}])
+    Application.put_env(:shuttle, :write_forward_client, StubGetFileClient)
+
+    on_exit(fn ->
+      restore_app_env(:remotes, previous_remotes)
+      restore_app_env(:write_forward_client, previous_client)
+    end)
+  end
+
+  defp restore_app_env(key, nil), do: Application.delete_env(:shuttle, key)
+  defp restore_app_env(key, value), do: Application.put_env(:shuttle, key, value)
 
   defp write_fiber!(store, fiber_id, content) do
     segments = String.split(fiber_id, "/")

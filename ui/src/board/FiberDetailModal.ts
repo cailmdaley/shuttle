@@ -566,11 +566,17 @@ export class FiberDetailModal {
     let reached = false
     try {
       const idPath = card.id.split('/').map(encodeURIComponent).join('/')
+      // Carry the owning origin so the daemon owner-routes the read to the host
+      // that can actually read the fiber (over the SSH tunnel), exactly like
+      // every write and the /file bytes route. A remote fiber's body is fetched
+      // FROM the remote, never from a git mirror — git sync is never relied on.
+      const origin = encodeURIComponent(card.originId ?? '')
       const ctrl = new AbortController()
       const timer = window.setTimeout(() => ctrl.abort(), 25000)
-      const res = await fetch(`${this.shuttleBase}/api/v1/fibers/${idPath}?body=true`, {
-        signal: ctrl.signal,
-      })
+      const res = await fetch(
+        `${this.shuttleBase}/api/v1/fibers/${idPath}?body=true&origin=${origin}`,
+        { signal: ctrl.signal },
+      )
       window.clearTimeout(timer)
       if (res.ok) {
         const data = (await res.json()) as {
