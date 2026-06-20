@@ -25,7 +25,7 @@ var embeddedAgentJSON = []byte(`
     "model": "opus",
     "extra_flags": "--permission-mode auto",
     "effort_levels": ["low", "medium", "high", "xhigh", "max"],
-    "default_effort": "low",
+    "default_effort": "xhigh",
     "chrome_capable": true,
     "cost_class": "premium",
     "aliases": [],

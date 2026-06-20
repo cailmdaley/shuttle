@@ -26,8 +26,9 @@ func TestResolve_BareClaudeUsesRegistryDefaultEffort(t *testing.T) {
 	if base.ID != "claude-opus" {
 		t.Fatalf("base = %q, want claude-opus", base.ID)
 	}
-	if eff.Effort != "low" || eff.Chrome {
-		t.Fatalf("expected effort=low and chrome=false, got %+v", eff)
+	// claude-opus's registry default_effort is xhigh.
+	if eff.Effort != "xhigh" || eff.Chrome {
+		t.Fatalf("expected effort=xhigh and chrome=false, got %+v", eff)
 	}
 }
 
