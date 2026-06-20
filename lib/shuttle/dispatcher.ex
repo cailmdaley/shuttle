@@ -82,6 +82,7 @@ defmodule Shuttle.Dispatcher do
             true ->
               resolve_resume_intent(prompt_context, fiber_id, fiber, felt_store,
                 force: force,
+                work_dir: work_dir,
                 session_id: Keyword.get(opts, :runtime_session_id)
               )
           end
@@ -141,7 +142,7 @@ defmodule Shuttle.Dispatcher do
           if force?, do: nil, else: run_window_start(prompt_context, fiber_id, felt_store)
 
         check_opts =
-          [since: since]
+          [since: since, work_dir: Keyword.get(opts, :work_dir)]
           |> then(fn o -> if is_nil(felt_store), do: o, else: [{:felt_store, felt_store} | o] end)
           |> then(fn o ->
             case Keyword.get(opts, :session_id) do
@@ -261,7 +262,9 @@ defmodule Shuttle.Dispatcher do
       # No human directive: decide fresh-vs-resume by whether the previous
       # worker handed off cleanly. This is the autonomous-loop path.
       true ->
-        decide_continuation(fiber_id, fiber, session_id, felt_store)
+        decide_continuation(fiber_id, fiber, session_id, felt_store,
+          work_dir: Keyword.get(opts, :work_dir)
+        )
     end
   end
 
@@ -278,11 +281,11 @@ defmodule Shuttle.Dispatcher do
   # Scoped to oneshots: pinned roles park on session-end (human Resume handles
   # their resume), and standing roles dispatch discrete scheduled occurrences
   # (always fresh). First run / no prior session → fresh (nothing to resume).
-  defp decide_continuation(fiber_id, fiber, session_id, felt_store) do
+  defp decide_continuation(fiber_id, fiber, session_id, felt_store, opts \\ []) do
     cond do
       fiber_kind(fiber) != "oneshot" -> :fresh
       not (is_binary(session_id) and session_id != "") -> :fresh
-      clean_handoff_since_last_dispatch?(fiber_id, felt_store) -> :fresh
+      clean_handoff_since_last_dispatch?(fiber_id, felt_store, opts) -> :fresh
       true -> {:previous, session_id}
     end
   end
@@ -293,12 +296,21 @@ defmodule Shuttle.Dispatcher do
   # logs), so typed handoff events must be queried separately by kind — exactly
   # like review-comments. We therefore compare timestamps across the two queries.
   #
+  # Two-store reality: the daemon writes dispatch/exit events to the configured
+  # `felt_store` (the loom aggregate), but the WORKER writes its handoff from its
+  # `work_dir` — whose `.felt` symlinks into the project's substore. A typed
+  # `--kind` query against the aggregate root does NOT federate substore-written
+  # events (default editorial does; typed does not), so the worker's handoff is
+  # invisible from `felt_store` and the loop never breaks. `latest_handoff_ts`
+  # therefore queries the work_dir store too. Timestamps are absolute UTC, so
+  # comparing a substore handoff against an aggregate dispatch is sound.
+  #
   # Defaults to clean (fresh) when the last session start can't be located, so
   # uncertainty never forces a surprising mid-transcript resume; but a located
   # dispatch with no handoff after it → died mid-thought → resume.
-  defp clean_handoff_since_last_dispatch?(fiber_id, felt_store) do
+  defp clean_handoff_since_last_dispatch?(fiber_id, felt_store, opts) do
     dispatch_ts = latest_dispatch_ts(fiber_id, felt_store)
-    handoff_ts = latest_handoff_ts(fiber_id, felt_store)
+    handoff_ts = latest_handoff_ts(fiber_id, felt_store, opts)
 
     cond do
       is_nil(dispatch_ts) -> true
@@ -308,12 +320,34 @@ defmodule Shuttle.Dispatcher do
   end
 
   # Timestamp of the most recent worker-authored clean-handoff marker, or nil.
-  defp latest_handoff_ts(fiber_id, felt_store) do
-    case query_history(fiber_id, ["--kind", "handoff", "--last", "1", "--json"],
-           felt_store: felt_store
-         ) do
-      [event | _] -> parse_occurred_at(Map.get(event, "occurred_at"))
-      _ -> nil
+  # Queries both the configured store (with the global id) and — when known —
+  # the worker's work_dir store (with the work_dir-local id, the address the
+  # worker actually appended under), taking whichever handoff is newest. The
+  # work_dir query is the one that finds substore-written handoffs the aggregate
+  # root can't see; the felt_store query covers fibers whose work_dir IS the
+  # store root.
+  defp latest_handoff_ts(fiber_id, felt_store, opts \\ []) do
+    work_dir = Keyword.get(opts, :work_dir)
+
+    queries =
+      [{fiber_id, felt_store}]
+      |> then(fn qs ->
+        if is_binary(work_dir) and work_dir != "" and work_dir != felt_store,
+          do: [{prompt_fiber_id(fiber_id, work_dir, felt_store), work_dir} | qs],
+          else: qs
+      end)
+
+    queries
+    |> Enum.map(fn {id, store} ->
+      case query_history(id, ["--kind", "handoff", "--last", "1", "--json"], felt_store: store) do
+        [event | _] -> parse_occurred_at(Map.get(event, "occurred_at"))
+        _ -> nil
+      end
+    end)
+    |> Enum.reject(&is_nil/1)
+    |> case do
+      [] -> nil
+      tss -> Enum.max_by(tss, &DateTime.to_unix(&1, :microsecond))
     end
   end
 
