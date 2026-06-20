@@ -142,8 +142,8 @@ no enabled flag) — so the daemon dispatches the fiber on its next poll.
 For a standing role awaiting review (status: closed + untempered), resume
 re-arms it for immediate dispatch and routes to the owning daemon (which clears
 the awaiting marker and recomputes due-ness from the schedule). The previous
-run's session id lives in the daemon's dispatch marker
-($SHUTTLE_DATA_DIR/dispatch/<key>.json), so the next worker can resume that
+run's session id lives in the fiber's shuttle.session_uuid frontmatter field
+(stamped by the daemon at dispatch), so the next worker can resume that
 transcript; this is distinct from accept, which advances the recurrence.
 
 A draft (status: open) is armed straight to status: active. Refuses on a
