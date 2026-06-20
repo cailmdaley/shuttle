@@ -110,25 +110,33 @@ defmodule Shuttle.DispatchIntegrationTest do
     {:ok, host: host}
   end
 
-  # ── Marker helpers (the felt-history replacement) ──
+  # ── Continuation helpers (the felt-history replacement) ──
 
-  # Mirror the dispatcher's at-spawn dispatch marker: `{session_uuid,
-  # dispatched_at, run_id}` keyed by the fiber's runtime key (the slug `id` for
-  # these uid-less test fibers). `at` lets a test order a later handoff against it.
-  defp write_dispatch_marker(id, session_id, at \\ DateTime.utc_now()) do
+  # Mirror the dispatcher's at-spawn stamp: `session_uuid` + `dispatched_at` into
+  # the fiber's `shuttle:` block (the real .md under `host`). `at` lets a test
+  # order a later handoff against it. The fiber must already exist (write_fiber).
+  defp write_dispatch_marker(host, id, session_id, at \\ DateTime.utc_now()) do
     :ok =
-      Shuttle.Markers.write_dispatch(id, %{
-        session_uuid: session_id,
-        dispatched_at: DateTime.to_iso8601(at)
-      })
+      Shuttle.FiberDoc.edit_path(fiber_md_path(host, id), [
+        {:put_nested, "shuttle", "session_uuid", session_id},
+        {:put_nested, "shuttle", "dispatched_at", DateTime.to_iso8601(at)}
+      ])
   end
 
-  # Mirror the worker's `shuttle-ctl handoff`: `~/.shuttle/handoff/<key>`
-  # (extensionless) with `{at}` in RFC3339 UTC — the clean-exit signal.
-  defp write_handoff_marker(id, at \\ DateTime.utc_now()) do
-    path = Shuttle.Markers.handoff_path(id)
-    File.mkdir_p!(Path.dirname(path))
-    File.write!(path, Jason.encode!(%{at: DateTime.to_iso8601(at)}))
+  # Mirror the worker's `shuttle-ctl handoff`: stamp `shuttle.handed_off_at` in
+  # RFC3339 UTC — the clean-exit signal the daemon compares against dispatched_at.
+  defp write_handoff_marker(host, id, at \\ DateTime.utc_now()) do
+    :ok =
+      Shuttle.FiberDoc.edit_path(fiber_md_path(host, id), [
+        {:put_nested, "shuttle", "handed_off_at", DateTime.to_iso8601(at)}
+      ])
+  end
+
+  # The fiber's on-disk `.md`: host/.felt/<id segments>/<basename>.md (mirrors
+  # write_fiber / read_frontmatter).
+  defp fiber_md_path(host, id) do
+    parts = String.split(id, "/")
+    Path.join([host, ".felt"] ++ parts ++ ["#{List.last(parts)}.md"])
   end
 
   # Start a Poller under ExUnit's per-test supervisor so it is torn down at test
@@ -270,11 +278,11 @@ defmodule Shuttle.DispatchIntegrationTest do
 
     # Dispatch marker (the session id), then a handoff marker after it → clean
     # close → the dispatcher takes the fresh path.
-    write_dispatch_marker("tests/cli-resume-no-event", "test-session-uuid-abcd",
+    write_dispatch_marker(host, "tests/cli-resume-no-event", "test-session-uuid-abcd",
       DateTime.add(DateTime.utc_now(), -60, :second)
     )
 
-    write_handoff_marker("tests/cli-resume-no-event")
+    write_handoff_marker(host, "tests/cli-resume-no-event")
 
     assert {:ok, _} =
              Dispatcher.dispatch("tests/cli-resume-no-event",
@@ -306,7 +314,7 @@ defmodule Shuttle.DispatchIntegrationTest do
 
     # The prior session id lives ONLY in the dispatch marker (the daemon wrote it
     # at spawn; the worker never knew its own UUID). No handoff after it → resume.
-    write_dispatch_marker("tests/cli-resume-fixed", "cli-resume-session-uuid")
+    write_dispatch_marker(host, "tests/cli-resume-fixed", "cli-resume-session-uuid")
 
     assert {:ok, _} =
              Dispatcher.dispatch("tests/cli-resume-fixed",
@@ -338,7 +346,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     """)
 
     # The prior session id lives in the dispatch marker.
-    write_dispatch_marker("tests/kanban-resume", "kanban-session-uuid-5678")
+    write_dispatch_marker(host, "tests/kanban-resume", "kanban-session-uuid-5678")
 
     # Kanban passes resume_mode: "previous" on the dispatch call (no felt event).
     assert {:ok, _} =
@@ -381,7 +389,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     A fiber whose stored resume session may no longer be resumable.
     """)
 
-    write_dispatch_marker("tests/resume-fallback", "gone-session-uuid-9999")
+    write_dispatch_marker(host, "tests/resume-fallback", "gone-session-uuid-9999")
 
     assert {:ok, _} =
              Dispatcher.dispatch("tests/resume-fallback",
@@ -421,7 +429,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     A codex fiber resumed from its dispatch marker.
     """)
 
-    write_dispatch_marker("tests/kanban-history-resume", "40740310-2345-4e33-a1e4-7950db41ce10")
+    write_dispatch_marker(host, "tests/kanban-history-resume", "40740310-2345-4e33-a1e4-7950db41ce10")
 
     assert {:ok, _} =
              Dispatcher.dispatch("tests/kanban-history-resume",
@@ -455,7 +463,7 @@ defmodule Shuttle.DispatchIntegrationTest do
 
     # Dispatch marker on file with no handoff after it (dirty death) — the
     # autonomous continuation resumes the marker's session, no directive needed.
-    write_dispatch_marker("tests/poller-history-resume", "history-resume-session-uuid")
+    write_dispatch_marker(host, "tests/poller-history-resume", "history-resume-session-uuid")
 
     {:ok, poller} =
       start_poller!(
@@ -588,14 +596,14 @@ defmodule Shuttle.DispatchIntegrationTest do
                work_dir: work_dir
              )
 
-    # The captured worker session id is recorded in the per-host dispatch marker
+    # The captured worker session id is stamped into the fiber's `shuttle:` block
     # (the only structured session-id home) so resume can recover it. The wrong
     # (human) session is ignored.
     assert eventually(fn ->
-             match?(
-               %{"session_uuid" => "right-worker-session"},
-               Shuttle.Markers.read_dispatch("tests/codex-capture")
-             )
+             {:ok, _p, _raw, fm, _body} =
+               Shuttle.FiberDoc.read_path(fiber_md_path(host, "tests/codex-capture"))
+
+             get_in(fm, ["shuttle", "session_uuid"]) == "right-worker-session"
            end)
   end
 
@@ -715,7 +723,7 @@ defmodule Shuttle.DispatchIntegrationTest do
 
     # A prior run's dispatch marker (session on file) — but no resume directive is
     # carried on THIS dispatch, and standing roles never auto-resume → fresh.
-    write_dispatch_marker("tests/standing-stale-resume", "11111111-2222-3333-4444-555555555555")
+    write_dispatch_marker(host, "tests/standing-stale-resume", "11111111-2222-3333-4444-555555555555")
 
     assert {:ok, _} =
              Dispatcher.dispatch("tests/standing-stale-resume",
@@ -888,7 +896,7 @@ defmodule Shuttle.DispatchIntegrationTest do
     A standing role whose worker died while the daemon was down.
     """)
 
-    write_dispatch_marker("tests/standing-dead", "dead-session-uuid")
+    write_dispatch_marker(host, "tests/standing-dead", "dead-session-uuid")
 
     # The control — armed, whose last run already handed off cleanly (a handoff
     # marker after its dispatch). Must be left untouched: the run completed, this
@@ -911,11 +919,11 @@ defmodule Shuttle.DispatchIntegrationTest do
     A standing role whose previous run completed; armed for the next tick.
     """)
 
-    write_dispatch_marker("tests/standing-armed", "completed-session-uuid",
+    write_dispatch_marker(host, "tests/standing-armed", "completed-session-uuid",
       DateTime.add(DateTime.utc_now(), -60, :second)
     )
 
-    write_handoff_marker("tests/standing-armed")
+    write_handoff_marker(host, "tests/standing-armed")
 
     # mark_awaiting resolves the fiber through FeltStores (LOOM_HOMES), not the
     # injected runner — point it at the temp store for the duration.
@@ -984,13 +992,13 @@ defmodule Shuttle.DispatchIntegrationTest do
       """)
 
       # Dispatch with NO handoff after it (dirty death).
-      write_dispatch_marker("tests/#{slug}", "#{slug}-uuid",
+      write_dispatch_marker(host, "tests/#{slug}", "#{slug}-uuid",
         DateTime.add(DateTime.utc_now(), -60, :second)
       )
 
       # Only the fix-target role gets the human accept (which stamps a handoff
       # marker, newer than the dispatch) after the death.
-      if accept?, do: write_handoff_marker("tests/#{slug}")
+      if accept?, do: write_handoff_marker(host, "tests/#{slug}")
     end
 
     prev_loom = System.get_env("LOOM_HOMES")
@@ -1269,7 +1277,7 @@ defmodule Shuttle.DispatchIntegrationTest do
 
     # Dispatch marker with no handoff after it → dirty-death state the heuristic
     # would resume; resume_mode: "fresh" must override it.
-    write_dispatch_marker("tests/resume-mode-fresh", "should-not-be-resumed-uuid")
+    write_dispatch_marker(host, "tests/resume-mode-fresh", "should-not-be-resumed-uuid")
 
     assert {:ok, _} =
              Dispatcher.dispatch("tests/resume-mode-fresh",
@@ -1437,7 +1445,7 @@ defmodule Shuttle.DispatchIntegrationTest do
 
     # The session id lives in the per-host dispatch marker (the only structured
     # session-id home). Keyed by the fiber's runtime key (slug for these fibers).
-    if session, do: write_dispatch_marker(id, session)
+    if session, do: write_dispatch_marker(host, id, session)
   end
 
   defp write_codex_session(session_dir, filename, uuid, cwd, timestamp, prompt) do

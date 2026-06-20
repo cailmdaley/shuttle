@@ -229,7 +229,46 @@ func (f *FiberFile) WriteBlock(block *Block) error {
 		setMappingValue(mappingNode, "shuttle", blockNode)
 	}
 
-	// Re-serialize the modified frontmatter.
+	return f.persist()
+}
+
+// SetShuttleField sets/replaces a scalar `key` INSIDE the existing `shuttle:`
+// mapping node, in place — preserving every other shuttle key (notably the
+// daemon-written runtime fields session_uuid / dispatched_at / run_id) and the
+// rest of the document. This is the surgical counterpart to WriteBlock: it does
+// NOT re-encode the Block struct, so a worker stamping `handed_off_at` at clean
+// exit never disturbs the dispatch fields the daemon wrote. The mutation takes
+// effect on the next Write call. Errors when there is no shuttle: block.
+func (f *FiberFile) SetShuttleField(key, value string) error {
+	if f.fmNode == nil || len(f.fmNode.Content) == 0 {
+		return fmt.Errorf("empty or invalid frontmatter in %s", f.Path)
+	}
+	mappingNode := f.fmNode.Content[0]
+	if mappingNode.Kind != yaml.MappingNode {
+		return fmt.Errorf("frontmatter root is not a YAML mapping in %s", f.Path)
+	}
+	shuttleNode := findMappingValue(mappingNode, "shuttle")
+	if shuttleNode == nil || shuttleNode.Kind != yaml.MappingNode {
+		return fmt.Errorf("no shuttle: block in %s to stamp %s", f.Path, key)
+	}
+	setMappingValue(shuttleNode, key, &yaml.Node{Kind: yaml.ScalarNode, Value: value, Tag: "!!str"})
+	return nil
+}
+
+// Write persists the in-memory frontmatter node (after Set* edits that mutate it
+// directly, e.g. SetShuttleField/SetStatus) atomically — the WriteBlock tail
+// without re-encoding a Block. Use this when the edit already lives in f.fmNode.
+func (f *FiberFile) Write() error {
+	if f.fmNode == nil || len(f.fmNode.Content) == 0 {
+		return fmt.Errorf("empty or invalid frontmatter in %s", f.Path)
+	}
+	return f.persist()
+}
+
+// persist re-serializes f.fmNode and writes the reconstructed file atomically.
+// The rest of the frontmatter is preserved byte-for-byte except for whitespace
+// normalisation that yaml.Node encoding may introduce.
+func (f *FiberFile) persist() error {
 	var fmBuf bytes.Buffer
 	enc := yaml.NewEncoder(&fmBuf)
 	enc.SetIndent(2)

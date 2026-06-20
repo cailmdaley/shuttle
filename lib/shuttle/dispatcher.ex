@@ -85,8 +85,7 @@ defmodule Shuttle.Dispatcher do
             true ->
               resolve_resume_intent(prompt_context, fiber_id, fiber,
                 force: force,
-                resume_mode: Keyword.get(opts, :resume_mode),
-                marker_key: marker_key(fiber, uid, fiber_id)
+                resume_mode: Keyword.get(opts, :resume_mode)
               )
           end
 
@@ -99,7 +98,7 @@ defmodule Shuttle.Dispatcher do
               felt_store: felt_store,
               uid: uid,
               kind: fiber_kind(fiber),
-              marker_key: marker_key(fiber, uid, fiber_id),
+              fiber_path: Map.get(fiber, "path"),
               run_id: prompt_context_run_id(prompt_context),
               user_message: Keyword.get(opts, :user_message)
             )
@@ -120,15 +119,14 @@ defmodule Shuttle.Dispatcher do
     so the carried `resume_mode` is honored.
   - All other contexts defer to `check_resume_intent/3`, which honors the
     `resume_mode` dispatch parameter (`"previous"` / `"fresh"`), falling back
-    to the per-host marker heuristic when no directive is carried.
+    to the continuation heuristic (read off the fiber's `shuttle:` block) when no
+    directive is carried.
 
   Options:
     * `:force` — when true, the ad-hoc short-circuit is skipped and the carried
       `resume_mode` wins. Set by manual kanban dispatches.
     * `:resume_mode` — the user's continuation directive (`"previous"` /
       `"fresh"` / absent), carried with the dispatch call.
-    * `:marker_key` — the runtime key (uid when present, else slug) that keys
-      the per-host dispatch/handoff markers.
   """
   @spec resolve_resume_intent(any(), String.t(), map(), keyword()) ::
           :fresh | {:previous, String.t()} | {:error, :missing_session_id}
@@ -140,10 +138,7 @@ defmodule Shuttle.Dispatcher do
         :fresh
 
       _ ->
-        check_resume_intent(fiber_id, fiber,
-          resume_mode: Keyword.get(opts, :resume_mode),
-          marker_key: Keyword.get(opts, :marker_key)
-        )
+        check_resume_intent(fiber_id, fiber, resume_mode: Keyword.get(opts, :resume_mode))
     end
   end
 
@@ -160,20 +155,18 @@ defmodule Shuttle.Dispatcher do
     of silently starting fresh; "New session" is the explicit fresh path.
 
   `resume_mode` is the user's directive (a transient dispatch parameter, no
-  longer a persisted felt event). The session id comes ONLY from the dispatch
-  marker (`Shuttle.Markers`) — the worker never knew its own UUID, the daemon
-  did.
+  longer a persisted felt event). The session id comes ONLY from the fiber's
+  `shuttle.session_uuid` (`Shuttle.Continuation`) — the worker never knew its own
+  UUID, the daemon stamped it at dispatch.
 
   Options:
     * `:resume_mode` — `"previous"` / `"fresh"` / absent.
-    * `:marker_key` — the runtime key the dispatch/handoff markers are keyed by.
   """
   @spec check_resume_intent(String.t(), map(), keyword()) ::
           :fresh | {:previous, String.t()} | {:error, :missing_session_id}
   def check_resume_intent(_fiber_id, fiber, opts \\ []) do
     resume_mode = Keyword.get(opts, :resume_mode)
-    marker_key = Keyword.get(opts, :marker_key)
-    session_id = marker_key && Shuttle.Markers.resumable_session_id(marker_key)
+    session_id = Shuttle.Continuation.resumable_session_id(fiber)
 
     cond do
       # A human explicitly asked to resume (kanban Resume button passes
@@ -196,35 +189,35 @@ defmodule Shuttle.Dispatcher do
       # No directive (resume_mode absent): decide fresh-vs-resume by whether the
       # previous worker handed off cleanly. The autonomous-loop path.
       true ->
-        decide_continuation(fiber, session_id, marker_key)
+        decide_continuation(fiber, session_id)
     end
   end
 
   # The autonomous fresh-vs-resume decision when there is no human resume
   # directive. A long-running oneshot loops across sessions: a worker exits, the
   # next poll re-dispatches and continues. The question is whether the previous
-  # session ended CLEANLY (it wrote a handoff marker via `shuttle-ctl handoff` as
-  # its last act — then the next worker starts fresh and reads the `## Status`
-  # block) or DIED mid-thought (no handoff — the process was killed, common on
-  # remote machines — then the fresh worker loses the in-flight reasoning and
-  # loops). On a dirty death we resume the prior transcript instead; the
-  # `resume || fresh-same-id` self-heal makes resume safe even if the transcript
-  # is gone.
+  # session ended CLEANLY (it stamped `shuttle.handed_off_at` via `shuttle-ctl
+  # handoff` as its last act — then the next worker starts fresh and reads the
+  # `## Status` block) or DIED mid-thought (no handoff — the process was killed,
+  # common on remote machines — then the fresh worker loses the in-flight
+  # reasoning and loops). On a dirty death we resume the prior transcript instead;
+  # the `resume || fresh-same-id` self-heal makes resume safe even if the
+  # transcript is gone.
   #
-  # The whole decision is now two per-host marker reads keyed by the intrinsic
-  # runtime key (`Shuttle.Markers`): `handoff` present AND `handoff.at >=
-  # dispatch.dispatched_at` → fresh, else resume the dispatch marker's
-  # session_uuid. Store-agnostic — no work_dir/aggregate federation, no
+  # The whole decision is now read straight off the fiber's `shuttle:` block
+  # (`Shuttle.Continuation`, no file IO — `felt show -j` already carried it):
+  # `handed_off_at` present AND `>= dispatched_at` → fresh, else resume
+  # `session_uuid`. Store-agnostic — no work_dir/aggregate federation, no
   # `SQLITE_BUSY` append-drop that could make a clean exit look dirty.
   #
   # Scoped to oneshots: pinned roles park on session-end (human Resume handles
   # their resume), and standing roles dispatch discrete scheduled occurrences
   # (always fresh). First run / no prior session → fresh (nothing to resume).
-  defp decide_continuation(fiber, session_id, marker_key) do
+  defp decide_continuation(fiber, session_id) do
     cond do
       fiber_kind(fiber) != "oneshot" -> :fresh
       not (is_binary(session_id) and session_id != "") -> :fresh
-      Shuttle.Markers.clean_handoff_since_dispatch?(marker_key) -> :fresh
+      Shuttle.Continuation.clean_handoff_since_dispatch?(fiber) -> :fresh
       true -> {:previous, session_id}
     end
   end
@@ -941,22 +934,9 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
-  # The runtime key the per-host markers are keyed by: the fiber's uid when
-  # present, else its slug. Mirrors `Poller.runtime_key_for_fiber/1` exactly so
-  # the dispatch marker the daemon writes and the handoff marker the worker
-  # writes (via `SHUTTLE_FIBER_KEY`) line up byte-for-byte. `uid` is read off the
-  # fiber by `dispatch/2`; `fiber_id` is the slug fallback.
-  @spec marker_key(map(), String.t() | nil, String.t()) :: String.t()
-  defp marker_key(fiber, uid, fiber_id) do
-    cond do
-      is_binary(uid) and uid != "" -> uid
-      is_binary(Map.get(fiber, "uid")) and Map.get(fiber, "uid") != "" -> Map.get(fiber, "uid")
-      true -> fiber_id
-    end
-  end
-
-  # The standing run id carried in the prompt context tuple, threaded into the
-  # dispatch marker. nil for a plain oneshot/constitution dispatch.
+  # The standing run id carried in the prompt context tuple, stamped into the
+  # `shuttle.run_id` field at dispatch. nil for a plain oneshot/constitution
+  # dispatch.
   defp prompt_context_run_id({:standing_run, run_id}), do: run_id
   defp prompt_context_run_id({:standing_run, run_id, _}), do: run_id
   defp prompt_context_run_id(_), do: nil
@@ -1019,7 +999,7 @@ defmodule Shuttle.Dispatcher do
             session: session,
             headless: headless,
             display_fiber_id: worker_fiber_id,
-            marker_key: Keyword.get(opts, :marker_key)
+            fiber_path: Keyword.get(opts, :fiber_path)
           )
 
         spawn_tmux(session, work_dir, run_script, runner)
@@ -1034,7 +1014,7 @@ defmodule Shuttle.Dispatcher do
         run_script =
           build_run_script(fiber_id, command, agent.id,
             display_fiber_id: worker_fiber_id,
-            marker_key: Keyword.get(opts, :marker_key)
+            fiber_path: Keyword.get(opts, :fiber_path)
           )
 
         case spawn_tmux(session, work_dir, run_script, runner) do
@@ -1043,7 +1023,7 @@ defmodule Shuttle.Dispatcher do
             # and the autonomous continuation heuristic can recover it.
             if Keyword.get(opts, :store_session_id, true) do
               store_session_id(fiber_id, session_uuid, runner,
-                marker_key: Keyword.get(opts, :marker_key),
+                fiber_path: Keyword.get(opts, :fiber_path),
                 run_id: Keyword.get(opts, :run_id)
               )
             end
@@ -1117,12 +1097,12 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
-  # Record the session UUID in the per-host dispatch marker after a successful
+  # Record the session UUID in the fiber's `shuttle:` block after a successful
   # fresh dispatch, so "Resume previous" and the autonomous continuation
-  # heuristic can recover it (the marker is the only structured session-id home —
+  # heuristic can recover it (the block is the only structured session-id home —
   # the worker never knows its own UUID, the daemon does). `opts` carries
-  # `:marker_key` (the runtime key the dispatch/handoff markers share) and
-  # `:run_id` (the standing run id, nil for a oneshot).
+  # `:fiber_path` (the fiber's `.md`, from `fiber["path"]`) and `:run_id` (the
+  # standing run id, nil for a oneshot).
   # - Claude: UUID was pre-specified; write synchronously (fire-and-forget Task).
   # - Codex/Pi: capture UUID from session file asynchronously with backoff.
   # - None: agent doesn't support session IDs; skip.
@@ -1160,30 +1140,29 @@ defmodule Shuttle.Dispatcher do
 
   defp store_session_id(_fiber_id, :none, _runner, _opts), do: :ok
 
-  # Write the per-host dispatch marker carrying `{session_uuid, dispatched_at,
-  # run_id}`, keyed by the fiber's runtime key. The handoff marker the worker
-  # writes at clean exit is compared against this marker's `dispatched_at` to
-  # decide fresh-vs-resume at the next dispatch. A missing `:marker_key` (no uid
-  # and no slug threaded) skips the write — the fiber simply has no resumable
-  # session, which the heuristic treats as fresh.
+  # Stamp `{session_uuid, dispatched_at, run_id}` into the fiber's `shuttle:`
+  # block. At the next dispatch the worker's `handed_off_at` is compared against
+  # this `dispatched_at` to decide fresh-vs-resume. A missing `:fiber_path` skips
+  # the write — the fiber simply has no resumable session, which the heuristic
+  # treats as fresh.
   defp record_dispatch_session(fiber_id, uuid, opts) do
-    case Keyword.get(opts, :marker_key) do
-      key when is_binary(key) and key != "" ->
-        case Shuttle.Markers.write_dispatch(key, %{
+    case Keyword.get(opts, :fiber_path) do
+      path when is_binary(path) and path != "" ->
+        case Shuttle.Continuation.write_dispatch(path, %{
                session_uuid: uuid,
                run_id: Keyword.get(opts, :run_id)
              }) do
           :ok ->
-            Logger.info("Recorded session UUID #{uuid} for #{fiber_id} in dispatch marker #{key}")
+            Logger.info("Recorded session UUID #{uuid} for #{fiber_id} in shuttle: block")
 
           {:error, reason} ->
             Logger.warning(
-              "Could not record session UUID for #{fiber_id} (marker #{key}): #{inspect(reason)}"
+              "Could not record session UUID for #{fiber_id} (#{path}): #{inspect(reason)}"
             )
         end
 
       _ ->
-        Logger.debug("record_dispatch_session: no marker key for #{fiber_id}; skipping")
+        Logger.debug("record_dispatch_session: no fiber path for #{fiber_id}; skipping")
     end
   rescue
     e -> Logger.warning("Could not record session UUID for #{fiber_id}: #{inspect(e)}")
@@ -1382,20 +1361,19 @@ defmodule Shuttle.Dispatcher do
     headless = Keyword.get(opts, :headless, false)
     display_fiber_id = Keyword.get(opts, :display_fiber_id, fiber_id)
 
-    # Marker env for the worker's `shuttle-ctl handoff`: the data dir AND the
-    # runtime key, both exported so the Go writer and this Elixir reader resolve
-    # the same `$SHUTTLE_DATA_DIR/handoff/<key>` byte-for-byte — independent of
-    # whatever the worker's login profile happens to set (a non-default
-    # SHUTTLE_DATA_DIR on the daemon must reach the worker, or they diverge).
+    # The fiber's `.md` path for the worker's `shuttle-ctl handoff`: it stamps
+    # `shuttle.handed_off_at` directly into this file (no felt-store resolution,
+    # no ambiguity), so the daemon hands it the path it already resolved at
+    # dispatch. The worker writes the same `shuttle:` block this daemon reads on
+    # the next poll.
     fiber_key_block =
-      "export SHUTTLE_DATA_DIR=#{shell_single_quote(Shuttle.Markers.data_dir())}\n" <>
-        case Keyword.get(opts, :marker_key) do
-          key when is_binary(key) and key != "" ->
-            "export SHUTTLE_FIBER_KEY=#{shell_single_quote(key)}\n"
+      case Keyword.get(opts, :fiber_path) do
+        path when is_binary(path) and path != "" ->
+          "export SHUTTLE_FIBER_PATH=#{shell_single_quote(path)}\n"
 
-          _ ->
-            ""
-        end
+        _ ->
+          ""
+      end
 
     # When resuming claude, schedule a backgrounded tmux send-keys to
     # dismiss the interactive warning page. Runs *inside* the same tmux
