@@ -260,6 +260,19 @@ rsync -az --delete ui/dist/ cineca:~/Documents/projects/shuttle/ui/dist/
 (The renderer is compiled *into* the bundle, so a remote serving the shipped
 `dist` self-serves the paper render — it needs no `lightcone-ui` at runtime.)
 
+**A daemon route change is a bundle-rebuild event.** `make all` rebuilds the
+escript and rebinds `:4000` but never touches `ui/dist`, and nothing checks that
+the shipped bundle and the daemon's route table still agree. So any change to the
+`/api/v1/*` shape (add/remove/rename a route) MUST be paired with a `cd ui && npm
+run build` + rsync to every host — the browser always runs the *local* bundle, and
+a route mismatch fails silently as a 404 with no daemon-side error. This is exactly
+how the shed-history merge broke *all* launches: it deleted `POST /api/v1/felt-history`,
+but the stale `dist` still posted the directive there as the first step of New
+Session, so the launch 404'd before it ever dispatched (provenance:
+[[shuttle/findings/finding-uidist-stale-after-route-removal]]). If a fresh
+`npm run build` exits 194 with *zero* output, that's not a type error — it's a
+corrupted `node_modules` (circular `.bin` symlinks); `npm ci` fixes it.
+
 **The ASTRA paper path needs node + a built MySTRA on each owning host.**
 `GET /api/v1/astra` is owner-routed and shells out to `priv/mystra/bake.mjs`,
 which imports MySTRA's built `dist`. Each host that *owns* astra.yamls you want
