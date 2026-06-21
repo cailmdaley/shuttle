@@ -60,7 +60,10 @@ jobs:
           go-version: "1.22"
 
       - name: Build CLI
-        run: go build ./cmd/shuttle
+        run: go build ./...
 
-      - name: Run tests
-        run: go test ./pkg/schema/...
+      # shuttle-ctl is now a thin `exec felt shuttle` shim (no Go tests of its
+      # own — the verb + schema tests moved into felt with the implementations).
+      # Vet keeps the shim honest; there is no longer a pkg/schema to test here.
+      - name: Vet
+        run: go vet ./...
