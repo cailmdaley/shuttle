@@ -1029,7 +1029,7 @@ defmodule Shuttle.Dispatcher do
             # and the autonomous continuation heuristic can recover it.
             if Keyword.get(opts, :store_session_id, true) do
               store_session_id(fiber_id, session_uuid, runner,
-                fiber_path: Keyword.get(opts, :fiber_path),
+                felt_store: felt_store,
                 run_id: Keyword.get(opts, :run_id)
               )
             end
@@ -1112,18 +1112,18 @@ defmodule Shuttle.Dispatcher do
   # - Claude: UUID was pre-specified; write synchronously (fire-and-forget Task).
   # - Codex/Pi: capture UUID from session file asynchronously with backoff.
   # - None: agent doesn't support session IDs; skip.
-  defp store_session_id(fiber_id, {:claude, uuid}, _runner, opts) do
+  defp store_session_id(fiber_id, {:claude, uuid}, runner, opts) do
     # Fire-and-forget: recording the UUID is best-effort; blocking dispatch on a
     # marker write would delay WorkerWatcher startup and cause flaky tests.
     Task.start(fn ->
-      record_dispatch_session(fiber_id, uuid, opts)
+      record_dispatch_session(fiber_id, uuid, runner, opts)
     end)
   end
 
   defp store_session_id(
          fiber_id,
          {:capture, cli, work_dir, capture_fiber_id, dispatched_after},
-         _runner,
+         runner,
          opts
        ) do
     # Fire-and-forget: capture the session UUID from the harness's JSONL file
@@ -1133,7 +1133,7 @@ defmodule Shuttle.Dispatcher do
     Task.start(fn ->
       case capture_session_uuid(cli, work_dir, capture_fiber_id, dispatched_after, 100) do
         {:ok, uuid} ->
-          record_dispatch_session(fiber_id, uuid, opts)
+          record_dispatch_session(fiber_id, uuid, runner, opts)
 
         {:error, reason} ->
           Logger.warning(
@@ -1146,29 +1146,31 @@ defmodule Shuttle.Dispatcher do
 
   defp store_session_id(_fiber_id, :none, _runner, _opts), do: :ok
 
-  # Stamp `{session_uuid, dispatched_at, run_id}` into the fiber's `shuttle:`
-  # block. At the next dispatch the worker's `handed_off_at` is compared against
-  # this `dispatched_at` to decide fresh-vs-resume. A missing `:fiber_path` skips
-  # the write — the fiber simply has no resumable session, which the heuristic
-  # treats as fresh.
-  defp record_dispatch_session(fiber_id, uuid, opts) do
-    case Keyword.get(opts, :fiber_path) do
-      path when is_binary(path) and path != "" ->
-        case Shuttle.Continuation.write_dispatch(path, %{
+  # Stamp `{session_uuid, dispatched_at, run_id}` into the fiber's
+  # `shuttle.runtime` block by shelling `felt shuttle mark-runtime` (felt owns
+  # the nesting — Stage 5, Option B). At the next dispatch the worker's
+  # `handed_off_at` is compared against this `dispatched_at` to decide
+  # fresh-vs-resume. `felt_store` + `fiber_id` are the store/scoped-id pair the
+  # dispatch read the fiber with, so felt resolves it. A missing `:felt_store`
+  # skips the write — the fiber then reads as a fresh dispatch, the safe default.
+  defp record_dispatch_session(fiber_id, uuid, runner, opts) do
+    case Keyword.get(opts, :felt_store) do
+      store when is_binary(store) and store != "" ->
+        case Shuttle.Continuation.write_dispatch(runner, store, fiber_id, %{
                session_uuid: uuid,
                run_id: Keyword.get(opts, :run_id)
              }) do
           :ok ->
-            Logger.info("Recorded session UUID #{uuid} for #{fiber_id} in shuttle: block")
+            Logger.info("Recorded session UUID #{uuid} for #{fiber_id} in shuttle.runtime")
 
           {:error, reason} ->
             Logger.warning(
-              "Could not record session UUID for #{fiber_id} (#{path}): #{inspect(reason)}"
+              "Could not record session UUID for #{fiber_id} (#{store}): #{inspect(reason)}"
             )
         end
 
       _ ->
-        Logger.debug("record_dispatch_session: no fiber path for #{fiber_id}; skipping")
+        Logger.debug("record_dispatch_session: no felt_store for #{fiber_id}; skipping")
     end
   rescue
     e -> Logger.warning("Could not record session UUID for #{fiber_id}: #{inspect(e)}")

@@ -3,6 +3,29 @@ defmodule Shuttle.LifecycleStoreTest do
 
   alias Shuttle.LifecycleStore
 
+  # Records felt invocations, returns success — lets the conclude tests assert
+  # the daemon shells `felt shuttle mark-runtime --handed-off-at` without running
+  # felt (Stage 5: felt owns the runtime nesting; the daemon's contract is the
+  # verb it issues).
+  defmodule MarkRuntimeRunner do
+    @behaviour Shuttle.Runner
+
+    def start do
+      case Agent.start_link(fn -> [] end, name: __MODULE__) do
+        {:ok, pid} -> {:ok, pid}
+        {:error, {:already_started, pid}} -> Agent.update(pid, fn _ -> [] end) && {:ok, pid}
+      end
+    end
+
+    @impl true
+    def cmd(command, args, opts) do
+      Agent.update(__MODULE__, &(&1 ++ [{command, args, opts}]))
+      {"", 0}
+    end
+
+    def calls, do: Agent.get(__MODULE__, & &1)
+  end
+
   describe "accept/resume recognize new-model awaiting (status:closed + untempered)" do
     test "accept re-arms a closed+untempered standing role from the doc schedule" do
       with_doc_awaiting_role(fn fiber_id, path ->
@@ -60,6 +83,45 @@ defmodule Shuttle.LifecycleStoreTest do
         end,
         status: "active"
       )
+    end
+  end
+
+  describe "conclude: status re-arm THEN `felt shuttle mark-runtime --handed-off-at` (Stage 5)" do
+    test "accept re-arms the doc (atomic) then shells mark-runtime to stamp the handoff" do
+      with_doc_awaiting_role(fn fiber_id, path ->
+        {:ok, _} = MarkRuntimeRunner.start()
+
+        assert {:ok, _} = LifecycleStore.accept(fiber_id, runner: MarkRuntimeRunner)
+
+        # First write (atomic, surgical): status re-armed, verdict cleared.
+        fm = read_frontmatter(path)
+        assert fm["status"] == "active"
+        refute Map.has_key?(fm, "tempered")
+
+        # Second write: the prior run is concluded by shelling felt (felt owns the
+        # nested write). The flat conclude op is gone — handed_off_at is NOT written
+        # into the doc by the daemon's surgical write.
+        refute get_in(fm, ["shuttle", "handed_off_at"])
+        refute get_in(fm, ["shuttle", "runtime"])
+
+        assert Enum.any?(MarkRuntimeRunner.calls(), fn {cmd, args, _} ->
+                 cmd == "felt" and match?(["shuttle", "mark-runtime" | _], args) and
+                   "--handed-off-at" in args
+               end)
+      end)
+    end
+
+    test "resume also concludes via mark-runtime" do
+      with_doc_awaiting_role(fn fiber_id, _path ->
+        {:ok, _} = MarkRuntimeRunner.start()
+
+        assert {:ok, _} = LifecycleStore.resume(fiber_id, runner: MarkRuntimeRunner)
+
+        assert Enum.any?(MarkRuntimeRunner.calls(), fn {cmd, args, _} ->
+                 cmd == "felt" and match?(["shuttle", "mark-runtime" | _], args) and
+                   "--handed-off-at" in args
+               end)
+      end)
     end
   end
 
@@ -287,7 +349,10 @@ defmodule Shuttle.LifecycleStoreTest do
     status = Keyword.get(opts, :status, "open")
 
     loom =
-      Path.join(System.tmp_dir!(), "shuttle-lifecycle-rich-test-#{System.unique_integer([:positive])}")
+      Path.join(
+        System.tmp_dir!(),
+        "shuttle-lifecycle-rich-test-#{System.unique_integer([:positive])}"
+      )
 
     felt_dir = Path.join([loom, ".felt", "science", "cmbx"])
     File.mkdir_p!(felt_dir)
@@ -403,7 +468,12 @@ defmodule Shuttle.LifecycleStoreTest do
     status = Keyword.get(opts, :status, "closed")
     tempered = Keyword.get(opts, :tempered, nil)
 
-    loom = Path.join(System.tmp_dir!(), "shuttle-lifecycle-doc-test-#{System.unique_integer([:positive])}")
+    loom =
+      Path.join(
+        System.tmp_dir!(),
+        "shuttle-lifecycle-doc-test-#{System.unique_integer([:positive])}"
+      )
+
     felt_dir = Path.join([loom, ".felt", "life", "french", "practice"])
     File.mkdir_p!(felt_dir)
     path = Path.join(felt_dir, "practice.md")
@@ -444,7 +514,12 @@ defmodule Shuttle.LifecycleStoreTest do
     status = Keyword.get(opts, :status, "open")
     tempered = Keyword.get(opts, :tempered, nil)
 
-    loom = Path.join(System.tmp_dir!(), "shuttle-lifecycle-pin-test-#{System.unique_integer([:positive])}")
+    loom =
+      Path.join(
+        System.tmp_dir!(),
+        "shuttle-lifecycle-pin-test-#{System.unique_integer([:positive])}"
+      )
+
     felt_dir = Path.join([loom, ".felt", "ai-futures", "tokenmaxxing", "operator"])
     File.mkdir_p!(felt_dir)
     path = Path.join(felt_dir, "operator.md")

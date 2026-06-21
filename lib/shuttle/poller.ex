@@ -683,10 +683,14 @@ defmodule Shuttle.Poller do
   def handle_call({:lifecycle_transition, verb, fiber_id, opts}, _from, state) do
     {runtime_key, slug} = resolve_identity(state, fiber_id)
 
+    # The conclude step (`felt shuttle mark-runtime --handed-off-at`) needs the
+    # injectable runner + this daemon's store set; thread them through opts.
+    opts = Keyword.merge([runner: state.runner, felt_stores: state.felt_stores], opts)
+
     result =
       case verb do
         :accept -> LifecycleStore.accept(slug, opts)
-        :resume -> LifecycleStore.resume(slug)
+        :resume -> LifecycleStore.resume(slug, opts)
         other -> {:error, "unknown lifecycle transition #{inspect(other)}"}
       end
 
@@ -1761,11 +1765,11 @@ defmodule Shuttle.Poller do
   # AND leave a pinned role looping (open → active). A failed re-arm (oneshot,
   # unreadable) is logged and the fiber passes through unchanged — force-dispatch
   # of a oneshot still spawns it for a single run.
-  defp maybe_force_rearm(fiber, opts) do
+  defp maybe_force_rearm(fiber, opts, %State{} = state) do
     if Keyword.get(opts, :force, false) and Map.get(fiber, "status") != "active" do
       fiber_id = Map.get(fiber, "id", "")
 
-      case LifecycleStore.rearm(fiber_id) do
+      case LifecycleStore.rearm(fiber_id, runner: state.runner, felt_stores: state.felt_stores) do
         {:ok, msg} ->
           Logger.info("force-dispatch re-arm #{fiber_id}: #{String.trim(msg)}")
 
@@ -1794,7 +1798,7 @@ defmodule Shuttle.Poller do
     # and the transition pipeline both call — NOT an inline patch here, so the
     # autonomous poll path (which rebuilds the whole cache anyway) pays nothing.
     # No-op for active roles, oneshots, and non-forced dispatch.
-    fiber = maybe_force_rearm(fiber, opts)
+    fiber = maybe_force_rearm(fiber, opts, state)
 
     # The runtime key (uid when the fiber carries one, else slug) keys every
     # runtime map — running, claimed, dispatch_failures. felt I/O below stays
@@ -2015,7 +2019,7 @@ defmodule Shuttle.Poller do
             dispatch_failures: Map.delete(state.dispatch_failures, runtime_key)
         }
 
-        log_worker_claim(fiber, Keyword.get(opts, :session_uuid))
+        log_worker_claim(state, fiber_id, Keyword.get(opts, :session_uuid))
         state = refresh_document_entry(state, fiber_id)
         Logger.info("Claimed session #{session} for #{fiber_id} (agent=#{agent_id})")
         {state, {:ok, %{session: session, agent_id: agent_id}}}
@@ -2027,22 +2031,24 @@ defmodule Shuttle.Poller do
   end
 
   # The claim-time analog of the dispatcher's dispatch write: a self-claimed /
-  # chat-captured session stamps (refreshes) the fiber's `shuttle:` dispatch
-  # fields so the continuation heuristic and "Resume previous" can recover its
-  # session UUID. Best-effort, keyed by the fiber's `.md` path. A claim with no
-  # captured session_uuid still stamps `dispatched_at` (the run-window anchor) so
-  # a clean handoff can later be compared against it. A path-less fiber (rare)
-  # skips the write — it then reads as a fresh dispatch, the safe default.
-  defp log_worker_claim(fiber, session_uuid) do
-    case Map.get(fiber, "path") do
-      path when is_binary(path) and path != "" ->
-        Shuttle.Continuation.write_dispatch(path, %{
-          session_uuid: if(is_binary(session_uuid) and session_uuid != "", do: session_uuid)
-        })
+  # chat-captured session stamps (refreshes) the fiber's `shuttle.runtime`
+  # dispatch fields so the continuation heuristic and "Resume previous" can
+  # recover its session UUID. Routes through `felt shuttle mark-runtime` (felt
+  # owns the nesting — Stage 5). The store/scoped-id pair mirrors the dispatch
+  # path: `host_for_fiber` (the same owning-store the poll enumerated this fiber
+  # from), falling back to the primary configured store. A claim with no captured
+  # session_uuid still stamps `dispatched_at` (the run-window anchor) so a clean
+  # handoff can later be compared against it.
+  defp log_worker_claim(%State{} = state, fiber_id, session_uuid) do
+    felt_store =
+      case host_for_fiber(fiber_id, state) do
+        {:ok, h} -> h
+        {:error, _} -> hd(state.felt_stores)
+      end
 
-      _ ->
-        :ok
-    end
+    Shuttle.Continuation.write_dispatch(state.runner, felt_store, fiber_id, %{
+      session_uuid: if(is_binary(session_uuid) and session_uuid != "", do: session_uuid)
+    })
   end
 
   # Records (or refreshes the attempt count on) a dispatch failure. The map
@@ -2329,7 +2335,12 @@ defmodule Shuttle.Poller do
     end
 
     opened_at = if tripping?, do: now, else: entry.opened_at
-    %{state | resume_loop: Map.put(state.resume_loop, runtime_key, %{entry | count: count, opened_at: opened_at})}
+
+    %{
+      state
+      | resume_loop:
+          Map.put(state.resume_loop, runtime_key, %{entry | count: count, opened_at: opened_at})
+    }
   end
 
   # True while the breaker is open AND inside its cooldown window. After the
@@ -2666,5 +2677,4 @@ defmodule Shuttle.Poller do
       %{state | felt_stores: fresh}
     end
   end
-
 end

@@ -97,13 +97,20 @@ defmodule Shuttle.DispatchIntegrationTest do
     # dispatcher writes the dispatch marker keyed by the fiber's runtime key (the
     # slug for these uid-less test fibers); resume reads it back.
     prev_data_dir = System.get_env("SHUTTLE_DATA_DIR")
-    data_dir = Path.join(System.tmp_dir!(), "shuttle-int-markers-#{System.unique_integer([:positive])}")
+
+    data_dir =
+      Path.join(System.tmp_dir!(), "shuttle-int-markers-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(data_dir)
     System.put_env("SHUTTLE_DATA_DIR", data_dir)
 
     on_exit(fn ->
       File.rm_rf!(host)
-      if prev_data_dir, do: System.put_env("SHUTTLE_DATA_DIR", prev_data_dir), else: System.delete_env("SHUTTLE_DATA_DIR")
+
+      if prev_data_dir,
+        do: System.put_env("SHUTTLE_DATA_DIR", prev_data_dir),
+        else: System.delete_env("SHUTTLE_DATA_DIR")
+
       File.rm_rf!(data_dir)
     end)
 
@@ -146,9 +153,11 @@ defmodule Shuttle.DispatchIntegrationTest do
   # same helper + rationale in poller_test.exs.
   defp start_poller!(opts) do
     pid =
-      start_supervised!(
-        %{id: make_ref(), start: {Poller, :start_link, [opts]}, restart: :temporary}
-      )
+      start_supervised!(%{
+        id: make_ref(),
+        start: {Poller, :start_link, [opts]},
+        restart: :temporary
+      })
 
     {:ok, pid}
   end
@@ -278,7 +287,10 @@ defmodule Shuttle.DispatchIntegrationTest do
 
     # Dispatch marker (the session id), then a handoff marker after it → clean
     # close → the dispatcher takes the fresh path.
-    write_dispatch_marker(host, "tests/cli-resume-no-event", "test-session-uuid-abcd",
+    write_dispatch_marker(
+      host,
+      "tests/cli-resume-no-event",
+      "test-session-uuid-abcd",
       DateTime.add(DateTime.utc_now(), -60, :second)
     )
 
@@ -429,7 +441,11 @@ defmodule Shuttle.DispatchIntegrationTest do
     A codex fiber resumed from its dispatch marker.
     """)
 
-    write_dispatch_marker(host, "tests/kanban-history-resume", "40740310-2345-4e33-a1e4-7950db41ce10")
+    write_dispatch_marker(
+      host,
+      "tests/kanban-history-resume",
+      "40740310-2345-4e33-a1e4-7950db41ce10"
+    )
 
     assert {:ok, _} =
              Dispatcher.dispatch("tests/kanban-history-resume",
@@ -596,14 +612,16 @@ defmodule Shuttle.DispatchIntegrationTest do
                work_dir: work_dir
              )
 
-    # The captured worker session id is stamped into the fiber's `shuttle:` block
-    # (the only structured session-id home) so resume can recover it. The wrong
-    # (human) session is ignored.
+    # The captured worker session id is stamped into the fiber's shuttle.runtime
+    # block via `felt shuttle mark-runtime` (felt owns the nesting — Stage 5) so
+    # resume can recover it; the wrong (human) session is ignored. The daemon's
+    # contract is the verb it shells — felt's own suite + the lockstep round-trip
+    # cover that mark-runtime nests under shuttle.runtime.
     assert eventually(fn ->
-             {:ok, _p, _raw, fm, _body} =
-               Shuttle.FiberDoc.read_path(fiber_md_path(host, "tests/codex-capture"))
-
-             get_in(fm, ["shuttle", "session_uuid"]) == "right-worker-session"
+             Enum.any?(IntegrationRunner.commands(), fn {cmd, args} ->
+               cmd == "felt" and match?(["shuttle", "mark-runtime" | _], args) and
+                 "--session" in args and "right-worker-session" in args
+             end)
            end)
   end
 
@@ -723,7 +741,11 @@ defmodule Shuttle.DispatchIntegrationTest do
 
     # A prior run's dispatch marker (session on file) — but no resume directive is
     # carried on THIS dispatch, and standing roles never auto-resume → fresh.
-    write_dispatch_marker(host, "tests/standing-stale-resume", "11111111-2222-3333-4444-555555555555")
+    write_dispatch_marker(
+      host,
+      "tests/standing-stale-resume",
+      "11111111-2222-3333-4444-555555555555"
+    )
 
     assert {:ok, _} =
              Dispatcher.dispatch("tests/standing-stale-resume",
@@ -919,7 +941,10 @@ defmodule Shuttle.DispatchIntegrationTest do
     A standing role whose previous run completed; armed for the next tick.
     """)
 
-    write_dispatch_marker(host, "tests/standing-armed", "completed-session-uuid",
+    write_dispatch_marker(
+      host,
+      "tests/standing-armed",
+      "completed-session-uuid",
       DateTime.add(DateTime.utc_now(), -60, :second)
     )
 
@@ -954,7 +979,9 @@ defmodule Shuttle.DispatchIntegrationTest do
       # not regress a role whose run already completed.
       assert read_frontmatter(host, "tests/standing-armed")["status"] == "active"
     after
-      if prev_loom, do: System.put_env("LOOM_HOMES", prev_loom), else: System.delete_env("LOOM_HOMES")
+      if prev_loom,
+        do: System.put_env("LOOM_HOMES", prev_loom),
+        else: System.delete_env("LOOM_HOMES")
     end
   end
 
@@ -972,7 +999,10 @@ defmodule Shuttle.DispatchIntegrationTest do
   # role staying active is the fix at work, not a reconcile that never fired.
   test "an accepted standing role is left armed despite a dirty death",
        %{host: host} do
-    for {slug, accept?} <- [{"standing-accepted-freeform", true}, {"standing-dead-freeform", false}] do
+    for {slug, accept?} <- [
+          {"standing-accepted-freeform", true},
+          {"standing-dead-freeform", false}
+        ] do
       write_fiber(host, "tests/#{slug}", """
       ---
       name: #{slug}
@@ -992,7 +1022,10 @@ defmodule Shuttle.DispatchIntegrationTest do
       """)
 
       # Dispatch with NO handoff after it (dirty death).
-      write_dispatch_marker(host, "tests/#{slug}", "#{slug}-uuid",
+      write_dispatch_marker(
+        host,
+        "tests/#{slug}",
+        "#{slug}-uuid",
         DateTime.add(DateTime.utc_now(), -60, :second)
       )
 
@@ -1023,11 +1056,15 @@ defmodule Shuttle.DispatchIntegrationTest do
       # FIX: the accepted role — same free-form exit, plus a human accept — stays
       # armed. The accept supersedes the dead-orphan inference.
       fm = read_frontmatter(host, "tests/standing-accepted-freeform")
+
       assert fm["status"] == "active",
              "an accepted role must stay armed, not be re-marked awaiting by the dead-orphan reconciler"
+
       refute Map.has_key?(fm, "closed-at")
     after
-      if prev_loom, do: System.put_env("LOOM_HOMES", prev_loom), else: System.delete_env("LOOM_HOMES")
+      if prev_loom,
+        do: System.put_env("LOOM_HOMES", prev_loom),
+        else: System.delete_env("LOOM_HOMES")
     end
   end
 
@@ -1072,7 +1109,10 @@ defmodule Shuttle.DispatchIntegrationTest do
       assert eventually(fn ->
                case Poller.cached_fiber_documents(poller) do
                  {:ok, body} ->
-                   Enum.any?(body.fibers, &(get_in(&1, [:fiber, "id"]) == "tests/standing-awaiting-rearm"))
+                   Enum.any?(
+                     body.fibers,
+                     &(get_in(&1, [:fiber, "id"]) == "tests/standing-awaiting-rearm")
+                   )
 
                  _ ->
                    false
@@ -1100,13 +1140,18 @@ defmodule Shuttle.DispatchIntegrationTest do
       # until the next tick even though the worker is live. No send(:run_poll_cycle).
       assert :ok = Poller.refresh_document(poller, "tests/standing-awaiting-rearm")
       assert {:ok, body} = Poller.cached_fiber_documents(poller)
-      entry = Enum.find(body.fibers, &(get_in(&1, [:fiber, "id"]) == "tests/standing-awaiting-rearm"))
+
+      entry =
+        Enum.find(body.fibers, &(get_in(&1, [:fiber, "id"]) == "tests/standing-awaiting-rearm"))
+
       assert entry, "re-armed role should still be in the owned feed"
       assert entry.fiber["status"] == "active"
       refute Map.has_key?(entry.fiber, "closed-at")
       refute Map.has_key?(entry.fiber, "tempered")
     after
-      if prev_loom, do: System.put_env("LOOM_HOMES", prev_loom), else: System.delete_env("LOOM_HOMES")
+      if prev_loom,
+        do: System.put_env("LOOM_HOMES", prev_loom),
+        else: System.delete_env("LOOM_HOMES")
     end
   end
 
@@ -1155,7 +1200,10 @@ defmodule Shuttle.DispatchIntegrationTest do
       assert eventually(fn ->
                case Poller.cached_fiber_documents(poller) do
                  {:ok, body} ->
-                   Enum.any?(body.fibers, &(get_in(&1, [:fiber, "id"]) == "tests/standing-temper-rest"))
+                   Enum.any?(
+                     body.fibers,
+                     &(get_in(&1, [:fiber, "id"]) == "tests/standing-temper-rest")
+                   )
 
                  _ ->
                    false
@@ -1164,7 +1212,8 @@ defmodule Shuttle.DispatchIntegrationTest do
              "expected the document cache to warm with the awaiting role"
 
       # The kanban drag-to-tempered on a standing awaiting role resolves to accept.
-      assert {:ok, _} = Poller.lifecycle_transition(poller, :accept, "tests/standing-temper-rest", [])
+      assert {:ok, _} =
+               Poller.lifecycle_transition(poller, :accept, "tests/standing-temper-rest", [])
 
       # Re-armed AND the prior outcome survives (accept no longer blanks it).
       fm = read_frontmatter(host, "tests/standing-temper-rest")
@@ -1188,7 +1237,9 @@ defmodule Shuttle.DispatchIntegrationTest do
       # It stays armed-and-resting (active), not re-fired back to awaiting.
       assert read_frontmatter(host, "tests/standing-temper-rest")["status"] == "active"
     after
-      if prev_loom, do: System.put_env("LOOM_HOMES", prev_loom), else: System.delete_env("LOOM_HOMES")
+      if prev_loom,
+        do: System.put_env("LOOM_HOMES", prev_loom),
+        else: System.delete_env("LOOM_HOMES")
     end
   end
 
@@ -1223,19 +1274,27 @@ defmodule Shuttle.DispatchIntegrationTest do
 
     assert eventually(fn ->
              case Poller.cached_fiber_documents(poller) do
-               {:ok, body} -> Enum.any?(body.fibers, &(get_in(&1, [:fiber, "id"]) == "tests/refresh-seam"))
-               _ -> false
+               {:ok, body} ->
+                 Enum.any?(body.fibers, &(get_in(&1, [:fiber, "id"]) == "tests/refresh-seam"))
+
+               _ ->
+                 false
              end
            end),
            "expected the document cache to warm"
 
     # Warming the cache runs a poll that DISPATCHES this status:active fiber,
-    # which fires an async Task stamping `shuttle.dispatched_at` into the
-    # frontmatter (a read-modify-write of this same file). Wait for that stamp to
-    # land before mutating out of band — otherwise the stamp's write races the
-    # mutation and can clobber it (or expose felt a half-written file).
-    assert eventually(fn -> Map.has_key?(read_frontmatter(host, "tests/refresh-seam")["shuttle"] || %{}, "dispatched_at") end),
-           "expected the dispatch stamp to settle"
+    # which fires an async Task that shells `felt shuttle mark-runtime` to stamp
+    # the dispatch fields (felt owns the runtime nesting — Stage 5). Wait for that
+    # async dispatch task to have issued the verb before mutating out of band, so
+    # the two writes are serialized rather than racing.
+    assert eventually(fn ->
+             Enum.any?(IntegrationRunner.commands(), fn {cmd, args} ->
+               cmd == "felt" and match?(["shuttle", "mark-runtime" | _], args) and
+                 "--dispatched-at" in args
+             end)
+           end),
+           "expected the dispatch stamp command to be issued"
 
     # Mutate a NON-status field out of band, then refresh — no poll cycle.
     write_fiber(host, "tests/refresh-seam", """

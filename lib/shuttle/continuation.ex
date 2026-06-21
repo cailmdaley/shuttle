@@ -4,24 +4,43 @@ defmodule Shuttle.Continuation do
   block — the substrate that replaced felt history (and, before this, the
   per-host marker files).
 
-  Three runtime fields live under `shuttle:`, written at the two natural moments
-  and read straight off the polled fiber map:
+  Four runtime fields live under `shuttle.runtime` (Stage 5: nested,
+  machine-managed), written at the two natural moments and read straight off the
+  polled fiber map:
 
-    * `shuttle.session_uuid` + `shuttle.dispatched_at` (+ `shuttle.run_id` for
-      standing) — **written by the daemon at dispatch** (`write_dispatch/2`). The
-      daemon holds the session UUID (claude: the `--session-id` it generated;
-      codex/pi: scraped from the JSONL), so nothing is plumbed to the worker.
-    * `shuttle.handed_off_at` — **written by the WORKER at clean exit** via
-      `shuttle-ctl handoff` (Go, surgical `WriteBlock`), and by a human re-arm
-      (`Shuttle.LifecycleStore`, which folds it into the same atomic re-arm
-      write). A clean exit is the only thing that stamps it newer than the
-      dispatch.
+    * `shuttle.runtime.session_uuid` + `shuttle.runtime.dispatched_at`
+      (+ `shuttle.runtime.run_id` for standing) — **written by the daemon at
+      dispatch** (`write_dispatch/4`). The daemon holds the session UUID
+      (claude: the `--session-id` it generated; codex/pi: scraped from the
+      JSONL), so nothing is plumbed to the worker.
+    * `shuttle.runtime.handed_off_at` — **written by the WORKER at clean exit**
+      via `felt shuttle handoff` (Go, nested surgical write), and by a human
+      re-arm (`Shuttle.LifecycleStore`, a second write after the status re-arm).
+      A clean exit is the only thing that stamps it newer than the dispatch.
 
   The fields are **per-host by nature** but safe in git: only the owning host
   (`shuttle.host`) dispatches or resumes a fiber, so `session_uuid` is written
   and read by the same host; the git-sync to other hosts is inert (they ignore
   non-owned fibers). Reassigning `host` degrades gracefully to a failed resume →
   fresh.
+
+  ## felt owns the nested write (Stage 5, Option B)
+
+  The runtime nesting lives in ONE engine — felt's `yaml.Node` code. The daemon
+  never edits the two-level `shuttle.runtime` structure with its own text
+  surgery; it shells `felt shuttle mark-runtime`, felt's daemon-facing
+  runtime-write channel. So the writers here take a `runner` + the fiber's felt
+  store + its store-scoped id and shell that verb, instead of editing the `.md`
+  directly.
+
+  ## Reading: nested-OR-flat
+
+  Readers prefer `shuttle.runtime.<key>` and fall back to the legacy flat
+  `shuttle.<key>`. This is what makes a mixed-on-disk state safe across the
+  runtime-nesting migration: a freshly written nested value always shadows a
+  stale flat one (it is newer, written at the latest dispatch/handoff), and an
+  un-migrated fiber still reads correctly off its flat keys until
+  `felt shuttle migrate-runtime` lifts it.
 
   ## Continuation decision
 
@@ -46,8 +65,6 @@ defmodule Shuttle.Continuation do
 
   require Logger
 
-  alias Shuttle.FiberDoc
-
   # ── readers (pure, over the polled fiber map) ────────────────────────────────
 
   @doc "The `shuttle:` block of a polled fiber map, or `%{}` when absent."
@@ -59,21 +76,23 @@ defmodule Shuttle.Continuation do
     end
   end
 
-  @doc "`shuttle.dispatched_at` as a `DateTime`, or `nil` when absent/unparseable."
+  @doc "`shuttle.runtime.dispatched_at` (or legacy flat) as a `DateTime`, or `nil`."
   @spec dispatched_at(map()) :: DateTime.t() | nil
-  def dispatched_at(fiber), do: fiber |> shuttle_block() |> Map.get("dispatched_at") |> parse_iso()
+  def dispatched_at(fiber),
+    do: fiber |> shuttle_block() |> runtime_field("dispatched_at") |> parse_iso()
 
-  @doc "`shuttle.handed_off_at` as a `DateTime`, or `nil` when absent/unparseable."
+  @doc "`shuttle.runtime.handed_off_at` (or legacy flat) as a `DateTime`, or `nil`."
   @spec handed_off_at(map()) :: DateTime.t() | nil
-  def handed_off_at(fiber), do: fiber |> shuttle_block() |> Map.get("handed_off_at") |> parse_iso()
+  def handed_off_at(fiber),
+    do: fiber |> shuttle_block() |> runtime_field("handed_off_at") |> parse_iso()
 
   @doc """
-  The resumable session UUID — `shuttle.session_uuid`, or `nil` when absent/empty.
-  The sole structured home for the resume id.
+  The resumable session UUID — `shuttle.runtime.session_uuid` (or legacy flat),
+  or `nil` when absent/empty. The sole structured home for the resume id.
   """
   @spec resumable_session_id(map()) :: String.t() | nil
   def resumable_session_id(fiber) do
-    case fiber |> shuttle_block() |> Map.get("session_uuid") do
+    case fiber |> shuttle_block() |> runtime_field("session_uuid") do
       uuid when is_binary(uuid) and uuid != "" -> uuid
       _ -> nil
     end
@@ -101,73 +120,92 @@ defmodule Shuttle.Continuation do
     end
   end
 
-  # ── writer (surgical frontmatter edit, keyed by fiber id) ────────────────────
+  # nested-OR-flat: `shuttle.runtime.<key>` wins over the legacy flat
+  # `shuttle.<key>`. A non-map `runtime:` (degenerate/null) falls back to flat.
+  defp runtime_field(shuttle, key) do
+    case shuttle do
+      %{"runtime" => runtime} when is_map(runtime) ->
+        case Map.get(runtime, key) do
+          nil -> Map.get(shuttle, key)
+          value -> value
+        end
 
-  @doc """
-  Stamp the dispatch fields into a fiber's `shuttle:` block:
-  `{session_uuid, dispatched_at, run_id}`. `path` is the fiber's on-disk `.md`
-  (the dispatcher carries `fiber["path"]` from the poll).
-
-  `dispatched_at` is set to now (RFC3339 UTC) unless the caller supplied one.
-  `session_uuid` is written only when non-empty (a codex/pi claim with no scraped
-  UUID still stamps `dispatched_at`, the run-window anchor). `run_id` is written
-  only when present (a plain oneshot omits it rather than writing `null`).
-
-  Surgical and atomic via `Shuttle.FiberDoc`. Best-effort: a write failure is
-  logged, not raised, so it can never block dispatch.
-  """
-  @spec write_dispatch(String.t(), map()) :: :ok | {:error, term()}
-  def write_dispatch(path, fields)
-      when is_binary(path) and path != "" and is_map(fields) do
-    ops =
-      [
-        {:put_nested, "shuttle", "dispatched_at", Map.get(fields, :dispatched_at) || iso_now()}
-      ]
-      |> put_if(fields, :session_uuid)
-      |> put_if(fields, :run_id)
-
-    case FiberDoc.edit_path(path, ops) do
-      :ok ->
-        :ok
-
-      {:error, reason} = err ->
-        Logger.warning("Continuation: failed to stamp dispatch at #{path}: #{inspect(reason)}")
-        err
+      _ ->
+        Map.get(shuttle, key)
     end
   end
 
-  def write_dispatch(_path, _fields), do: :ok
+  # ── writers (shell `felt shuttle mark-runtime` — felt owns the nesting) ───────
 
   @doc """
-  Stamp `shuttle.handed_off_at = now` into the fiber `.md` at `path` — the
-  clean-exit signal, written surgically. The worker uses the Go path; this is the
-  Elixir entry point (used by tests and any daemon-side conclude that is not
-  already folded into a lifecycle re-arm write).
+  Stamp the dispatch runtime fields into a fiber's `shuttle.runtime` block:
+  `{session_uuid, dispatched_at, run_id}`, by shelling `felt shuttle
+  mark-runtime` (felt's daemon-facing runtime-write channel) with
+  `cd: felt_store`. `fiber_id` is the id scoped to `felt_store` — the same pair
+  the dispatch read the fiber with — so felt resolves it from that store.
+
+  `dispatched_at` is set to now (RFC3339 UTC) unless the caller supplied one.
+  `session_uuid` is passed only when non-empty (a codex/pi claim with no scraped
+  UUID still stamps `dispatched_at`, the run-window anchor). `run_id` is passed
+  only when present (a plain oneshot omits it).
+
+  Best-effort: a non-zero `felt` exit is logged, not raised, so it can never
+  block dispatch. A missing `felt_store`/`fiber_id` is a no-op (the fiber then
+  reads as a fresh dispatch — the safe default).
   """
-  @spec mark_handed_off(String.t()) :: :ok | {:error, term()}
-  def mark_handed_off(path) when is_binary(path) and path != "" do
-    FiberDoc.edit_path(path, [{:put_nested, "shuttle", "handed_off_at", iso_now()}])
+  @spec write_dispatch(module(), String.t(), String.t(), map()) :: :ok | {:error, term()}
+  def write_dispatch(runner, felt_store, fiber_id, fields)
+      when is_binary(felt_store) and felt_store != "" and is_binary(fiber_id) and fiber_id != "" and
+             is_map(fields) do
+    flags =
+      [{"--dispatched-at", Map.get(fields, :dispatched_at) || iso_now()}]
+      |> add_flag("--session", Map.get(fields, :session_uuid))
+      |> add_flag("--run-id", Map.get(fields, :run_id))
+
+    mark_runtime(runner, felt_store, fiber_id, flags)
   end
 
-  def mark_handed_off(_), do: :ok
+  def write_dispatch(_runner, _felt_store, _fiber_id, _fields), do: :ok
+
+  @doc """
+  Stamp `shuttle.runtime.handed_off_at = now` — the clean-exit / human-re-arm
+  signal — by shelling `felt shuttle mark-runtime --handed-off-at`
+  (`cd: felt_store`). The worker's own exit uses the Go `felt shuttle handoff`;
+  this is the daemon-side entry point (the `LifecycleStore` conclude after an
+  accept/resume/rearm, and tests).
+  """
+  @spec mark_handed_off(module(), String.t(), String.t()) :: :ok | {:error, term()}
+  def mark_handed_off(runner, felt_store, fiber_id)
+      when is_binary(felt_store) and felt_store != "" and is_binary(fiber_id) and fiber_id != "" do
+    mark_runtime(runner, felt_store, fiber_id, [{"--handed-off-at", iso_now()}])
+  end
+
+  def mark_handed_off(_runner, _felt_store, _fiber_id), do: :ok
 
   # ── internals ────────────────────────────────────────────────────────────────
 
-  # Append a `{:put_nested, "shuttle", key, value}` op for an OPTIONAL field:
-  # only when the caller supplied a non-nil, non-empty value. Keeps `session_uuid`
-  # and `run_id` out of the block when there is nothing to write.
-  defp put_if(ops, fields, key) do
-    case Map.get(fields, key) do
-      value when is_binary(value) and value != "" ->
-        ops ++ [{:put_nested, "shuttle", to_string(key), value}]
+  # Shell `felt shuttle mark-runtime <fiber_id> <flags...>` (cd: felt_store).
+  # `flags` is a list of `{flag, value}` pairs, already filtered to non-empty.
+  defp mark_runtime(runner, felt_store, fiber_id, flags) do
+    args = ["shuttle", "mark-runtime", fiber_id] ++ Enum.flat_map(flags, fn {f, v} -> [f, v] end)
 
-      value when not is_nil(value) and not is_binary(value) ->
-        ops ++ [{:put_nested, "shuttle", to_string(key), value}]
+    case runner.cmd("felt", args, cd: felt_store, stderr_to_stdout: true) do
+      {_output, 0} ->
+        :ok
 
-      _ ->
-        ops
+      {output, status} ->
+        reason = "felt shuttle mark-runtime exited #{status}: #{String.trim(to_string(output))}"
+        Logger.warning("Continuation: #{reason} (fiber=#{fiber_id}, store=#{felt_store})")
+        {:error, reason}
     end
   end
+
+  # Append a `{flag, value}` pair for an OPTIONAL field: only when the caller
+  # supplied a non-nil, non-empty value. Keeps `--session` / `--run-id` off the
+  # command line when there is nothing to write.
+  defp add_flag(flags, _flag, value) when value in [nil, ""], do: flags
+  defp add_flag(flags, flag, value) when is_binary(value), do: flags ++ [{flag, value}]
+  defp add_flag(flags, flag, value), do: flags ++ [{flag, to_string(value)}]
 
   defp iso_now, do: DateTime.to_iso8601(DateTime.utc_now())
 

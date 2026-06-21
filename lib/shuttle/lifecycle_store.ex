@@ -17,7 +17,9 @@ defmodule Shuttle.LifecycleStore do
   at open, so it has no accept/awaiting cycle here — only the `rearm` open.
   """
 
-  alias Shuttle.FiberDoc
+  require Logger
+
+  alias Shuttle.{Continuation, FiberDoc}
 
   # Legacy + daemon-owned shuttle keys wiped from the block on every accept /
   # resume / mark-awaiting rewrite: `enabled` and `review` no longer exist;
@@ -26,7 +28,7 @@ defmodule Shuttle.LifecycleStore do
   @runtime_keys ~w(enabled review next_due_at last_run_at session)
 
   @spec accept(String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
-  def accept(fiber_id, _opts \\ []) when is_binary(fiber_id) do
+  def accept(fiber_id, opts \\ []) when is_binary(fiber_id) do
     with {:ok, path, raw_fm, frontmatter, body} <- FiberDoc.read(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
          :ok <- require_standing(shuttle),
@@ -39,40 +41,43 @@ defmodule Shuttle.LifecycleStore do
       # blanks it; see rearm_ops). Accept is standing-only: a pinned role
       # is not cyclical (Option D — it loops while active, parks at open), so it
       # has no awaiting/accept cycle to advance.
-      accept_from_doc(fiber_id, path, raw_fm, body, shuttle)
+      accept_from_doc(fiber_id, path, raw_fm, body, shuttle, opts)
     end
   end
 
-  defp accept_from_doc(fiber_id, path, raw_fm, body, shuttle) do
+  defp accept_from_doc(fiber_id, path, raw_fm, body, shuttle, opts) do
     with {:ok, _schedule} <- require_schedule(shuttle) do
       # The document carries the entire lifecycle: writing `status: active` re-arms
-      # the role, `handed_off_at` concludes the prior run (one atomic write), and
-      # `next_due` is recomputed by felt on the next poll (the daemon no longer
-      # parses cron — Stage 4b). There is no runtime row to upsert, and the precise
-      # next-due timestamp rides the board's polled snapshot, not this message.
-      FiberDoc.write!(path, raw_fm, body, rearm_ops() ++ [conclude_run_op()] ++ evict_runtime_ops())
+      # the role and `next_due` is recomputed by felt on the next poll (the daemon
+      # no longer parses cron — Stage 4b). The prior run is then concluded by a
+      # SECOND write (`conclude_run`: `felt shuttle mark-runtime --handed-off-at`),
+      # because felt owns the nesting (Stage 5, Option B) — see conclude_run.
+      FiberDoc.write!(path, raw_fm, body, rearm_ops() ++ evict_runtime_ops())
+      conclude_run(fiber_id, opts)
 
       {:ok, "accepted run for #{fiber_id} (re-armed; next run on the schedule's next tick)\n"}
     end
   end
 
-  @spec resume(String.t()) :: {:ok, String.t()} | {:error, String.t()}
-  def resume(fiber_id) when is_binary(fiber_id) do
+  @spec resume(String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
+  def resume(fiber_id, opts \\ []) when is_binary(fiber_id) do
     with {:ok, path, raw_fm, frontmatter, body} <- FiberDoc.read(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
          :ok <- require_standing(shuttle),
          :ok <- require_doc_awaiting(frontmatter) do
-      resume_from_doc(fiber_id, path, raw_fm, body)
+      resume_from_doc(fiber_id, path, raw_fm, body, opts)
     end
   end
 
-  defp resume_from_doc(fiber_id, path, raw_fm, body) do
+  defp resume_from_doc(fiber_id, path, raw_fm, body, opts) do
     now = DateTime.utc_now()
 
     # Re-arm by writing `status: active`; the next poll's cron window picks the
-    # role up immediately (the active document IS the re-queue). `handed_off_at`
-    # concludes the prior run in the same atomic write. No runtime row.
-    FiberDoc.write!(path, raw_fm, body, rearm_ops() ++ [conclude_run_op()] ++ evict_runtime_ops())
+    # role up immediately (the active document IS the re-queue). The prior run is
+    # concluded by `conclude_run` (a second `felt shuttle mark-runtime` write —
+    # felt owns the runtime nesting, Stage 5). No runtime row.
+    FiberDoc.write!(path, raw_fm, body, rearm_ops() ++ evict_runtime_ops())
+    conclude_run(fiber_id, opts)
 
     {:ok,
      "resumed #{fiber_id} (standing role; re-queued for immediate dispatch)\n" <>
@@ -130,15 +135,16 @@ defmodule Shuttle.LifecycleStore do
 
   Mirror of `mark_awaiting/1` (the worker-exit closer): this is the open.
   """
-  @spec rearm(String.t()) :: {:ok, String.t()} | {:error, String.t()}
-  def rearm(fiber_id) when is_binary(fiber_id) do
+  @spec rearm(String.t(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
+  def rearm(fiber_id, opts \\ []) when is_binary(fiber_id) do
     with {:ok, path, raw_fm, frontmatter, body} <- FiberDoc.read(fiber_id),
          {:ok, shuttle} <- shuttle_block(frontmatter),
          :ok <- require_perennial(shuttle) do
       if Map.get(frontmatter, "status") == "active" do
         {:ok, "#{fiber_id} already active\n"}
       else
-        FiberDoc.write!(path, raw_fm, body, rearm_ops() ++ [conclude_run_op()] ++ evict_runtime_ops())
+        FiberDoc.write!(path, raw_fm, body, rearm_ops() ++ evict_runtime_ops())
+        conclude_run(fiber_id, opts)
         {:ok, "re-armed #{fiber_id} (status: active) for force-dispatch\n"}
       end
     end
@@ -245,9 +251,7 @@ defmodule Shuttle.LifecycleStore do
   defp require_pinned(%{"mode" => "pinned"}), do: :ok
 
   defp require_pinned(shuttle),
-    do:
-      {:error,
-       "park only applies to pinned roles (kind=#{inspect(Map.get(shuttle, "kind"))})"}
+    do: {:error, "park only applies to pinned roles (kind=#{inspect(Map.get(shuttle, "kind"))})"}
 
   defp require_schedule(%{"schedule" => schedule}) when is_map(schedule), do: {:ok, schedule}
   defp require_schedule(_), do: {:error, "fiber has no schedule"}
@@ -272,14 +276,53 @@ defmodule Shuttle.LifecycleStore do
     Enum.map(@runtime_keys, &{:delete_nested, "shuttle", &1})
   end
 
-  # Conclude the in-flight run by stamping `shuttle.handed_off_at = now` into the
-  # block — folded into the SAME atomic re-arm write as `status: active`. A human
-  # accept/resume/rearm declares the run concluded, which is exactly the signal a
-  # clean worker exit leaves (`Shuttle.Continuation` reads `handed_off_at`), so
-  # the standing-role dead-orphan detector sees a clean exit
-  # (`handed_off_at >= dispatched_at`) and the cron lookback baseline advances.
-  # This stops the temper oscillation with no separate re-arm field — the same
-  # `handed_off_at` covers both the worker's clean exit and the human re-arm.
-  defp conclude_run_op,
-    do: {:put_nested, "shuttle", "handed_off_at", DateTime.to_iso8601(DateTime.utc_now())}
+  # Conclude the in-flight run by stamping `shuttle.runtime.handed_off_at = now`.
+  # A human accept/resume/rearm declares the run concluded, which is exactly the
+  # signal a clean worker exit leaves (`Shuttle.Continuation` reads
+  # `handed_off_at`), so the standing-role dead-orphan detector sees a clean exit
+  # (`handed_off_at >= dispatched_at`) and the cron lookback baseline advances —
+  # stopping the temper oscillation with no separate re-arm field.
+  #
+  # Stage 5, Option B: felt owns the nesting, so the daemon cannot fold this into
+  # the atomic status write the way the old flat `conclude_run_op` did. It is a
+  # SECOND write — `felt shuttle mark-runtime --handed-off-at` — after the status
+  # re-arm. The sub-ms non-atomic window between the two is the one accepted
+  # tradeoff: a daemon crash there leaves the role `active` with no fresh handoff
+  # → the dead-orphan reconciler marks it awaiting → the human re-accepts. Rare
+  # (crash during a human action), recoverable, standing-only. Best-effort: a
+  # resolution miss or a non-zero `felt` exit is logged, never fails the re-arm.
+  defp conclude_run(fiber_id, opts) do
+    runner = Keyword.get(opts, :runner, Shuttle.Runner.Default)
+
+    case resolve_runtime_target(fiber_id, Keyword.get(opts, :felt_stores)) do
+      {:ok, host, scoped_id} ->
+        Continuation.mark_handed_off(runner, host, scoped_id)
+
+      :error ->
+        Logger.warning(
+          "LifecycleStore: could not resolve #{fiber_id} to conclude its run " <>
+            "(shuttle.runtime.handed_off_at not stamped; the dead-orphan reconciler will recover)"
+        )
+    end
+
+    :ok
+  end
+
+  # Resolve a fiber id to its owning felt store + store-scoped id — the pair
+  # `felt shuttle mark-runtime` needs (run with `cd: host`). Uses the daemon's
+  # configured `felt_stores` when threaded (the poller passes `state.felt_stores`),
+  # else the global configured stores.
+  defp resolve_runtime_target(fiber_id, felt_stores) do
+    resolution =
+      if is_list(felt_stores) and felt_stores != [] do
+        Shuttle.FeltStores.resolve_fiber(fiber_id, felt_stores)
+      else
+        Shuttle.FeltStores.resolve_fiber(fiber_id)
+      end
+
+    case resolution do
+      {:ok, %{host: host, fiber_id: scoped_id}} -> {:ok, host, scoped_id}
+      _ -> :error
+    end
+  end
 end

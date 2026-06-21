@@ -175,10 +175,30 @@ defmodule Shuttle.PollerTest do
     # matter (id/cli/wrapper/model); axes are absent here. Defined before `cmd`
     # so the attribute is in scope where the felt-resolve branch reads it.
     @resolved_agents %{
-      "claude-sonnet" => %{"id" => "claude-sonnet", "cli" => "claude", "wrapper" => "claude", "model" => "sonnet"},
-      "claude-opus" => %{"id" => "claude-opus", "cli" => "claude", "wrapper" => "claude", "model" => "opus"},
-      "claude-haiku" => %{"id" => "claude-haiku", "cli" => "claude", "wrapper" => "claude", "model" => "haiku"},
-      "codex" => %{"id" => "codex", "cli" => "codex", "wrapper" => "codex", "model" => "gpt-5.5-codex"}
+      "claude-sonnet" => %{
+        "id" => "claude-sonnet",
+        "cli" => "claude",
+        "wrapper" => "claude",
+        "model" => "sonnet"
+      },
+      "claude-opus" => %{
+        "id" => "claude-opus",
+        "cli" => "claude",
+        "wrapper" => "claude",
+        "model" => "opus"
+      },
+      "claude-haiku" => %{
+        "id" => "claude-haiku",
+        "cli" => "claude",
+        "wrapper" => "claude",
+        "model" => "haiku"
+      },
+      "codex" => %{
+        "id" => "codex",
+        "cli" => "codex",
+        "wrapper" => "codex",
+        "model" => "gpt-5.5-codex"
+      }
     }
 
     @impl true
@@ -326,7 +346,10 @@ defmodule Shuttle.PollerTest do
     # throwaway SHUTTLE_DATA_DIR so continuation/orphan tests don't bleed across
     # each other or into the developer's real ~/.shuttle.
     prev_data_dir = System.get_env("SHUTTLE_DATA_DIR")
-    data_dir = Path.join(System.tmp_dir!(), "shuttle-poller-markers-#{System.unique_integer([:positive])}")
+
+    data_dir =
+      Path.join(System.tmp_dir!(), "shuttle-poller-markers-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(data_dir)
     System.put_env("SHUTTLE_DATA_DIR", data_dir)
 
@@ -354,9 +377,11 @@ defmodule Shuttle.PollerTest do
   # `{:ok, pid}` so existing `{:ok, poller} = ...` call sites are unchanged.
   defp start_poller!(opts) do
     pid =
-      start_supervised!(
-        %{id: make_ref(), start: {Shuttle.Poller, :start_link, [opts]}, restart: :temporary}
-      )
+      start_supervised!(%{
+        id: make_ref(),
+        start: {Shuttle.Poller, :start_link, [opts]},
+        restart: :temporary
+      })
 
     {:ok, pid}
   end
@@ -1142,7 +1167,12 @@ defmodule Shuttle.PollerTest do
     # park regression would silently no-op — masking whether the gate even fired.
     prev_loom = System.get_env("LOOM_HOMES")
     System.put_env("LOOM_HOMES", "/private/tmp")
-    on_exit(fn -> if prev_loom, do: System.put_env("LOOM_HOMES", prev_loom), else: System.delete_env("LOOM_HOMES") end)
+
+    on_exit(fn ->
+      if prev_loom,
+        do: System.put_env("LOOM_HOMES", prev_loom),
+        else: System.delete_env("LOOM_HOMES")
+    end)
 
     fiber_id = "tests/pinned-exit-parks"
     leaf = fiber_id |> String.split("/") |> List.last()
@@ -1195,7 +1225,12 @@ defmodule Shuttle.PollerTest do
     # This is what guards the gate against being broadened to skip standing too.
     prev_loom = System.get_env("LOOM_HOMES")
     System.put_env("LOOM_HOMES", "/private/tmp")
-    on_exit(fn -> if prev_loom, do: System.put_env("LOOM_HOMES", prev_loom), else: System.delete_env("LOOM_HOMES") end)
+
+    on_exit(fn ->
+      if prev_loom,
+        do: System.put_env("LOOM_HOMES", prev_loom),
+        else: System.delete_env("LOOM_HOMES")
+    end)
 
     fiber_id = "tests/standing-exit-closes"
     leaf = fiber_id |> String.split("/") |> List.last()
@@ -1364,7 +1399,12 @@ defmodule Shuttle.PollerTest do
     # prev_due (the last weekday-09:00 tick) sits before this service; next_due is
     # the future tick → valid (so the snapshot reads "scheduled", not invalid).
     write_dispatch_marker("tests/standing-sleeping", "seed-recent")
-    set_resolved_occurrences("tests/standing-sleeping", ~U[2026-05-01 09:00:00Z], ~U[2999-01-01 09:00:00Z])
+
+    set_resolved_occurrences(
+      "tests/standing-sleeping",
+      ~U[2026-05-01 09:00:00Z],
+      ~U[2999-01-01 09:00:00Z]
+    )
 
     {:ok, poller} =
       start_poller!(
@@ -2125,7 +2165,12 @@ defmodule Shuttle.PollerTest do
     # not due. The legacy flat next_due_at above is now inert — felt's resolved
     # occurrences are the source.
     write_dispatch_marker("tests/standing-stale", "seed-recent")
-    set_resolved_occurrences("tests/standing-stale", ~U[2026-05-01 09:00:00Z], ~U[2999-01-01 09:00:00Z])
+
+    set_resolved_occurrences(
+      "tests/standing-stale",
+      ~U[2026-05-01 09:00:00Z],
+      ~U[2999-01-01 09:00:00Z]
+    )
 
     {:ok, poller} =
       start_poller!(
@@ -2180,7 +2225,12 @@ defmodule Shuttle.PollerTest do
     # felt resolves a valid schedule (prev before service, next in the future) so
     # the snapshot reads a genuine "valid but sleeping", not an invalid role.
     write_dispatch_marker("tests/standing-review", "seed-recent")
-    set_resolved_occurrences("tests/standing-review", ~U[2026-05-01 09:00:00Z], ~U[2999-01-01 09:00:00Z])
+
+    set_resolved_occurrences(
+      "tests/standing-review",
+      ~U[2026-05-01 09:00:00Z],
+      ~U[2999-01-01 09:00:00Z]
+    )
 
     # A draft role (status: open) still reads scheduled in the schedule-derived
     # snapshot — paused/draft is a document fact (status), surfaced by the kanban
@@ -2199,7 +2249,11 @@ defmodule Shuttle.PollerTest do
 
     # A draft (status: open) still resolves a valid schedule; its last tick is in
     # the past (outside the 90s display window) so it reads "scheduled".
-    set_resolved_occurrences("tests/standing-accepted", ~U[2026-05-01 09:00:00Z], ~U[2999-01-01 09:00:00Z])
+    set_resolved_occurrences(
+      "tests/standing-accepted",
+      ~U[2026-05-01 09:00:00Z],
+      ~U[2999-01-01 09:00:00Z]
+    )
 
     {:ok, poller} =
       start_poller!(
@@ -2489,7 +2543,12 @@ defmodule Shuttle.PollerTest do
     MockRunner.set_shuttle(fiber_id, "kind: oneshot\nagent: claude-sonnet\n")
 
     # Back-date the dispatch so the handoff (now) is unambiguously >= dispatch.
-    write_dispatch_marker(fiber_id, "old-session-id", DateTime.add(DateTime.utc_now(), -60, :second))
+    write_dispatch_marker(
+      fiber_id,
+      "old-session-id",
+      DateTime.add(DateTime.utc_now(), -60, :second)
+    )
+
     write_handoff_marker(fiber_id)
 
     {:ok, poller} =
@@ -3653,10 +3712,14 @@ defmodule Shuttle.PollerTest do
     snap = Poller.snapshot(poller)
     assert Enum.any?(snap.eligible, &(&1.fiber_id == id))
 
-    # The claim stamped the session uuid into the fiber's `shuttle:` block (the
-    # real .md at the carried path), so resume / continuation can recover it.
-    {:ok, _p, _raw, claimed_fm, _body} = Shuttle.FiberDoc.read_path(MockRunner.fiber(id)["path"])
-    assert claimed_fm["shuttle"]["session_uuid"] == "uuid-claim-1"
+    # The claim shelled `felt shuttle mark-runtime` to stamp the session uuid into
+    # the fiber's `shuttle.runtime` block (felt owns the nesting — Stage 5), so
+    # resume / continuation can recover it. The daemon's contract is the verb it
+    # issues; felt's own suite covers that the verb nests correctly.
+    assert Enum.any?(MockRunner.commands(), fn {cmd, args} ->
+             cmd == "felt" and match?(["shuttle", "mark-runtime" | _], args) and
+               "--session" in args and "uuid-claim-1" in args
+           end)
 
     new_sessions_before =
       Enum.count(MockRunner.commands(), fn {cmd, args} ->
