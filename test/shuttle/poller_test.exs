@@ -445,6 +445,23 @@ defmodule Shuttle.PollerTest do
     MockRunner.put_shuttle_fields(id, %{"handed_off_at" => DateTime.to_iso8601(at)})
   end
 
+  # Inject the resolved occurrences felt computes for a standing role — the same
+  # way the mock's `with_resolved_agent` injects resolved.agent. felt is the cron
+  # authority (Stage 4b): it inlines `prev_due` (the catch-up dispatch signal —
+  # most recent tick <= now) and `next_due` (display + the parseable-schedule /
+  # validity signal), and the daemon reads them off `felt show -j` and parses no
+  # cron. A `prev_due` after the role's last service makes it due; an old one
+  # leaves it valid-but-sleeping. Without this a standing fiber resolves no
+  # occurrence → it is treated as having an unparseable schedule (never due).
+  defp set_resolved_occurrences(id, prev_due, next_due) do
+    MockRunner.put_shuttle_fields(id, %{
+      "resolved" => %{
+        "prev_due" => DateTime.to_iso8601(prev_due),
+        "next_due" => DateTime.to_iso8601(next_due)
+      }
+    })
+  end
+
   # ── Tests ──
 
   test "poller discovers and dispatches eligible fibers" do
@@ -1343,8 +1360,11 @@ defmodule Shuttle.PollerTest do
 
     # Just serviced (a "worker dispatched" event at ~now): under the one due rule,
     # a role is due only once a scheduled occurrence elapses AFTER its last
-    # service, so a freshly-serviced weekday-09:00 role is not due now.
+    # service, so a freshly-serviced weekday-09:00 role is not due now. felt's
+    # prev_due (the last weekday-09:00 tick) sits before this service; next_due is
+    # the future tick → valid (so the snapshot reads "scheduled", not invalid).
     write_dispatch_marker("tests/standing-sleeping", "seed-recent")
+    set_resolved_occurrences("tests/standing-sleeping", ~U[2026-05-01 09:00:00Z], ~U[2999-01-01 09:00:00Z])
 
     {:ok, poller} =
       start_poller!(
@@ -1383,8 +1403,12 @@ defmodule Shuttle.PollerTest do
       """
     )
 
-    # Recently serviced ⇒ not due now (so it stays scheduled, not running).
+    # Recently serviced ⇒ not due now (so it stays scheduled, not running). felt
+    # resolves a valid schedule (last tick before this service, next in the
+    # future) so the snapshot reads a genuine valid-but-sleeping role, not an
+    # invalid one.
     write_dispatch_marker(fiber_id, "seed-recent")
+    set_resolved_occurrences(fiber_id, ~U[2026-05-01 09:00:00Z], ~U[2999-01-01 09:00:00Z])
 
     {:ok, poller} =
       start_poller!(
@@ -1424,6 +1448,11 @@ defmodule Shuttle.PollerTest do
         tz: Europe/Paris
       """
     )
+
+    # An every-minute schedule's most recent tick is ~now; with no prior service
+    # (last_serviced = created_at, old) that elapsed occurrence makes it due.
+    now = DateTime.utc_now()
+    set_resolved_occurrences(fiber_id, now, DateTime.add(now, 60, :second))
 
     {:ok, poller} =
       start_poller!(
@@ -2004,6 +2033,10 @@ defmodule Shuttle.PollerTest do
       """
     )
 
+    # `* * * * *`'s most recent tick is ~now; with no prior service it is due.
+    now = DateTime.utc_now()
+    set_resolved_occurrences("tests/standing-due", now, DateTime.add(now, 60, :second))
+
     {:ok, poller} =
       start_poller!(
         name: :test_poller_standing_due,
@@ -2086,9 +2119,13 @@ defmodule Shuttle.PollerTest do
       """
     )
 
-    # Recently serviced ⇒ not due now (the stored next_due_at is ignored under the
-    # one due rule; what gates is "has an occurrence elapsed since last service").
+    # Recently serviced ⇒ not due now (what gates is "has an occurrence elapsed
+    # since last service"). felt's prev_due (the last real tick) sits before this
+    # service; next_due is the future tick → valid (validation_errors empty) but
+    # not due. The legacy flat next_due_at above is now inert — felt's resolved
+    # occurrences are the source.
     write_dispatch_marker("tests/standing-stale", "seed-recent")
+    set_resolved_occurrences("tests/standing-stale", ~U[2026-05-01 09:00:00Z], ~U[2999-01-01 09:00:00Z])
 
     {:ok, poller} =
       start_poller!(
@@ -2140,7 +2177,10 @@ defmodule Shuttle.PollerTest do
     )
 
     # Recently serviced ⇒ not due ⇒ stays "scheduled" (not dispatched/"running").
+    # felt resolves a valid schedule (prev before service, next in the future) so
+    # the snapshot reads a genuine "valid but sleeping", not an invalid role.
     write_dispatch_marker("tests/standing-review", "seed-recent")
+    set_resolved_occurrences("tests/standing-review", ~U[2026-05-01 09:00:00Z], ~U[2999-01-01 09:00:00Z])
 
     # A draft role (status: open) still reads scheduled in the schedule-derived
     # snapshot — paused/draft is a document fact (status), surfaced by the kanban
@@ -2156,6 +2196,10 @@ defmodule Shuttle.PollerTest do
       """,
       "open"
     )
+
+    # A draft (status: open) still resolves a valid schedule; its last tick is in
+    # the past (outside the 90s display window) so it reads "scheduled".
+    set_resolved_occurrences("tests/standing-accepted", ~U[2026-05-01 09:00:00Z], ~U[2999-01-01 09:00:00Z])
 
     {:ok, poller} =
       start_poller!(

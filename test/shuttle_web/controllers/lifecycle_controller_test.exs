@@ -196,9 +196,9 @@ defmodule ShuttleWeb.LifecycleControllerTest do
 
       assert conn.status == 200
       assert conn.resp_body =~ "accepted run for tests/standing-accept"
-      # accept re-arms to the next occurrence AFTER now (cron.next(now)) — the
-      # message carries the computed future tick.
-      assert conn.resp_body =~ "next due:"
+      # accept re-arms the role; the precise next tick rides the board's polled
+      # snapshot (felt is the cron authority — Stage 4b), not this message.
+      assert conn.resp_body =~ "next run on the schedule's next tick"
 
       text = File.read!(path)
       frontmatter = frontmatter(text)
