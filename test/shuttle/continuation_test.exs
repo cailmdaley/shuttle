@@ -137,11 +137,15 @@ defmodule Shuttle.ContinuationTest do
       assert "--dispatched-at" in args
     end
 
-    test "mark_handed_off passes --handed-off-at" do
+    test "mark_handed_off passes --handed-off-at and --host (no re-entrant resolution)" do
       :ok = Continuation.mark_handed_off(RecordingRunner, "/loom", "demo/task")
 
       assert [{"felt", args, _}] = RecordingRunner.calls()
-      assert ["shuttle", "mark-runtime", "demo/task", "--handed-off-at", _ts] = args
+      assert ["shuttle", "mark-runtime", "demo/task" | rest] = args
+      assert "--handed-off-at" in rest
+      # --host carries this daemon's authoritative own_host_id so felt's ownership
+      # guard never calls back to /api/v1/state (the re-entrancy blocker).
+      assert "--host" in rest
     end
 
     test "a missing store or fiber_id is a no-op (reads as a fresh dispatch)" do
