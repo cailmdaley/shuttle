@@ -38,21 +38,12 @@ AGENT_SSH_AUTH_SOCK ?= $(HOME)/.ssh/agent.sock
 
 .PHONY: all build cli start stop restart logs status clean help install-agent uninstall-agent
 
-# share/agents.json is the single source of truth for the agent registry.
-# The Elixir daemon reads it at compile/runtime. The Go CLI reads it at
-# runtime via FindSharePath, falling back to an embedded copy when the
-# share/ dir isn't adjacent to the binary. That embedded copy lives in
-# pkg/schema/agents_embedded.go and is regenerated from share/agents.json
-# by this rule — never hand-edit the .go file.
-pkg/schema/agents_embedded.go: share/agents.json
-	@printf '%s\n' 'package schema' '' \
-	  '// embeddedAgentJSON is generated from share/agents.json by `make` —' \
-	  '// do not hand-edit. Run `make pkg/schema/agents_embedded.go` (or any' \
-	  '// target that depends on it, e.g. `make cli`) to regenerate.' \
-	  'var embeddedAgentJSON = []byte(`' > $@
-	@cat $< >> $@
-	@printf '%s\n' '`)' >> $@
-	@echo "regenerated $@ from $<"
+# share/agents.json is the agent registry the Elixir daemon embeds at
+# compile/runtime. The Go CLI no longer owns a copy: shuttle-ctl is a thin
+# `exec felt shuttle` shim (cmd/shuttle/main.go) and felt owns the registry
+# (internal/shuttle, //go:embed agents.json) as the merge's single source of
+# truth — so the old pkg/schema + its generated agents_embedded.go are gone.
+# (Until Stage 4, the daemon still embeds this share/agents.json on its side.)
 
 help:
 	@echo "shuttle daemon:"
@@ -81,9 +72,9 @@ build:
 # Build the Go CLI and install to $(CLI_DEST). `go install ./cmd/shuttle`
 # would output as `shuttle` (matches cobra Use:), so we use `go build -o`
 # to land it under the historical `shuttle-ctl` name.
-cli: pkg/schema/agents_embedded.go
+cli:
 	@go build -o $(CLI_DEST) ./cmd/shuttle
-	@echo "shuttle-ctl → $(CLI_DEST) ($$($(CLI_DEST) --help 2>/dev/null | head -1))"
+	@echo "shuttle-ctl → $(CLI_DEST) (shim: exec felt shuttle)"
 
 start:
 	@if pgrep -f '$(PIDPATTERN)' >/dev/null; then \
