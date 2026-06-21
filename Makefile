@@ -38,12 +38,12 @@ AGENT_SSH_AUTH_SOCK ?= $(HOME)/.ssh/agent.sock
 
 .PHONY: all build cli start stop restart logs status clean help install-agent uninstall-agent
 
-# share/agents.json is the agent registry the Elixir daemon embeds at
-# compile/runtime. The Go CLI no longer owns a copy: shuttle-ctl is a thin
-# `exec felt shuttle` shim (cmd/shuttle/main.go) and felt owns the registry
-# (internal/shuttle, //go:embed agents.json) as the merge's single source of
-# truth — so the old pkg/schema + its generated agents_embedded.go are gone.
-# (Until Stage 4, the daemon still embeds this share/agents.json on its side.)
+# Felt owns the agent registry — the single source of truth for the merge. The
+# Go CLI is a thin `exec felt shuttle` shim (cmd/shuttle/main.go); the Elixir
+# daemon no longer embeds a registry either (Stage 4a): it reads the
+# already-resolved record off felt's `shuttle.resolved.agent` JSON and shells
+# `felt shuttle agents [resolve]` for the registry / no-fiber cases. The old
+# share/agents.json + pkg/schema's generated agents_embedded.go are gone.
 
 help:
 	@echo "shuttle daemon:"

@@ -1229,6 +1229,14 @@ defmodule Shuttle.DispatchIntegrationTest do
            end),
            "expected the document cache to warm"
 
+    # Warming the cache runs a poll that DISPATCHES this status:active fiber,
+    # which fires an async Task stamping `shuttle.dispatched_at` into the
+    # frontmatter (a read-modify-write of this same file). Wait for that stamp to
+    # land before mutating out of band — otherwise the stamp's write races the
+    # mutation and can clobber it (or expose felt a half-written file).
+    assert eventually(fn -> Map.has_key?(read_frontmatter(host, "tests/refresh-seam")["shuttle"] || %{}, "dispatched_at") end),
+           "expected the dispatch stamp to settle"
+
     # Mutate a NON-status field out of band, then refresh — no poll cycle.
     write_fiber(host, "tests/refresh-seam", """
     ---

@@ -1,9 +1,17 @@
 defmodule Shuttle.Agents do
   @moduledoc """
-  Agent configuration loading and tag resolution.
+  Agent command rendering.
 
-  Agents are loaded from `share/agents.json` at compile time. That JSON file
-  is the single source of truth shared with the Go CLI.
+  Felt owns the agent registry and resolution: it parses a fiber's
+  `shuttle.agent` name plus the block-declared axes (effort, chrome, headless),
+  overlays the registry, and inlines the *effective* record under
+  `shuttle.resolved.agent` in its JSON (`felt show -j` / `ls --json`). The two
+  registry-read verbs `felt shuttle agents [resolve]` cover the cases with no
+  fiber to read from.
+
+  This module keeps only what felt does NOT do: turning a resolved record into
+  the harness's shell invocation. `from_resolved/1` adapts felt's string-keyed
+  JSON into the atom-keyed record the command builders consume.
   """
 
   @type agent_record :: %{
@@ -12,282 +20,34 @@ defmodule Shuttle.Agents do
           wrapper: String.t() | nil,
           provider: String.t() | nil,
           model: String.t() | nil,
-          base_url: String.t() | nil,
           extra_flags: String.t() | nil,
           requires_model: boolean(),
-          effort_levels: [String.t()],
-          default_effort: String.t() | nil,
-          chrome_capable: boolean(),
-          cost_class: String.t() | nil,
-          alias_of: String.t() | nil,
-          axes: map() | nil,
-          aliases: [String.t()],
-          default: boolean()
+          effort: String.t() | nil,
+          chrome: boolean(),
+          headless: boolean()
         }
 
-  @external_resource Path.expand("../../share/agents.json", __DIR__)
-  @embedded_agents File.read!(@external_resource) |> Jason.decode!(keys: :atoms)
-
   @doc """
-  Returns the list of configured agent records.
+  Builds the command-rendering agent record from felt's resolved.agent JSON
+  (felt show -j / ls --json). felt owns resolution (name + axes → effective
+  record); the daemon owns only rendering. omitempty keys (absent chrome /
+  headless / effort / requires_model) map to nil/false, which render_flags
+  already treats as "axis off".
   """
-  @spec list() :: [agent_record()]
-  def list do
-    normalize_agents(@embedded_agents)
-  end
-
-  @doc """
-  Resolves an agent record from a fiber's tags.
-
-  Resolution order:
-  1. First `agent:<name>` compound tag
-  2. Bare `codex` tag (alias)
-  3. Bare `pi` tag (alias)
-  4. Default agent
-  """
-  @spec resolve([String.t()]) :: {:ok, agent_record()} | {:error, String.t()}
-  def resolve(tags) when is_list(tags) do
-    agents = list()
-
-    # 1. agent:<name> compound tag
-    compound =
-      Enum.find_value(tags, fn tag ->
-        case String.split(tag, ":", parts: 2) do
-          ["agent", name] -> find_by_id(agents, name)
-          _ -> nil
-        end
-      end)
-
-    # 2. Bare codex tag
-    bare_codex = if "codex" in tags, do: find_by_alias(agents, "codex"), else: nil
-
-    # 3. Bare pi tag
-    bare_pi = if "pi" in tags, do: find_by_alias(agents, "pi"), else: nil
-
-    # 4. Default
-    default = Enum.find(agents, & &1.default) || List.first(agents)
-
-    case compound || bare_codex || bare_pi || default do
-      nil -> {:error, "no agent configured"}
-      agent -> {:ok, agent}
-    end
-  end
-
-  defp find_by_id(agents, id) do
-    id = String.downcase(id)
-    Enum.find(agents, fn a -> String.downcase(a.id) == id end)
-  end
-
-  defp find_by_alias(agents, alias_name) do
-    alias_name = String.downcase(alias_name)
-
-    Enum.find(agents, fn a ->
-      Enum.any?(a.aliases, &(&1 == alias_name))
-    end)
-  end
-
-  defp normalize_agents(agents) when is_list(agents) do
-    Enum.map(agents, &normalize_agent/1)
-  end
-
-  defp normalize_agent(agent) when is_map(agent) do
-    normalize_agent(Map.to_list(agent))
-  end
-
-  defp normalize_agent(agent) when is_list(agent) do
-    alias_of = optional_string(agent, :alias_of)
-    # Alias records (alias_of set) carry no cli/wrapper/model — only the base id
-    # and an axes overlay. Base agents require cli/wrapper.
-    {cli, wrapper} =
-      if alias_of do
-        {optional_string(agent, :cli), optional_string(agent, :wrapper)}
-      else
-        {required_string(agent, :cli), required_string(agent, :wrapper)}
-      end
-
+  @spec from_resolved(map()) :: agent_record()
+  def from_resolved(resolved) when is_map(resolved) do
     %{
-      id: required_string(agent, :id),
-      cli: cli,
-      wrapper: wrapper,
-      provider: optional_string(agent, :provider),
-      model: optional_string(agent, :model),
-      base_url: optional_string(agent, :base_url),
-      extra_flags: optional_string(agent, :extra_flags),
-      requires_model: Keyword.get(agent, :requires_model, false),
-      effort_levels: normalized_aliases(Keyword.get(agent, :effort_levels, [])),
-      default_effort: optional_string(agent, :default_effort),
-      chrome_capable: Keyword.get(agent, :chrome_capable, false),
-      cost_class: optional_string(agent, :cost_class),
-      alias_of: alias_of,
-      axes: normalize_axes(Keyword.get(agent, :axes)),
-      aliases: normalized_aliases(Keyword.get(agent, :aliases, [])),
-      default: Keyword.get(agent, :default, false)
+      id: resolved["id"],
+      cli: resolved["cli"],
+      wrapper: resolved["wrapper"],
+      provider: resolved["provider"],
+      model: resolved["model"],
+      extra_flags: resolved["extra_flags"],
+      requires_model: resolved["requires_model"] == true,
+      effort: resolved["effort"],
+      chrome: resolved["chrome"] == true,
+      headless: resolved["headless"] == true
     }
-  end
-
-  defp normalize_axes(nil), do: nil
-
-  defp normalize_axes(axes) when is_map(axes) do
-    %{
-      effort: axes |> Map.get(:effort) |> normalize_optional_string(),
-      chrome: Map.get(axes, :chrome, false),
-      headless: Map.get(axes, :headless, false)
-    }
-  end
-
-  defp normalize_optional_string(nil), do: nil
-  defp normalize_optional_string(v) when is_binary(v), do: v
-
-  defp required_string(agent, key) do
-    case Keyword.fetch(agent, key) do
-      {:ok, value} when is_binary(value) and value != "" ->
-        value
-
-      {:ok, value} ->
-        raise ArgumentError,
-              "agent #{inspect(key)} must be a non-empty string, got: #{inspect(value)}"
-
-      :error ->
-        raise ArgumentError, "agent missing required #{inspect(key)}"
-    end
-  end
-
-  defp optional_string(agent, key) do
-    case Keyword.get(agent, key) do
-      nil ->
-        nil
-
-      value when is_binary(value) ->
-        value
-
-      value ->
-        raise ArgumentError,
-              "agent #{inspect(key)} must be a string or nil, got: #{inspect(value)}"
-    end
-  end
-
-  defp normalized_aliases(aliases) when is_list(aliases) do
-    Enum.map(aliases, fn
-      alias_name when is_binary(alias_name) ->
-        String.downcase(alias_name)
-
-      alias_name ->
-        raise ArgumentError, "agent alias must be a string, got: #{inspect(alias_name)}"
-    end)
-  end
-
-  @doc """
-  Resolves an agent record from a shuttle.agent name string.
-
-  Called by the dispatch path after migration, where agent identity lives in the
-  shuttle: block rather than in agent:* tags. Falls back to the default agent
-  when name is nil or empty.
-  """
-  @spec resolve_by_name(String.t() | nil) :: {:ok, agent_record()} | {:error, String.t()}
-  def resolve_by_name(nil), do: resolve_by_name("")
-
-  def resolve_by_name(name) when is_binary(name) do
-    agents = list()
-
-    if name == "" do
-      case Enum.find(agents, & &1.default) || List.first(agents) do
-        nil -> {:error, "no agent configured"}
-        agent -> {:ok, agent}
-      end
-    else
-      # Match by id first, then by alias — mirrors the Go registry's Find so a
-      # block the Go CLI accepts (e.g. agent: codex, an alias of codex-gpt-5.5)
-      # also resolves on the Elixir dispatch path.
-      case find_by_id(agents, name) || find_by_alias(agents, name) do
-        nil -> {:error, "unknown agent: #{name}"}
-        agent -> {:ok, agent}
-      end
-    end
-  end
-
-  @doc """
-  Resolves an agent name plus the block-declared axes (effort, chrome) into the
-  base agent record augmented with the effective, validated `:effort`,
-  `:chrome`, and `:headless` keys.
-
-  An alias record (`alias_of` set) expands to its base agent with the alias's
-  `axes` overlaid *beneath* the block axes (block wins). Effort falls back
-  through: block → alias overlay → base `default_effort`. Chrome is block OR
-  overlay; headless rides the overlay only (a fiber opts into print mode by
-  naming a `*-headless` agent — there is no block field for it). Validation
-  rejects an effort token outside the base agent's `effort_levels` (or any
-  effort on an agent with none), chrome on a non-chrome-capable harness, and
-  headless on any non-claude harness.
-
-  `block_effort` may be `nil`/`""`; `block_chrome` is a boolean.
-  """
-  @spec resolve_with_axes(String.t() | nil, String.t() | nil, boolean()) ::
-          {:ok, agent_record()} | {:error, String.t()}
-  def resolve_with_axes(name, block_effort, block_chrome) do
-    with {:ok, rec} <- resolve_by_name(name) do
-      apply_axes(rec, block_effort, block_chrome)
-    end
-  end
-
-  @doc """
-  Overlays axes onto a (possibly alias) agent record. See `resolve_with_axes/3`.
-  """
-  @spec apply_axes(agent_record(), String.t() | nil, boolean()) ::
-          {:ok, agent_record()} | {:error, String.t()}
-  def apply_axes(rec, block_effort, block_chrome) do
-    {base, overlay} =
-      if rec[:alias_of] do
-        case find_by_id(list(), rec.alias_of) do
-          nil -> {nil, %{}}
-          base -> {base, rec[:axes] || %{}}
-        end
-      else
-        {rec, %{}}
-      end
-
-    cond do
-      base == nil ->
-        {:error, "agent #{rec.id} aliases unknown base #{rec[:alias_of]}"}
-
-      true ->
-        effort =
-          first_present([block_effort, overlay[:effort], base[:default_effort]])
-
-        chrome = !!block_chrome or !!overlay[:chrome]
-        # Headless rides the alias overlay only — there is no block field for it
-        # (a fiber selects the print-mode shape by naming a `*-headless` agent).
-        headless = !!overlay[:headless]
-
-        with :ok <- validate_axes(base, effort, chrome, headless) do
-          {:ok, Map.merge(base, %{effort: effort, chrome: chrome, headless: headless})}
-        end
-    end
-  end
-
-  defp first_present(values) do
-    Enum.find(values, fn v -> is_binary(v) and v != "" end)
-  end
-
-  defp validate_axes(base, effort, chrome, headless) do
-    levels = base[:effort_levels] || []
-
-    cond do
-      is_binary(effort) and effort != "" and levels == [] ->
-        {:error, "agent #{base.id} does not support an effort axis"}
-
-      is_binary(effort) and effort != "" and effort not in levels ->
-        {:error,
-         "effort #{effort} not allowed for agent #{base.id} (allowed: #{Enum.join(levels, ", ")})"}
-
-      chrome and not base[:chrome_capable] ->
-        {:error, "chrome not supported by agent #{base.id} (claude harness only)"}
-
-      headless and base[:cli] != "claude" ->
-        {:error, "headless (-p print mode) not supported by agent #{base.id} (claude harness only)"}
-
-      true ->
-        :ok
-    end
   end
 
   @doc """
@@ -314,6 +74,7 @@ defmodule Shuttle.Agents do
       "claude" ->
         session_flag =
           if session_id, do: "--session-id #{shell_escape(session_id)} ", else: ""
+
         "#{agent.wrapper} #{session_flag}#{flags} <<< #{shell_escape(prompt)}"
 
       "codex" ->
@@ -386,8 +147,8 @@ defmodule Shuttle.Agents do
   #            swaps the interactive permission mode for `bypassPermissions`
   #   pi     → `:level` suffix on the model string (preserves today's behaviour)
   #   codex  → `-c model_reasoning_effort="<level>"`
-  # Effort/chrome/headless come from the agent map's `:effort`/`:chrome`/
-  # `:headless` keys set by apply_axes/3; absent (raw record) means no axis
+  # Effort/chrome/headless come from felt's resolved record via from_resolved/1
+  # (the `:effort`/`:chrome`/`:headless` keys); absent (nil/false) means no axis
   # rendering.
   defp render_flags(agent) do
     effort = agent[:effort]

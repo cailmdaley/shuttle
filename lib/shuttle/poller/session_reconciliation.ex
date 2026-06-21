@@ -17,7 +17,7 @@ defmodule Shuttle.Poller.SessionReconciliation do
   helpers stay in `Shuttle.Poller` and are called from here:
   `running_key/2`, `fiber_address/1`, `runtime_key_for_fiber/1`,
   `list_shuttle_sessions/1`, `discover_candidates/1`, `fetch_fiber_full/2`,
-  `fetch_shuttle_agent_name/2`, `start_watcher/3`, `live_session_for_fiber/3`.
+  `agent_id_from_fiber/1`, `start_watcher/3`, `live_session_for_fiber/3`.
   """
 
   require Logger
@@ -76,8 +76,9 @@ defmodule Shuttle.Poller.SessionReconciliation do
             Dispatcher.session_name(fiber_id, uid)
 
         if Map.get(fiber, "status") != "closed" do
-          agent_name = Poller.fetch_shuttle_agent_name(fiber_id, state)
-          {:ok, agent} = Shuttle.Agents.resolve_by_name(agent_name)
+          # Label only — felt owns resolution; read its resolved id off the
+          # already-fetched fiber JSON rather than re-resolving.
+          agent_id = Poller.agent_id_from_fiber(fiber)
 
           now = DateTime.utc_now()
           runtime_key = Poller.runtime_key_for_fiber(fiber)
@@ -85,7 +86,7 @@ defmodule Shuttle.Poller.SessionReconciliation do
           running_meta = %{
             fiber_id: fiber_id,
             session: session,
-            agent_id: agent.id,
+            agent_id: agent_id,
             uid: uid,
             started_at: now,
             last_activity_at: now

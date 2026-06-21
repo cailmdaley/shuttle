@@ -163,7 +163,7 @@ defmodule ShuttleWeb.APIControllerTest do
               end
             end)
 
-          {Jason.encode!(fibers), 0}
+          {Jason.encode!(Enum.map(fibers, &with_resolved_agent/1)), 0}
 
         command == "felt" and String.contains?(full_args, "show") and
             String.contains?(full_args, "--field shuttle") ->
@@ -177,7 +177,7 @@ defmodule ShuttleWeb.APIControllerTest do
 
           case Map.get(fibers, fiber_id) do
             nil -> {"fiber not found", 1}
-            fiber -> {Jason.encode!(fiber), 0}
+            fiber -> {Jason.encode!(with_resolved_agent(fiber)), 0}
           end
 
         command == "tmux" and hd(args) == "has-session" ->
@@ -217,6 +217,24 @@ defmodule ShuttleWeb.APIControllerTest do
       |> Enum.reject(&(&1 in ["show", "--json", "--field", "shuttle"]))
       |> List.first("")
     end
+
+    # Real felt inlines a resolved `shuttle.resolved.agent` on every fiber with a
+    # shuttle facet (felt show -j); the daemon reads that record and no longer
+    # resolves names itself, so the mock synthesizes it from the block's `agent`
+    # name (default claude-sonnet). Only the rendering keys matter here.
+    @resolved_agents %{
+      "claude-sonnet" => %{"id" => "claude-sonnet", "cli" => "claude", "wrapper" => "claude", "model" => "sonnet"},
+      "claude-opus" => %{"id" => "claude-opus", "cli" => "claude", "wrapper" => "claude", "model" => "opus"}
+    }
+
+    defp with_resolved_agent(%{"shuttle" => shuttle} = fiber) when is_map(shuttle) do
+      name = Map.get(shuttle, "agent") || "claude-sonnet"
+      record = Map.get(@resolved_agents, name, @resolved_agents["claude-sonnet"])
+      resolved = Map.merge(Map.get(shuttle, "resolved") || %{}, %{"agent" => record})
+      %{fiber | "shuttle" => Map.put(shuttle, "resolved", resolved)}
+    end
+
+    defp with_resolved_agent(fiber), do: fiber
 
     defp tmux_session_exists?(sessions, "=" <> session), do: MapSet.member?(sessions, session)
 
@@ -343,6 +361,17 @@ defmodule ShuttleWeb.APIControllerTest do
     assert body["fiber_id"] == "tests/haiku"
     assert body["agent"] == "claude-sonnet"
     assert body["runtime_seconds"] >= 0
+  end
+
+  test "GET /api/v1/agents degrades to []/200 when felt's agents verb is unavailable" do
+    # The registry is felt-owned now: the controller shells `felt shuttle agents
+    # --json`. When that verb is absent (old felt) or errors, the MockRunner
+    # returns the fall-through `{"", 0}` — unparseable as a JSON array. The
+    # controller must degrade to an empty list with 200 (the board's picker falls
+    # back to free-text), never crash the request.
+    conn = get(api_conn(), "/api/v1/agents")
+    assert conn.status == 200
+    assert Jason.decode!(conn.resp_body) == []
   end
 
   test "returns not running for idle fiber" do
@@ -1066,24 +1095,14 @@ defmodule ShuttleWeb.APIControllerTest do
 
   # ── GET /api/v1/agents ──
 
-  test "agents returns the registry as a JSON array" do
-    conn = get(api_conn(), "/api/v1/agents")
-    assert conn.status == 200
-    body = Jason.decode!(conn.resp_body)
-    assert is_list(body)
-    assert length(body) > 0
-
-    # Each record carries the registry's stable shape.
-    [first | _] = body
-    assert is_binary(first["id"])
-    assert is_binary(first["cli"])
-    assert is_binary(first["wrapper"])
-
-    # Default agent (claude-sonnet at the time of writing) is present and flagged.
-    default = Enum.find(body, & &1["default"])
-    assert default != nil
-    assert is_binary(default["id"])
-  end
+  # NOTE (Stage 4a): the former "agents returns the registry as a JSON array"
+  # test was deleted. `GET /api/v1/agents` now shells `felt shuttle agents
+  # --json` (felt owns the registry); its CONTENTS — non-empty list, a flagged
+  # default — are felt's responsibility, verified felt-side, and the verb is not
+  # guaranteed live in `mix test`. The controller's only daemon-side contract is
+  # "200 + bare array, degrading to [] when felt is unavailable" — and a test
+  # asserting that would still depend on the live verb to distinguish the two,
+  # so the route's content is left to felt's own suite.
 
   # ── GET /api/v1/version ──
 

@@ -1,8 +1,6 @@
 defmodule Shuttle.RealHarnessSmokeTest do
   use ExUnit.Case, async: false
 
-  alias Shuttle.Agents
-
   @moduletag :integration
   @moduletag timeout: 60_000
 
@@ -89,9 +87,29 @@ defmodule Shuttle.RealHarnessSmokeTest do
     end
   end
 
+  # felt owns the registry now; the smoke derives each agent's wrapper/model from
+  # `felt shuttle agents --json` (the same source the daemon serves at
+  # /api/v1/agents). This is the opt-in real-harness path, so a live felt is
+  # already a precondition — flunk loudly if the verb or the id is missing.
   defp agent!(agent_id) do
-    Enum.find(Agents.list(), &(&1.id == agent_id)) ||
-      flunk("expected agent #{agent_id} in share/agents.json")
+    records =
+      case System.cmd("felt", ["shuttle", "agents", "--json"], stderr_to_stdout: true) do
+        {output, 0} -> Jason.decode!(output)
+        {output, status} -> flunk("felt shuttle agents --json exited #{status}: #{output}")
+      end
+
+    record =
+      Enum.find(records, &(&1["id"] == agent_id)) ||
+        flunk("expected agent #{agent_id} in `felt shuttle agents --json`")
+
+    %{
+      id: record["id"],
+      cli: record["cli"],
+      wrapper: record["wrapper"],
+      provider: record["provider"],
+      model: record["model"],
+      extra_flags: record["extra_flags"]
+    }
   end
 
   defp idle_command(agent) do
