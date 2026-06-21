@@ -8,7 +8,7 @@ defmodule Shuttle.LifecycleStoreTest do
       with_doc_awaiting_role(fn fiber_id, path ->
         assert {:ok, message} = LifecycleStore.accept(fiber_id)
         assert message =~ "accepted run for #{fiber_id}"
-        assert message =~ "next due:"
+        assert message =~ "next run on the schedule's next tick"
 
         # Document re-armed straight from the doc: status:active, verdict cleared.
         # next_due is recomputed from the cron schedule on the next poll — there

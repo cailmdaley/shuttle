@@ -17,7 +17,7 @@ defmodule Shuttle.LifecycleStore do
   at open, so it has no accept/awaiting cycle here — only the `rearm` open.
   """
 
-  alias Shuttle.{Cron, FiberDoc}
+  alias Shuttle.FiberDoc
 
   # Legacy + daemon-owned shuttle keys wiped from the block on every accept /
   # resume / mark-awaiting rewrite: `enabled` and `review` no longer exist;
@@ -44,15 +44,15 @@ defmodule Shuttle.LifecycleStore do
   end
 
   defp accept_from_doc(fiber_id, path, raw_fm, body, shuttle) do
-    with {:ok, schedule} <- require_schedule(shuttle),
-         {:ok, next_due_at} <- Cron.next_occurrence(schedule, DateTime.utc_now()) do
+    with {:ok, _schedule} <- require_schedule(shuttle) do
       # The document carries the entire lifecycle: writing `status: active` re-arms
       # the role, `handed_off_at` concludes the prior run (one atomic write), and
-      # `next_due` is recomputed from the cron schedule on the next poll. There is
-      # no runtime row to upsert.
+      # `next_due` is recomputed by felt on the next poll (the daemon no longer
+      # parses cron — Stage 4b). There is no runtime row to upsert, and the precise
+      # next-due timestamp rides the board's polled snapshot, not this message.
       FiberDoc.write!(path, raw_fm, body, rearm_ops() ++ [conclude_run_op()] ++ evict_runtime_ops())
 
-      {:ok, "accepted run for #{fiber_id}\n  next due: #{DateTime.to_iso8601(next_due_at)}\n"}
+      {:ok, "accepted run for #{fiber_id} (re-armed; next run on the schedule's next tick)\n"}
     end
   end
 
