@@ -23,6 +23,15 @@
 # hands off cleanly or sleeps to be killed mid-thought. The argv line is the gold
 # observable; we cross-check it against the fiber's stamped frontmatter.
 #
+# STATUS (Stage 4a, felt-registry migration): BROKEN, needs a felt-side rewire.
+# The fake-claude agent was injected by patching the daemon's compile-time
+# `share/agents.json`. That file is gone — felt now owns the registry and the
+# daemon reads the already-resolved record off `shuttle.resolved.agent`. To
+# revive this gate, inject the fake agent into felt's registry (so felt emits it
+# under resolved.agent) instead of editing a daemon-embedded JSON. Until then the
+# guard below exits non-zero with this explanation rather than failing obscurely
+# on the missing file.
+#
 # Determinism: every dispatch is driven by `POST /dispatch {force:true}`
 # (force_dispatch_eligible? — host-match only), and the probe fibers are born
 # `status: open` so the autonomous 30s poll tick NEVER races us.
@@ -75,6 +84,19 @@ cleanup() {
 trap cleanup EXIT
 
 [ -n "$FELT_BIN" ] || { echo "felt not found (set FELT=<path>)"; exit 2; }
+
+# Stage 4a guard: the fake-agent injection below patches a daemon-embedded
+# share/agents.json that no longer exists (felt owns the registry now). Fail
+# fast with the rewire note rather than cp-ing a missing file. See the header.
+if [ ! -f "$AGENTS_JSON" ]; then
+  echo "handoff_live.sh is BROKEN by the felt-registry migration (Stage 4a):" >&2
+  echo "  the fake agent was injected into the daemon's compile-time" >&2
+  echo "  share/agents.json, which is gone — felt owns the registry now." >&2
+  echo "  Rewire: inject the fake agent into felt's registry so it appears" >&2
+  echo "  under shuttle.resolved.agent. See this script's header." >&2
+  exit 2
+fi
+
 mkdir -p "$BIN" "$DATA"
 
 # Pick a free port (baked into the escript below). Default 4071; bump if busy,

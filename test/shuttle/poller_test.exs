@@ -167,6 +167,20 @@ defmodule Shuttle.PollerTest do
 
     def commands, do: Agent.get(__MODULE__, & &1.commands)
 
+    # Real felt inlines a fully-resolved `shuttle.resolved.agent` on every fiber
+    # with a shuttle facet (felt show -j) and serves the registry via `felt
+    # shuttle agents [resolve]`. The daemon reads those records and no longer
+    # resolves names itself, so the mock synthesizes them — keyed off the block's
+    # `agent` name (default claude-sonnet). Only the command-rendering keys
+    # matter (id/cli/wrapper/model); axes are absent here. Defined before `cmd`
+    # so the attribute is in scope where the felt-resolve branch reads it.
+    @resolved_agents %{
+      "claude-sonnet" => %{"id" => "claude-sonnet", "cli" => "claude", "wrapper" => "claude", "model" => "sonnet"},
+      "claude-opus" => %{"id" => "claude-opus", "cli" => "claude", "wrapper" => "claude", "model" => "opus"},
+      "claude-haiku" => %{"id" => "claude-haiku", "cli" => "claude", "wrapper" => "claude", "model" => "haiku"},
+      "codex" => %{"id" => "codex", "cli" => "codex", "wrapper" => "codex", "model" => "gpt-5.5-codex"}
+    }
+
     @impl true
     def cmd(command, args, _opts) do
       Agent.update(__MODULE__, fn state ->
@@ -176,6 +190,18 @@ defmodule Shuttle.PollerTest do
       full_args = Enum.join(args, " ")
 
       cond do
+        # `felt shuttle agents resolve <name> ...` — the capture path's no-fiber
+        # resolution. The daemon shells felt (registry owner) rather than
+        # re-resolving; the mock returns felt's resolved.agent JSON shape. These
+        # poller tests only exercise the default capture agent (claude-sonnet).
+        command == "felt" and match?(["shuttle", "agents", "resolve" | _], args) ->
+          name = Enum.at(args, 3)
+          record = Map.get(@resolved_agents, name, @resolved_agents["claude-sonnet"])
+          {Jason.encode!(record), 0}
+
+        command == "felt" and match?(["shuttle", "agents" | _], args) ->
+          {Jason.encode!(Map.values(@resolved_agents)), 0}
+
         command == "felt" and String.contains?(full_args, "ls") ->
           delay_ms = Agent.get(__MODULE__, &Map.get(&1, :felt_ls_delay_ms, 0))
           if delay_ms > 0, do: Process.sleep(delay_ms)
@@ -199,7 +225,7 @@ defmodule Shuttle.PollerTest do
               end
             end)
 
-          {Jason.encode!(fibers), 0}
+          {Jason.encode!(Enum.map(fibers, &with_resolved_agent/1)), 0}
 
         command == "felt" and String.contains?(full_args, "show") and
             String.contains?(full_args, "--field shuttle") ->
@@ -217,7 +243,7 @@ defmodule Shuttle.PollerTest do
 
           case Map.get(fibers, fiber_id) do
             nil -> {"fiber not found", 1}
-            fiber -> {Jason.encode!(fiber), 0}
+            fiber -> {Jason.encode!(with_resolved_agent(fiber)), 0}
           end
 
         command == "tmux" and hd(args) == "has-session" ->
@@ -273,6 +299,15 @@ defmodule Shuttle.PollerTest do
       |> Enum.reject(&(&1 in ["show", "--json", "--field", "shuttle"]))
       |> List.first("")
     end
+
+    defp with_resolved_agent(%{"shuttle" => shuttle} = fiber) when is_map(shuttle) do
+      name = Map.get(shuttle, "agent") || "claude-sonnet"
+      record = Map.get(@resolved_agents, name, @resolved_agents["claude-sonnet"])
+      resolved = Map.merge(Map.get(shuttle, "resolved") || %{}, %{"agent" => record})
+      %{fiber | "shuttle" => Map.put(shuttle, "resolved", resolved)}
+    end
+
+    defp with_resolved_agent(fiber), do: fiber
 
     defp tmux_session_exists?(sessions, "=" <> session), do: MapSet.member?(sessions, session)
 

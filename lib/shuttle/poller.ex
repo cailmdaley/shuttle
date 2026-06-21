@@ -1676,25 +1676,15 @@ defmodule Shuttle.Poller do
     end
   end
 
-  # Extract the shuttle.agent name from a pre-fetched shuttle block map.
-  # Returns nil when absent (the caller should use the default agent).
-  defp shuttle_agent_from_block(shuttle) when is_map(shuttle) do
-    case Map.get(shuttle, "agent") do
-      v when is_binary(v) and v != "" -> v
-      _ -> nil
-    end
-  end
-
-  defp shuttle_agent_from_block(_), do: nil
-
-  # Returns the shuttle.agent name for a fiber, reading its block through felt.
-  # Used by dispatch paths that don't already hold the block map.
+  # The agent id for snapshot metadata, read off felt's already-resolved record
+  # (felt owns resolution; the daemon no longer re-resolves). Prefers the
+  # effective `shuttle.resolved.agent.id`, falls back to the raw `shuttle.agent`
+  # name, then `"unknown"` — this is a display/metadata label, never a dispatch
+  # decision, so a best-effort label is correct when felt emitted no resolution.
   @doc false
-  def fetch_shuttle_agent_name(fiber_id, state) do
-    case fetch_shuttle_block(fiber_id, state) do
-      {:ok, shuttle} -> shuttle_agent_from_block(shuttle)
-      {:error, _} -> nil
-    end
+  def agent_id_from_fiber(fiber) when is_map(fiber) do
+    get_in(fiber, ["shuttle", "resolved", "agent", "id"]) ||
+      get_in(fiber, ["shuttle", "agent"]) || "unknown"
   end
 
   # Returns the working directory to use when dispatching this fiber.
@@ -1850,16 +1840,13 @@ defmodule Shuttle.Poller do
         {state, {:ok, "human"}}
 
       {:ok, session} ->
-        agent_name = fetch_shuttle_agent_name(fiber_id, state)
-        {:ok, agent} = Shuttle.Agents.resolve_by_name(agent_name)
-
         now = DateTime.utc_now()
 
         running_meta =
           %{
             fiber_id: fiber_id,
             session: session,
-            agent_id: agent.id,
+            agent_id: agent_id_from_fiber(fiber),
             uid: Map.get(fiber, "uid"),
             started_at: now,
             last_activity_at: now
@@ -1962,14 +1949,11 @@ defmodule Shuttle.Poller do
   end
 
   defp register_claimed_session(%State{} = state, fiber_id, fiber, tmux_session, opts) do
-    agent_name = Keyword.get(opts, :agent) || fetch_shuttle_agent_name(fiber_id, state)
-
-    # Unknown agent names degrade to the registry default rather than crashing
-    # the claim — the session is already live; record it under our best label.
-    {:ok, agent} =
-      with {:error, _} <- Shuttle.Agents.resolve_by_name(agent_name) do
-        Shuttle.Agents.resolve_by_name("")
-      end
+    # The session is already live; we only need a label for the running-state
+    # entry. Prefer the claim's explicit `:agent` (the worker names itself),
+    # else felt's resolved id, else the raw name / "unknown" — a best-effort
+    # display label, never a dispatch decision.
+    agent_id = Keyword.get(opts, :agent) || agent_id_from_fiber(fiber)
 
     # Rename to the canonical `<leaf>-<uid>-shuttle` name so everything
     # downstream — restart re-adoption, dual-recognition liveness, the kanban's
@@ -2004,17 +1988,17 @@ defmodule Shuttle.Poller do
         {state, error}
 
       {:ok, session} ->
-        register_renamed_session(state, fiber_id, fiber, session, agent, opts)
+        register_renamed_session(state, fiber_id, fiber, session, agent_id, opts)
     end
   end
 
-  defp register_renamed_session(%State{} = state, fiber_id, fiber, session, agent, opts) do
+  defp register_renamed_session(%State{} = state, fiber_id, fiber, session, agent_id, opts) do
     now = DateTime.utc_now()
 
     running_meta = %{
       fiber_id: fiber_id,
       session: session,
-      agent_id: agent.id,
+      agent_id: agent_id,
       uid: Map.get(fiber, "uid"),
       started_at: now,
       last_activity_at: now
@@ -2033,8 +2017,8 @@ defmodule Shuttle.Poller do
 
         log_worker_claim(fiber, Keyword.get(opts, :session_uuid))
         state = refresh_document_entry(state, fiber_id)
-        Logger.info("Claimed session #{session} for #{fiber_id} (agent=#{agent.id})")
-        {state, {:ok, %{session: session, agent_id: agent.id}}}
+        Logger.info("Claimed session #{session} for #{fiber_id} (agent=#{agent_id})")
+        {state, {:ok, %{session: session, agent_id: agent_id}}}
 
       {:error, reason} ->
         Logger.error("Failed to start watcher for claimed #{fiber_id}: #{inspect(reason)}")

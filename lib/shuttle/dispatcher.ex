@@ -576,7 +576,7 @@ defmodule Shuttle.Dispatcher do
     port = Keyword.get(opts, :port, 4000)
     host = Keyword.get(opts, :host)
 
-    with {:ok, agent} <- capture_resolve_axes(agent_name, effort, chrome),
+    with {:ok, agent} <- capture_resolve_axes(agent_name, effort, chrome, runner),
          :ok <- validate_agent(agent) do
       session = capture_session_name()
 
@@ -630,14 +630,37 @@ defmodule Shuttle.Dispatcher do
     end
   end
 
-  # Tags axes-constraint violations as `{:error, {:invalid_axes, msg}}` so the
-  # HTTP layer can answer 422 (client error) without string-sniffing — other
-  # capture failures (tmux spawn, missing model config) stay 500-shaped.
-  defp capture_resolve_axes(agent_name, effort, chrome) do
-    case Agents.resolve_with_axes(agent_name, effort, chrome) do
-      {:error, msg} when is_binary(msg) -> {:error, {:invalid_axes, msg}}
-      other -> other
+  # Capture/Stash resolves an agent name + axes with no fiber on disk, so it
+  # shells felt — the registry owner — rather than re-resolving locally:
+  #   felt shuttle agents resolve <name> [--effort <E>] [--chrome] --json
+  # emits the same shape felt inlines as `shuttle.resolved.agent`. The daemon
+  # turns it into a command record via from_resolved/1. felt exits non-zero with
+  # a descriptive stderr message on an unknown agent / dangling alias /
+  # unsupported axis; that becomes `{:error, {:invalid_axes, msg}}` so the HTTP
+  # layer can answer 422 (client error) without string-sniffing — other capture
+  # failures (tmux spawn, missing model config) stay 500-shaped. Routed through
+  # the injected `runner` so tests need no live `felt shuttle agents` verb.
+  defp capture_resolve_axes(agent_name, effort, chrome, runner) do
+    args =
+      ["shuttle", "agents", "resolve", agent_name] ++
+        if(is_binary(effort) and effort != "", do: ["--effort", effort], else: []) ++
+        if(chrome, do: ["--chrome"], else: []) ++
+        ["--json"]
+
+    # `stderr_to_stdout: true`: on success felt writes only the resolved JSON to
+    # stdout (nothing to stderr), so `output` is clean JSON; on a non-zero exit
+    # stdout is empty and stderr carries felt's descriptive diagnostic, so
+    # `output` is the constraint message. Folding gives the right bytes either way.
+    case runner.cmd("felt", args, stderr_to_stdout: true) do
+      {output, 0} -> {:ok, Agents.from_resolved(Jason.decode!(output))}
+      {output, _status} -> {:error, {:invalid_axes, String.trim(output)}}
     end
+  rescue
+    # ErlangError: the spawn itself failed — most pointedly `felt` not on PATH
+    # (`:enoent`). Jason.DecodeError: felt exited 0 but emitted non-JSON (a
+    # contract violation). Either surfaces loudly as a 500 rather than crashing.
+    e in [ErlangError, Jason.DecodeError] ->
+      {:error, "felt shuttle agents resolve failed: #{Exception.message(e)}"}
   end
 
   @doc false
@@ -881,29 +904,18 @@ defmodule Shuttle.Dispatcher do
   end
 
   defp resolve_agent(fiber) do
-    # Prefer the post-migration shuttle.agent field when present; fall back
-    # to legacy tag-based resolution (agent:<name> compound + bare aliases).
-    # `felt show --json` rounds-trip-the-bytes (felt v1.0.4+): tool-owned
-    # frontmatter namespaces like `shuttle:` and `tags:` appear as flat
-    # top-level JSON keys.
-    effort = get_in(fiber, ["shuttle", "effort"])
-    chrome = get_in(fiber, ["shuttle", "chrome"]) == true
+    # felt resolves name + axes → the effective record and inlines it under
+    # shuttle.resolved.agent (felt show -j). The daemon consumes that finished
+    # record and renders it (Agents.build_command); it keeps no registry. Absent
+    # resolved.agent ⇒ felt could not resolve (unknown agent) or felt is not on
+    # PATH — fail the dispatch loudly rather than launch a broken worker.
+    case get_in(fiber, ["shuttle", "resolved", "agent"]) do
+      resolved when is_map(resolved) ->
+        {:ok, Agents.from_resolved(resolved)}
 
-    base =
-      case get_in(fiber, ["shuttle", "agent"]) do
-        name when is_binary(name) and name != "" ->
-          Agents.resolve_by_name(name)
-
-        _ ->
-          tags = Map.get(fiber, "tags", [])
-          Agents.resolve(tags)
-      end
-
-    # Overlay the block's effort/chrome axes onto the resolved base agent,
-    # validating against per-harness constraints. apply_axes also expands an
-    # alias record (e.g. claude-opus-chrome → claude-opus + chrome).
-    with {:ok, agent} <- base do
-      Agents.apply_axes(agent, effort, chrome)
+      _ ->
+        {:error,
+         "no resolved agent in felt JSON for #{inspect(get_in(fiber, ["shuttle", "agent"]))} (felt must emit shuttle.resolved.agent)"}
     end
   end
 

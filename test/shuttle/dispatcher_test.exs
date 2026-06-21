@@ -40,39 +40,82 @@ defmodule Shuttle.DispatcherTest do
     # `felt show --field shuttle` emits structured values as YAML; `--field
     # tags` emits sequences of scalars one-per-line. The cmd handler below
     # routes each `felt show` flavor through the right shape.
+    # felt owns resolution and inlines the effective record under
+    # `shuttle.resolved.agent` (felt show -j). The daemon reads that finished
+    # record — it no longer re-resolves. So each dispatchable fiber here carries
+    # a `resolved` agent the way real felt JSON does. The keys mirror felt's
+    # omitempty shape (a falsey chrome/headless/effort simply absent).
+    @claude_opus_resolved %{
+      "id" => "claude-opus",
+      "cli" => "claude",
+      "wrapper" => "claude",
+      "model" => "opus",
+      "extra_flags" => "--permission-mode auto"
+    }
+    @claude_sonnet_resolved %{
+      "id" => "claude-sonnet",
+      "cli" => "claude",
+      "wrapper" => "claude",
+      "model" => "sonnet",
+      "extra_flags" => "--permission-mode auto"
+    }
+    @pi_resolved %{
+      "id" => "pi-deepseek-flash",
+      "cli" => "pi",
+      "wrapper" => "pi",
+      "provider" => "openrouter",
+      "model" => "deepseek/deepseek-v4-flash"
+    }
+
     @test_fibers %{
       "tests/haiku" => %{
         status: "active",
         tags: ["constitution"],
-        shuttle: nil
+        shuttle: %{"resolved" => %{"agent" => @claude_sonnet_resolved}}
       },
       "tests/closed" => %{
         status: "closed",
         tags: ["constitution"],
-        shuttle: nil
+        shuttle: %{"resolved" => %{"agent" => @claude_sonnet_resolved}}
       },
       "tests/pi-tagged" => %{
         status: "active",
         tags: ["constitution", "pi"],
-        shuttle: nil
+        shuttle: %{"agent" => "pi-deepseek-flash", "resolved" => %{"agent" => @pi_resolved}}
       },
       "tests/shuttle-agent-block" => %{
         status: "active",
         tags: ["constitution"],
-        shuttle: %{"enabled" => true, "kind" => "oneshot", "agent" => "claude-opus"}
+        shuttle: %{
+          "enabled" => true,
+          "kind" => "oneshot",
+          "agent" => "claude-opus",
+          "resolved" => %{"agent" => @claude_opus_resolved}
+        }
       },
       "tests/shuttle-agent-overrides-tag" => %{
-        # Even with a legacy bare `pi` tag (would resolve to pi-deepseek-flash),
-        # shuttle.agent should win — the post-migration source of truth.
+        # A legacy bare `pi` tag still rides the fiber, but felt's resolved
+        # record (claude-opus) is the only thing the daemon reads — the block's
+        # agent is the source of truth, tags are inert for dispatch.
         status: "active",
         tags: ["constitution", "pi"],
-        shuttle: %{"enabled" => true, "kind" => "oneshot", "agent" => "claude-opus"}
+        shuttle: %{
+          "enabled" => true,
+          "kind" => "oneshot",
+          "agent" => "claude-opus",
+          "resolved" => %{"agent" => @claude_opus_resolved}
+        }
       },
       "tests/uid-fiber" => %{
         status: "active",
         tags: ["constitution"],
         uid: "01KTHDNZS287ZSSG8X8V59XKWB",
-        shuttle: %{"enabled" => true, "kind" => "oneshot", "agent" => "claude-sonnet"}
+        shuttle: %{
+          "enabled" => true,
+          "kind" => "oneshot",
+          "agent" => "claude-sonnet",
+          "resolved" => %{"agent" => @claude_sonnet_resolved}
+        }
       }
     }
 
@@ -111,6 +154,41 @@ defmodule Shuttle.DispatcherTest do
       Enum.any?(sessions, &(&1 == session or String.starts_with?(&1, session <> "/")))
     end
 
+    defp handle_felt(["shuttle", "agents", "resolve" | rest]) do
+      # Stub of `felt shuttle agents resolve <name> [--effort E] [--chrome]
+      # --json`. felt owns real resolution; here we cover only the agents +
+      # axes the capture tests exercise, returning felt's resolved.agent JSON
+      # shape (exit 0) or its descriptive non-zero diagnostic. Keeps the suite
+      # off a live `felt shuttle agents` verb (it may not be installed yet).
+      name = hd(rest)
+      effort = flag_value(rest, "--effort")
+      chrome = "--chrome" in rest
+
+      cond do
+        name == "codex" and chrome ->
+          {"chrome not supported by agent codex (claude harness only)", 1}
+
+        name == "claude-opus" and effort == "bogus" ->
+          {"effort bogus not allowed for agent claude-opus (allowed: low, medium, high, xhigh, max)",
+           1}
+
+        name == "claude-opus" ->
+          resolved = %{"id" => "claude-opus", "cli" => "claude", "wrapper" => "claude", "model" => "opus"}
+          resolved = if is_binary(effort), do: Map.put(resolved, "effort", effort), else: resolved
+          resolved = if chrome, do: Map.put(resolved, "chrome", true), else: resolved
+          {Jason.encode!(resolved), 0}
+
+        true ->
+          # Default capture agent (claude-sonnet).
+          {Jason.encode!(%{
+             "id" => "claude-sonnet",
+             "cli" => "claude",
+             "wrapper" => "claude",
+             "model" => "sonnet"
+           }), 0}
+      end
+    end
+
     defp handle_felt(args) do
       fiber_id = Enum.find(args, &Map.has_key?(@test_fibers, &1))
 
@@ -147,6 +225,14 @@ defmodule Shuttle.DispatcherTest do
 
     defp maybe_put(map, _key, nil), do: map
     defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+    # The value following `flag` in an arg list (e.g. `--effort xhigh`), or nil.
+    defp flag_value(args, flag) do
+      case Enum.find_index(args, &(&1 == flag)) do
+        nil -> nil
+        i -> Enum.at(args, i + 1)
+      end
+    end
   end
 
   # ── Setup ──
@@ -490,7 +576,7 @@ defmodule Shuttle.DispatcherTest do
            end)
   end
 
-  test "dispatch resolves pi agent from bare tag" do
+  test "dispatch reads felt's resolved pi agent (pi-tagged fiber)" do
     result = Dispatcher.dispatch("tests/pi-tagged", runner: MockRunner, store_session_id: false)
     assert {:ok, session} = result
     assert session == Dispatcher.session_name("tests/pi-tagged")
@@ -504,14 +590,14 @@ defmodule Shuttle.DispatcherTest do
     assert hd(args) == "new-session"
   end
 
-  test "dispatch resolves agent from shuttle.agent block when present" do
+  test "dispatch uses felt's resolved agent (claude-opus) when present" do
     assert {:ok, _session} = Dispatcher.dispatch("tests/shuttle-agent-block", runner: MockRunner)
     script = read_run_script_for(Dispatcher.session_name("tests/shuttle-agent-block"))
     assert script =~ "agent=claude-opus"
     refute script =~ "agent=claude-sonnet"
   end
 
-  test "dispatch: shuttle.agent overrides legacy bare tag" do
+  test "dispatch: felt's resolved.agent (claude-opus) wins over a legacy bare tag" do
     assert {:ok, _session} =
              Dispatcher.dispatch("tests/shuttle-agent-overrides-tag", runner: MockRunner)
 
@@ -532,32 +618,16 @@ defmodule Shuttle.DispatcherTest do
     File.read!(script_path)
   end
 
-  test "agent resolution: default is claude-sonnet" do
-    assert {:ok, agent} = Agents.resolve(["constitution"])
-    assert agent.id == "claude-sonnet"
-    assert agent.model == "sonnet"
-  end
-
-  test "agent resolution: compound tag" do
-    assert {:ok, agent} = Agents.resolve(["constitution", "agent:pi-kimi"])
-    assert agent.id == "pi-kimi"
-    assert agent.provider == "openrouter"
-  end
-
-  test "agent resolution: bare codex tag" do
-    assert {:ok, agent} = Agents.resolve(["constitution", "codex"])
-    assert agent.id == "codex"
-  end
-
-  test "agent resolution: bare pi tag resolves to pi-deepseek-flash" do
-    assert {:ok, agent} = Agents.resolve(["constitution", "pi"])
-    assert agent.id == "pi-deepseek-flash"
-    assert agent.model == "deepseek/deepseek-v4-flash"
-  end
+  # felt owns resolution and inlines the effective record as `shuttle.resolved.agent`
+  # JSON. These tests exercise the daemon's job — turning that record into the
+  # harness shell command — so they build it via Agents.from_resolved/1, exactly
+  # the production path. A resolved record carries the effective axes already
+  # overlaid (effort/chrome/headless), which is felt's responsibility, not the
+  # daemon's; the daemon only renders what it's handed.
+  defp resolved(fields), do: Agents.from_resolved(fields)
 
   test "build_command for claude uses here-string" do
-    agent = Enum.find(Agents.list(), &(&1.id == "claude-sonnet"))
-    refute is_nil(agent), "expected claude-sonnet agent in defaults"
+    agent = resolved(%{"id" => "claude-sonnet", "cli" => "claude", "wrapper" => "claude", "model" => "sonnet"})
     cmd = Agents.build_command(agent, "hello world")
     assert cmd =~ "claude"
     assert cmd =~ "<<<"
@@ -565,7 +635,7 @@ defmodule Shuttle.DispatcherTest do
   end
 
   test "build_command for codex uses positional arg" do
-    agent = Enum.find(Agents.list(), &(&1.id == "codex"))
+    agent = resolved(%{"id" => "codex", "cli" => "codex", "wrapper" => "codex", "model" => "gpt-5.5-codex"})
     cmd = Agents.build_command(agent, "hello world")
     assert cmd =~ "codex"
     refute cmd =~ "<<<"
@@ -573,8 +643,9 @@ defmodule Shuttle.DispatcherTest do
   end
 
   test "build_command for codex spark selects the spark model" do
-    agent = Enum.find(Agents.list(), &(&1.id == "codex-spark"))
-    refute is_nil(agent), "expected codex-spark agent in defaults"
+    agent =
+      resolved(%{"id" => "codex-spark", "cli" => "codex", "wrapper" => "codex", "model" => "gpt-5.3-codex-spark"})
+
     cmd = Agents.build_command(agent, "hello world")
     assert cmd =~ "codex"
     assert cmd =~ "--model 'gpt-5.3-codex-spark'"
@@ -583,68 +654,120 @@ defmodule Shuttle.DispatcherTest do
   end
 
   test "build_command for pi includes provider and model" do
-    agent = Enum.find(Agents.list(), &(&1.id == "pi-kimi"))
-    refute is_nil(agent), "expected pi-kimi agent in defaults"
+    agent =
+      resolved(%{
+        "id" => "pi-kimi",
+        "cli" => "pi",
+        "wrapper" => "pi",
+        "provider" => "openrouter",
+        "model" => "moonshotai/kimi-k2.6"
+      })
+
     cmd = Agents.build_command(agent, "hello world")
     assert cmd =~ "pi"
     assert cmd =~ "--provider 'openrouter'"
     assert cmd =~ "--model 'moonshotai/kimi-k2.6'"
   end
 
-  # ── Axis rendering (effort × chrome) per harness ──
+  # ── Axis rendering (effort × chrome × headless) per harness ──
+  #
+  # felt resolves the axes; these assert the daemon renders an already-resolved
+  # record's effort/chrome/headless into each CLI's native flag form.
 
   test "claude effort renders --effort and chrome renders --chrome" do
-    {:ok, agent} = Agents.resolve_with_axes("claude-opus", "xhigh", true)
+    agent =
+      resolved(%{
+        "id" => "claude-opus",
+        "cli" => "claude",
+        "wrapper" => "claude",
+        "model" => "opus",
+        "effort" => "xhigh",
+        "chrome" => true
+      })
+
     cmd = Agents.build_command(agent, "hi")
     assert cmd =~ "--effort 'xhigh'"
     assert cmd =~ "--chrome"
   end
 
-  test "claude with no declared effort renders the registry default" do
-    # claude-opus's registry default_effort is xhigh.
-    {:ok, agent} = Agents.resolve_with_axes("claude-opus", nil, false)
+  test "claude with the resolved default effort renders it, no chrome" do
+    agent =
+      resolved(%{
+        "id" => "claude-opus",
+        "cli" => "claude",
+        "wrapper" => "claude",
+        "model" => "opus",
+        "effort" => "xhigh"
+      })
+
     cmd = Agents.build_command(agent, "hi")
     assert cmd =~ "--effort 'xhigh'"
     refute cmd =~ "--chrome"
   end
 
   test "pi renders effort as :level suffix on the model" do
-    {:ok, agent} = Agents.resolve_with_axes("pi-gpt-5.4", "high", false)
+    agent =
+      resolved(%{"id" => "pi-gpt-5.4", "cli" => "pi", "wrapper" => "pi", "model" => "gpt-5.4", "effort" => "high"})
+
     cmd = Agents.build_command(agent, "hi")
     assert cmd =~ "--model 'gpt-5.4:high'"
     refute cmd =~ "--effort"
   end
 
-  test "pi default effort preserves the legacy suffix (pi-sonnet :high)" do
-    {:ok, agent} = Agents.resolve_with_axes("pi-sonnet", nil, false)
+  test "pi renders the resolved effort as the model suffix (pi-sonnet :high)" do
+    agent =
+      resolved(%{
+        "id" => "pi-sonnet",
+        "cli" => "pi",
+        "wrapper" => "pi",
+        "model" => "claude-sonnet-4.6",
+        "effort" => "high"
+      })
+
     cmd = Agents.build_command(agent, "hi")
     assert cmd =~ "--model 'claude-sonnet-4.6:high'"
   end
 
   test "codex renders effort via -c model_reasoning_effort" do
-    {:ok, agent} = Agents.resolve_with_axes("codex", "high", false)
+    agent =
+      resolved(%{"id" => "codex", "cli" => "codex", "wrapper" => "codex", "model" => "gpt-5.5-codex", "effort" => "high"})
+
     cmd = Agents.build_command(agent, "hi")
     assert cmd =~ ~s(-c model_reasoning_effort='high')
   end
 
-  test "codex with no declared effort renders the registry default" do
-    {:ok, agent} = Agents.resolve_with_axes("codex", nil, false)
+  test "codex renders the resolved default effort" do
+    agent =
+      resolved(%{"id" => "codex", "cli" => "codex", "wrapper" => "codex", "model" => "gpt-5.5-codex", "effort" => "xhigh"})
+
     cmd = Agents.build_command(agent, "hi")
     assert cmd =~ ~s(-c model_reasoning_effort='xhigh')
   end
 
-  test "claude-opus-chrome alias expands to claude-opus + --chrome" do
-    {:ok, agent} = Agents.resolve_with_axes("claude-opus-chrome", nil, false)
-    assert agent.id == "claude-opus"
+  test "resolved chrome renders --chrome (claude-opus-chrome → opus + chrome)" do
+    # felt expanded the chrome alias to the claude-opus base with chrome:true;
+    # the daemon renders it.
+    agent =
+      resolved(%{"id" => "claude-opus", "cli" => "claude", "wrapper" => "claude", "model" => "opus", "chrome" => true})
+
     cmd = Agents.build_command(agent, "hi")
     assert cmd =~ "--model 'opus'"
     assert cmd =~ "--chrome"
   end
 
-  test "claude-*-headless alias expands to base + -p print mode with bypass permissions" do
-    {:ok, agent} = Agents.resolve_with_axes("claude-haiku-headless", nil, false)
-    assert agent.id == "claude-haiku"
-    assert agent[:headless] == true
+  test "resolved headless renders -p print mode with bypass permissions" do
+    # felt expanded the headless alias to the claude-haiku base with
+    # headless:true; the daemon renders -p + the bypass swap.
+    agent =
+      resolved(%{
+        "id" => "claude-haiku",
+        "cli" => "claude",
+        "wrapper" => "claude",
+        "model" => "haiku",
+        "headless" => true,
+        "extra_flags" => "--permission-mode auto"
+      })
+
     cmd = Agents.build_command(agent, "hi", session_id: "11111111-2222-4333-8444-555555555555")
     assert cmd =~ "-p"
     assert cmd =~ "--model 'haiku'"
@@ -654,8 +777,18 @@ defmodule Shuttle.DispatcherTest do
     assert cmd =~ "--session-id '11111111-2222-4333-8444-555555555555'"
   end
 
-  test "headless composes with effort (claude-opus-headless + max)" do
-    {:ok, agent} = Agents.resolve_with_axes("claude-opus-headless", "max", false)
+  test "resolved headless composes with effort (-p + --effort max)" do
+    agent =
+      resolved(%{
+        "id" => "claude-opus",
+        "cli" => "claude",
+        "wrapper" => "claude",
+        "model" => "opus",
+        "effort" => "max",
+        "headless" => true,
+        "extra_flags" => "--permission-mode auto"
+      })
+
     cmd = Agents.build_command(agent, "hi")
     assert cmd =~ "-p"
     assert cmd =~ "--effort 'max'"
@@ -663,52 +796,25 @@ defmodule Shuttle.DispatcherTest do
   end
 
   test "non-headless claude keeps interactive permission mode and no -p" do
-    {:ok, agent} = Agents.resolve_with_axes("claude-sonnet", nil, false)
+    agent =
+      resolved(%{
+        "id" => "claude-sonnet",
+        "cli" => "claude",
+        "wrapper" => "claude",
+        "model" => "sonnet",
+        "extra_flags" => "--permission-mode auto"
+      })
+
     cmd = Agents.build_command(agent, "hi")
     assert cmd =~ "--permission-mode auto"
     refute cmd =~ "bypassPermissions"
     refute cmd =~ ~r/(^|\s)-p(\s|$)/
   end
 
-  test "headless is rejected on a non-claude harness" do
-    rec = %{
-      id: "codex-headless-bogus",
-      cli: "codex",
-      effort_levels: ["low"],
-      chrome_capable: false,
-      alias_of: "codex",
-      axes: %{headless: true, chrome: false, effort: nil}
-    }
-
-    assert {:error, msg} = Agents.apply_axes(rec, nil, false)
-    assert msg =~ "headless"
-    assert msg =~ "claude harness only"
-  end
-
-  test "effort out of range is rejected (Copilot Sonnet capped at high)" do
-    assert {:error, msg} = Agents.resolve_with_axes("pi-sonnet", "xhigh", false)
-    assert msg =~ "not allowed"
-  end
-
-  test "chrome on a non-claude harness is rejected" do
-    assert {:error, msg} = Agents.resolve_with_axes("codex", nil, true)
-    assert msg =~ "chrome not supported"
-  end
-
-  test "effort on an agent without an effort axis is rejected" do
-    assert {:error, msg} = Agents.resolve_with_axes("pi-kimi", "high", false)
-    assert msg =~ "does not support an effort"
-  end
-
-  test "resolve_with_axes accepts a registry alias (codex → codex base)" do
-    {:ok, agent} = Agents.resolve_with_axes("codex", nil, false)
-    assert agent.cli == "codex"
-  end
-
   # ── Resume command shape ──
 
   test "build_resume_command for claude with empty prompt: --resume only, no stdin pipe" do
-    agent = Enum.find(Agents.list(), &(&1.id == "claude-sonnet"))
+    agent = resolved(%{"id" => "claude-sonnet", "cli" => "claude", "wrapper" => "claude", "model" => "sonnet"})
     cmd = Agents.build_resume_command(agent, "abc-123", "")
     assert cmd =~ "claude"
     assert cmd =~ "--resume 'abc-123'"
@@ -716,20 +822,20 @@ defmodule Shuttle.DispatcherTest do
   end
 
   test "build_resume_command for claude with prompt: pipes via here-string" do
-    agent = Enum.find(Agents.list(), &(&1.id == "claude-sonnet"))
+    agent = resolved(%{"id" => "claude-sonnet", "cli" => "claude", "wrapper" => "claude", "model" => "sonnet"})
     cmd = Agents.build_resume_command(agent, "abc-123", "address the typo")
     assert cmd =~ "--resume 'abc-123'"
     assert cmd =~ "<<< 'address the typo'"
   end
 
   test "build_resume_command for claude with whitespace-only prompt: treated as empty" do
-    agent = Enum.find(Agents.list(), &(&1.id == "claude-sonnet"))
+    agent = resolved(%{"id" => "claude-sonnet", "cli" => "claude", "wrapper" => "claude", "model" => "sonnet"})
     cmd = Agents.build_resume_command(agent, "abc-123", "   \n  ")
     refute cmd =~ "<<<"
   end
 
   test "build_resume_command for codex with prompt: positional arg" do
-    agent = Enum.find(Agents.list(), &(&1.id == "codex"))
+    agent = resolved(%{"id" => "codex", "cli" => "codex", "wrapper" => "codex", "model" => "gpt-5.5-codex"})
     cmd = Agents.build_resume_command(agent, "abc-123", "address the typo")
     assert cmd =~ "codex"
     assert cmd =~ "resume 'abc-123'"
@@ -738,7 +844,7 @@ defmodule Shuttle.DispatcherTest do
   end
 
   test "build_resume_command for codex with empty prompt: resume only" do
-    agent = Enum.find(Agents.list(), &(&1.id == "codex"))
+    agent = resolved(%{"id" => "codex", "cli" => "codex", "wrapper" => "codex", "model" => "gpt-5.5-codex"})
     cmd = Agents.build_resume_command(agent, "abc-123", "")
     assert cmd =~ "resume 'abc-123'"
     # No trailing prompt arg.
@@ -746,14 +852,22 @@ defmodule Shuttle.DispatcherTest do
   end
 
   test "build_resume_command for pi: drops prompt (no inline arg supported)" do
-    agent = Enum.find(Agents.list(), &(&1.id == "pi-kimi"))
+    agent =
+      resolved(%{
+        "id" => "pi-kimi",
+        "cli" => "pi",
+        "wrapper" => "pi",
+        "provider" => "openrouter",
+        "model" => "moonshotai/kimi-k2.6"
+      })
+
     cmd = Agents.build_resume_command(agent, "abc-123", "ignored directive")
     assert cmd =~ "--session 'abc-123'"
     refute cmd =~ "ignored directive"
   end
 
   test "build_resume_command/2 default-arg form still works (zero-arg prompt)" do
-    agent = Enum.find(Agents.list(), &(&1.id == "claude-sonnet"))
+    agent = resolved(%{"id" => "claude-sonnet", "cli" => "claude", "wrapper" => "claude", "model" => "sonnet"})
     cmd = Agents.build_resume_command(agent, "abc-123")
     assert cmd =~ "--resume 'abc-123'"
     refute cmd =~ "<<<"
