@@ -464,7 +464,7 @@ defmodule Shuttle.PollerTest do
     })
   end
 
-  # Mirror the worker's `shuttle-ctl handoff`: stamp `shuttle.handed_off_at` in
+  # Mirror the worker's `felt shuttle handoff`: stamp `shuttle.handed_off_at` in
   # RFC3339 UTC — the clean-exit signal the daemon compares against dispatched_at.
   defp write_handoff_marker(id, at \\ DateTime.utc_now()) do
     MockRunner.put_shuttle_fields(id, %{"handed_off_at" => DateTime.to_iso8601(at)})
@@ -2461,7 +2461,7 @@ defmodule Shuttle.PollerTest do
   test "force-dispatch honors resume_mode: previous dispatch param (unified resume path)" do
     # The old kanban-modal flow had two separate paths: "New session"
     # (ad-hoc, force-fresh) and "Resume" (a special accept-then-dispatch
-    # dance via shuttle-ctl resume). Under unified force semantics, BOTH
+    # dance via felt shuttle resume). Under unified force semantics, BOTH
     # buttons carry resume_mode on the dispatch call and dispatch with
     # force: true. resolve_resume_intent honors the carried resume_mode
     # regardless of dispatch context (oneshot, standing scheduled, standing

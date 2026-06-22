@@ -12,7 +12,7 @@
 #
 #   daemon stamps session_uuid + dispatched_at  (async Task, real felt write)
 #     → worker runs in real tmux, sources the daemon-exported SHUTTLE_FIBER_PATH
-#     → real `shuttle-ctl handoff` stamps handed_off_at (clean) / nothing (dirty)
+#     → real `felt shuttle handoff` stamps handed_off_at (clean) / nothing (dirty)
 #     → daemon reads the fiber back off `felt show -j`
 #     → decide_continuation builds `--session-id <new>` (fresh) or `--resume <old>`
 #
@@ -59,9 +59,11 @@ AGENTS_BAK="$WORK/agents.json.bak"
 DEV_EXS="$REPO/config/dev.exs"
 DEV_BAK="$WORK/dev.exs.bak"
 FAKE_CLAUDE="$BIN/fake-claude"
-CTL="$BIN/shuttle-ctl"
 DAEMON="$WORK/shuttle"
 FELT_BIN=$(command -v "$FELT" || true)
+# The worker's handoff verb is `felt shuttle handoff` (the standalone shuttle-ctl
+# shim is retired). CTL is the verb prefix the fake worker appends `handoff` to.
+CTL=("$FELT" shuttle)
 
 FAIL=0
 DAEMON_PID=""
@@ -106,9 +108,9 @@ if command -v lsof >/dev/null && port_busy "$PORT"; then
   for p in 4072 4073 4074 4081 4082 4091; do port_busy "$p" || { PORT=$p; break; }; done
 fi
 
-# ── 1. Build shuttle-ctl (the real worker handoff verb) ──────────────────────
-info "building shuttle-ctl"
-go -C "$REPO" build -o "$CTL" ./cmd/shuttle || { echo "go build failed"; exit 2; }
+# ── 1. The real worker handoff verb is `felt shuttle handoff` ────────────────
+# Nothing to build — the shim is retired; the fake worker shells the felt binary
+# resolved above directly.
 
 # ── 2. Write the fake claude worker ──────────────────────────────────────────
 # Derives its per-fiber argv log + mode file from SHUTTLE_FIBER_PATH (the daemon
@@ -125,7 +127,7 @@ MODE=\$(cat "\$DIR/mode" 2>/dev/null || echo clean)
 # the daemon's async dispatch-stamp lands first (matches production ordering).
 sleep 1
 if [ "\$MODE" = clean ]; then
-  "$CTL" handoff probe   # SHUTTLE_FIBER_PATH wins; the arg is ignored
+  "${CTL[@]}" handoff probe   # SHUTTLE_FIBER_PATH wins; the arg is ignored
 else
   sleep 600              # stay alive to be killed mid-thought
 fi
@@ -252,7 +254,7 @@ U1=$(sh_field e2e/probe-clean session_uuid); D1=$(sh_field e2e/probe-clean dispa
 wait_until 20 "worker stamps handed_off_at (#1)" has_handoff e2e/probe-clean || true
 wait_until 20 "worker ends its own tmux session (#1)" no_session "$S1" || true
 H1=$(sh_field e2e/probe-clean handed_off_at)
-[ -n "$H1" ] && pass "worker stamped handed_off_at=$H1 (real shuttle-ctl, daemon-exported path)" || fail "handed_off_at never stamped"
+[ -n "$H1" ] && pass "worker stamped handed_off_at=$H1 (real felt shuttle handoff, daemon-exported path)" || fail "handed_off_at never stamped"
 no_session "$S1" && pass "endOwnTmuxSession killed $S1" || fail "tmux session survived handoff"
 python3 - "$D1" "$H1" <<'PY' && pass "handed_off_at >= dispatched_at → decision domain is FRESH" || fail "handoff not after dispatch"
 import sys, re

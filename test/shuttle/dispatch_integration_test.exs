@@ -130,7 +130,7 @@ defmodule Shuttle.DispatchIntegrationTest do
       ])
   end
 
-  # Mirror the worker's `shuttle-ctl handoff`: stamp `shuttle.handed_off_at` in
+  # Mirror the worker's `felt shuttle handoff`: stamp `shuttle.handed_off_at` in
   # RFC3339 UTC — the clean-exit signal the daemon compares against dispatched_at.
   defp write_handoff_marker(host, id, at \\ DateTime.utc_now()) do
     :ok =

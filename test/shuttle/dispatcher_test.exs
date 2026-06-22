@@ -271,7 +271,7 @@ defmodule Shuttle.DispatcherTest do
     # the signal that distinguishes a clean close (next worker starts fresh) from
     # a mid-thought death (daemon resumes the transcript) — and to rewrite the
     # `## Status` handoff prose. The old `felt history append` ritual is gone.
-    assert prompt =~ "shuttle-ctl handoff"
+    assert prompt =~ "felt shuttle handoff"
     assert prompt =~ "## Status"
     refute prompt =~ "felt history append"
   end
@@ -289,10 +289,10 @@ defmodule Shuttle.DispatcherTest do
     refute pinned =~ "your final action must be `kill $PPID`"
 
     # Oneshot (the default) keeps the autonomous exit-on-completion contract:
-    # the final action is `shuttle-ctl handoff`, which writes the marker and ends
+    # the final action is `felt shuttle handoff`, which writes the marker and ends
     # the session (it folds in the old `kill $PPID`).
     oneshot = Dispatcher.render_prompt("tests/haiku")
-    assert oneshot =~ "your FINAL action is `shuttle-ctl handoff"
+    assert oneshot =~ "your FINAL action is `felt shuttle handoff"
     refute oneshot =~ "stay alive and wait"
     refute oneshot =~ "pinned interactive role"
   end
@@ -499,13 +499,13 @@ defmodule Shuttle.DispatcherTest do
     assert {:error, :closed} = result
   end
 
-  test "dispatch with force: true on a closed fiber shells out to shuttle-ctl reopen" do
+  test "dispatch with force: true on a closed fiber shells out to felt shuttle reopen" do
     # The kanban Resume button on an awaitingReview / closed card flows here
     # with force=true. Without the reopen step, the worker spawns but the
     # YAML stays closed and Portolan's classifyFiber keeps the card pinned
     # in its prior column — see KanbanModal.runRequeue's comment about why
     # this side-effect is daemon-owned. The contract: force-dispatch on a
-    # not-already-clean fiber issues `shuttle-ctl reopen <fiber>` before
+    # not-already-clean fiber issues `felt shuttle reopen <fiber>` before
     # tmux new-session fires.
     result = Dispatcher.dispatch("tests/closed", runner: MockRunner, force: true)
     assert {:ok, _session} = result
@@ -514,16 +514,16 @@ defmodule Shuttle.DispatcherTest do
 
     reopen_call =
       Enum.find(commands, fn
-        {"shuttle-ctl", args} -> "reopen" in args and "tests/closed" in args
+        {"felt", args} -> "reopen" in args and "tests/closed" in args
         _ -> false
       end)
 
-    assert reopen_call != nil, "expected shuttle-ctl reopen call; got #{inspect(commands)}"
+    assert reopen_call != nil, "expected felt shuttle reopen call; got #{inspect(commands)}"
 
     # And it must precede tmux new-session — reopen-then-spawn, not the other way.
     reopen_index =
       Enum.find_index(commands, fn
-        {"shuttle-ctl", args} -> "reopen" in args
+        {"felt", args} -> "reopen" in args
         _ -> false
       end)
 
@@ -550,10 +550,10 @@ defmodule Shuttle.DispatcherTest do
     assert {:ok, _session} = result
 
     refute Enum.any?(MockRunner.commands(), fn
-             {"shuttle-ctl", args} -> "reopen" in args
+             {"felt", args} -> "reopen" in args
              _ -> false
            end),
-           "expected no shuttle-ctl reopen on already-clean fiber; got #{inspect(MockRunner.commands())}"
+           "expected no felt shuttle reopen on already-clean fiber; got #{inspect(MockRunner.commands())}"
   end
 
   test "dispatch refuses already-running fiber" do

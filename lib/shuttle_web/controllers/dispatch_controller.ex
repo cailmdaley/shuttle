@@ -98,7 +98,7 @@ defmodule ShuttleWeb.DispatchController do
             run_id: run_id,
             completed_at: completed_at,
             message:
-              "This role is awaiting review#{review_detail(run_id, completed_at)}. Accept first with `shuttle-ctl accept #{fiber_id}`, or use `shuttle-ctl resume #{fiber_id}` to continue the same run."
+              "This role is awaiting review#{review_detail(run_id, completed_at)}. Accept first with `felt shuttle accept #{fiber_id}`, or use `felt shuttle resume #{fiber_id}` to continue the same run."
           })
 
         {:error, reason} ->

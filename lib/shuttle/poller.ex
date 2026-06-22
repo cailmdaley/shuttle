@@ -1265,7 +1265,7 @@ defmodule Shuttle.Poller do
   # otherwise re-dispatch every tick — surveying, finding nothing, exiting —
   # burning tokens on an idle interface (the shapepipe redispatch loop). Pinned
   # roles remain explicitly dispatchable: force-dispatch bypasses this entirely,
-  # and a plain `shuttle-ctl dispatch <id>` still routes through `eligible?`
+  # and a plain `felt shuttle dispatch <id>` still routes through `eligible?`
   # (which has no pinned gate), so only the *autonomous* path is severed.
   # See [[ai-futures/shuttle/findings/finding-pinned-roles-are-interfaces-not-loops]].
   defp filter_eligible(candidates, state) do
@@ -1339,7 +1339,7 @@ defmodule Shuttle.Poller do
           false
 
         # Pinned roles need no bespoke branch HERE: this predicate also serves
-        # the explicit-dispatch path (`shuttle-ctl dispatch`, plain POST
+        # the explicit-dispatch path (`felt shuttle dispatch`, plain POST
         # /dispatch), where a pinned role IS eligible — it's a human asking for
         # it. The autonomous tick is what must never loop a pinned interface;
         # that exclusion lives in `filter_eligible/2` (the tick's only caller),
@@ -2227,7 +2227,7 @@ defmodule Shuttle.Poller do
             case fetch_fiber_full(fiber_id, state) do
               {:ok, fiber} ->
                 # The daemon does NOT write the handoff marker — the WORKER does,
-                # via `shuttle-ctl handoff`, as its second-to-last act. A worker
+                # via `felt shuttle handoff`, as its second-to-last act. A worker
                 # that dies without handing off leaves no handoff marker, so the
                 # next dispatch reads dirty-death → resume. The clean/dirty-death
                 # distinction lives entirely in the presence (and timestamp) of

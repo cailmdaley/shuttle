@@ -114,7 +114,7 @@ defmodule Shuttle.Transition do
 
   # Action availability resolves through the same fast query path as
   # transition_local/2: felt document + tmux liveness, outside the Poller
-  # mailbox. The host is resolved separately for the shuttle-ctl verbs that
+  # mailbox. The host is resolved separately for the `felt shuttle` verbs that
   # still shell out (close / pause / reopen).
   defp validate_available(fiber_id, action) do
     case ActionQueries.actions_for(fiber_id) do
@@ -134,7 +134,7 @@ defmodule Shuttle.Transition do
     end
   end
 
-  # Resolve the felt store owning `fiber_id` (so shuttle-ctl verbs get the right
+  # Resolve the felt store owning `fiber_id` (so `felt shuttle` verbs get the right
   # `--felt-store`) by asking felt for the carried path — the same resolution
   # /api/v1/fibers uses, so it never disagrees with the id we advertised.
   defp host_for_fiber(fiber_id), do: FeltStores.host_for_fiber(fiber_id)
@@ -157,8 +157,8 @@ defmodule Shuttle.Transition do
     do: run_offline(["reopen", fiber_id, "--as-draft"], host)
 
   # accept-run goes through the in-process lifecycle path so the felt-document
-  # re-arm happens atomically against poll cycles, not the Go `shuttle-ctl
-  # accept` (which can race a concurrent poll's document read).
+  # re-arm happens atomically against poll cycles, not the shelled-out
+  # `felt shuttle accept` (which can race a concurrent poll's document read).
   defp invoke_action(fiber_id, "accept-run", _host) do
     case LifecycleService.accept(fiber_id) do
       {:ok, _output} -> :ok
@@ -190,7 +190,7 @@ defmodule Shuttle.Transition do
   defp lifecycle_offline_env, do: [{"SHUTTLE_LIFECYCLE_OFFLINE", "1"}]
 
   defp run_cmd(args, env) do
-    case System.cmd("shuttle-ctl", args, stderr_to_stdout: true, env: env) do
+    case System.cmd("felt", ["shuttle" | args], stderr_to_stdout: true, env: env) do
       {_, 0} -> :ok
       {output, status} -> {:error, {:command_error, status, output}}
     end

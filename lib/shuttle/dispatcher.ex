@@ -196,7 +196,7 @@ defmodule Shuttle.Dispatcher do
   # The autonomous fresh-vs-resume decision when there is no human resume
   # directive. A long-running oneshot loops across sessions: a worker exits, the
   # next poll re-dispatches and continues. The question is whether the previous
-  # session ended CLEANLY (it stamped `shuttle.handed_off_at` via `shuttle-ctl
+  # session ended CLEANLY (it stamped `shuttle.handed_off_at` via `felt shuttle
   # handoff` as its last act — then the next worker starts fresh and reads the
   # `## Status` block) or DIED mid-thought (no handoff — the process was killed,
   # common on remote machines — then the fresh worker loses the in-flight
@@ -531,7 +531,7 @@ defmodule Shuttle.Dispatcher do
     render_block(
       "Exit Contract",
       nil,
-      "This is an autonomous Shuttle worker. After you update outcome, file findings, and commit at a clean checkpoint, rewrite the constitution's `## Status` section in prose — where the work stands, what's blocked, where the next session picks up (rewritten, never a session log) — then your FINAL action is `shuttle-ctl handoff <fiber-id>`, which writes the clean-exit marker and ends your session (no separate `kill $PPID` needed). The handoff marker is load-bearing: it tells the daemon you closed cleanly, so the next dispatch starts fresh and reads your `## Status` note. WITHOUT it, a session that simply died (the process was killed mid-thought — common on remote machines) is indistinguishable from a clean exit, so the daemon RESUMES your transcript instead of looping a fresh, context-less worker. Exception: if the dispatch directive or constitution explicitly asks you to wait for a human (a 2FA gate, a send-in-his-voice step, a \"talk to me first\" signal), drive to that checkpoint and stay alive there instead — do not hand off. Do not substitute a normal chat final response for worker exit; the handoff belongs in the fiber."
+      "This is an autonomous Shuttle worker. After you update outcome, file findings, and commit at a clean checkpoint, rewrite the constitution's `## Status` section in prose — where the work stands, what's blocked, where the next session picks up (rewritten, never a session log) — then your FINAL action is `felt shuttle handoff <fiber-id>`, which writes the clean-exit marker and ends your session (no separate `kill $PPID` needed). The handoff marker is load-bearing: it tells the daemon you closed cleanly, so the next dispatch starts fresh and reads your `## Status` note. WITHOUT it, a session that simply died (the process was killed mid-thought — common on remote machines) is indistinguishable from a clean exit, so the daemon RESUMES your transcript instead of looping a fresh, context-less worker. Exception: if the dispatch directive or constitution explicitly asks you to wait for a human (a 2FA gate, a send-in-his-voice step, a \"talk to me first\" signal), drive to that checkpoint and stay alive there instead — do not hand off. Do not substitute a normal chat final response for worker exit; the handoff belongs in the fiber."
     )
   end
 
@@ -859,8 +859,8 @@ defmodule Shuttle.Dispatcher do
       :ok
     else
       case runner.cmd(
-             "shuttle-ctl",
-             ["--felt-store", felt_store, "reopen", fiber_id],
+             "felt",
+             ["shuttle", "--felt-store", felt_store, "reopen", fiber_id],
              stderr_to_stdout: true
            ) do
         {output, 0} ->
@@ -1369,7 +1369,7 @@ defmodule Shuttle.Dispatcher do
     headless = Keyword.get(opts, :headless, false)
     display_fiber_id = Keyword.get(opts, :display_fiber_id, fiber_id)
 
-    # The fiber's `.md` path for the worker's `shuttle-ctl handoff`: it stamps
+    # The fiber's `.md` path for the worker's `felt shuttle handoff`: it stamps
     # `shuttle.handed_off_at` directly into this file (no felt-store resolution,
     # no ambiguity), so the daemon hands it the path it already resolved at
     # dispatch. The worker writes the same `shuttle:` block this daemon reads on

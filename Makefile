@@ -1,23 +1,20 @@
-# Shuttle daemon + CLI — build + lifecycle
+# Shuttle daemon — build + lifecycle
 #
-# Two artifacts share this repo:
+# One artifact lives in this repo:
 #   - bin/shuttle  (Elixir escript) — the daemon. Loads BEAMs at boot;
 #     `make restart` rebuilds + bounces.
-#   - shuttle-ctl  (Go binary)      — the agent-facing CLI. Built into
-#     $(CLI_DEST) which sits on PATH; `make cli` rebuilds + installs.
 #
-# `make restart` is the load-bearing daemon target. `make cli` is the
-# load-bearing CLI target — when a new shuttle-ctl verb lands, any
-# tool that shells out to it will silently break with a stale binary.
-# The daemon and CLI are independent (Elixir vs Go), so building one
-# never implies rebuilding the other; `make all` does both.
+# The agent-facing CLI is now `felt shuttle <verb>` — owned by felt, not built
+# here (the old standalone shuttle-ctl Go shim is retired). This repo is pure
+# Elixir + TS; there is nothing to `go build`.
+#
+# `make restart` is the load-bearing daemon target.
 
 LOG := $(HOME)/Library/Logs/shuttle.log
 # Match both the local `bin/shuttle ... -extra bin/shuttle start` shape and
 # remote respawn-loop `./bin/shuttle ... -extra ./bin/shuttle start` shape.
 # `[b]in` prevents pgrep from matching its own shell command.
 PIDPATTERN := [b]in/shuttle -B .* -extra \.?/?bin/shuttle start
-CLI_DEST := $(HOME)/go/bin/shuttle-ctl
 AGENT_LABEL := io.shuttle.daemon
 AGENT_PLIST := $(HOME)/Library/LaunchAgents/$(AGENT_LABEL).plist
 # Felt stores the launchd daemon polls. Defaults to the loom aggregate (~/loom,
@@ -25,7 +22,7 @@ AGENT_PLIST := $(HOME)/Library/LaunchAgents/$(AGENT_LABEL).plist
 # Full Disk Access. Override to add stores: make install-agent AGENT_LOOM_HOMES=~/loom,/some/other
 AGENT_LOOM_HOMES ?= $(HOME)/loom
 # The daemon's PATH, captured from a login shell at install time so it carries
-# Homebrew (escript/erl), ~/.local/bin (felt), ~/go/bin (shuttle-ctl), etc. —
+# Homebrew (escript/erl) and ~/.local/bin (felt), etc. —
 # launchd's own env is too bare, and sourcing the profile at runtime under
 # launchd doesn't reconstruct it. This is the user's real PATH, frozen.
 AGENT_PATH ?= $(shell /bin/bash -lc 'echo $$PATH')
@@ -36,11 +33,11 @@ AGENT_PATH ?= $(shell /bin/bash -lc 'echo $$PATH')
 # ~/.ssh/agent.sock is the stable login-agent path; override if yours differs.
 AGENT_SSH_AUTH_SOCK ?= $(HOME)/.ssh/agent.sock
 
-.PHONY: all build cli start stop restart logs status clean help install-agent uninstall-agent
+.PHONY: all build start stop restart logs status clean help install-agent uninstall-agent
 
 # Felt owns the agent registry — the single source of truth for the merge. The
-# Go CLI is a thin `exec felt shuttle` shim (cmd/shuttle/main.go); the Elixir
-# daemon no longer embeds a registry either (Stage 4a): it reads the
+# agent-facing CLI is `felt shuttle <verb>` (felt absorbed every verb); the
+# Elixir daemon no longer embeds a registry either (Stage 4a): it reads the
 # already-resolved record off felt's `shuttle.resolved.agent` JSON and shells
 # `felt shuttle agents [resolve]` for the registry / no-fiber cases. The old
 # share/agents.json + pkg/schema's generated agents_embedded.go are gone.
@@ -54,27 +51,17 @@ help:
 	@echo "  make install-agent   — durable launchd keep-alive (crash + login restart)"
 	@echo "  make uninstall-agent — remove the launchd agent"
 	@echo "  make logs     — tail -f the daemon log"
-	@echo "  make status   — shuttle-ctl ps + snapshot summary"
+	@echo "  make status   — felt shuttle ps + snapshot summary"
 	@echo "  make clean    — remove _build and stray .beam files"
 	@echo ""
-	@echo "shuttle-ctl CLI (Go):"
-	@echo "  make cli      — go build → $(CLI_DEST) (must be on PATH)"
-	@echo ""
 	@echo "everything:"
-	@echo "  make all      — restart (daemon) + cli"
+	@echo "  make all      — restart (daemon)"
 
-all: restart cli
+all: restart
 
 build:
 	mix shuttle.gen_version
 	mix escript.build
-
-# Build the Go CLI and install to $(CLI_DEST). `go install ./cmd/shuttle`
-# would output as `shuttle` (matches cobra Use:), so we use `go build -o`
-# to land it under the historical `shuttle-ctl` name.
-cli:
-	@go build -o $(CLI_DEST) ./cmd/shuttle
-	@echo "shuttle-ctl → $(CLI_DEST) (shim: exec felt shuttle)"
 
 start:
 	@if pgrep -f '$(PIDPATTERN)' >/dev/null; then \
@@ -138,7 +125,7 @@ logs:
 	@tail -f $(LOG)
 
 status:
-	@shuttle-ctl ps 2>/dev/null || echo "(shuttle-ctl ps unavailable)"
+	@felt shuttle ps 2>/dev/null || echo "(felt shuttle ps unavailable)"
 	@echo
 	@bin/shuttle snapshot 2>/dev/null | python3 -c "import json,sys; o=json.load(sys.stdin); \
 	  print('felt_hosts:', o.get('felt_hosts','MISSING (binary pre-297a24d)')); \
