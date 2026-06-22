@@ -29,7 +29,7 @@ config :shuttle,
   # pos_integer (default 2000), stale_multiplier: pos_integer (default
   # 2)}. Empty by default — local-only setups pay nothing.
   #
-  # Example, after running `shuttle tunnels install`:
+  # Example, after running `felt shuttle tunnels install`:
   #
   #   remotes: [
   #     %{name: "candide", url: "http://localhost:4001"}

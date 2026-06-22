@@ -51,13 +51,21 @@ Shuttle depends on felt entirely through the felt CLI — no in-process parsing,
 
 ## Installation
 
+One command stands up the full local surface — daemon, served UI, the loom event-stream hook, and a keep-alive supervisor — branching by host type (a launchd LaunchAgent on macOS, a `shuttle-daemon` respawn loop on the clusters):
+
 ```bash
 git clone https://github.com/cailmdaley/shuttle
 cd shuttle
+./install.sh --dry-run   # check prerequisites + print the plan, change nothing
+./install.sh             # full bootstrap for this host
+```
 
-# Build the daemon
-mix deps.get && mix escript.build
-# bin/shuttle is now built
+The installer names any missing prerequisites and how to get them. Flags: `--skip-ui` / `--build-ui` (the UI bundle builds on macOS and is rsync'd to the clusters), `--skip-hook`, `--with-tunnels`.
+
+Just the daemon, no supervisor:
+
+```bash
+mix deps.get && make build   # → bin/shuttle
 ```
 
 The agent-facing CLI is `felt shuttle <verb>`, provided by the felt binary on your `PATH` — nothing to build here.
