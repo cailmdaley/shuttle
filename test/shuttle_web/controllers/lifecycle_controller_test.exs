@@ -8,7 +8,7 @@ defmodule ShuttleWeb.LifecycleControllerTest do
   # Interactivity is retired: install never forwards --interactive, even if a
   # stale client still posts the key. The flag is silently dropped, not relayed.
   test "install drops a stale interactive key rather than forwarding it" do
-    args_file = install_fake_shuttle_ctl!()
+    args_file = install_fake_felt!()
 
     conn =
       post(
@@ -30,9 +30,9 @@ defmodule ShuttleWeb.LifecycleControllerTest do
 
   # pin reshapes a fiber to the schedule-less kind:pinned role — the board's
   # drag-onto-the-Pinned-strip gesture. The controller forwards model / project
-  # / host to `shuttle-ctl pin`; no schedule (a pinned block has none).
-  test "pin delegates to shuttle-ctl with model, project_dir and host" do
-    args_file = install_fake_shuttle_ctl!()
+  # / host to `felt shuttle pin`; no schedule (a pinned block has none).
+  test "pin delegates to felt shuttle with model, project_dir and host" do
+    args_file = install_fake_felt!()
 
     conn =
       post(
@@ -54,7 +54,7 @@ defmodule ShuttleWeb.LifecycleControllerTest do
   end
 
   # set-interactive is retired: the controller no longer allows the action, so a
-  # stale client gets a clean rejection rather than a shuttle-ctl invocation.
+  # stale client gets a clean rejection rather than a felt shuttle invocation.
   test "set-interactive is rejected as an unknown lifecycle action" do
     conn =
       post(
@@ -71,7 +71,7 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     assert conn.resp_body =~ "unknown lifecycle action"
   end
 
-  test "set-outcome delegates to shuttle-ctl, preserving a multi-line value as one arg" do
+  test "set-outcome delegates to felt shuttle, preserving a multi-line value as one arg" do
     root =
       System.tmp_dir!()
       |> Path.join("shuttle-lifecycle-outcome-#{System.unique_integer([:positive])}")
@@ -81,7 +81,7 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     File.mkdir_p!(fiber_dir)
     File.write!(Path.join(fiber_dir, "outcome-edit.md"), "---\nname: Outcome edit\n---\n\n")
 
-    args_file = install_fake_shuttle_ctl!()
+    args_file = install_fake_felt!()
     old_loom_homes = System.get_env("LOOM_HOMES")
     System.put_env("LOOM_HOMES", store)
 
@@ -113,7 +113,7 @@ defmodule ShuttleWeb.LifecycleControllerTest do
   # The agent positional is optional and the axes ride as flags; chrome always
   # renders explicitly (`--chrome=true|false`) so a toggle-off is unambiguous,
   # and effort passes through verbatim.
-  test "set-agent forwards agent plus effort and chrome axes to shuttle-ctl" do
+  test "set-agent forwards agent plus effort and chrome axes to felt shuttle" do
     root =
       System.tmp_dir!()
       |> Path.join("shuttle-lifecycle-set-agent-#{System.unique_integer([:positive])}")
@@ -123,7 +123,7 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     File.mkdir_p!(fiber_dir)
     File.write!(Path.join(fiber_dir, "axes-edit.md"), "---\nname: Axes edit\n---\n\n")
 
-    args_file = install_fake_shuttle_ctl!()
+    args_file = install_fake_felt!()
     old_loom_homes = System.get_env("LOOM_HOMES")
     System.put_env("LOOM_HOMES", store)
 
@@ -377,8 +377,8 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     File.rm_rf(root)
   end
 
-  test "accept fails closed instead of falling back to shuttle-ctl frontmatter writes" do
-    args_file = install_fake_shuttle_ctl!()
+  test "accept fails closed instead of falling back to felt shuttle frontmatter writes" do
+    args_file = install_fake_felt!()
 
     root =
       System.tmp_dir!()
@@ -449,33 +449,45 @@ defmodule ShuttleWeb.LifecycleControllerTest do
     end
   end
 
-  defp install_fake_shuttle_ctl! do
+  # The lifecycle controller now shells `felt shuttle <verb>` for the write, but
+  # ALSO shells the real felt (`felt -C <store> show <id> -j`) to resolve the
+  # owning store first. So the stub is a fake `felt` that captures ONLY the
+  # `shuttle` subcommand (dropping it and logging the verb + flags the per-verb
+  # assertions check) and delegates every other felt call to the real binary —
+  # exactly the separation the old `shuttle-ctl`-named stub got for free.
+  defp install_fake_felt! do
     dir =
       System.tmp_dir!()
       |> Path.join("shuttle-lifecycle-controller-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(dir)
 
-    bin = Path.join(dir, "shuttle-ctl")
+    bin = Path.join(dir, "felt")
     args_file = Path.join(dir, "args")
+    real_felt = System.find_executable("felt") || "felt"
 
     File.write!(bin, """
     #!/bin/sh
-    printf '%s\\n' "$@" > "$SHUTTLE_CTL_ARGS_FILE"
-    printf 'ok\\n'
+    if [ "$1" = shuttle ]; then
+      shift  # drop the `shuttle` subcommand; log the verb + flags
+      printf '%s\\n' "$@" > "$FELT_SHUTTLE_ARGS_FILE"
+      printf 'ok\\n'
+    else
+      exec "#{real_felt}" "$@"   # store resolution etc. → the real felt
+    fi
     """)
 
     File.chmod!(bin, 0o755)
 
     old_path = System.get_env("PATH")
-    old_args_file = System.get_env("SHUTTLE_CTL_ARGS_FILE")
+    old_args_file = System.get_env("FELT_SHUTTLE_ARGS_FILE")
 
     System.put_env("PATH", dir <> ":" <> (old_path || ""))
-    System.put_env("SHUTTLE_CTL_ARGS_FILE", args_file)
+    System.put_env("FELT_SHUTTLE_ARGS_FILE", args_file)
 
     on_exit(fn ->
       restore_env("PATH", old_path)
-      restore_env("SHUTTLE_CTL_ARGS_FILE", old_args_file)
+      restore_env("FELT_SHUTTLE_ARGS_FILE", old_args_file)
       File.rm_rf(dir)
     end)
 

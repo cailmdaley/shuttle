@@ -6,13 +6,13 @@ defmodule ShuttleWeb.LifecycleController do
   Owner-routed via `Shuttle.OriginRouter`: a local-owned card's mutation runs
   here; a remote-owned card's request is forwarded to the owning daemon's
   identical `/lifecycle` (origin stripped) and relayed verbatim. The local
-  branch delegates to the existing shuttle-ctl Go CLI, so the validated offline
+  branch delegates to felt's `shuttle` CLI verbs, so the validated offline
   frontmatter writer remains the single implementation of
   install/pause/resume/repeat/pin/accept/set-model/set-outcome/uninstall.
 
   `pin` reshapes a fiber to the schedule-less `kind: pinned` umbrella role
   (the board's drag-onto-the-Pinned-strip gesture). Like a kind reshape, the
-  caller composes `uninstall` then `pin` client-side — `shuttle-ctl pin`
+  caller composes `uninstall` then `pin` client-side — `felt shuttle pin`
   refuses to clobber an existing block — echoing the fiber's model / host /
   project_dir so the block survives the round trip.
   """
@@ -196,7 +196,7 @@ defmodule ShuttleWeb.LifecycleController do
   defp run(args) do
     env = [{"SHUTTLE_LIFECYCLE_OFFLINE", "1"}]
 
-    case System.cmd("shuttle-ctl", args, stderr_to_stdout: true, env: env) do
+    case System.cmd("felt", ["shuttle" | args], stderr_to_stdout: true, env: env) do
       {output, 0} -> {:ok, output}
       {output, status} -> {:command_error, status, output}
     end

@@ -3,7 +3,7 @@ defmodule Shuttle.LifecycleService do
   Daemon-side orchestration for the standing-role lifecycle verbs that re-arm an
   awaiting role by writing the felt document (`accept` / `resume`).
 
-  Both the `/api/v1/lifecycle` endpoint (operator / shuttle-ctl) and the
+  Both the `/api/v1/lifecycle` endpoint (operator / `felt shuttle`) and the
   `/api/v1/transition` kanban path go through here, so an accept behaves
   identically regardless of which gesture triggered it. The work is to run the
   transition *through the Poller* (`Poller.lifecycle_transition/3`) so the

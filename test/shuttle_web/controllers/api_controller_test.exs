@@ -493,7 +493,7 @@ defmodule ShuttleWeb.APIControllerTest do
     # /dispatch path folds ad_hoc into force (`force: force or ad_hoc`), so an
     # explicit dispatch IS the human verdict: it bypasses the awaiting gate,
     # re-arms the doc, and spawns — instead of the old 422 that told the user to
-    # `shuttle-ctl accept/resume` first. (The autonomous poller, which calls
+    # `felt shuttle accept/resume` first. (The autonomous poller, which calls
     # dispatch_fiber in-process with ad_hoc and NOT force, is still gated — see
     # PollerTest "ad-hoc dispatch refuses an awaiting standing role only when NOT
     # forced".)
@@ -560,14 +560,23 @@ defmodule ShuttleWeb.APIControllerTest do
 
     File.mkdir_p!(stub_dir)
     argv_log = Path.join(stub_dir, "argv.log")
+    real_felt = System.find_executable("felt") || "felt"
 
-    File.write!(Path.join(stub_dir, "shuttle-ctl"), """
+    # The transition pipeline shells the real felt to resolve the store/target,
+    # THEN shells `felt shuttle <verb>` for the write. Capture only the `shuttle`
+    # subcommand (logging its verb + flags, the `shuttle` prefix dropped) and
+    # delegate everything else to the real felt — so resolution still works and
+    # the log holds just the write's argv.
+    File.write!(Path.join(stub_dir, "felt"), """
     #!/usr/bin/env bash
-    printf '%s\\n' "$@" >> "#{argv_log}"
-    exit 0
+    if [ "$1" = shuttle ]; then
+      printf '%s\\n' "${@:2}" >> "#{argv_log}"
+      exit 0
+    fi
+    exec "#{real_felt}" "$@"
     """)
 
-    File.chmod!(Path.join(stub_dir, "shuttle-ctl"), 0o755)
+    File.chmod!(Path.join(stub_dir, "felt"), 0o755)
 
     previous_path = System.get_env("PATH")
     System.put_env("PATH", "#{stub_dir}:#{previous_path}")

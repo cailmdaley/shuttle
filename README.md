@@ -36,16 +36,15 @@ See `NOTICE` for full attribution.
 | Artifact | Language | Purpose |
 |---|---|---|
 | `bin/shuttle` | Elixir (OTP escript) | Daemon: polls fiber tree, dispatches workers, exposes HTTP snapshot |
-| `shuttle-ctl` | Go | Agent-facing CLI: schema-validating fiber lifecycle verbs; works offline |
+| `felt shuttle` | (felt) | Agent-facing CLI: schema-validating fiber lifecycle verbs; works offline |
 | Claude Code skill | YAML/Markdown | Worker protocol: how agents survey, work, and hand off |
 
-The Elixir daemon and Go CLI are in this repo. The Claude Code skill ships separately as a plugin — see [Skills](#skills).
+Only the Elixir daemon lives in this repo. The agent-facing CLI is `felt shuttle <verb>` — felt absorbed every lifecycle verb, so there is nothing to build here for it. The Claude Code skill ships separately as a plugin — see [Skills](#skills).
 
 ## Requirements
 
 - Erlang/OTP 26+ and Elixir 1.16+
-- Go 1.21+
-- [felt](https://github.com/LightconeResearch/felt) CLI on `PATH`
+- [felt](https://github.com/LightconeResearch/felt) CLI on `PATH` (also provides the `felt shuttle` agent-facing CLI)
 - tmux
 
 Shuttle depends on felt entirely through the felt CLI — no in-process parsing, no library import. `felt ls --json`, `felt show -j`, and `felt edit` are the seams. (Continuation state — `session_uuid` / `dispatched_at` / `handed_off_at` — rides in the fiber's `shuttle:` frontmatter block, written surgically; there is no separate history store.)
@@ -59,12 +58,9 @@ cd shuttle
 # Build the daemon
 mix deps.get && mix escript.build
 # bin/shuttle is now built
-
-# Build the CLI and install to ~/go/bin/shuttle-ctl
-make cli
 ```
 
-Add `~/go/bin` (or wherever `$(GOPATH)/bin` points) to your `PATH` so `shuttle-ctl` is available.
+The agent-facing CLI is `felt shuttle <verb>`, provided by the felt binary on your `PATH` — nothing to build here.
 
 ### Configure a felt store
 
@@ -88,8 +84,8 @@ make start
 bin/shuttle start
 
 # Check what's running:
-shuttle-ctl status      # all fibers with shuttle: blocks
-shuttle-ctl ps          # live tmux workers only
+felt shuttle status      # all fibers with shuttle: blocks
+felt shuttle ps          # live tmux workers only
 bin/shuttle snapshot    # daemon's JSON view of eligible + running + standing
 ```
 
@@ -119,22 +115,22 @@ Describe desired state here. Shuttle dispatches a worker; the worker reads
 this file, does the work, updates outcome:, and exits.
 ```
 
-Install via `shuttle-ctl install <fiber-id> --project-dir "$PWD"` or write the block directly.
+Install via `felt shuttle install <fiber-id> --project-dir "$PWD"` or write the block directly.
 
 ## Lifecycle Verbs
 
 ```bash
-shuttle-ctl install  <fiber> --project-dir "$PWD" [-m <agent>] [--disabled]  # oneshot
-shuttle-ctl repeat   <fiber> --schedule "0 9 * * 1-5" --tz Europe/Paris --project-dir "$PWD"
-shuttle-ctl pause    <fiber>      # enabled=false → drafts; kills live worker unless --no-kill
-shuttle-ctl resume   <fiber>      # enabled=true → in-flight
-shuttle-ctl accept   <fiber>      # standing: advance next_due_at after review
-shuttle-ctl close    <fiber>      # mark done; optionally --tempered true|false
-shuttle-ctl reopen   <fiber>      # requeue a closed fiber
-shuttle-ctl abort    <fiber>      # kill the worker's tmux session
-shuttle-ctl attach   <fiber>      # tmux attach to a live worker
-shuttle-ctl set-model <fiber> <agent-id>  # change agent
-shuttle-ctl uninstall <fiber>     # remove shuttle: block
+felt shuttle install  <fiber> --project-dir "$PWD" [-m <agent>] [--disabled]  # oneshot
+felt shuttle repeat   <fiber> --schedule "0 9 * * 1-5" --tz Europe/Paris --project-dir "$PWD"
+felt shuttle pause    <fiber>      # enabled=false → drafts; kills live worker unless --no-kill
+felt shuttle resume   <fiber>      # enabled=true → in-flight
+felt shuttle accept   <fiber>      # standing: advance next_due_at after review
+felt shuttle close    <fiber>      # mark done; optionally --tempered true|false
+felt shuttle reopen   <fiber>      # requeue a closed fiber
+felt shuttle abort    <fiber>      # kill the worker's tmux session
+felt shuttle attach   <fiber>      # tmux attach to a live worker
+felt shuttle set-model <fiber> <agent-id>  # change agent
+felt shuttle uninstall <fiber>     # remove shuttle: block
 ```
 
 All write verbs validate the block before touching any file. The daemon picks up changes on its next poll.
@@ -159,21 +155,21 @@ shuttle:
   last_run_at: null
 ```
 
-The worker exits with `review.state: awaiting`; `shuttle-ctl accept <fiber>` advances `next_due_at` to the next occurrence. Manual standing-role dispatch uses an `adhoc-...` run id and preserves the existing `next_due_at` through accept, so an extra run does not consume the next scheduled slot.
+The worker exits with `review.state: awaiting`; `felt shuttle accept <fiber>` advances `next_due_at` to the next occurrence. Manual standing-role dispatch uses an `adhoc-...` run id and preserves the existing `next_due_at` through accept, so an extra run does not consume the next scheduled slot.
 
 ## Agent Registry
 
-Agents live in `share/agents.json` — the single source of truth for both the Elixir daemon and the Go CLI (embedded at compile time). Edit the JSON, then `make restart` to pick up changes.
+Agents are owned by felt — the single source of truth for the merge. The Elixir daemon reads the already-resolved record off felt's `shuttle.resolved.agent` and shells `felt shuttle agents [resolve]` for the registry / no-fiber cases.
 
 Built-in agents: `claude-sonnet`, `claude-opus`, `codex`, `codex-spark`, and several `pi-*` variants (for [pi](https://github.com/mariozechner/pi)). Add your own by following the same shape.
 
 ## Remote Dispatch
 
-Stage 7 (BEAM distribution / SSH-tunnel multi-host) is in progress. The `--all` and `--remote` flags on `shuttle-ctl status` already pull composite snapshots from configured remote daemons via the local daemon's `/api/v1/state/composite` endpoint. Multi-host dispatch (fibers eligible on one machine dispatched to another) is the next step.
+Stage 7 (BEAM distribution / SSH-tunnel multi-host) is in progress. The `--all` and `--remote` flags on `felt shuttle status` already pull composite snapshots from configured remote daemons via the local daemon's `/api/v1/state/composite` endpoint. Multi-host dispatch (fibers eligible on one machine dispatched to another) is the next step.
 
 ## Skills
 
-The Claude Code skill ships as a separate plugin. It documents the worker protocol: how agents survey the constitution, carry the work forward, rewrite the `## Status` handoff block, and exit cleanly via `shuttle-ctl handoff` (which stamps `shuttle.handed_off_at` and ends the worker's own tmux session). Install it as a Claude Code extension to make it available in worker sessions.
+The Claude Code skill ships as a separate plugin. It documents the worker protocol: how agents survey the constitution, carry the work forward, rewrite the `## Status` handoff block, and exit cleanly via `felt shuttle handoff` (which stamps `shuttle.handed_off_at` and ends the worker's own tmux session). Install it as a Claude Code extension to make it available in worker sessions.
 
 A `Shuttle.WorkSource` behaviour (for non-felt adapters like Linear) is planned but out of scope for v0; follow the tracking issue for progress.
 
@@ -184,14 +180,12 @@ make build    # mix escript.build → bin/shuttle
 make start    # start daemon detached
 make stop     # SIGTERM with 5s grace
 make restart  # build + stop + start (the load-bearing daemon target)
-make cli      # go build → ~/go/bin/shuttle-ctl
-make all      # restart + cli
+make all      # restart (daemon)
 make logs     # tail -f the daemon log
-make status   # shuttle-ctl ps + snapshot summary
+make status   # felt shuttle ps + snapshot summary
 make clean    # rm _build and stray .beam files
 
-mix test                    # Elixir suite (110 tests)
-go test ./pkg/schema/...    # Go schema tests
+mix test                    # Elixir suite
 
 # Opt-in real harness smoke: opens Claude/Codex/Pi in tmux, sends no prompt,
 # captures the idle pane, then kills the smoke-owned sessions.
