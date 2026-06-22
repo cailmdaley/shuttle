@@ -26,10 +26,6 @@ shuttle-*.tar
 /bin/shuttle
 /lib/shuttle/build_info.ex
 
-# Go binaries (build with `go build` from cmd/shuttle/)
-/bin/shuttle-ctl
-/shuttle
-
 # felt symlink (user-local; points to the user's felt store)
 .felt
 

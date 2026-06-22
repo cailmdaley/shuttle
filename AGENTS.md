@@ -74,10 +74,34 @@ action needed beyond letting them age out as the code they describe is rewritten
 
 ## Build + lifecycle
 
+### Fresh-machine install — `./install.sh`
+
+One command stands up the **entire** local surface on a new host, branching by
+host type: prerequisites check → daemon escript (`mix deps.get` + build) →
+`ui/dist` (built on macOS, rsync'd to clusters) → loom event-stream hook →
+keep-alive (the launchd LaunchAgent on macOS / the `shuttle-daemon` respawn
+loop on the clusters). It composes what were separate manual steps and is
+honest about missing prerequisites.
+
+```
+./install.sh --dry-run   # check prerequisites + print the plan, change nothing
+./install.sh             # full bootstrap for this host
+make install             # same, via the Makefile (pass flags: make install ARGS="--dry-run")
+```
+
+Flags: `--skip-ui` / `--build-ui` (UI defaults to build on macOS, skip on
+clusters), `--skip-hook`, `--with-tunnels` (also `felt shuttle tunnels install`
+on the macOS hub). This is the "top-level installer" of the felt+shuttle unify
+work; `felt shuttle install <fiber>` is the unrelated fiber-install verb, so the
+system bootstrap is deliberately *not* that name (a `felt shuttle` wrapper waits
+for the Stage-B repo merge). The individual lifecycle targets below remain for
+day-to-day daemon work:
+
 The escript loads its BEAMs at boot, so editing source has zero effect on a
 running daemon until you restart. Use the Makefile:
 
 ```
+make install    # one-command full bootstrap (see "Fresh-machine install" above)
 make build      # mix escript.build → bin/shuttle (MIX_ENV=dev)
 make start      # nohup detached; logs → ~/Library/Logs/shuttle.log (macOS)
 make stop       # SIGTERM with 5s grace

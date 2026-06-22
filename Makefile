@@ -33,7 +33,7 @@ AGENT_PATH ?= $(shell /bin/bash -lc 'echo $$PATH')
 # ~/.ssh/agent.sock is the stable login-agent path; override if yours differs.
 AGENT_SSH_AUTH_SOCK ?= $(HOME)/.ssh/agent.sock
 
-.PHONY: all build start stop restart logs status clean help install-agent uninstall-agent
+.PHONY: all build start stop restart logs status clean help install install-agent uninstall-agent
 
 # Felt owns the agent registry — the single source of truth for the merge. The
 # agent-facing CLI is `felt shuttle <verb>` (felt absorbed every verb); the
@@ -44,6 +44,7 @@ AGENT_SSH_AUTH_SOCK ?= $(HOME)/.ssh/agent.sock
 
 help:
 	@echo "shuttle daemon:"
+	@echo "  make install  — one-command full bootstrap (daemon + ui + hook + keep-alive)"
 	@echo "  make build    — rebuild bin/shuttle escript (MIX_ENV=dev)"
 	@echo "  make start    — start daemon detached (logs → $(LOG))"
 	@echo "  make stop     — SIGTERM the running daemon"
@@ -88,6 +89,14 @@ stop:
 	fi
 
 restart: build stop start
+
+# ── One-command bootstrap ─────────────────────────────────────────────────
+# The full fresh-machine install: prerequisites → daemon escript → ui/dist →
+# loom hook → keep-alive (launchd on macOS / shuttle-daemon respawn loop on the
+# clusters). install.sh holds the host-branching logic; this target is the
+# entry point. Pass flags through:  make install ARGS="--dry-run"
+install:
+	@bash install.sh $(ARGS)
 
 # ── Durable launch (macOS LaunchAgent) ──────────────────────────────────
 # Shuttle's own keep-alive, independent of any other process. Installs a
