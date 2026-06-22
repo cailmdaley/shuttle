@@ -990,7 +990,8 @@ export class FiberDetailModal {
 
     if (shuttleManaged) {
       const requeueBtn = this.buildActionBtn('New session ▸', 'primary')
-      requeueBtn.title = 'Dispatch a fresh worker; outcome preserved'
+      requeueBtn.title =
+        'Cut any open session and dispatch a fresh worker reading ## Status; outcome preserved'
 
       const resumeBtn = this.buildActionBtn('Resume ▸', 'primary')
       resumeBtn.title = 'Resume the previous worker session (claude --resume); outcome preserved'
@@ -2086,6 +2087,21 @@ export class FiberDetailModal {
     btn: HTMLButtonElement,
     errorEl: HTMLElement,
   ): Promise<void> {
+    // A "New session" over a LIVE worker is a CUT: the daemon stamps the
+    // clean-exit marker, kills the running session, and starts fresh — which
+    // discards whatever in-flight context that worker was holding. Confirm
+    // before doing that. A dormant card (no live worker) cuts nothing, so it's
+    // silent; Resume never cuts, so it never confirms.
+    if (mode === 'fresh' && card.runningWorker) {
+      const working = card.runtimePhase === 'working' ? ' (actively working)' : ''
+      const ok = window.confirm(
+        `A worker is still running for “${card.name}”${working}.\n\n` +
+          `Start a new session? This cuts the open session and discards its ` +
+          `in-flight context. Use Resume instead to continue that worker.`,
+      )
+      if (!ok) return
+    }
+
     const original = btn.textContent ?? ''
     btn.disabled = true
     btn.textContent = mode === 'fresh' ? 'Starting…' : 'Resuming…'
