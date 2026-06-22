@@ -365,10 +365,17 @@ defmodule ShuttleWeb.APIControllerTest do
 
   test "GET /api/v1/agents degrades to []/200 when felt's agents verb is unavailable" do
     # The registry is felt-owned now: the controller shells `felt shuttle agents
-    # --json`. When that verb is absent (old felt) or errors, the MockRunner
-    # returns the fall-through `{"", 0}` — unparseable as a JSON array. The
+    # --json` through Shuttle.Felt.run. Route that shell-out at MockRunner (the
+    # `:felt_runner` seam), whose fall-through returns `{"", 0}` — felt emitted
+    # nothing parseable as a JSON array, the "verb absent / old felt" shape. The
     # controller must degrade to an empty list with 200 (the board's picker falls
-    # back to free-text), never crash the request.
+    # back to free-text), never crash the request. Without the seam this asserted
+    # `== []` only on a box where felt happened to be absent — a real felt on PATH
+    # returned the live registry and the test flapped.
+    previous_felt_runner = Application.get_env(:shuttle, :felt_runner)
+    Application.put_env(:shuttle, :felt_runner, MockRunner)
+    on_exit(fn -> restore_app_env(:felt_runner, previous_felt_runner) end)
+
     conn = get(api_conn(), "/api/v1/agents")
     assert conn.status == 200
     assert Jason.decode!(conn.resp_body) == []
