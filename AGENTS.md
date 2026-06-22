@@ -229,6 +229,24 @@ deploy freely whenever there's a fix to ship — never hold back, gate it behind
 brief API/board blip during the ~1s (local) to ~2min (candide cold-walk)
 restart; in-flight work is unaffected.
 
+**An autonomous worker that has built and verified a change SHOULD deploy it —
+that is the default, not a step to stop before.** Because the deploy itself is
+mechanically safe (above), the only thing a branch-and-wait gate buys is a human
+*code review* — and in practice that review rarely happens, so parking finished,
+verified work on a branch is mostly latency and friction, not safety. The
+verification that *does* matter happens in-session: build → run the tripwire
+(`mix test`, `cd ui && npm run build`) → get the skill's independent fresh-eyes
+review (a subagent over the diff-against-constitution, an adversarial pass for
+complex work) → **then deploy, in the same session.** Don't hand a finished,
+green change back to Cail just to have him run `make all` + rsync. Reserve
+"stop for the human" for the genuinely different case — a change whose *design*
+he should weigh in on before it ships (a capability removed, a contract redrawn,
+a load-bearing model choice); even then, surface the alternatives in the fiber
+and keep moving rather than treating the deploy *mechanics* as the gate. A
+constitution may still pin an explicit human-review gate when the stakes warrant
+it, but that is the deliberate exception a constitution names, not the resting
+posture of every change.
+
 **Deploying to remote hosts (candide, cineca):** push to GitHub first, then build on the host — don't copy the macOS escript, as BEAM bytecode format varies across OTP versions and the binary will crash on startup on a different host.
 
 ```bash
