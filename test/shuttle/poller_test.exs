@@ -1008,6 +1008,113 @@ defmodule Shuttle.PollerTest do
     assert {:ok, :no_session} = Poller.kill_session(poller, "tests/killme")
   end
 
+  test "New session (force + resume_mode:fresh) CUTS an open session: marker stamped, live tmux killed, then dispatched fresh" do
+    fiber_id = "tests/cut-open-session"
+    uid = "01JZ00000000000000000000CT"
+
+    MockRunner.set_fiber(fiber_id, make_fiber(fiber_id, %{"uid" => uid, "status" => "active"}))
+    MockRunner.set_shuttle(fiber_id, "kind: oneshot\nagent: claude-sonnet\nhost: test-host\n", "active")
+
+    # max_concurrent_workers: 0 silences the autonomous tick; explicit
+    # dispatch_fiber/3 is not slot-gated, so the cut path is fully exercised
+    # without the poll racing the two manual dispatches.
+    {:ok, poller} =
+      start_poller!(
+        name: :test_poller_cut_open_session,
+        runner: MockRunner,
+        own_host_id: "test-host",
+        poll_interval_ms: 60_000,
+        max_concurrent_workers: 0,
+        felt_stores: ["/tmp"]
+      )
+
+    # First dispatch makes the fiber live (a fresh worker, a real tmux session).
+    assert {:ok, first_session} = Poller.dispatch_fiber(poller, fiber_id, force: true, ad_hoc: true)
+    assert Shuttle.Tmux.present?(MockRunner, first_session)
+
+    before_cut = length(MockRunner.commands())
+
+    # "New session" — a forced fresh dispatch against the now-live session. The
+    # cut fires INSTEAD of bouncing off :already_running: marker + kill, fresh.
+    assert {:ok, second_session} =
+             Poller.dispatch_fiber(poller, fiber_id, force: true, ad_hoc: true, resume_mode: "fresh")
+
+    cut_commands = MockRunner.commands() |> Enum.drop(before_cut)
+
+    marker_idx =
+      Enum.find_index(cut_commands, fn
+        {"felt", args} -> "mark-runtime" in args and "--handed-off-at" in args
+        _ -> false
+      end)
+
+    kill_idx =
+      Enum.find_index(cut_commands, fn
+        {"tmux", ["kill-session", "-t", ^first_session]} -> true
+        _ -> false
+      end)
+
+    new_idx =
+      Enum.find_index(cut_commands, fn
+        {"tmux", ["new-session" | _]} -> true
+        _ -> false
+      end)
+
+    # The clean-exit marker was stamped, the live tmux was killed, and a fresh
+    # session was spawned — all three happened.
+    assert is_integer(marker_idx), "expected a felt mark-runtime --handed-off-at during the cut"
+    assert is_integer(kill_idx), "expected the live tmux session to be killed during the cut"
+    assert is_integer(new_idx), "expected a fresh tmux session after the cut"
+
+    # Order is load-bearing: marker BEFORE kill (so a failed re-dispatch still
+    # leaves the cut session clean), and the fresh spawn AFTER the kill.
+    assert marker_idx < kill_idx
+    assert new_idx > kill_idx
+
+    # The fiber is live again under a fresh session (same canonical name).
+    assert Shuttle.Tmux.present?(MockRunner, second_session)
+  end
+
+  test "Resume (force + resume_mode:previous) does NOT cut a live session — it refuses with :already_running" do
+    fiber_id = "tests/resume-no-cut"
+    uid = "01JZ00000000000000000000RC"
+
+    MockRunner.set_fiber(fiber_id, make_fiber(fiber_id, %{"uid" => uid, "status" => "active"}))
+    MockRunner.set_shuttle(fiber_id, "kind: oneshot\nagent: claude-sonnet\nhost: test-host\n", "active")
+
+    {:ok, poller} =
+      start_poller!(
+        name: :test_poller_resume_no_cut,
+        runner: MockRunner,
+        own_host_id: "test-host",
+        poll_interval_ms: 60_000,
+        max_concurrent_workers: 0,
+        felt_stores: ["/tmp"]
+      )
+
+    assert {:ok, session} = Poller.dispatch_fiber(poller, fiber_id, force: true, ad_hoc: true)
+    before = length(MockRunner.commands())
+
+    # Resume against a live session is refused — you don't resume what's already
+    # running; only "fresh" cuts. The live transcript is the one Resume preserves.
+    assert {:error, :already_running} =
+             Poller.dispatch_fiber(poller, fiber_id, force: true, ad_hoc: true, resume_mode: "previous")
+
+    resume_commands = MockRunner.commands() |> Enum.drop(before)
+
+    refute Enum.any?(resume_commands, fn
+             {"felt", args} -> "mark-runtime" in args and "--handed-off-at" in args
+             _ -> false
+           end)
+
+    refute Enum.any?(resume_commands, fn
+             {"tmux", ["kill-session" | _]} -> true
+             _ -> false
+           end)
+
+    # The live session is untouched.
+    assert Shuttle.Tmux.present?(MockRunner, session)
+  end
+
   test "snapshot remains responsive while poll cycle is reading felt" do
     fiber = make_fiber("tests/slow-felt-read")
     MockRunner.set_fiber("tests/slow-felt-read", fiber)

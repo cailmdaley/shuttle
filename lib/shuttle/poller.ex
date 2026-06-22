@@ -630,6 +630,13 @@ defmodule Shuttle.Poller do
     uid = running_uid(state, fiber_id) || if(Shuttle.ULID.valid?(runtime_key), do: runtime_key)
     session = Dispatcher.session_name(fiber_id, uid)
 
+    # "New session" on an OPEN session is a CUT, not a refusal: a forced fresh
+    # dispatch (force + resume_mode:"fresh" — the kanban New-session button and
+    # drag-launch) stamps the clean-exit marker, kills the live tmux, and drops
+    # the runtime entry, then FALLS THROUGH to the fresh dispatch below instead
+    # of bouncing off `:already_running`. See cut_open_session_for_fresh/5.
+    state = cut_open_session_for_fresh(state, fiber_id, runtime_key, uid, opts)
+
     cond do
       running_key(state, fiber_id) != nil or MapSet.member?(state.claimed, runtime_key) ->
         {:reply, {:error, :already_running}, state}
@@ -2450,6 +2457,80 @@ defmodule Shuttle.Poller do
       | running: Map.delete(state.running, runtime_key),
         claimed: MapSet.delete(state.claimed, runtime_key)
     }
+  end
+
+  # "New session" on a fiber that still holds an OPEN tmux session is a CUT, not
+  # a refusal. A forced fresh dispatch (`force` + `resume_mode:"fresh"` — the
+  # kanban New-session button and drag-launch both send these) stamps the
+  # clean-exit marker, kills the live `shuttle-<id>`, and drops the runtime
+  # entry, THEN lets the caller's `cond` fall through to a fresh dispatch —
+  # instead of returning `:already_running`. Without this, starting fresh on an
+  # open session meant the costly resume → reload-stale-transcript → handoff
+  # dance this fiber's constitution set out to kill.
+  #
+  # Gated strictly on `force` + `resume_mode:"fresh"`: the autonomous poll never
+  # carries `resume_mode`, so it can NEVER cut a live worker — only an explicit
+  # human New-session can. A non-fresh force-dispatch (Resume, `"previous"`) is
+  # untouched and still resumes the in-flight transcript.
+  defp cut_open_session_for_fresh(%State{} = state, fiber_id, runtime_key, uid, opts) do
+    forced_fresh? =
+      Keyword.get(opts, :force, false) and Keyword.get(opts, :resume_mode) == "fresh"
+
+    open? =
+      running_key(state, fiber_id) != nil or
+        MapSet.member?(state.claimed, runtime_key) or
+        fiber_session_live?(state, fiber_id, uid)
+
+    if forced_fresh? and open? do
+      cut_open_session(state, fiber_id, runtime_key, uid)
+    else
+      state
+    end
+  end
+
+  # The cut itself — the user-gesture twin of `kill_session`, plus the marker.
+  # Stamps the clean-exit marker FIRST so a cut is robust against a failed
+  # re-dispatch: even if the fresh dispatch that follows never spawns, the cut
+  # session reads clean (`handed_off_at >= dispatched_at` → fresh) and the next
+  # poll starts fresh rather than resuming the killed transcript.
+  defp cut_open_session(%State{} = state, fiber_id, runtime_key, uid) do
+    felt_store =
+      case host_for_fiber(fiber_id, state) do
+        {:ok, h} -> h
+        {:error, _} -> hd(state.felt_stores)
+      end
+
+    # 1. Clean-exit marker — daemon-side, no worker spawned, no transcript
+    #    reload. Best-effort (logged, never raised) so it can't block the cut.
+    _ = Shuttle.Continuation.mark_handed_off(state.runner, felt_store, fiber_id)
+
+    # 2. Drop the runtime footprint + resolve the session to kill. A TRACKED
+    #    worker: stop its watcher BEFORE the kill (so the watcher's has-session
+    #    poll doesn't also report the exit and double-handle through
+    #    handle_worker_exit) and kill exactly the session we're watching — the
+    #    kill_session twin. An ORPHAN (live tmux, no running entry): resolve the
+    #    live name by liveness and release any lingering claim.
+    {state, session} =
+      case running_key(state, fiber_id) do
+        nil ->
+          {release_claim(state, runtime_key), live_session_for_fiber(state, fiber_id, uid)}
+
+        key ->
+          meta = Map.get(state.running, key)
+          stop_watcher(meta)
+          {remove_running(state, key), meta.session}
+      end
+
+    # 3. SIGKILL the live tmux session (tracked or orphan). Idempotent — a kill
+    #    on an already-gone session is harmless.
+    if session,
+      do: state.runner.cmd("tmux", ["kill-session", "-t", session], stderr_to_stdout: true)
+
+    Logger.info(
+      "Cut open session for #{fiber_id} (New session): clean-exit marker stamped, tmux #{session || "(none)"} killed"
+    )
+
+    state
   end
 
   @doc false
