@@ -193,16 +193,16 @@ Each host's daemon tails its own host's `~/.shuttle/events.jsonl`.
 remotes authenticate differently, and getting it wrong looks like "the host is
 down" when it isn't:
 
-- **candide** (`candide-login`, IAP) — plain pubkey auth with `~/.ssh/id_rsa`
+- **candide** (IAP) — plain pubkey auth with `~/.ssh/id_rsa`
   (the `Host *` identity), reached through an `nc` `ProxyCommand` hop. No cert
   dance: `ssh candide` just works whenever you're on a network that can reach
   IAP. Nothing expires.
-- **cineca** (`cineca-login`, user `USER`, Leonardo) —
+- **cineca** (Leonardo, CINECA) —
   auth is a **step-ca short-lived SSH certificate** held in the ssh-agent,
   valid **24h**. Refresh it once per day with:
 
   ```bash
-  step ssh login 'user@example.org' --provisioner cineca-hpc
+  step ssh login "$CINECA_SSO_EMAIL" --provisioner cineca-hpc
   ```
 
   When the cert is fresh, `ssh cineca` works non-interactively. When it has
